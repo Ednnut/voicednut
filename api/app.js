@@ -250,6 +250,13 @@ async function persistDtmfCapture(callSid, digits, options = {}) {
 
     const digitsPreview = sanitizedDigits;
     console.log(`🔢 Captured DTMF input for ${callSid}: ${digitsPreview}`.cyan);
+
+    return {
+      stageKey: compliancePayload.metadata.stage_key,
+      stageLabel: resolvedStageLabel,
+      digits: sanitizedDigits,
+      callRecord,
+    };
   } catch (error) {
     console.error('❌ Failed to persist DTMF input:', error);
   }
@@ -324,6 +331,135 @@ function parseMetadataJson(value) {
     console.warn('Failed to parse metadata_json:', error.message);
     return null;
   }
+}
+
+function parseBusinessContextPayload(raw) {
+  if (!raw) return null;
+  if (typeof raw === 'object') {
+    return raw;
+  }
+  try {
+    return JSON.parse(raw);
+  } catch (error) {
+    console.warn('Failed to parse business_context payload:', error.message);
+    return null;
+  }
+}
+
+function flattenExpectationSource(source) {
+  if (!source) {
+    return [];
+  }
+  if (Array.isArray(source)) {
+    return source.map((entry) => ({ ...entry }));
+  }
+  if (typeof source === 'object') {
+    return Object.entries(source).map(([key, value]) => {
+      if (value && typeof value === 'object') {
+        return { stage: key, ...value };
+      }
+      return { stage: key, expectedValue: value };
+    });
+  }
+  return [];
+}
+
+function resolveDtmfExpectation(callConfig, stageKey) {
+  const normalizedStage = dtmfUtils.normalizeStage(stageKey || 'GENERIC');
+  if (!callConfig) {
+    return {
+      stageKey: normalizedStage,
+      label: stageKey || 'Entry',
+      expectedValue: null,
+      expectedLength: null,
+      successMessage: null,
+      failureMessage: null,
+    };
+  }
+
+  const metadata = parseMetadataJson(callConfig.metadata_json) || {};
+  const allowGlobalDigits = callConfig.call_type === 'collect_input';
+  const candidates = [
+    ...flattenExpectationSource(callConfig.collect_input_sequence),
+    ...flattenExpectationSource(metadata.input_sequence),
+    ...flattenExpectationSource(metadata.dtmf_expectations),
+    ...flattenExpectationSource(metadata.input_expectations),
+    ...flattenExpectationSource(metadata.secure_inputs),
+  ].filter(Boolean);
+
+  let match = candidates.find((candidate) => {
+    const candidateStage = candidate.stage || candidate.stage_key || candidate.label;
+    return candidateStage && dtmfUtils.normalizeStage(candidateStage) === normalizedStage;
+  });
+
+  if (!match && normalizedStage === 'OTP') {
+    match = {
+      stage: 'OTP',
+      label: 'OTP',
+      expectedValue:
+        metadata.expected_otp ||
+        metadata.otp_code ||
+        metadata.one_time_passcode ||
+        metadata.expected_passcode ||
+        metadata.passcode,
+    };
+  }
+
+  if (!match && candidates.length === 1) {
+    match = candidates[0];
+  }
+
+  const expectedValue =
+    match?.expectedValue ??
+    match?.expected ??
+    match?.value ??
+    match?.code ??
+    match?.digits ??
+    (normalizedStage === 'OTP'
+      ? metadata.expected_otp ||
+        metadata.otp_code ||
+        metadata.one_time_passcode ||
+        metadata.expected_passcode ||
+        metadata.passcode
+      : null);
+
+  const expectedLengthRaw =
+    match?.numDigits ??
+    match?.length ??
+    metadata.default_digit_length ??
+    (allowGlobalDigits ? callConfig.collect_digits : null) ??
+    metadata.expected_length;
+
+  const expectedLengthNumber = Number(expectedLengthRaw);
+  const expectedLength =
+    Number.isFinite(expectedLengthNumber) && expectedLengthNumber > 0 ? expectedLengthNumber : null;
+
+  return {
+    stageKey: normalizedStage,
+    label: match?.label || match?.name || match?.stage || stageKey || 'Entry',
+    expectedValue: expectedValue ? String(expectedValue) : null,
+    expectedLength,
+    successMessage: match?.successMessage || match?.success_message || null,
+    failureMessage: match?.failureMessage || match?.failure_message || null,
+  };
+}
+
+function evaluateDtmfVerification(digits, expectation) {
+  if (!digits) {
+    return { status: 'unknown' };
+  }
+
+  if (expectation?.expectedValue) {
+    const isMatch = digits === expectation.expectedValue;
+    return { status: isMatch ? 'match' : 'mismatch', expectedValue: expectation.expectedValue };
+  }
+
+  if (expectation?.expectedLength) {
+    const meetsLength = digits.length === expectation.expectedLength;
+    return { status: meetsLength ? 'length_match' : 'length_mismatch', expectedLength: expectation.expectedLength };
+  }
+
+  return { status: 'captured' };
 }
 
 async function handleCollectInputRequest(req, res, callRecord) {
@@ -980,6 +1116,98 @@ app.ws('/connection', (ws) => {
     let interactionCount = 0;
     let isInitialized = false;
 
+    const emitRealtimeDtmfInsights = async (summary, metadataEnvelope = {}) => {
+      if (!summary || !summary.digits || !gptService || !callConfig || callConfig.call_type === 'collect_input') {
+        return;
+      }
+
+      const expectation = resolveDtmfExpectation(callConfig, summary.stageKey);
+      const verification = evaluateDtmfVerification(summary.digits, expectation);
+      const stageDisplay = summary.stageLabel || expectation.label || summary.stageKey || 'Entry';
+      const businessContext = summary.callRecord
+        ? parseBusinessContextPayload(summary.callRecord.business_context)
+        : null;
+      const personaName =
+        callConfig.business_display_name ||
+        businessContext?.persona?.businessDisplayName ||
+        businessContext?.businessDisplayName ||
+        businessContext?.companyName ||
+        null;
+
+      const promptSegments = [
+        `Caller entered keypad input for ${stageDisplay}.`,
+        `Digits: ${summary.digits}.`,
+      ];
+
+      switch (verification.status) {
+        case 'match':
+          promptSegments.push('System verification confirms the digits match the expected value. Deliver the closing steps or thank-you message next.');
+          break;
+        case 'length_match':
+          promptSegments.push('Digits meet the expected length. Continue guiding the caller toward the final steps.');
+          break;
+        case 'mismatch':
+          promptSegments.push('These digits do NOT match the expected value. Let the caller know and politely ask them to try again.');
+          break;
+        case 'length_mismatch':
+          if (verification.expectedLength) {
+            promptSegments.push(`System expected ${verification.expectedLength} digits. Let the caller know and request a full re-entry.`);
+          } else {
+            promptSegments.push('System validation failed. Ask the caller to re-enter the code carefully.');
+          }
+          break;
+        default:
+          promptSegments.push('Acknowledge the keypad entry and continue assisting the caller.');
+      }
+
+      if (expectation.successMessage && ['match', 'length_match'].includes(verification.status)) {
+        promptSegments.push(expectation.successMessage);
+      }
+
+      if (expectation.failureMessage && ['mismatch', 'length_mismatch'].includes(verification.status)) {
+        promptSegments.push(expectation.failureMessage);
+      }
+
+      if (personaName) {
+        promptSegments.push(`Keep the ${personaName} persona/tone consistent while responding.`);
+      }
+
+      const transcriptLine = `[Keypad] ${stageDisplay}: ${summary.digits}`;
+
+      try {
+        await db.addTranscript({
+          call_sid: callSid,
+          speaker: 'user',
+          message: transcriptLine,
+          interaction_count: interactionCount
+        });
+
+        await db.updateCallState(callSid, 'dtmf_verified', {
+          stage_key: summary.stageKey,
+          digits_preview: summary.digits,
+          verification: verification.status,
+          expected_value: expectation.expectedValue || null,
+          expected_length: expectation.expectedLength || null,
+          metadata: metadataEnvelope
+        });
+      } catch (dbError) {
+        console.error('Database error logging keypad transcript:', dbError);
+      }
+
+      try {
+        await db.logServiceHealth('call_system', 'dtmf_forwarded', {
+          call_sid: callSid,
+          stage_key: summary.stageKey,
+          verification: verification.status
+        });
+      } catch (healthError) {
+        console.warn('Failed to log dtmf_forwarded health event:', healthError.message);
+      }
+
+      gptService.completion(promptSegments.join(' '), interactionCount, 'user', 'dtmf_input');
+      interactionCount += 1;
+    };
+
     const recordDtmfInput = async (digits, source = 'twilio', extraMeta = {}) => {
       if (!callSid) {
         return;
@@ -1011,7 +1239,7 @@ app.ws('/connection', (ws) => {
         metadataEnvelope.captured_at = extraMeta.captured_at;
       }
 
-      await persistDtmfCapture(callSid, digits, {
+      const summary = await persistDtmfCapture(callSid, digits, {
         source,
         provider: currentProvider,
         stage_key: stageCandidate,
@@ -1021,6 +1249,8 @@ app.ws('/connection', (ws) => {
         reason: extraMeta.reason,
         capture_method: 'twilio_stream',
       });
+
+      await emitRealtimeDtmfInsights(summary, metadataEnvelope);
     };
 
     ws.on('message', async function message(data) {

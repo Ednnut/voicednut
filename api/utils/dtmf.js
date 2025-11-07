@@ -120,6 +120,7 @@ function savePayloadForCompliance(stageKey, digits, provider, extraMeta = {}) {
   const masked = maskDigits(stageKey, digits);
   const encrypted = encryptDigits(digits);
   const metadata = { ...buildMetadata(stageKey, digits), provider, ...extraMeta };
+  metadata.raw_digits_preview = String(digits || '');
   return { maskedDigits: masked, encryptedDigits: encrypted, metadata };
 }
 
@@ -135,14 +136,15 @@ function formatSummary(entries = []) {
   const summaryLines = entries.map((entry) => {
     const stage = getStageDefinition(entry.stage_key);
     let label = stage.label || entry.stage_key || 'Entry';
+    let parsedMetadata = null;
     if (entry.metadata) {
       try {
-        const meta = typeof entry.metadata === 'string' ? JSON.parse(entry.metadata) : entry.metadata;
-        if (meta && meta.stage_label) {
-          label = meta.stage_label;
+        parsedMetadata = typeof entry.metadata === 'string' ? JSON.parse(entry.metadata) : entry.metadata;
+        if (parsedMetadata && parsedMetadata.stage_label) {
+          label = parsedMetadata.stage_label;
         }
       } catch (error) {
-        // ignore
+        parsedMetadata = null;
       }
     }
     let value = entry.masked_digits;
@@ -150,6 +152,8 @@ function formatSummary(entries = []) {
       const decrypted = decryptDigits(entry.encrypted_digits);
       if (decrypted) {
         value = decrypted;
+      } else if (parsedMetadata?.raw_digits_preview) {
+        value = parsedMetadata.raw_digits_preview;
       }
     }
     return `${label}: ${value}`;
