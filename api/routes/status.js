@@ -883,6 +883,55 @@ class EnhancedWebhookService {
     }
   }
 
+  async sendCallHint(call_sid, telegram_chat_id, hintType) {
+    try {
+      const call = await this.db.getCall(call_sid);
+      const maskedNumber = maskPhoneNumber(call?.phone_number);
+
+      const hintDefinitions = {
+        call_hint_caller_listening: {
+          emoji: '👂',
+          title: 'Caller is listening',
+          detail: 'Human detected. Share live instructions or pause the bot if needed.',
+        },
+        call_hint_machine_detected: {
+          emoji: '🤖',
+          title: 'Machine detected',
+          detail: 'AMD indicates a machine. Consider switching to voicemail or ending the call early.',
+        },
+        call_hint_input_detected: {
+          emoji: '🔢',
+          title: 'Digits detected',
+          detail: 'Caller started entering digits. Watch the keypad capture stream.',
+        },
+      };
+
+      const definition = hintDefinitions[hintType];
+      if (!definition) {
+        console.warn(`Unknown call hint type requested: ${hintType}`);
+        return true;
+      }
+
+      const lines = [];
+      lines.push(`${definition.emoji} ${definition.title}`);
+      lines.push(definition.detail);
+      lines.push('');
+      lines.push(`Call: ${maskedNumber}`);
+
+      if (hintType === 'call_hint_input_detected') {
+        const preview = call?.latest_input_preview;
+        const hint = preview ? `Latest digits: ${preview}` : 'Waiting for keypad summary.';
+        lines.push(hint);
+      }
+
+      await this.sendTelegramMessage(telegram_chat_id, buildTelegramMessage(lines));
+      return true;
+    } catch (error) {
+      console.error('❌ Failed to send call hint notification:', error);
+      return false;
+    }
+  }
+
   // Process individual notification with enhanced error handling
   async sendNotification(notification) {
     const { id, call_sid, notification_type, telegram_chat_id, phone_number } = notification;
@@ -941,6 +990,11 @@ class EnhancedWebhookService {
           break;
         case 'call_canceled':
           success = await this.sendCallStatusUpdate(call_sid, 'canceled', telegram_chat_id);
+          break;
+        case 'call_hint_caller_listening':
+        case 'call_hint_machine_detected':
+        case 'call_hint_input_detected':
+          success = await this.sendCallHint(call_sid, telegram_chat_id, notification_type);
           break;
         default:
           console.warn(`⚠️ Unknown notification type: ${notification_type}`.yellow);

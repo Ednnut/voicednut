@@ -20,10 +20,12 @@ const Database = require('./db/db');
 const { webhookService } = require('./routes/status');
 const DynamicFunctionEngine = require('./functions/DynamicFunctionEngine');
 const PersonaComposer = require('./services/PersonaComposer');
+const CallHintStateMachine = require('./services/CallHintStateMachine');
 const DEFAULT_PERSONAS = require('./functions/personas');
 const { AwsConnectAdapter, AwsTtsAdapter, AwsSmsAdapter, VonageVoiceAdapter, VonageSmsAdapter } = require('./adapters');
 const { v4: uuidv4 } = require('uuid');
 const dtmfUtils = require('./utils/dtmf');
+const { normalizeAnsweredBy, isHumanAnsweredBy, isMachineAnsweredBy } = require('./utils/amd');
 
 const VoiceResponse = require('twilio').twiml.VoiceResponse;
 
@@ -83,6 +85,7 @@ const smsService = new EnhancedSmsService({
   provider: currentProvider
 });
 const personaComposer = new PersonaComposer();
+const callHintStateMachine = new CallHintStateMachine();
 const awsCallSessions = new Map();
 const awsContactIndex = new Map();
 const vonageCallIndex = new Map();
@@ -94,25 +97,6 @@ let vonageAdapters = null;
 const COLLECT_INPUT_FUNCTIONS = new Set(['ivr_survey', 'pin_entry', 'menu_selection', 'otp_collection', 'account_verification']);
 const collectInputCompletion = new Set();
 
-const HUMAN_ANSWER_VALUES = new Set(['human', 'person', 'live', 'positive_human']);
-const MACHINE_ANSWER_VALUES = new Set(['machine', 'machine_start', 'fax', 'positive_machine', 'unknown_machine', 'answering_machine']);
-
-function normalizeAnsweredBy(value) {
-  if (!value) {
-    return '';
-  }
-  return value.toString().trim().toLowerCase();
-}
-
-function isHumanAnsweredBy(value) {
-  const normalized = normalizeAnsweredBy(value);
-  return HUMAN_ANSWER_VALUES.has(normalized);
-}
-
-function isMachineAnsweredBy(value) {
-  const normalized = normalizeAnsweredBy(value);
-  return MACHINE_ANSWER_VALUES.has(normalized);
-}
 
 function sanitizeDigits(rawInput) {
   if (rawInput == null) {
@@ -256,6 +240,12 @@ async function persistDtmfCapture(callSid, digits, options = {}) {
       digits_length: sanitizedDigits.length,
       stage_key: compliancePayload.metadata.stage_key,
       source,
+    });
+
+    await callHintStateMachine.handleDtmfCapture(callSid, {
+      call: callRecord,
+      provider,
+      metadata: normalizedMetadata
     });
 
     const digitsPreview = sanitizedDigits;
@@ -916,6 +906,7 @@ async function startServer() {
     db = new Database();
     await db.initialize();
     console.log('✅ Enhanced database initialized successfully'.green);
+    callHintStateMachine.setDatabase(db);
 
     if (smsService && typeof smsService.setDatabase === 'function') {
       smsService.setDatabase(db);
@@ -2188,6 +2179,14 @@ app.post('/webhook/amd-status', async (req, res) => {
       markAnswered: Boolean(normalizedAnswer),
     });
 
+    await callHintStateMachine.handleAmdUpdate(CallSid, answeredValue, {
+      call,
+      provider: 'twilio',
+      metadata: {
+        confidence: Number.isFinite(confidenceValue) ? confidenceValue : undefined
+      }
+    });
+
     const targetChatId = call.telegram_chat_id || call.user_chat_id;
     if (targetChatId && answeredValue) {
       await db.createEnhancedWebhookNotification(CallSid, 'call_amd_update', targetChatId, 'high');
@@ -2264,6 +2263,12 @@ app.post('/webhook/call-status', async (req, res) => {
     }
 
     await db.updateCallStatus(CallSid, normalizedStatus, updateData);
+
+    await callHintStateMachine.handleTwilioStatus(CallSid, normalizedStatus, {
+      call,
+      answeredBy: AnsweredBy,
+      provider: 'twilio'
+    });
 
     if (call.call_type === 'collect_input' && ['completed', 'no-answer', 'failed', 'canceled'].includes(normalizedStatus)) {
       await finalizeCollectInputCall(CallSid, call);
