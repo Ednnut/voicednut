@@ -1028,6 +1028,39 @@ class EnhancedDatabase {
         });
     }
 
+    async getRecentCallStates(call_sid, state = null, limit = 5) {
+        if (!call_sid) {
+            return [];
+        }
+        return new Promise((resolve, reject) => {
+            let sql = `
+                SELECT id, call_sid, state, data, timestamp, sequence_number
+                FROM call_states
+                WHERE call_sid = ?
+            `;
+            const params = [call_sid];
+            if (state) {
+                sql += ' AND state = ?';
+                params.push(state);
+            }
+            sql += ' ORDER BY timestamp DESC LIMIT ?';
+            params.push(limit);
+
+            this.db.all(sql, params, (err, rows) => {
+                if (err) {
+                    reject(err);
+                } else {
+                    resolve(rows || []);
+                }
+            });
+        });
+    }
+
+    async getLatestCallState(call_sid, state = null) {
+        const rows = await this.getRecentCallStates(call_sid, state, 1);
+        return rows.length ? rows[0] : null;
+    }
+
     // Enhanced transcript with personality tracking (supports both table names)
     async addTranscript(transcriptData) {
         const {

@@ -311,6 +311,52 @@ async function handleCallFollowUp(ctx, callSid, followAction) {
             await ctx.reply(transcriptMessage, { parse_mode: 'Markdown' });
             break;
         }
+        case 'callagain': {
+            if (!callData.phone_number) {
+                await ctx.reply('❌ Cannot place the follow-up call because the phone number is missing.');
+                return;
+            }
+            ctx.session.meta = ctx.session.meta || {};
+            ctx.session.meta.prefill = {
+                phoneNumber: callData.phone_number,
+                followUp: 'call',
+                callSid,
+                quickAction: 'callagain'
+            };
+            await ctx.reply('☎️ Calling the customer again with the same configuration...');
+            try {
+                await ctx.conversation.enter('call-conversation');
+            } catch (error) {
+                console.error('Follow-up call-again flow error:', error);
+                await ctx.reply('❌ Unable to start the call flow. You can use /call to retry manually.');
+            }
+            break;
+        }
+        case 'skip': {
+            await ctx.reply('👍 Noted. Skipping the follow-up for now—you can revisit this call anytime from /calls.');
+            break;
+        }
+        case 'resend': {
+            if (!callData.phone_number) {
+                await ctx.reply('❌ Cannot resend the code: original phone number missing.');
+                return;
+            }
+            ctx.session.meta = ctx.session.meta || {};
+            ctx.session.meta.prefill = {
+                phoneNumber: callData.phone_number,
+                followUp: 'sms',
+                callSid,
+                quickAction: 'resend_code'
+            };
+            await ctx.reply('🔁 Sending a fresh verification code via SMS...');
+            try {
+                await ctx.conversation.enter('sms-conversation');
+            } catch (error) {
+                console.error('Resend code flow error:', error);
+                await ctx.reply('❌ Unable to start SMS flow. You can use /sms to send the code manually.');
+            }
+            break;
+        }
 
         default:
             await ctx.reply('ℹ️ Quick action not recognised or not yet implemented.');

