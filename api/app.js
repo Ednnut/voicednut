@@ -259,6 +259,33 @@ function sanitizeDigits(rawInput) {
   return String(rawInput).replace(/[^0-9*#]/g, '');
 }
 
+function sanitizeCustomerName(rawName) {
+  if (!rawName) {
+    return null;
+  }
+  const cleaned = rawName
+    .toString()
+    .replace(/[^a-zA-Z0-9\s'\-]/g, '')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+  return cleaned || null;
+}
+
+function buildPersonalizedFirstMessage(baseMessage, customerName, personaLabel) {
+  if (!customerName) {
+    return baseMessage;
+  }
+  const greeting = `Hello ${customerName}!`;
+  const trimmedBase = (baseMessage || '').trim();
+  if (!trimmedBase) {
+    const brand = personaLabel || 'our team';
+    return `${greeting} Welcome to ${brand}! For your security, we'll complete a quick verification to help protect your account from online fraud. If you've received your 6-digit one-time password by SMS, please enter it now.`;
+  }
+  const withoutExistingGreeting = trimmedBase.replace(/^hello[^.!?]*[.!?]?\s*/i, '').trim();
+  const remainder = withoutExistingGreeting.length ? withoutExistingGreeting : trimmedBase;
+  return `${greeting} ${remainder}`;
+}
+
 async function persistDtmfCapture(callSid, digits, options = {}) {
   if (!callSid || !db) {
     return;
@@ -1841,7 +1868,8 @@ app.post('/outbound-call', async (req, res) => {
       metadata_json,
       input_sequence,
       collect_digits,
-      collect_thank_you_message
+      collect_thank_you_message,
+      customer_name
     } = req.body;
 
     if (!number) {
@@ -1903,6 +1931,7 @@ app.post('/outbound-call', async (req, res) => {
     }
 
     const resolvedBusinessId = businessProfile ? businessProfile.id : (business_id || 'general');
+    const sanitizedCustomerName = sanitizeCustomerName(customer_name);
     const businessFunction = businessFunctionRaw ? businessFunctionRaw.toString().trim().toLowerCase() : null;
     let callType = (requestedCallType || '').toString().trim().toLowerCase();
     const requiresInputFlag = toBoolean(requires_input);
@@ -1973,6 +2002,16 @@ app.post('/outbound-call', async (req, res) => {
     const usingDefaultPrompt = selectedPrompt === DEFAULT_SYSTEM_PROMPT;
     const usingDefaultFirstMessage = selectedFirstMessage === DEFAULT_FIRST_MESSAGE;
 
+    const personaDisplayName =
+      businessProfile?.displayName ||
+      templateName ||
+      'our team';
+    selectedFirstMessage = buildPersonalizedFirstMessage(
+      selectedFirstMessage,
+      sanitizedCustomerName,
+      personaDisplayName
+    );
+
     console.log('🔧 Generating adaptive function system for call...'.blue);
     const functionSystem = functionEngine.generateAdaptiveFunctionSystem(selectedPrompt, selectedFirstMessage);
     console.log(
@@ -1994,6 +2033,9 @@ app.post('/outbound-call', async (req, res) => {
       ? normalizeInputSequencePayload(input_sequence, collect_digits || 4)
       : [];
     const metadataPayload = parseMetadataJson(metadata_json) || {};
+    if (sanitizedCustomerName) {
+      metadataPayload.customer_name = sanitizedCustomerName;
+    }
     if (callType === 'collect_input') {
       metadataPayload.input_sequence = sanitizedInputSequence;
     }
@@ -2016,6 +2058,7 @@ app.post('/outbound-call', async (req, res) => {
       persona_metadata: composition ? composition.metadata : null,
       voice_model: effectiveVoiceModel,
       template_name: templateName,
+      customer_name: sanitizedCustomerName,
       call_type: callType,
       business_function: businessFunction,
       collect_input_sequence: sanitizedInputSequence,

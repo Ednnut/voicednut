@@ -254,6 +254,7 @@ async function handleCallFollowUp(ctx, callSid, followAction) {
             ctx.session.meta = ctx.session.meta || {};
             ctx.session.meta.prefill = {
                 phoneNumber: callData.phone_number,
+                customerName: callData.customer_name || callData.client_name || callData.metadata?.customer_name || null,
                 followUp: 'sms',
                 callSid
             };
@@ -275,6 +276,7 @@ async function handleCallFollowUp(ctx, callSid, followAction) {
             ctx.session.meta = ctx.session.meta || {};
             ctx.session.meta.prefill = {
                 phoneNumber: callData.phone_number,
+                customerName: callData.customer_name || callData.client_name || callData.metadata?.customer_name || null,
                 followUp: 'call',
                 callSid
             };
@@ -319,6 +321,7 @@ async function handleCallFollowUp(ctx, callSid, followAction) {
             ctx.session.meta = ctx.session.meta || {};
             ctx.session.meta.prefill = {
                 phoneNumber: callData.phone_number,
+                customerName: callData.customer_name || callData.client_name || callData.metadata?.customer_name || null,
                 followUp: 'call',
                 callSid,
                 quickAction: 'callagain'

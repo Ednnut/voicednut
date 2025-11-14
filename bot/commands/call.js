@@ -37,6 +37,29 @@ function replacePlaceholders(text = '', values = {}) {
   return output;
 }
 
+function sanitizeCustomerName(rawName) {
+  if (!rawName) {
+    return null;
+  }
+  const cleaned = rawName.replace(/[^a-zA-Z0-9\\s'\\-]/g, '').trim();
+  return cleaned || null;
+}
+
+function buildPersonalizedFirstMessage(baseMessage, customerName, personaLabel) {
+  if (!customerName) {
+    return baseMessage;
+  }
+  const greeting = `Hello ${customerName}!`;
+  const trimmedBase = (baseMessage || '').trim();
+  if (!trimmedBase) {
+    const brandLabel = personaLabel || 'our team';
+    return `${greeting} Welcome to ${brandLabel}! For your security, we'll complete a quick verification to help protect your account from online fraud. If you've received your 6-digit one-time password by SMS, please enter it now.`;
+  }
+  const withoutExistingGreeting = trimmedBase.replace(/^hello[^.!?]*[.!?]?\\s*/i, '').trim();
+  const remainder = withoutExistingGreeting.length ? withoutExistingGreeting : trimmedBase;
+  return `${greeting} ${remainder}`;
+}
+
 async function safeTemplatesRequest(method, url, options = {}) {
   try {
     const response = await axios.request({
@@ -223,7 +246,12 @@ async function selectCallTemplate(conversation, ctx, ensureActive) {
 
   return {
     payloadUpdates,
-    summary
+    summary,
+    meta: {
+      templateName: template.name,
+      templateDescription: template.description || 'No description provided',
+      personaLabel: businessOption?.label || template.business_id || 'Custom'
+    }
   };
 }
 
@@ -372,7 +400,12 @@ async function buildCustomCallConfig(conversation, ctx, ensureActive, businessOp
 
   return {
     payloadUpdates,
-    summary
+    summary,
+    meta: {
+      templateName: personaOptions?.label || 'Custom',
+      templateDescription: 'Custom persona configuration',
+      personaLabel: personaOptions?.label || 'Custom'
+    }
   };
 }
 
@@ -392,6 +425,7 @@ async function callFlow(conversation, ctx) {
   };
 
   try {
+    await ctx.reply('Starting call process…');
     const user = await new Promise((resolve) => getUser(ctx.from.id, resolve));
     ensureActive();
     if (!user) {
@@ -406,6 +440,7 @@ async function callFlow(conversation, ctx) {
 
     const prefill = ctx.session.meta?.prefill || {};
     let number = prefill.phoneNumber || null;
+    let customerName = prefill.customerName || null;
 
     if (number) {
       await ctx.reply(`📞 Using follow-up number: ${number}`);
@@ -414,7 +449,7 @@ async function callFlow(conversation, ctx) {
       }
       flow.touch('number-prefilled');
     } else {
-      await ctx.reply('📞 Enter phone number (E.164 format, e.g., +16125151442):');
+      await ctx.reply('📞 Enter phone number (E.164 format):');
       const numMsg = await waitForMessage();
       number = numMsg?.message?.text?.trim();
 
@@ -430,10 +465,25 @@ async function callFlow(conversation, ctx) {
       flow.touch('number-captured');
     }
 
+    if (customerName) {
+      await ctx.reply(`👤 Using customer name: ${customerName}`);
+    } else {
+      await ctx.reply('👤 Please enter the customer\'s name (as it should be spoken on the call):\nType skip to leave blank.');
+      const nameMsg = await waitForMessage();
+      const providedName = nameMsg?.message?.text?.trim();
+      if (providedName && providedName.toLowerCase() !== 'skip') {
+        const sanitized = sanitizeCustomerName(providedName);
+        if (sanitized) {
+          customerName = sanitized;
+          flow.touch('customer-name');
+        }
+      }
+    }
+
     const configurationMode = await askOptionWithButtons(
       conversation,
       ctx,
-      '⚙️ *How would you like to configure this call?*',
+      '⚙️ How would you like to configure this call?',
       [
         { id: 'template', label: '📁 Use call template' },
         { id: 'custom', label: '🛠️ Build custom persona' }
@@ -464,6 +514,7 @@ async function callFlow(conversation, ctx) {
     const payload = {
       number,
       user_chat_id: ctx.from.id.toString(),
+      customer_name: customerName || null,
       ...configuration.payloadUpdates
     };
 
@@ -471,18 +522,35 @@ async function callFlow(conversation, ctx) {
     payload.purpose = payload.purpose || config.defaultPurpose;
     payload.voice_model = payload.voice_model || config.defaultVoiceModel;
     payload.template = payload.template || 'custom';
+    payload.technical_level = payload.technical_level || 'auto';
 
-    const summaryLines = [
-      '📋 *Call Details:*',
-      '',
-      `📞 Number: ${number}`
+    const templateName =
+      configuration.meta?.templateName ||
+      configuration.payloadUpdates?.template ||
+      'Custom';
+    const templateDescription =
+      configuration.meta?.templateDescription ||
+      configuration.payloadUpdates?.template_description ||
+      'No description provided';
+    const personaLabel =
+      configuration.meta?.personaLabel ||
+      configuration.payloadUpdates?.persona_label ||
+      'Custom';
+
+    const callDetailsCard = [
+      '📋 Call Details:',
+      `• Number: ${number}`,
+      `• Customer: ${customerName || 'Not provided'}`,
+      `• Template: ${templateName}`,
+      `• Description: ${templateDescription}`,
+      `• Purpose: ${payload.purpose || 'general'}`,
+      `• Tone: ${payload.emotion || 'auto'}`,
+      `• Urgency: ${payload.urgency || 'auto'}`,
+      `• Technical level: ${payload.technical_level || 'auto'}`
     ];
 
-    configuration.summary.forEach((line) => summaryLines.push(`• ${line}`));
-    summaryLines.push('');
-    summaryLines.push('⏳ Making the call...');
-
-    await ctx.reply(summaryLines.join('\n'), { parse_mode: 'Markdown' });
+    await ctx.reply(callDetailsCard.join('\n'));
+    await ctx.reply('⏳ Making the call…');
 
     const payloadForLog = { ...payload };
     if (payloadForLog.prompt) {
@@ -509,14 +577,13 @@ async function callFlow(conversation, ctx) {
 
     const data = response?.data;
     if (data?.success && data.call_sid) {
-      const successMsg = `✅ *Call Placed Successfully!*\n\n` +
-        `📞 To: ${data.to}\n` +
-        `🆔 Call SID: \`${data.call_sid}\`\n` +
-        `📊 Status: ${data.status}\n\n` +
-        `🔔 *You'll receive notifications about:*\n` +
-        `• Call progress updates\n` +
-        `• Complete transcript when call ends\n` +
-        `• AI-generated summary\n\n`;
+      const successMsg = [
+        '✅ *Call Placed Successfully!*',
+        '',
+        `📞 To: ${data.to}`,
+        `🆔 Call SID: \`${data.call_sid}\``,
+        `📊 Status: ${data.status}`
+      ].join('\n');
 
       await ctx.reply(successMsg, { parse_mode: 'Markdown' });
       flow.touch('completed');
