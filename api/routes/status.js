@@ -248,6 +248,7 @@ function collectInputLines(metadata = {}, entries = [], options = {}) {
   const sequence = Array.isArray(metadata?.input_sequence) ? metadata.input_sequence : [];
   const capturedStages = new Map();
   const stageOrder = [];
+  const fields = [];
 
   entries.forEach((entry) => {
     const entryMetadata = parseDtmfMetadata(entry.metadata);
@@ -279,8 +280,10 @@ function collectInputLines(metadata = {}, entries = [], options = {}) {
       const captured = capturedStages.get(normalizedStageKey);
       if (captured && captured.value) {
         lines.push(`${label}: ${captured.value}`);
+        fields.push({ label, value: captured.value, stage: normalizedStageKey, missing: false });
       } else if (includeMissing) {
         lines.push(`${label}: No ${formatMissingInputLabel(label)} entered`);
+        fields.push({ label, value: null, stage: normalizedStageKey, missing: true });
       }
     });
   } else if (capturedStages.size) {
@@ -288,6 +291,11 @@ function collectInputLines(metadata = {}, entries = [], options = {}) {
       const captured = capturedStages.get(stageKey);
       if (captured?.value) {
         lines.push(`${captured.label}: ${captured.value}`);
+        fields.push({ label: captured.label, value: captured.value, stage: stageKey, missing: false });
+      } else if (includeMissing) {
+        const fallbackLabel = getStageDefinition(stageKey).label || stageKey || 'Entry';
+        lines.push(`${fallbackLabel}: No ${formatMissingInputLabel(fallbackLabel)} entered`);
+        fields.push({ label: fallbackLabel, value: null, stage: stageKey, missing: true });
       }
     });
   }
@@ -297,7 +305,7 @@ function collectInputLines(metadata = {}, entries = [], options = {}) {
   }
 
   const hasValues = Array.from(capturedStages.values()).some((entry) => Boolean(entry.value));
-  return { lines, hasValues };
+  return { lines, hasValues, fields };
 }
 
 function escapeMarkdownV2(text = '') {
@@ -362,74 +370,145 @@ function describeDualChannelIssue(issue = {}) {
   return `${issue.label || 'Secondary check'} alert`;
 }
 
+function formatInputSummary(callType, customerName, timestamp, fields = []) {
+  const safeName = escapeMarkdownV2(customerName || 'Client');
+  const safeTime = escapeMarkdownV2(timestamp || formatLocalTimestamp());
+  if (callType === 'verification') {
+    return [
+      '⚠️ Input Summary',
+      'Verification input received.',
+      `Client: ${safeName}`,
+      'Call Type: Verification',
+      `Time: ${safeTime}`
+    ].join('\n');
+  }
+  if (callType === 'information') {
+    const lines = [
+      '⚠️ Input Summary',
+      'Requested information received.',
+      `Client: ${safeName}`,
+      'Call Type: Information Collection',
+      `Time: ${safeTime}`
+    ];
+    const detailFields = (fields || []).filter((field) => field && field.value);
+    lines.push('');
+    lines.push('Details:');
+    if (detailFields.length) {
+      detailFields.forEach((field) => {
+        lines.push(`${escapeMarkdownV2(field.label)}: ${escapeMarkdownV2(field.value)}`);
+      });
+    } else {
+      lines.push('No inputs captured yet.');
+    }
+    return lines.join('\n');
+  }
+  return null;
+}
+
 function formatStatusMeta(status, callTiming = {}, additionalData = {}) {
   const normalized = (status || '').toLowerCase();
-  const meta = {
-    emoji: '📞',
-    label: titleCase(normalized || 'Call Update'),
-    detail: 'Monitoring call status…'
-  };
+  let emoji = '📞';
+  let message = 'Dialing the customer…';
 
   switch (normalized) {
     case 'initiated':
     case 'queued':
-      meta.emoji = '📞';
-      meta.detail = 'Dialing the customer…';
+      emoji = '📞';
+      message = 'Initiating call...';
+      callTiming.initiated = new Date();
       break;
     case 'ringing': {
-      meta.emoji = '🔔';
-      meta.detail = 'Ringing…';
+      emoji = '🔔';
+      message = 'Ringing...';
       if (callTiming.initiated) {
         const ringDelay = ((new Date() - callTiming.initiated) / 1000).toFixed(1);
         if (ringDelay > 0) {
-          meta.detail += ` (${ringDelay}s)`;
+          message += ` (${ringDelay}s)`;
         }
       }
       callTiming.ringing = new Date();
       break;
     }
     case 'in-progress':
-    case 'answered':
-      meta.emoji = '☎️';
-      meta.detail = 'Live conversation in progress.';
+    case 'answered': {
+      emoji = '☎️';
+      message = 'In progress';
       callTiming.answered = new Date();
+      if (callTiming.ringing) {
+        const ringDuration = ((new Date() - callTiming.ringing) / 1000).toFixed(0);
+        message += ` (rang ${ringDuration}s)`;
+      }
       break;
+    }
     case 'completed': {
-      meta.emoji = '🏁';
-      const durationSeconds = additionalData.duration || (callTiming.answered ? ((new Date() - callTiming.answered) / 1000).toFixed(0) : null);
-      meta.detail = durationSeconds && durationSeconds > 3
-        ? `Call completed (${formatDurationShort(durationSeconds)})`
-        : 'Call completed.';
+      emoji = '🏁';
+      const actualDuration = additionalData.duration;
+      if (actualDuration && actualDuration > 3) {
+        const minutes = Math.floor(actualDuration / 60);
+        const seconds = actualDuration % 60;
+        message = `Call completed (${minutes}:${String(seconds).padStart(2, '0')})`;
+      } else if (callTiming.answered) {
+        const totalTime = ((new Date() - callTiming.answered) / 1000).toFixed(0);
+        if (totalTime > 3) {
+          const minutes = Math.floor(totalTime / 60);
+          const seconds = totalTime % 60;
+          message = `Call completed (~${minutes}:${String(seconds).padStart(2, '0')})`;
+        } else {
+          message = 'Call completed';
+        }
+      } else {
+        message = 'Call completed';
+      }
       break;
     }
     case 'busy':
-      meta.emoji = '📵';
-      meta.detail = 'Line busy.';
+      emoji = '📵';
+      message = 'Line busy';
+      if (callTiming.ringing || callTiming.initiated) {
+        const busyTime = callTiming.ringing || callTiming.initiated;
+        const timeBeforeBusy = ((new Date() - busyTime) / 1000).toFixed(0);
+        if (timeBeforeBusy > 1) {
+          message += ` (${timeBeforeBusy}s)`;
+        }
+      }
       break;
     case 'no-answer':
-    case 'no_answer':
-      meta.emoji = '❌';
-      meta.detail = 'No answer — call attempt completed.';
+    case 'no_answer': {
+      emoji = '❌';
+      message = 'No answer. The call attempt was completed with no response.';
+      let ringTime = 0;
+      if (additionalData.ring_duration) {
+        ringTime = additionalData.ring_duration;
+      } else if (callTiming.ringing) {
+        ringTime = Math.round((new Date() - callTiming.ringing) / 1000);
+      } else if (callTiming.initiated) {
+        ringTime = Math.round((new Date() - callTiming.initiated) / 1000);
+      }
+      if (ringTime > 0) {
+        message += ` (rang ${ringTime}s)`;
+      }
       break;
+    }
     case 'failed':
-      meta.emoji = '❌';
-      meta.detail = additionalData.error_message
-        ? `Call failed: ${additionalData.error_message}`
-        : 'Call failed.';
+      emoji = '❌';
+      message = additionalData.error_message
+        ? `Call failed (${additionalData.error_message})`
+        : 'Call failed';
       break;
     case 'canceled':
-      meta.emoji = '🚫';
-      meta.detail = 'Call was canceled.';
+      emoji = '🚫';
+      message = 'Call canceled';
       break;
     default:
-      meta.detail = titleCase(normalized || 'update');
+      message = titleCase(normalized || 'update');
   }
 
-  if (additionalData.error_message && normalized !== 'failed') {
-    meta.detail += ` (${additionalData.error_message})`;
-  }
-
-  return meta;
+  return {
+    emoji,
+    label: titleCase(normalized || 'Call Update'),
+    detail: message,
+    line: `${emoji} ${message}`
+  };
 }
 
 class EnhancedWebhookService {
@@ -441,6 +520,7 @@ class EnhancedWebhookService {
     this.processInterval = 3000; // Check every 3 seconds for faster updates
     this.activeCallStatus = new Map(); // Track call status to avoid duplicates
     this.callThreads = new Map(); // Track Telegram master message threads
+    this.callInputQueue = new Map(); // Queue keypad summaries until call completion
     this.callTimestamps = new Map(); // Track call timing for better status management
     this.statusOrder = ['queued', 'initiated', 'ringing', 'in-progress', 'answered', 'completed', 'busy', 'no-answer', 'failed', 'canceled'];
   }
@@ -483,6 +563,7 @@ class EnhancedWebhookService {
     this.isRunning = false;
     this.activeCallStatus.clear();
     this.callThreads.clear();
+    this.callInputQueue.clear();
     this.callTimestamps.clear();
     console.log('Enhanced webhook service stopped'.yellow);
   }
@@ -597,6 +678,12 @@ class EnhancedWebhookService {
           ? (callDetails?.call_summary || additionalData.summary || null)
           : undefined
       }, callDetails);
+
+      if (normalizedStatus === 'completed') {
+        await this.flushInputQueue(call_sid, chatId, callDetails);
+      } else if (['failed', 'no-answer', 'no_answer', 'busy', 'canceled'].includes(normalizedStatus)) {
+        this.callInputQueue.delete(call_sid);
+      }
 
       if (this.db && this.db.logNotificationMetric) {
         await this.db.logNotificationMetric(`call_${normalizedStatus}`, true);
@@ -739,36 +826,12 @@ class EnhancedWebhookService {
       const customerName = getCustomerName(callDetails, metadata);
       const timestamp = formatLocalTimestamp();
       const structuredSummary = collectInputLines(metadata, entries || [], { includeMissing: true });
-      let replyMarkup = null;
-
-      const header =
-        scenario === 'verification'
-          ? '⚠️ Verification Input'
-          : scenario === 'information'
-            ? '📝 Information Captured'
-            : '📞 Call Completed';
-
-      let message = `*${escapeMarkdownV2(header)}*\n`;
-      message += `*Client:* ${escapeMarkdownV2(customerName)}\n`;
-      message += `*Time:* ${escapeMarkdownV2(timestamp)}\n`;
-
-      if (scenario !== 'general' && structuredSummary.lines.length) {
-        message += `\n*Details*\n`;
-        structuredSummary.lines.forEach((line) => {
-          message += `• ${escapeMarkdownV2(line)}\n`;
-        });
-        replyMarkup = this.buildCallFollowUpKeyboard(call_sid, 'completed', {
-          allowTranscript: true,
-          callAgainPrompt: true,
-        });
-      } else {
-        message += `\n_${escapeMarkdownV2('No keypad input was required for this call.')}_\n`;
-        replyMarkup = this.buildOutcomeFollowUpKeyboard(call_sid, {
-          allowCallAgain: true,
-        });
-      }
-
-      await this.sendTelegramMessage(telegram_chat_id, message.trim(), 'MarkdownV2', replyMarkup);
+      this.enqueueInputSummary(call_sid, {
+        scenario,
+        customerName,
+        timestamp,
+        fields: structuredSummary.fields,
+      });
 
       if (this.db && this.db.logNotificationMetric) {
         await this.db.logNotificationMetric('call_input_dtmf', true);
@@ -884,17 +947,17 @@ class EnhancedWebhookService {
       const metadata = parseCallMetadata(callDetails.metadata_json) || {};
       const scenario = determineCallScenario(callDetails, metadata);
       const structuredSummary = collectInputLines(metadata, dtmfEntries || [], { includeMissing: true });
-      const summaryText = structuredSummary.lines.length
-        ? structuredSummary.lines.join('\n')
-        : scenario === 'general'
-          ? 'Call completed without keypad input.'
-          : 'Secure input workflow marked complete.';
+    this.enqueueInputSummary(call_sid, {
+      scenario,
+      customerName: getCustomerName(callDetails, metadata),
+      timestamp: formatLocalTimestamp(),
+      fields: structuredSummary.fields,
+    });
 
-      await this.updateCallThread(call_sid, telegram_chat_id, {
-        summary: summaryText,
-        status: { emoji: '✅', label: 'Verification Complete', detail: 'Secure input workflow finished.' },
-        secureInput: { workflowComplete: true }
-      }, callDetails);
+    await this.updateCallThread(call_sid, telegram_chat_id, {
+      status: { emoji: '✅', label: 'Verification Complete', detail: 'Secure input workflow finished.' },
+      secureInput: { workflowComplete: true }
+    }, callDetails);
       return true;
     } catch (error) {
       console.error('❌ Failed to send workflow completion notification:', error);
@@ -937,32 +1000,16 @@ class EnhancedWebhookService {
       }
 
       const combinedEntries = [...(dtmfEntries || []), ...syntheticEntries];
-      const structuredSummary = collectInputLines(metadata, combinedEntries, {
+      const structuredSummary = collectInputLines(metadata, combinedEntries || [], {
         includeMissing: true,
       });
 
-      const lines = [];
-      if (scenario === 'verification') {
-        lines.push('⚠️ Input Summary', '', 'Verification input received.');
-        lines.push(`Client: ${customerName}`);
-        lines.push('Call Type: Verification');
-      } else if (scenario === 'information') {
-        lines.push('⚠️ Input Summary', '', 'Requested information received.');
-        lines.push(`Client: ${customerName}`);
-        lines.push('Call Type: Information Collection');
-      } else {
-        lines.push('📞 Call Completed');
-        lines.push(`Client: ${customerName}`);
-        lines.push('No input was required for this call.');
-      }
-
-      if (structuredSummary.lines.length) {
-        lines.push('');
-        lines.push('Details:');
-        structuredSummary.lines.forEach((entryLine) => lines.push(entryLine));
-      }
-
-      await this.sendTelegramMessage(telegram_chat_id, buildTelegramMessage(lines));
+      this.enqueueInputSummary(call_sid, {
+        scenario,
+        customerName,
+        timestamp: formatLocalTimestamp(),
+        fields: structuredSummary.fields,
+      });
       return true;
     } catch (error) {
       console.error('❌ Failed to send call input summary:', error);
@@ -1070,51 +1117,52 @@ class EnhancedWebhookService {
       const inputDetails = await this.buildInputDetails(call_sid, metadata);
       const transcriptPreview = await this.buildTranscriptPreview(call_sid, call);
       const aiSummary = call.call_summary || call.ai_summary || null;
-      const lines = [];
-
+      let message;
       if (failureStates.includes(outcome)) {
-        if (outcome === 'NO_ANSWER') {
-          lines.push('❌ Call Not Answered');
-        } else if (outcome === 'BUSY') {
-          lines.push('⚠️ Line Busy');
-        } else if (outcome === 'FAILED') {
-          lines.push('❌ Call Failed');
-        } else if (outcome === 'CANCELED') {
-          lines.push('🚫 Call Canceled');
-        }
-        lines.push(`Client: ${customerName}`);
-        lines.push(`Number: ${maskedNumber}`);
+        const statusLabel =
+          outcome === 'NO_ANSWER'
+            ? '❌ Call Not Answered'
+            : outcome === 'BUSY'
+              ? '⚠️ Line Busy'
+              : outcome === 'FAILED'
+                ? '❌ Call Failed'
+                : '🚫 Call Canceled';
+        message = [
+          `*${escapeMarkdownV2(statusLabel)}*`,
+          `Client: ${escapeMarkdownV2(customerName)}`,
+          `Number: ${escapeMarkdownV2(maskedNumber)}`,
+        ];
         if (call.error_message) {
-          lines.push(`Reason: ${call.error_message}`);
+          message.push(`Reason: ${escapeMarkdownV2(call.error_message)}`);
         }
+        message = message.join('\n');
       } else {
-        lines.push('📞 Service Call Completed');
-        lines.push(`Client: ${customerName}`);
-        lines.push(`Answered by: ${answeredLabel}`);
-        lines.push(`Duration: ${durationText}`);
-        lines.push(`Call Type: ${callTypeLabel}`);
-        if (inputDetails?.text) {
-          lines.push('');
-          lines.push('Collected Inputs:');
-          lines.push(inputDetails.text);
-        } else if (scenario !== 'general') {
-          lines.push('');
-          lines.push('Collected Inputs: None recorded.');
-        }
-        if (transcriptPreview) {
-          lines.push('');
-          lines.push(`Transcript: "${transcriptPreview}"`);
-        }
-        if (aiSummary) {
-          lines.push('');
-          lines.push(`AI Summary: ${aiSummary}`);
-        }
+        const inputsDisplay = inputDetails?.text
+          ? inputDetails.text.replace(/\n+/g, ' | ')
+          : scenario !== 'general'
+            ? 'None'
+            : 'N/A';
+        const transcriptLine = transcriptPreview
+          ? `"${transcriptPreview}"`
+          : `Use /transcript ${call_sid}`;
+        const aiSummaryLine = aiSummary || 'N/A';
+
+        message = [
+          '*📞 Service Call Completed*',
+          `Client: ${escapeMarkdownV2(customerName)}`,
+          `Answered by: ${escapeMarkdownV2(answeredLabel)}`,
+          `Duration: ${escapeMarkdownV2(durationText)}`,
+          `Call Type: ${escapeMarkdownV2(callTypeLabel)}`,
+          `Inputs Received: ${escapeMarkdownV2(inputsDisplay)}`,
+          `Transcript: ${escapeMarkdownV2(transcriptLine)}`,
+          `AI Summary: ${escapeMarkdownV2(aiSummaryLine)}`
+        ].join('\n');
       }
 
       const followUpKeyboard = this.buildOutcomeFollowUpKeyboard(call_sid, {
         allowCallAgain: !failureStates.includes(outcome),
       });
-      await this.sendTelegramMessage(telegram_chat_id, buildTelegramMessage(lines), 'HTML', followUpKeyboard);
+      await this.sendTelegramMessage(telegram_chat_id, message, 'MarkdownV2', followUpKeyboard);
 
       const statusForUpdate = call.status || call.twilio_status || 'completed';
       await this.db.updateCallStatus(call_sid, statusForUpdate, {
@@ -1471,6 +1519,67 @@ class EnhancedWebhookService {
     return response.data;
   }
 
+  enqueueInputSummary(callSid, summary) {
+    if (!callSid || !summary) {
+      return;
+    }
+    const queue = this.callInputQueue.get(callSid) || [];
+    queue.push(summary);
+    this.callInputQueue.set(callSid, queue);
+  }
+
+  async flushInputQueue(callSid, chatId, callDetails = null) {
+    if (!chatId) {
+      return;
+    }
+    const queue = this.callInputQueue.get(callSid) || [];
+    if (!queue.length) {
+      const metadata = parseCallMetadata(callDetails?.metadata_json) || {};
+      const scenario = determineCallScenario(callDetails, metadata);
+      if (scenario !== 'general') {
+        const customerName = getCustomerName(callDetails, metadata);
+        const message = [
+          '⚠️ Input Summary',
+          'No keypad input was captured for this call.',
+          `Client: ${escapeMarkdownV2(customerName)}`,
+          `Call Type: ${escapeMarkdownV2(titleCase(scenario))}`
+        ].join('\n');
+        await this.sendTelegramMessage(
+          chatId,
+          message,
+          'MarkdownV2',
+          this.buildCallFollowUpKeyboard(callSid, 'completed', {
+            allowTranscript: true,
+            callAgainPrompt: true,
+          })
+        );
+      }
+      this.callInputQueue.delete(callSid);
+      return;
+    }
+
+    for (const summary of queue) {
+      const text = formatInputSummary(
+        summary.scenario,
+        summary.customerName,
+        summary.timestamp,
+        summary.fields
+      );
+      if (text) {
+        await this.sendTelegramMessage(
+          chatId,
+          text,
+          'MarkdownV2',
+          this.buildCallFollowUpKeyboard(callSid, 'completed', {
+            allowTranscript: true,
+            callAgainPrompt: true,
+          })
+        );
+      }
+    }
+    this.callInputQueue.delete(callSid);
+  }
+
   // Debug method for troubleshooting
   async sendDebugInfo(call_sid, telegram_chat_id, webhookData) {
     try {
@@ -1638,6 +1747,7 @@ class EnhancedWebhookService {
     this.activeCallStatus.delete(callSid);
     this.callTimestamps.delete(callSid);
     this.callThreads.delete(callSid);
+    this.callInputQueue.delete(callSid);
   }
 
   getOrCreateThread(callSid, chatId) {
@@ -1686,7 +1796,7 @@ class EnhancedWebhookService {
 
   composeThreadMessage(context = {}) {
     const lines = [];
-    const statusLine = `${context.status?.emoji || '📞'} ${context.status?.label || 'Call Update'}`;
+    const statusLine = context.status?.line || `${context.status?.emoji || '📞'} ${context.status?.label || 'Call Update'}`;
     lines.push(`*${escapeMarkdownV2(statusLine)}*`);
 
     const phoneDisplay = context.customer?.phone ? maskPhoneNumber(context.customer.phone) : 'Unknown';

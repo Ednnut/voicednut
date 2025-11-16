@@ -28,7 +28,8 @@ const { v4: uuidv4 } = require('uuid');
 const dtmfUtils = require('./utils/dtmf');
 const { normalizeAnsweredBy, isHumanAnsweredBy, isMachineAnsweredBy } = require('./utils/amd');
 
-const VoiceResponse = require('twilio').twiml.VoiceResponse;
+const twilioSdk = require('twilio');
+const VoiceResponse = twilioSdk.twiml.VoiceResponse;
 
 const app = express();
 ExpressWs(app);
@@ -64,6 +65,10 @@ const {
   authToken: twilioAuthToken,
   fromNumber: twilioFromNumber,
 } = twilioConfig;
+const twilioRestClient =
+  twilioAccountSid && twilioAuthToken
+    ? twilioSdk(twilioAccountSid, twilioAuthToken)
+    : null;
 const missingTwilioEnv = [];
 if (!twilioAccountSid) missingTwilioEnv.push('TWILIO_ACCOUNT_SID');
 if (!twilioAuthToken) missingTwilioEnv.push('TWILIO_AUTH_TOKEN');
@@ -98,6 +103,25 @@ let vonageAdapters = null;
 
 const COLLECT_INPUT_FUNCTIONS = new Set(['ivr_survey', 'pin_entry', 'menu_selection', 'otp_collection', 'account_verification']);
 const collectInputCompletion = new Set();
+
+async function endProviderCall(callSid) {
+  if (!callSid) {
+    return;
+  }
+  try {
+    if (currentProvider === 'twilio' && twilioRestClient) {
+      await twilioRestClient.calls(callSid).update({ status: 'completed' });
+      console.log(`☎️ Requested Twilio hangup for ${callSid}`.gray);
+    } else if (currentProvider === 'vonage') {
+      await ensureVonageAdapters();
+      console.log(`☎️ Awaiting Vonage hangup for ${callSid}`.gray);
+    } else if (currentProvider === 'aws') {
+      console.log(`ℹ️ AWS Connect will handle hangup for ${callSid}`.gray);
+    }
+  } catch (error) {
+    console.error(`❌ Failed to end provider call ${callSid}:`, error.message);
+  }
+}
 
 const DEFAULT_SECURE_INPUT_TEMPLATE = [
   {
@@ -1491,6 +1515,25 @@ app.ws('/connection', (ws) => {
     let interactionCount = 0;
     let isInitialized = false;
 
+    let wrapUpScheduled = false;
+
+    const scheduleCallWrapUp = async () => {
+      if (wrapUpScheduled || !gptService) {
+        return;
+      }
+      wrapUpScheduled = true;
+      const callerName = callConfig?.customer_name || 'the caller';
+      const closingSegments = [
+        `All required information has been collected for ${callerName}.`,
+        'Deliver a warm closing message, confirm any next steps, and let them know the call is ending now.'
+      ];
+      gptService.completion(closingSegments.join(' '), interactionCount, 'user', 'call_wrapup');
+      interactionCount += 1;
+      setTimeout(() => {
+        endProviderCall(callSid);
+      }, 6000);
+    };
+
     const emitRealtimeDtmfInsights = async (summary, metadataEnvelope = {}) => {
       if (!summary || !summary.digits || !gptService) {
         return;
@@ -1523,9 +1566,12 @@ app.ws('/connection', (ws) => {
       }
 
       if (guidance?.needsRetry) {
-        promptSegments.push('Ask them politely to re-enter the digits and stay present like a human agent would.');
+        promptSegments.push(
+          `Let them know the entry did not match and this was attempt ${guidance.attempts}. Offer to resend the code or let them speak it slowly.`
+        );
       } else if (guidance?.workflowComplete) {
         promptSegments.push('Let the caller know that verification is complete and transition into your closing/thank-you script.');
+        await scheduleCallWrapUp();
       } else if (guidance?.nextStage) {
         const nextLabel = guidance.nextStage.label || guidance.nextStage.stageKey || 'the next item';
         if (guidance.nextStage.prompt) {
@@ -1536,6 +1582,21 @@ app.ws('/connection', (ws) => {
       }
 
       gptService.completion(promptSegments.join(' '), interactionCount, 'user', 'dtmf_input');
+      interactionCount += 1;
+    };
+
+    const promptForMissingDigits = async (reasonLabel = 'timeout') => {
+      if (!gptService) {
+        return;
+      }
+      const orchestrator = inputOrchestrators.get(callSid);
+      const pendingStage = orchestrator?.getNextPendingStage();
+      const pendingLabel = pendingStage?.label || pendingStage?.stageKey || 'the requested input';
+      const message = [
+        `No keypad digits were received for ${pendingLabel} (${reasonLabel}).`,
+        'Politely let the caller know nothing was detected, and guide them to enter the digits slowly or speak them aloud.'
+      ].join(' ');
+      gptService.completion(message, interactionCount, 'user', 'dtmf_input');
       interactionCount += 1;
     };
 
@@ -1806,6 +1867,7 @@ app.ws('/connection', (ws) => {
 
             const flushBuffer = async (reason) => {
               if (!buffer.digits) {
+                await promptForMissingDigits(reason);
                 return;
               }
 
