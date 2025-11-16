@@ -590,6 +590,35 @@ module.exports = ${name};`;
       generatedFunctions: Array.from(this.functionRegistry.keys())
     };
   }
+
+  getSecureInputHints(context = null) {
+    const resolvedContext = context || this.businessContext || {};
+    const industry = resolvedContext.industry || 'general';
+    const businessLabel =
+      resolvedContext.businessDisplayName ||
+      resolvedContext.companyName ||
+      resolvedContext.brand ||
+      'our team';
+
+    const hints = {};
+
+    if (industry === 'finance' || resolvedContext.businessType === 'banking') {
+      hints.OTP = `It is the 6-digit security code sent to protect the ${businessLabel} account.`;
+      hints.PIN = `Use the PIN you set when opening your ${businessLabel} profile.`;
+      hints.CARD_LAST4 = `Only the last four digits of the ${businessLabel} card are required.`;
+    } else if (industry === 'healthcare') {
+      hints.OTP = `This code confirms access to your ${businessLabel} health portal.`;
+      hints.PIN = `Use the clinic PIN associated with your ${businessLabel} file.`;
+    } else if (industry === 'real_estate' || industry === 'automotive') {
+      hints.OTP = `It verifies your ${businessLabel} inquiry; check the text we just sent.`;
+      hints.PIN = `This is the application PIN tied to your ${businessLabel} request.`;
+    } else {
+      hints.OTP = `This keeps your ${businessLabel} experience secure; enter the code we texted.`;
+      hints.PIN = `Use the short PIN you chose with ${businessLabel}.`;
+    }
+
+    return hints;
+  }
 }
 
 module.exports = DynamicFunctionEngine;

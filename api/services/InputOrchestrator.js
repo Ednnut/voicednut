@@ -160,6 +160,27 @@ class InputOrchestrator {
     if (failureMessage) {
       definition.failureMessage = failureMessage;
     }
+    if (entry.hint) {
+      definition.hint = entry.hint;
+    }
+    if (entry.contextTags) {
+      definition.contextTags = Array.isArray(entry.contextTags) ? entry.contextTags : [entry.contextTags];
+    }
+    if (entry.speechFallbackScript) {
+      definition.speechFallbackScript = entry.speechFallbackScript;
+    }
+    if (entry.confirmDigits !== undefined) {
+      definition.confirmDigits = Boolean(entry.confirmDigits);
+    }
+    if (entry.confidenceThreshold !== undefined) {
+      const threshold = Number(entry.confidenceThreshold);
+      if (!Number.isNaN(threshold)) {
+        definition.confidenceThreshold = threshold;
+      }
+    }
+    if (entry.secondaryChecks) {
+      definition.secondaryChecks = Array.isArray(entry.secondaryChecks) ? entry.secondaryChecks : [entry.secondaryChecks];
+    }
     return definition;
   }
 
@@ -208,10 +229,6 @@ class InputOrchestrator {
       return 'success';
     }
     return 'captured';
-  }
-
-  composeAgentPrompt(stage, digits, status) {
-    return this.composeAgentPrompt(stage, digits, status, {});
   }
 
   composeAgentPrompt(stage, digits, status, context = {}) {
@@ -264,22 +281,109 @@ class InputOrchestrator {
     return lines.filter(Boolean).join(' ').trim();
   }
 
-  handleInput(stageKey, digits) {
+  buildClarification(stage, digits, issues = [], context = {}, stage = {}) {
+    const lines = [];
+
+    if (stage.hint) {
+      lines.push(stage.hint);
+    }
+
+    if (issues.includes('timeout')) {
+      lines.push('Explain that the entry timed out and invite them to try again.');
+    }
+    if (issues.includes('extra_digits')) {
+      const expectedText = stage.expectedLength
+        ? `${stage.expectedLength} digits`
+        : 'only the requested digits';
+      lines.push(`Let them know you only need ${expectedText} and guide them to slow down.`);
+    } else if (issues.includes('missing_digits')) {
+      lines.push('Let them know a few digits were missing and encourage a slower re-entry.');
+    }
+    if (issues.includes('pattern_mismatch')) {
+      lines.push('Describe the expected format before retrying (for example “month then day”).');
+    }
+    if (issues.includes('value_mismatch')) {
+      lines.push('Politely explain it does not match our records and offer to resend.');
+    }
+    if (issues.includes('low_confidence')) {
+      lines.push('Repeat the digits back slowly to confirm you heard them correctly.');
+    }
+
+    if (!lines.length && stage.confirmDigits) {
+      lines.push('Repeat the digits back to confirm accuracy before proceeding.');
+    }
+
+    if (context?.nextStage && issues.length === 0) {
+      const nextLabel = context.nextStage.label || context.nextStage.stageKey || 'the next step';
+      lines.push(`After confirming, steer directly into ${nextLabel}.`);
+    }
+
+    return lines.filter(Boolean).join(' ');
+  }
+
+  getStageDefinition(stageKey) {
+    const normalized = normalizeStage(stageKey || 'GENERIC');
+    return this.stageMap.get(normalized) || this.ensureStage(stageKey);
+  }
+
+  handleInput(stageKey, digits, context = {}) {
     if (!digits) {
       return null;
     }
     const stage = this.ensureStage(stageKey);
-    const status = this.evaluateStage(stage, digits);
+    const baseStatus = this.evaluateStage(stage, digits);
     const progress = this.stageProgress.get(stage.stageKey) || { attempts: 0, status: 'pending' };
     progress.attempts += 1;
     progress.lastValue = digits;
-    progress.status = ['success', 'captured'].includes(status) ? 'completed' : 'retry';
+    progress.status = ['success', 'captured'].includes(baseStatus) ? 'completed' : 'retry';
     this.stageProgress.set(stage.stageKey, progress);
 
     const workflowComplete = this.isWorkflowComplete();
     const nextStage = progress.status === 'completed' ? this.getNextPendingStage(stage.stageKey) : null;
 
-    const needsRetry = ['value_mismatch', 'length_mismatch', 'pattern_mismatch'].includes(status);
+    const providerConfidence = toNumber(context?.confidence);
+    const threshold = toNumber(stage.confidenceThreshold);
+    const lowConfidence = threshold && providerConfidence !== null && providerConfidence < threshold;
+
+    const issues = [];
+    if (context?.reason === 'timeout') {
+      issues.push('timeout');
+    }
+    if (context?.reason === 'stream_stopped') {
+      issues.push('interruption');
+    }
+    if (baseStatus === 'length_mismatch') {
+      if (stage.expectedLength && digits.length > stage.expectedLength) {
+        issues.push('extra_digits');
+      } else {
+        issues.push('missing_digits');
+      }
+    } else if (baseStatus === 'value_mismatch') {
+      issues.push('value_mismatch');
+    } else if (baseStatus === 'pattern_mismatch') {
+      issues.push('pattern_mismatch');
+    }
+    if (lowConfidence && !issues.includes('low_confidence')) {
+      issues.push('low_confidence');
+    }
+
+    let status = baseStatus;
+    if (lowConfidence && baseStatus === 'success') {
+      status = 'low_confidence';
+    }
+
+    const clarificationPrompt = this.buildClarification(stage, digits, issues, { nextStage }, stage);
+    const shouldOfferSpeechFallback =
+      issues.includes('timeout') ||
+      issues.includes('extra_digits') ||
+      (progress.attempts >= 2 && status !== 'success');
+    const shouldConfirmDigits =
+      Boolean(stage.confirmDigits) ||
+      issues.includes('low_confidence') ||
+      digits.length <= 4;
+
+    const needsRetry =
+      ['value_mismatch', 'length_mismatch', 'pattern_mismatch'].includes(baseStatus) || issues.includes('low_confidence');
 
     return {
       stageKey: stage.stageKey,
@@ -296,6 +400,12 @@ class InputOrchestrator {
       nextStage,
       attempts: progress.attempts,
       isFinalStage: this.isFinalStage(stage.stageKey),
+      clarificationPrompt,
+      shouldOfferSpeechFallback,
+      shouldConfirmDigits,
+      detectedIssues: issues,
+      speechFallbackScript: stage.speechFallbackScript || null,
+      providerConfidence,
     };
   }
 

@@ -300,6 +300,138 @@ function collectInputLines(metadata = {}, entries = [], options = {}) {
   return { lines, hasValues };
 }
 
+function escapeMarkdownV2(text = '') {
+  return String(text)
+    .replace(/\\/g, '\\\\')
+    .replace(/([_*\[\]()~`>#+\-=|{}.!])/g, '\\$1');
+}
+
+function titleCase(value = '') {
+  return value
+    .toString()
+    .split(/[\s_-]+/)
+    .filter(Boolean)
+    .map((word) => word.charAt(0).toUpperCase() + word.slice(1).toLowerCase())
+    .join(' ');
+}
+
+function resolveIntentLabel(call = {}, metadata = {}) {
+  const context = parseBusinessContext(call.business_context);
+  return (
+    metadata.intent ||
+    metadata.call_intent ||
+    call.business_function ||
+    context?.businessType ||
+    metadata.purpose ||
+    'General'
+  );
+}
+
+function extractSentimentInfo(analysisRaw) {
+  if (!analysisRaw) {
+    return { label: 'neutral', emoji: '😐' };
+  }
+  let analysis = analysisRaw;
+  if (typeof analysisRaw === 'string') {
+    try {
+      analysis = JSON.parse(analysisRaw);
+    } catch (error) {
+      analysis = {};
+    }
+  }
+  const sentiment = (analysis?.sentiment || analysis?.analysis?.sentiment || 'neutral').toLowerCase();
+  if (sentiment.includes('pos')) {
+    return { label: 'positive', emoji: '🙂' };
+  }
+  if (sentiment.includes('neg')) {
+    return { label: 'negative', emoji: '⚠️' };
+  }
+  return { label: 'neutral', emoji: '😐' };
+}
+
+function describeDualChannelIssue(issue = {}) {
+  if (!issue || !issue.status) {
+    return null;
+  }
+  if (issue.status === 'mismatch') {
+    return `${issue.label || 'Secondary check'} mismatch`;
+  }
+  if (issue.status === 'missing_reference') {
+    return `${issue.label || 'Secondary check'} reference missing`;
+  }
+  return `${issue.label || 'Secondary check'} alert`;
+}
+
+function formatStatusMeta(status, callTiming = {}, additionalData = {}) {
+  const normalized = (status || '').toLowerCase();
+  const meta = {
+    emoji: '📞',
+    label: titleCase(normalized || 'Call Update'),
+    detail: 'Monitoring call status…'
+  };
+
+  switch (normalized) {
+    case 'initiated':
+    case 'queued':
+      meta.emoji = '📞';
+      meta.detail = 'Dialing the customer…';
+      break;
+    case 'ringing': {
+      meta.emoji = '🔔';
+      meta.detail = 'Ringing…';
+      if (callTiming.initiated) {
+        const ringDelay = ((new Date() - callTiming.initiated) / 1000).toFixed(1);
+        if (ringDelay > 0) {
+          meta.detail += ` (${ringDelay}s)`;
+        }
+      }
+      callTiming.ringing = new Date();
+      break;
+    }
+    case 'in-progress':
+    case 'answered':
+      meta.emoji = '☎️';
+      meta.detail = 'Live conversation in progress.';
+      callTiming.answered = new Date();
+      break;
+    case 'completed': {
+      meta.emoji = '🏁';
+      const durationSeconds = additionalData.duration || (callTiming.answered ? ((new Date() - callTiming.answered) / 1000).toFixed(0) : null);
+      meta.detail = durationSeconds && durationSeconds > 3
+        ? `Call completed (${formatDurationShort(durationSeconds)})`
+        : 'Call completed.';
+      break;
+    }
+    case 'busy':
+      meta.emoji = '📵';
+      meta.detail = 'Line busy.';
+      break;
+    case 'no-answer':
+    case 'no_answer':
+      meta.emoji = '❌';
+      meta.detail = 'No answer — call attempt completed.';
+      break;
+    case 'failed':
+      meta.emoji = '❌';
+      meta.detail = additionalData.error_message
+        ? `Call failed: ${additionalData.error_message}`
+        : 'Call failed.';
+      break;
+    case 'canceled':
+      meta.emoji = '🚫';
+      meta.detail = 'Call was canceled.';
+      break;
+    default:
+      meta.detail = titleCase(normalized || 'update');
+  }
+
+  if (additionalData.error_message && normalized !== 'failed') {
+    meta.detail += ` (${additionalData.error_message})`;
+  }
+
+  return meta;
+}
+
 class EnhancedWebhookService {
   constructor() {
     this.isRunning = false;
@@ -308,6 +440,7 @@ class EnhancedWebhookService {
     this.telegramBotToken = process.env.TELEGRAM_BOT_TOKEN;
     this.processInterval = 3000; // Check every 3 seconds for faster updates
     this.activeCallStatus = new Map(); // Track call status to avoid duplicates
+    this.callThreads = new Map(); // Track Telegram master message threads
     this.callTimestamps = new Map(); // Track call timing for better status management
     this.statusOrder = ['queued', 'initiated', 'ringing', 'in-progress', 'answered', 'completed', 'busy', 'no-answer', 'failed', 'canceled'];
   }
@@ -349,6 +482,7 @@ class EnhancedWebhookService {
     }
     this.isRunning = false;
     this.activeCallStatus.clear();
+    this.callThreads.clear();
     this.callTimestamps.clear();
     console.log('Enhanced webhook service stopped'.yellow);
   }
@@ -426,175 +560,60 @@ class EnhancedWebhookService {
   // Enhanced call status update with proper no-answer detection
   async sendCallStatusUpdate(call_sid, status, telegram_chat_id, additionalData = {}) {
     try {
-      // Check if we should send this status
       if (!this.shouldSendStatus(call_sid, status)) {
-        return true; // Return success to mark notification as processed
+        return true;
       }
 
-      const normalizedStatus = status.toLowerCase();
-      let message = '';
-      let emoji = '';
-      let allowTranscript = additionalData.sensitive_dtmf ? false : true;
-      
-      // Track call timing for duration calculations
       if (!this.callTimestamps.has(call_sid)) {
         this.callTimestamps.set(call_sid, { started: new Date() });
       }
       const callTiming = this.callTimestamps.get(call_sid);
+      const normalizedStatus = status.toLowerCase();
+      const statusMeta = formatStatusMeta(normalizedStatus, callTiming, additionalData);
+      const callDetails = await this.db.getCall(call_sid);
+      const metadata = parseCallMetadata(callDetails?.metadata_json) || {};
+      const chatId = telegram_chat_id || callDetails?.telegram_chat_id;
 
-      switch (normalizedStatus) {
-        case 'queued':
-        case 'initiated':
-          emoji = '📞';
-          message = 'Initiating call...';
-          callTiming.initiated = new Date();
-          break;
-          
-        case 'ringing':
-          emoji = '🔔';
-          message = 'Ringing...';
-          callTiming.ringing = new Date();
-          // Calculate time to ring
-          if (callTiming.initiated) {
-            const ringDelay = ((new Date() - callTiming.initiated) / 1000).toFixed(1);
-            if (ringDelay > 2) {
-              message += ` (${ringDelay}s)`;
-            }
-          }
-          break;
-          
-        case 'in-progress':
-        case 'answered':
-          emoji = '☎️';
-          message = 'In progress';
-          callTiming.answered = new Date();
-          // Calculate ring duration
-          if (callTiming.ringing) {
-            const ringDuration = ((new Date() - callTiming.ringing) / 1000).toFixed(0);
-            message += ` (rang ${ringDuration}s)`;
-          }
-          break;
-          
-        case 'completed':
-          emoji = '🏁';
-          callTiming.completed = new Date();
-          
-          // Calculate call duration - be more careful about actual vs ring time
-          let duration = '';
-          const actualDuration = additionalData.duration;
-          
-          if (actualDuration && actualDuration > 3) {
-            const minutes = Math.floor(actualDuration / 60);
-            const seconds = actualDuration % 60;
-            duration = ` (${minutes}:${String(seconds).padStart(2, '0')})`;
-          } else if (callTiming.answered) {
-            const totalTime = ((new Date() - callTiming.answered) / 1000).toFixed(0);
-            if (totalTime > 3) {
-              const minutes = Math.floor(totalTime / 60);
-              const seconds = totalTime % 60;
-              duration = ` (~${minutes}:${String(seconds).padStart(2, '0')})`;
-            }
-          }
-          
-          message = `Call completed${duration}`;
-          break;
-          
-        case 'busy':
-          emoji = '📵';
-          message = 'Line busy';
-          // Calculate time before busy signal
-          if (callTiming.ringing || callTiming.initiated) {
-            const busyTime = callTiming.ringing || callTiming.initiated;
-            const timeBeforeBusy = ((new Date() - busyTime) / 1000).toFixed(0);
-            if (timeBeforeBusy > 1) {
-              message += ` (${timeBeforeBusy}s)`;
-            }
-          }
-          break;
-          
-        case 'no-answer':
-        case 'no_answer':
-          emoji = '❌';
-          message = 'No answer. The call attempt was completed with no response.';
-          
-          // Enhanced no-answer timing calculation
-          let ringTime = 0;
-          
-          if (additionalData.ring_duration) {
-            // Use ring duration from database if available
-            ringTime = additionalData.ring_duration;
-            console.log(`📞 Using database ring duration: ${ringTime}s`.cyan);
-          } else if (callTiming.ringing) {
-            // Calculate from our timing data
-            ringTime = Math.round((new Date() - callTiming.ringing) / 1000);
-            console.log(`📞 Calculated ring duration: ${ringTime}s`.cyan);
-          } else if (callTiming.initiated) {
-            // Fall back to total time since call started
-            ringTime = Math.round((new Date() - callTiming.initiated) / 1000);
-            console.log(`📞 Using total call time: ${ringTime}s`.cyan);
-          }
-          
-          if (ringTime > 0) {
-            message += ` (rang ${ringTime}s)`;
-          }
-          
-          allowTranscript = false;
-          console.log(`📞 No-answer notification: ${message}`.yellow);
-          break;
-          
-        case 'failed':
-          emoji = '❌';
-          message = 'Call failed';
-          if (additionalData.error || additionalData.error_message) {
-            const errorMsg = additionalData.error || additionalData.error_message;
-            message += ` (${errorMsg})`;
-          }
-          break;
-          
-        case 'canceled':
-          emoji = '🚫';
-          message = 'Call canceled';
-          break;
-          
-        default:
-          emoji = '📱';
-          message = `Call ${status}`;
+      if (!chatId) {
+        console.warn(`No Telegram chat configured for call ${call_sid}; skipping status update.`);
+        return true;
       }
 
-      const fullMessage = `${emoji} ${message}`;
-      
-      const isTerminal = ['completed', 'failed', 'no-answer', 'busy', 'canceled'].includes(normalizedStatus);
-      const followUpKeyboard = isTerminal ? this.buildCallFollowUpKeyboard(call_sid, normalizedStatus, { allowTranscript }) : null;
+      const personaLabel = callDetails ? getPersonaLabel(callDetails) : 'Adaptive Agent';
+      const intentLabel = resolveIntentLabel(callDetails || {}, metadata);
+      const sentimentInfo = extractSentimentInfo(callDetails?.ai_analysis);
 
-      let messageText = fullMessage;
-      if (followUpKeyboard) {
-        messageText += '\n\n⚡ Quick actions:';
-      }
+      await this.updateCallThread(call_sid, chatId, {
+        customer: {
+          name: getCustomerName(callDetails, metadata),
+          phone: callDetails?.phone_number || metadata?.dialed_number || null
+        },
+        persona: personaLabel,
+        intent: intentLabel,
+        sentiment: sentimentInfo,
+        status: statusMeta,
+        provider: callDetails?.provider || 'UNKNOWN',
+        summary: normalizedStatus === 'completed'
+          ? (callDetails?.call_summary || additionalData.summary || null)
+          : undefined
+      }, callDetails);
 
-      await this.sendTelegramMessage(telegram_chat_id, messageText, 'HTML', followUpKeyboard);
-      console.log(`✅ Sent enhanced status update: ${normalizedStatus} for call ${call_sid}`.green);
-      
-      // Log notification metric
       if (this.db && this.db.logNotificationMetric) {
         await this.db.logNotificationMetric(`call_${normalizedStatus}`, true);
       }
 
-      // Schedule cleanup for terminal states
-      if (['completed', 'failed', 'no-answer', 'busy', 'canceled'].includes(normalizedStatus)) {
+      if (['completed', 'failed', 'no-answer', 'no_answer', 'busy', 'canceled'].includes(normalizedStatus)) {
         setTimeout(() => {
           this.cleanupCallData(call_sid);
-        }, 5 * 60 * 1000); // Cleanup after 5 minutes
+        }, 5 * 60 * 1000);
       }
 
       return true;
     } catch (error) {
       console.error('❌ Failed to send enhanced call status update:', error);
-      
-      // Log failed notification metric
       if (this.db && this.db.logNotificationMetric) {
         await this.db.logNotificationMetric(`call_${status.toLowerCase()}`, false);
       }
-      
       return false;
     }
   }
@@ -720,39 +739,36 @@ class EnhancedWebhookService {
       const customerName = getCustomerName(callDetails, metadata);
       const timestamp = formatLocalTimestamp();
       const structuredSummary = collectInputLines(metadata, entries || [], { includeMissing: true });
-      const lines = [];
       let replyMarkup = null;
 
-      if (scenario === 'verification') {
-        lines.push('⚠️ Input Summary', '', 'Verification input received.');
-        lines.push(`Client: ${customerName}`);
-        lines.push('Call Type: Verification');
-        lines.push(`Time: ${timestamp}`);
-        if (structuredSummary.lines.length) {
-          lines.push('');
-          lines.push('Details:');
-          structuredSummary.lines.forEach((detail) => lines.push(detail));
-        }
-      } else if (scenario === 'information') {
-        lines.push('⚠️ Input Summary', '', 'Requested information received.');
-        lines.push(`Client: ${customerName}`);
-        lines.push('Call Type: Information Collection');
-        lines.push(`Time: ${timestamp}`);
-        if (structuredSummary.lines.length) {
-          lines.push('');
-          lines.push('Details:');
-          structuredSummary.lines.forEach((line) => lines.push(line));
-        }
+      const header =
+        scenario === 'verification'
+          ? '⚠️ Verification Input'
+          : scenario === 'information'
+            ? '📝 Information Captured'
+            : '📞 Call Completed';
+
+      let message = `*${escapeMarkdownV2(header)}*\n`;
+      message += `*Client:* ${escapeMarkdownV2(customerName)}\n`;
+      message += `*Time:* ${escapeMarkdownV2(timestamp)}\n`;
+
+      if (scenario !== 'general' && structuredSummary.lines.length) {
+        message += `\n*Details*\n`;
+        structuredSummary.lines.forEach((line) => {
+          message += `• ${escapeMarkdownV2(line)}\n`;
+        });
+        replyMarkup = this.buildCallFollowUpKeyboard(call_sid, 'completed', {
+          allowTranscript: true,
+          callAgainPrompt: true,
+        });
       } else {
-        lines.push('📞 Call Completed');
-        lines.push(`Client: ${customerName}`);
-        lines.push('No input was required for this call.');
+        message += `\n_${escapeMarkdownV2('No keypad input was required for this call.')}_\n`;
         replyMarkup = this.buildOutcomeFollowUpKeyboard(call_sid, {
           allowCallAgain: true,
         });
       }
 
-      await this.sendTelegramMessage(telegram_chat_id, buildTelegramMessage(lines), 'HTML', replyMarkup);
+      await this.sendTelegramMessage(telegram_chat_id, message.trim(), 'MarkdownV2', replyMarkup);
 
       if (this.db && this.db.logNotificationMetric) {
         await this.db.logNotificationMetric('call_input_dtmf', true);
@@ -801,60 +817,55 @@ class EnhancedWebhookService {
         ? getStageLabelFromMetadata(metadata, stateData.next_stage_key) || stateData.next_stage_key.replace(/_/g, ' ')
         : null;
       const workflowComplete = Boolean(stateData.workflow_completed);
+      const clarificationPrompt = stateData.clarification_prompt || '';
+      const offerSpeech = Boolean(stateData.offer_speech);
+      const confirmDigits = Boolean(stateData.confirm_digits);
+      const issueList = Array.isArray(stateData.detected_issues)
+        ? stateData.detected_issues
+        : stateData.detected_issues
+          ? [stateData.detected_issues]
+          : [];
+      const dualChannelInfo =
+        typeof stateData.dual_channel === 'string'
+          ? (() => {
+              try {
+                return JSON.parse(stateData.dual_channel);
+              } catch (error) {
+                return null;
+              }
+            })()
+          : stateData.dual_channel;
 
-      const lines = [];
-      if (scenario === 'verification') {
-        const headerEmoji = needsRetry ? '🔁' : '✅';
-        lines.push(`${headerEmoji} Verification Step Update`);
-        lines.push(`Client: ${customerName}`);
-        lines.push(`Stage: ${stageLabel}`);
-        lines.push(`Entry: ${digits}`);
-        lines.push(`Attempts: ${attempts}`);
-        lines.push(`Time: ${timestamp}`);
-        if (needsRetry) {
-          lines.push('');
-          lines.push('Status: Needs attention — agent requested a retry.');
-        } else if (workflowComplete) {
-          lines.push('');
-          lines.push('All verification steps are complete.');
-        } else if (nextStageLabel) {
-          lines.push('');
-          lines.push(`Next: ${nextStageLabel}`);
-        }
-      } else {
-        lines.push('⚠️ Information Step Update');
-        lines.push(`Client: ${customerName}`);
-        lines.push(`Field: ${stageLabel}`);
-        lines.push(`Value: ${digits}`);
-        lines.push(`Attempts: ${attempts}`);
-        lines.push(`Time: ${timestamp}`);
-        if (needsRetry) {
-          lines.push('');
-          lines.push('Status: Awaiting correct input.');
-        } else if (nextStageLabel) {
-          lines.push('');
-          lines.push(`Next: ${nextStageLabel}`);
-        }
+      const secureInput = {
+        stageLabel,
+        value: digits === 'None' ? null : digits,
+        attempts,
+        needsRetry,
+        nextStage: nextStageLabel,
+        timestamp,
+        clarification: clarificationPrompt,
+        offerSpeech,
+        confirmDigits,
+        issues: issueList,
+        dualIssue: describeDualChannelIssue(dualChannelInfo?.issue),
+        allowResend: /code|otp|passcode|pin/i.test(stageLabel || '')
+      };
+
+      await this.updateCallThread(call_sid, telegram_chat_id, {
+        secureInput
+      }, callDetails);
+
+      if (this.db && this.db.logNotificationMetric) {
+        const metric = options.isRetry ? 'call_step_retry' : 'call_step_complete';
+        await this.db.logNotificationMetric(metric, true);
       }
-
-      let replyMarkup = null;
-      if (needsRetry) {
-        replyMarkup = this.buildCallFollowUpKeyboard(call_sid, 'retry', {
-          allowTranscript: false,
-          callAgainPrompt: true,
-          allowResend: stageLabel.toLowerCase().includes('code') || stageLabel.toLowerCase().includes('otp'),
-        });
-      } else if (workflowComplete) {
-        replyMarkup = this.buildCallFollowUpKeyboard(call_sid, 'completed', {
-          allowTranscript: true,
-          callAgainPrompt: true,
-        });
-      }
-
-      await this.sendTelegramMessage(telegram_chat_id, buildTelegramMessage(lines), 'HTML', replyMarkup);
       return true;
     } catch (error) {
-      console.error('❌ Failed to send call step notification:', error);
+      console.error('❌ Failed to process call step notification:', error);
+      if (this.db && this.db.logNotificationMetric) {
+        const metric = options.isRetry ? 'call_step_retry' : 'call_step_complete';
+        await this.db.logNotificationMetric(metric, false);
+      }
       return false;
     }
   }
@@ -872,49 +883,18 @@ class EnhancedWebhookService {
 
       const metadata = parseCallMetadata(callDetails.metadata_json) || {};
       const scenario = determineCallScenario(callDetails, metadata);
-      const customerName = getCustomerName(callDetails, metadata);
       const structuredSummary = collectInputLines(metadata, dtmfEntries || [], { includeMissing: true });
-      const lines = [];
+      const summaryText = structuredSummary.lines.length
+        ? structuredSummary.lines.join('\n')
+        : scenario === 'general'
+          ? 'Call completed without keypad input.'
+          : 'Secure input workflow marked complete.';
 
-      if (scenario === 'verification') {
-        lines.push('⚠️ Input Summary', '', 'Verification input received.');
-        lines.push(`Client: ${customerName}`);
-        lines.push('Call Type: Verification');
-        lines.push(`Time: ${formatLocalTimestamp()}`);
-        if (structuredSummary.lines.length) {
-          lines.push('');
-          lines.push('Details:');
-          structuredSummary.lines.forEach((line) => lines.push(line));
-        }
-      } else if (scenario === 'information') {
-        lines.push('⚠️ Input Summary', '', 'Requested information received.');
-        lines.push(`Client: ${customerName}`);
-        lines.push('Call Type: Information Collection');
-        lines.push(`Time: ${formatLocalTimestamp()}`);
-        if (structuredSummary.lines.length) {
-          lines.push('');
-          lines.push('Details:');
-          structuredSummary.lines.forEach((line) => lines.push(line));
-        }
-      } else {
-        lines.push('📞 Call Completed');
-        lines.push(`Client: ${customerName}`);
-        lines.push('No input was required for this call.');
-      }
-
-      let keyboard = null;
-      if (scenario === 'general') {
-        keyboard = this.buildOutcomeFollowUpKeyboard(call_sid, {
-          allowCallAgain: true,
-        });
-      } else {
-        keyboard = this.buildCallFollowUpKeyboard(call_sid, 'completed', {
-          allowTranscript: true,
-          callAgainPrompt: true,
-        });
-      }
-
-      await this.sendTelegramMessage(telegram_chat_id, buildTelegramMessage(lines), 'HTML', keyboard);
+      await this.updateCallThread(call_sid, telegram_chat_id, {
+        summary: summaryText,
+        status: { emoji: '✅', label: 'Verification Complete', detail: 'Secure input workflow finished.' },
+        secureInput: { workflowComplete: true }
+      }, callDetails);
       return true;
     } catch (error) {
       console.error('❌ Failed to send workflow completion notification:', error);
@@ -1159,25 +1139,28 @@ class EnhancedWebhookService {
         return true;
       }
 
+      const chatId = telegram_chat_id || call?.telegram_chat_id;
+      if (!chatId) {
+        return true;
+      }
+
       const label = formatAnsweredLabel(answeredSignal);
-      const lines = [`🤖 Answer detection update — Answered by: ${label}`];
+      const confidencePercent = Number(call.amd_confidence) * 100;
+      const amdDetail =
+        label === 'human'
+          ? 'Caller is live. Keep the conversation flowing like a human agent.'
+          : label === 'machine'
+            ? 'Likely voicemail or IVR detected. Pivot to a voicemail script or hang up.'
+            : 'Monitoring audio channel for a final answer signal.';
 
-      if (call.amd_confidence) {
-        const confidencePercent = Number(call.amd_confidence) * 100;
-        if (Number.isFinite(confidencePercent)) {
-          lines.push(`Confidence: ${confidencePercent.toFixed(1)}%`);
+      await this.updateCallThread(call_sid, chatId, {
+        amd: {
+          label: titleCase(label),
+          emoji: label === 'human' ? '👂' : label === 'machine' ? '🤖' : '📡',
+          confidence: Number.isFinite(confidencePercent) ? `${confidencePercent.toFixed(1)}%` : null,
+          detail: amdDetail
         }
-      }
-
-      if (label === 'human') {
-        lines.push('Caller is live. Keep the conversation flowing like a human agent.');
-      } else if (label === 'machine') {
-        lines.push('Likely voicemail or IVR detected. Pivot to a voicemail script or hang up.');
-      } else {
-        lines.push('Monitoring audio channel for a final answer signal.');
-      }
-
-      await this.sendTelegramMessage(telegram_chat_id, buildTelegramMessage(lines));
+      }, call);
       return true;
     } catch (error) {
       console.error('❌ Failed to send AMD update notification:', error);
@@ -1230,6 +1213,83 @@ class EnhancedWebhookService {
       return true;
     } catch (error) {
       console.error('❌ Failed to send call hint notification:', error);
+      return false;
+    }
+  }
+
+  async sendDualChannelAlert(call_sid, telegram_chat_id) {
+    try {
+      const [latestState, callDetails] = await Promise.all([
+        this.db.getLatestCallState(call_sid, 'dtmf_verified'),
+        this.db.getCall(call_sid),
+      ]);
+
+      if (!latestState || !callDetails) {
+        return true;
+      }
+
+      const metadata = parseCallMetadata(callDetails.metadata_json) || {};
+      const customerName = getCustomerName(callDetails, metadata);
+      const stateData = parseStateData(latestState.data);
+      const dualChannelRaw = stateData.dual_channel;
+      const dualChannel =
+        typeof dualChannelRaw === 'string'
+          ? (() => {
+              try {
+                return JSON.parse(dualChannelRaw);
+              } catch (error) {
+                return null;
+              }
+            })()
+          : dualChannelRaw;
+
+      if (!dualChannel || !dualChannel.issue) {
+        return true;
+      }
+
+      const issue = dualChannel.issue;
+      const stageKey = stateData.stage_key || stateData.stageKey;
+      const stageLabel =
+        getStageLabelFromMetadata(metadata, stageKey) ||
+        (stageKey ? stageKey.replace(/_/g, ' ') : 'Verification');
+
+      let message = `*${escapeMarkdownV2('🚨 Dual-Channel Verification Alert')}*\n`;
+      message += `*Client:* ${escapeMarkdownV2(customerName)}\n`;
+      message += `*Stage:* ${escapeMarkdownV2(stageLabel)}\n`;
+
+      if (issue.status === 'mismatch') {
+        const checkLabel = issue.label || 'Secondary reference';
+        message += `*Check:* ${escapeMarkdownV2(checkLabel)}\n`;
+        if (issue.reference) {
+          message += `*Reference:* ${escapeMarkdownV2(issue.reference)}\n`;
+        }
+        if (issue.observed) {
+          message += `*Observed:* ${escapeMarkdownV2(issue.observed)}\n`;
+        }
+        message += `_${escapeMarkdownV2('Action: escalate to a human agent or re-verify before continuing.')}_\n`;
+      } else {
+        message += `_${escapeMarkdownV2(`Reference missing for ${issue.label || issue.type || 'secondary check'}. Please refresh CRM data.`)}_\n`;
+      }
+
+      await this.sendTelegramMessage(
+        telegram_chat_id,
+        message.trim(),
+        'MarkdownV2',
+        this.buildCallFollowUpKeyboard(call_sid, 'alert', {
+          allowTranscript: true,
+          callAgainPrompt: true,
+        })
+      );
+
+      if (this.db && this.db.logNotificationMetric) {
+        await this.db.logNotificationMetric('call_dual_channel_alert', true);
+      }
+      return true;
+    } catch (error) {
+      console.error('❌ Failed to send dual-channel alert:', error);
+      if (this.db && this.db.logNotificationMetric) {
+        await this.db.logNotificationMetric('call_dual_channel_alert', false);
+      }
       return false;
     }
   }
@@ -1307,6 +1367,9 @@ class EnhancedWebhookService {
         case 'call_hint_input_detected':
           success = await this.sendCallHint(call_sid, telegram_chat_id, notification_type);
           break;
+        case 'call_dual_channel_alert':
+          success = await this.sendDualChannelAlert(call_sid, telegram_chat_id);
+          break;
         default:
           console.warn(`⚠️ Unknown notification type: ${notification_type}`.yellow);
           success = await this.sendCallStatusUpdate(call_sid, notification_type.replace('call_', ''), telegram_chat_id);
@@ -1337,7 +1400,8 @@ class EnhancedWebhookService {
   // Enhanced Telegram message sending with markdown support
   async sendTelegramMessage(chatId, message, parseMode = 'HTML', replyMarkup = null) {
     const url = `https://api.telegram.org/bot${this.telegramBotToken}/sendMessage`;
-    const sanitizedText = sanitizeTelegramText(message);
+    const useMarkdown = parseMode === 'MarkdownV2';
+    const sanitizedText = useMarkdown ? message : sanitizeTelegramText(message);
     const payload = {
       chat_id: chatId,
       text: sanitizedText,
@@ -1372,6 +1436,36 @@ class EnhancedWebhookService {
 
     if (!response.data.ok) {
       throw new Error(`Telegram API error: ${response.data.description || 'Unknown error'}`);
+    }
+
+    return response.data;
+  }
+
+  async editTelegramMessage(chatId, messageId, message, parseMode = 'MarkdownV2', replyMarkup = null) {
+    const url = `https://api.telegram.org/bot${this.telegramBotToken}/editMessageText`;
+    const useMarkdown = parseMode === 'MarkdownV2';
+    const sanitizedText = useMarkdown ? message : sanitizeTelegramText(message);
+    const payload = {
+      chat_id: chatId,
+      message_id: messageId,
+      text: sanitizedText,
+    };
+
+    if (parseMode) {
+      payload.parse_mode = parseMode;
+    }
+
+    if (replyMarkup) {
+      payload.reply_markup = replyMarkup;
+    }
+
+    const response = await axios.post(url, payload, {
+      timeout: 15000,
+      headers: { 'Content-Type': 'application/json' }
+    });
+
+    if (!response.data.ok) {
+      throw new Error(`Telegram edit error: ${response.data.description || 'Unknown error'}`);
     }
 
     return response.data;
@@ -1543,6 +1637,185 @@ class EnhancedWebhookService {
   cleanupCallData(callSid) {
     this.activeCallStatus.delete(callSid);
     this.callTimestamps.delete(callSid);
+    this.callThreads.delete(callSid);
+  }
+
+  getOrCreateThread(callSid, chatId) {
+    let thread = this.callThreads.get(callSid);
+    if (!thread) {
+      thread = {
+        chatId,
+        messageId: null,
+        context: {
+          callSid,
+          customer: { name: 'Client', phone: null },
+          persona: 'Adaptive Agent',
+          intent: 'General',
+          sentiment: { label: 'neutral', emoji: '😐' },
+          status: { emoji: '📞', label: 'Call Update', detail: 'Stand by…' },
+          provider: 'UNKNOWN'
+        }
+      };
+      this.callThreads.set(callSid, thread);
+    } else if (chatId && thread.chatId !== chatId) {
+      thread.chatId = chatId;
+    }
+    return thread;
+  }
+
+  buildThreadActionKeyboard(callSid, options = {}) {
+    if (!callSid) return null;
+    const base = `FOLLOWUP_CALL:${callSid}:`;
+    const rows = [
+      [
+        { text: '☎️ Call Back', callback_data: `${base}callagain` },
+        { text: '💬 SMS Recap', callback_data: `${base}recap` }
+      ],
+      [
+        { text: '📋 View Transcript', callback_data: `${base}transcript` },
+        { text: '⏰ Schedule Follow-Up', callback_data: `${base}schedule` }
+      ]
+    ];
+
+    if (options.allowResend) {
+      rows.push([{ text: '🔁 Resend Code', callback_data: `${base}resend` }]);
+    }
+
+    return { inline_keyboard: rows };
+  }
+
+  composeThreadMessage(context = {}) {
+    const lines = [];
+    const statusLine = `${context.status?.emoji || '📞'} ${context.status?.label || 'Call Update'}`;
+    lines.push(`*${escapeMarkdownV2(statusLine)}*`);
+
+    const phoneDisplay = context.customer?.phone ? maskPhoneNumber(context.customer.phone) : 'Unknown';
+    lines.push(`*Client:* ${escapeMarkdownV2(context.customer?.name || 'Client')} (${escapeMarkdownV2(phoneDisplay)})`);
+    lines.push(`*Persona:* ${escapeMarkdownV2(context.persona || 'Adaptive Agent')}`);
+    lines.push(`*Intent:* ${escapeMarkdownV2(context.intent || 'General')}`);
+    const sentimentText = `${context.sentiment?.emoji || '😐'} ${context.sentiment?.label || 'neutral'}`;
+    lines.push(`*Sentiment:* ${escapeMarkdownV2(sentimentText)}`);
+
+    if (context.status?.detail) {
+      lines.push(`*Status Detail:* ${escapeMarkdownV2(context.status.detail)}`);
+    }
+
+    if (context.amd) {
+      const amdLine = `${context.amd.emoji || '👂'} ${context.amd.label || 'Answer Update'}`;
+      lines.push(`*Answer Detection:* ${escapeMarkdownV2(amdLine)}`);
+      if (context.amd.detail) {
+        lines.push(`_${escapeMarkdownV2(context.amd.detail)}_`);
+      }
+    }
+
+    if (context.secureInput) {
+      lines.push(`\n*Secure Input:* ${escapeMarkdownV2(context.secureInput.stageLabel || 'Verification')}`);
+      if (context.secureInput.value) {
+        lines.push(`Digits: ${escapeMarkdownV2(context.secureInput.value)}`);
+      }
+      if (context.secureInput.needsRetry) {
+        lines.push('_Retry requested — agent attention needed._');
+      }
+      if (context.secureInput.clarification) {
+        lines.push(`_${escapeMarkdownV2(context.secureInput.clarification)}_`);
+      }
+      if (context.secureInput.dualIssue) {
+        lines.push(`⚠️ ${escapeMarkdownV2(context.secureInput.dualIssue)}`);
+      }
+      if (context.secureInput.nextStage) {
+        lines.push(`Next: ${escapeMarkdownV2(context.secureInput.nextStage)}`);
+      }
+    }
+
+    if (context.summary) {
+      lines.push(`\n*Summary*\n${escapeMarkdownV2(context.summary)}`);
+    }
+
+    lines.push(`\n*Provider:* ${escapeMarkdownV2((context.provider || 'UNKNOWN').toUpperCase())}`);
+    lines.push(`*Call ID:* ${escapeMarkdownV2(context.callSid || 'N/A')}`);
+
+    if (context.lastUpdated) {
+      lines.push(`_Last updated: ${escapeMarkdownV2(formatLocalTimestamp(context.lastUpdated))}_`);
+    }
+
+    return lines.join('\n');
+  }
+
+  async updateCallThread(callSid, chatId, updates = {}, callDetails = null) {
+    if (!chatId) {
+      console.warn(`Skipping thread update for ${callSid}; missing chat id.`);
+      return false;
+    }
+    const thread = this.getOrCreateThread(callSid, chatId);
+    const ctx = thread.context;
+    ctx.callSid = ctx.callSid || callSid;
+    ctx.lastUpdated = new Date().toISOString();
+
+    if (callDetails) {
+      ctx.provider = callDetails.provider || ctx.provider;
+      ctx.customer = ctx.customer || {};
+      ctx.customer.phone = callDetails.phone_number || ctx.customer.phone;
+    }
+
+    if (updates.customer) {
+      ctx.customer = { ...(ctx.customer || {}), ...updates.customer };
+    }
+    if (updates.persona) {
+      ctx.persona = updates.persona;
+    }
+    if (updates.intent) {
+      ctx.intent = updates.intent;
+    }
+    if (updates.sentiment) {
+      ctx.sentiment = updates.sentiment;
+    }
+    if (updates.status) {
+      ctx.status = { ...(ctx.status || {}), ...updates.status };
+    }
+    if (updates.secureInput) {
+      ctx.secureInput = { ...(ctx.secureInput || {}), ...updates.secureInput };
+    }
+    if (updates.summary !== undefined) {
+      ctx.summary = updates.summary;
+    }
+    if (updates.amd) {
+      ctx.amd = { ...(ctx.amd || {}), ...updates.amd };
+    }
+    if (updates.provider) {
+      ctx.provider = updates.provider;
+    }
+
+    const keyboard = this.buildThreadActionKeyboard(callSid, {
+      allowResend: ctx.secureInput?.allowResend
+    });
+    const text = this.composeThreadMessage(ctx);
+    const messageId = await this.upsertThreadMessage(callSid, thread.chatId, text, keyboard);
+    thread.messageId = messageId;
+    return true;
+  }
+
+  async upsertThreadMessage(callSid, chatId, message, replyMarkup = null) {
+    const thread = this.callThreads.get(callSid);
+    const parseMode = 'MarkdownV2';
+    try {
+      if (thread?.messageId) {
+        await this.editTelegramMessage(chatId, thread.messageId, message, parseMode, replyMarkup);
+        return thread.messageId;
+      }
+      const sent = await this.sendTelegramMessage(chatId, message, parseMode, replyMarkup);
+      const messageId = sent?.result?.message_id || sent?.message_id;
+      if (thread) {
+        thread.messageId = messageId;
+      }
+      return messageId;
+    } catch (error) {
+      if (thread?.messageId) {
+        console.warn(`Failed to edit thread message for ${callSid}, retrying with new message:`, error.message);
+        thread.messageId = null;
+        return this.upsertThreadMessage(callSid, chatId, message, replyMarkup);
+      }
+      throw error;
+    }
   }
 
   // Enhanced immediate status update with better error handling

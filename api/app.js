@@ -104,10 +104,17 @@ const DEFAULT_SECURE_INPUT_TEMPLATE = [
     stage: 'OTP',
     label: 'One-Time Passcode',
     numDigits: 6,
+    pattern: '^\\d{6}$',
+    confidenceThreshold: 0.9,
     prompt: 'Please enter the one-time passcode we just sent you.',
     instructions: 'Let the caller know you are listening for the code and confirm once it is received.',
     successMessage: 'Great, the code looks good. Continue to the next verification step.',
     failureMessage: 'That code did not match. Offer to resend and ask them to try again carefully.',
+    hint: 'This is the 6-digit SMS we just delivered; pause briefly between each digit.',
+    contextTags: ['otp', 'sms'],
+    speechFallbackScript: 'If typing is difficult, feel free to say the six digits aloud and I will record them.',
+    confirmDigits: true,
+    secondaryChecks: [{ type: 'registered_phone', label: 'Registered phone on file' }],
   },
   {
     stage: 'PIN',
@@ -117,6 +124,12 @@ const DEFAULT_SECURE_INPUT_TEMPLATE = [
     instructions: 'Remind the caller to take their time and speak clearly if they prefer.',
     successMessage: 'Thanks! That PIN matches. Let’s verify one final detail.',
     failureMessage: 'That PIN did not match our records. Ask if they want to try again or reset it.',
+    hint: 'Use the PIN you set up with our team. Say it slowly if needed.',
+    contextTags: ['pin', 'account'],
+    speechFallbackScript: 'You can speak the digits if that is easier than using the keypad.',
+    confirmDigits: true,
+    confidenceThreshold: 0.85,
+    secondaryChecks: [{ type: 'crm_record', label: 'CRM profile' }],
   },
   {
     stage: 'CARD_LAST4',
@@ -125,8 +138,93 @@ const DEFAULT_SECURE_INPUT_TEMPLATE = [
     prompt: 'Finally, enter the last four digits of the card we have on file.',
     instructions: 'Let them know this confirms the account ownership.',
     successMessage: 'Perfect—verification is complete. Wrap up the call with a thank-you message.',
+    hint: 'This is the card linked to your account—we only need the final four digits.',
+    contextTags: ['billing', 'card'],
+    speechFallbackScript: 'Feel free to read the final four digits aloud for me to confirm.',
+    confirmDigits: true,
+    confidenceThreshold: 0.95,
+    secondaryChecks: [{ type: 'crm_shadow', label: 'Billing profile' }],
   },
 ];
+
+function getSecureInputHint(metadataPayload = {}, stageKey, fallback = null) {
+  if (!stageKey) {
+    return fallback;
+  }
+  const normalized = dtmfUtils.normalizeStage(stageKey);
+  const hints = metadataPayload.secure_input_hints || {};
+  return hints?.[normalized] || hints?.[stageKey] || fallback;
+}
+
+function buildStageContextTags(metadataPayload = {}, stageKey, defaultTags = []) {
+  const tags = new Set(Array.isArray(defaultTags) ? defaultTags : [defaultTags].filter(Boolean));
+  const context = metadataPayload.business_context || {};
+  if (stageKey) {
+    tags.add(stageKey.toLowerCase());
+  }
+  if (context.industry) {
+    tags.add(String(context.industry).toLowerCase());
+  }
+  if (context.businessType) {
+    tags.add(String(context.businessType).toLowerCase());
+  }
+  if (metadataPayload.secure_profile) {
+    tags.add(String(metadataPayload.secure_profile).toLowerCase());
+  }
+  return Array.from(tags).filter(Boolean);
+}
+
+function mergeSecondaryChecks(stageDefinition = {}, metadataPayload = {}) {
+  const normalizedStage = dtmfUtils.normalizeStage(
+    stageDefinition.stage || stageDefinition.stage_key || stageDefinition.label || 'GENERIC'
+  );
+  const metadataChecksRaw =
+    metadataPayload.dual_channel_checks?.[normalizedStage] ||
+    metadataPayload.dual_channel_checks?.[stageDefinition.stage] ||
+    metadataPayload.dual_channel_checks?.[stageDefinition.label];
+
+  const normalizeEntry = (entry) => {
+    if (!entry) {
+      return null;
+    }
+    if (typeof entry === 'string') {
+      return { type: entry };
+    }
+    if (typeof entry === 'object') {
+      return entry;
+    }
+    return null;
+  };
+
+  const baseChecks = Array.isArray(stageDefinition.secondaryChecks)
+    ? stageDefinition.secondaryChecks
+    : stageDefinition.secondaryChecks
+      ? [stageDefinition.secondaryChecks]
+      : [];
+
+  const metadataChecks = Array.isArray(metadataChecksRaw)
+    ? metadataChecksRaw
+    : metadataChecksRaw
+      ? [metadataChecksRaw]
+      : [];
+
+  return [...baseChecks, ...metadataChecks].map(normalizeEntry).filter(Boolean);
+}
+
+function enhanceStageDefinition(stageDefinition, metadataPayload = {}) {
+  if (!stageDefinition) {
+    return stageDefinition;
+  }
+  const normalizedKey = dtmfUtils.normalizeStage(
+    stageDefinition.stage || stageDefinition.stage_key || stageDefinition.label || 'GENERIC'
+  );
+  return {
+    ...stageDefinition,
+    hint: getSecureInputHint(metadataPayload, normalizedKey, stageDefinition.hint),
+    contextTags: buildStageContextTags(metadataPayload, normalizedKey, stageDefinition.contextTags),
+    secondaryChecks: mergeSecondaryChecks(stageDefinition, metadataPayload),
+  };
+}
 
 function buildStructuredInputSequence(metadataPayload = {}, fallbackDigits = 4) {
   const stages = [];
@@ -139,7 +237,7 @@ function buildStructuredInputSequence(metadataPayload = {}, fallbackDigits = 4) 
     Boolean(metadataPayload.enable_structured_inputs);
 
   if (needOtp) {
-    stages.push({
+    stages.push(enhanceStageDefinition({
       stage: 'OTP',
       label: metadataPayload.otp_label || 'One-Time Passcode',
       numDigits: otpDigits || 6,
@@ -150,7 +248,8 @@ function buildStructuredInputSequence(metadataPayload = {}, fallbackDigits = 4) 
       instructions: 'Let the caller know you are waiting for the code and confirm once it is received.',
       successMessage: 'Great, the code looks good. Continue with the next verification step.',
       failureMessage: 'That code did not match. Offer to resend and ask them to try again carefully.',
-    });
+      hint: metadataPayload.otp_hint || undefined,
+    }, metadataPayload));
   }
 
   const expectedPin = metadataPayload.expected_pin;
@@ -158,7 +257,7 @@ function buildStructuredInputSequence(metadataPayload = {}, fallbackDigits = 4) 
   const needPin = Boolean(expectedPin) || Boolean(metadataPayload.require_pin) || metadataPayload.secure_profile === 'bank';
 
   if (needPin) {
-    stages.push({
+    stages.push(enhanceStageDefinition({
       stage: 'PIN',
       label: metadataPayload.pin_label || 'Account PIN',
       numDigits: pinDigits || fallbackDigits || 4,
@@ -169,11 +268,12 @@ function buildStructuredInputSequence(metadataPayload = {}, fallbackDigits = 4) 
       instructions: 'Remind the caller to take their time and to speak clearly if they prefer speech input.',
       successMessage: 'Thank you, that PIN matches. Let’s verify one last detail.',
       failureMessage: 'That PIN did not match our records. Offer to try again or reset it.',
-    });
+      hint: metadataPayload.pin_hint || undefined,
+    }, metadataPayload));
   }
 
   if (metadataPayload.require_card_type || metadataPayload.card_type_prompt) {
-    stages.push({
+    stages.push(enhanceStageDefinition({
       stage: 'CARD_TYPE',
       label: metadataPayload.card_type_label || 'Card Type',
       prompt:
@@ -182,11 +282,12 @@ function buildStructuredInputSequence(metadataPayload = {}, fallbackDigits = 4) 
       instructions: 'Listen for a short response and confirm the card type back to the caller.',
       successMessage: 'Card type captured. Moving on.',
       failureMessage: 'I did not catch that card type. Ask the caller to repeat it clearly.',
-    });
+      hint: metadataPayload.card_type_hint || undefined,
+    }, metadataPayload));
   }
 
   if (metadataPayload.require_card_last4 || metadataPayload.expected_card_last4) {
-    stages.push({
+    stages.push(enhanceStageDefinition({
       stage: 'CARD_LAST4',
       label: metadataPayload.card_last4_label || 'Card Last 4',
       numDigits: 4,
@@ -197,11 +298,12 @@ function buildStructuredInputSequence(metadataPayload = {}, fallbackDigits = 4) 
       instructions: 'Let the caller know this confirms the account ownership.',
       successMessage: 'Perfect—verification is complete.',
       failureMessage: 'Those digits do not match. Offer a retry or alternate verification.',
-    });
+      hint: metadataPayload.card_last4_hint || undefined,
+    }, metadataPayload));
   }
 
   if (metadataPayload.require_zip || metadataPayload.billing_zip_prompt) {
-    stages.push({
+    stages.push(enhanceStageDefinition({
       stage: 'BILLING_ZIP',
       label: metadataPayload.billing_zip_label || 'Billing ZIP',
       numDigits: Number(metadataPayload.billing_zip_length || 5),
@@ -209,11 +311,12 @@ function buildStructuredInputSequence(metadataPayload = {}, fallbackDigits = 4) 
         metadataPayload.billing_zip_prompt ||
         'What is the billing ZIP code associated with your account?',
       instructions: 'Repeat the ZIP code back to confirm before proceeding.',
-    });
+      hint: metadataPayload.billing_zip_hint || undefined,
+    }, metadataPayload));
   }
 
   if (!stages.length && (metadataPayload.enable_structured_inputs || metadataPayload.secure_profile === 'bank')) {
-    return DEFAULT_SECURE_INPUT_TEMPLATE.map((entry) => ({ ...entry }));
+    return DEFAULT_SECURE_INPUT_TEMPLATE.map((entry) => enhanceStageDefinition({ ...entry }, metadataPayload));
   }
 
   return stages;
@@ -251,6 +354,126 @@ function ensureStructuredInputSequence(callConfig, metadataPayload) {
   }
 }
 
+
+function normalizePhoneDigits(value) {
+  if (!value) {
+    return null;
+  }
+  const digits = String(value).replace(/\D/g, '');
+  return digits || null;
+}
+
+function describePhonePreview(value) {
+  const digits = normalizePhoneDigits(value);
+  if (!digits) {
+    return 'unknown';
+  }
+  if (digits.length <= 4) {
+    return digits;
+  }
+  return `•••${digits.slice(-4)}`;
+}
+
+function performDualChannelVerification(callRecord, stageDefinition, digits) {
+  if (
+    !callRecord ||
+    !stageDefinition ||
+    !Array.isArray(stageDefinition.secondaryChecks) ||
+    !stageDefinition.secondaryChecks.length
+  ) {
+    return null;
+  }
+
+  const metadata = parseMetadataJson(callRecord.metadata_json) || {};
+  const results = [];
+  const normalizedStage = dtmfUtils.normalizeStage(stageDefinition.stage || stageDefinition.stageKey || stageDefinition.label);
+
+  const checks = stageDefinition.secondaryChecks.map((entry) =>
+    typeof entry === 'string' ? { type: entry } : entry || {}
+  );
+
+  checks.forEach((check) => {
+    switch (check.type) {
+      case 'registered_phone': {
+        const registered = check.field ? metadata[check.field] : metadata.registered_phone_number;
+        const observed = callRecord.phone_number || metadata.dialed_number;
+        if (!registered || !observed) {
+          results.push({
+            type: 'registered_phone',
+            status: 'missing_reference',
+            label: check.label || 'Registered phone',
+          });
+        } else {
+          const match = normalizePhoneDigits(registered) === normalizePhoneDigits(observed);
+          results.push({
+            type: 'registered_phone',
+            status: match ? 'match' : 'mismatch',
+            label: check.label || 'Registered phone',
+            reference: describePhonePreview(registered),
+            observed: describePhonePreview(observed),
+          });
+        }
+        break;
+      }
+      case 'crm_record': {
+        const crmId = metadata.crm_contact_id || metadata.crm_id || metadata.customer_id;
+        if (!crmId) {
+          results.push({
+            type: 'crm_record',
+            status: 'missing_reference',
+            label: check.label || 'CRM record',
+          });
+        } else {
+          results.push({
+            type: 'crm_record',
+            status: 'match',
+            label: check.label || 'CRM record',
+            reference: crmId,
+          });
+        }
+        break;
+      }
+      case 'crm_shadow': {
+        const shadowValues = metadata.crm_shadow_values || {};
+        const expectedShadow =
+          shadowValues[normalizedStage] ||
+          shadowValues[stageDefinition.stageKey] ||
+          shadowValues[stageDefinition.stage];
+        if (!expectedShadow) {
+          results.push({
+            type: 'crm_shadow',
+            status: 'missing_reference',
+            label: check.label || 'CRM mirror',
+          });
+        } else {
+          const match = String(expectedShadow) === String(digits);
+          results.push({
+            type: 'crm_shadow',
+            status: match ? 'match' : 'mismatch',
+            label: check.label || 'CRM mirror',
+            reference: expectedShadow,
+          });
+        }
+        break;
+      }
+      default:
+        break;
+    }
+  });
+
+  if (!results.length) {
+    return null;
+  }
+
+  const failing = results.find((entry) => entry.status === 'mismatch');
+  const missing = results.find((entry) => entry.status === 'missing_reference');
+
+  return {
+    hasIssue: Boolean(failing || missing),
+    issue: failing || missing || null,
+    results,
+  };
+}
 
 function sanitizeDigits(rawInput) {
   if (rawInput == null) {
@@ -449,10 +672,16 @@ async function evaluateInputStage(callSid, summary, metadataEnvelope = {}, inter
   }
 
   const orchestrator = inputOrchestrators.get(callSid);
-  const guidance = orchestrator ? orchestrator.handleInput(summary.stageKey, summary.digits) : null;
+  const guidance = orchestrator ? orchestrator.handleInput(summary.stageKey, summary.digits, metadataEnvelope) : null;
+  const stageDefinition = orchestrator?.getStageDefinition
+    ? orchestrator.getStageDefinition(summary.stageKey)
+    : null;
   const stageDisplay = guidance?.stageLabel || summary.stageLabel || summary.stageKey || 'Entry';
   const transcriptLine = `[Keypad] ${stageDisplay}: ${summary.digits}`;
   const callRecord = summary.callRecord || (await db.getCall(callSid));
+  const dualChannel = stageDefinition
+    ? performDualChannelVerification(callRecord, stageDefinition, summary.digits)
+    : null;
 
   try {
     await db.addTranscript({
@@ -472,6 +701,12 @@ async function evaluateInputStage(callSid, summary, metadataEnvelope = {}, inter
       next_stage_key: guidance?.nextStage?.stageKey || null,
       needs_retry: guidance?.needsRetry || false,
       attempts: guidance?.attempts || 1,
+      clarification_prompt: guidance?.clarificationPrompt || null,
+      offer_speech: Boolean(guidance?.shouldOfferSpeechFallback),
+      confirm_digits: Boolean(guidance?.shouldConfirmDigits),
+      detected_issues: guidance?.detectedIssues || [],
+      provider_confidence: guidance?.providerConfidence ?? null,
+      dual_channel: dualChannel,
       metadata: metadataEnvelope,
     });
   } catch (dbError) {
@@ -487,6 +722,17 @@ async function evaluateInputStage(callSid, summary, metadataEnvelope = {}, inter
   } catch (healthError) {
     console.warn('Failed to log dtmf_forwarded health event:', healthError.message);
   }
+  if (dualChannel?.hasIssue) {
+    try {
+      await db.logServiceHealth('call_system', 'dual_channel_alert', {
+        call_sid: callSid,
+        stage_key: summary.stageKey,
+        issue: dualChannel.issue || null,
+      });
+    } catch (dualLogError) {
+      console.warn('Failed to log dual channel alert:', dualLogError.message);
+    }
+  }
 
   try {
     const targetChatId = callRecord?.telegram_chat_id || callRecord?.user_chat_id;
@@ -497,12 +743,15 @@ async function evaluateInputStage(callSid, summary, metadataEnvelope = {}, inter
       if (guidance?.workflowComplete) {
         await db.createEnhancedWebhookNotification(callSid, 'call_workflow_complete', targetChatId, 'high');
       }
+      if (dualChannel?.hasIssue) {
+        await db.createEnhancedWebhookNotification(callSid, 'call_dual_channel_alert', targetChatId, 'urgent');
+      }
     }
   } catch (notificationError) {
     console.error('Failed to enqueue structured input notification:', notificationError);
   }
 
-  return { guidance, stageDisplay, callRecord };
+  return { guidance, stageDisplay, callRecord, dualChannel };
 }
 
 function extractDigitsFromPayload(candidate) {
@@ -1260,6 +1509,18 @@ app.ws('/connection', (ws) => {
       } else {
         promptSegments.push('Acknowledge the keypad entry and continue guiding the caller just like a live agent would.');
       }
+      if (guidance?.clarificationPrompt) {
+        promptSegments.push(guidance.clarificationPrompt);
+      }
+      if (guidance?.shouldConfirmDigits) {
+        promptSegments.push('Repeat the digits back with a pause between each number and confirm before moving on.');
+      }
+      if (guidance?.shouldOfferSpeechFallback) {
+        promptSegments.push(
+          guidance.speechFallbackScript ||
+            'Offer that they can simply say the digits out loud if entering them is difficult.'
+        );
+      }
 
       if (guidance?.needsRetry) {
         promptSegments.push('Ask them politely to re-enter the digits and stay present like a human agent would.');
@@ -1298,6 +1559,12 @@ app.ws('/connection', (ws) => {
       }
       if (typeof dtmfDetails?.confidence === 'number') {
         metadataEnvelope.confidence = dtmfDetails.confidence;
+      }
+      if (extraMeta?.reason) {
+        metadataEnvelope.reason = extraMeta.reason;
+      }
+      if (typeof extraMeta?.finished === 'boolean') {
+        metadataEnvelope.finished = extraMeta.finished;
       }
       if (dtmfDetails?.type) {
         metadataEnvelope.provider_type = dtmfDetails.type;
@@ -2033,8 +2300,32 @@ app.post('/outbound-call', async (req, res) => {
       ? normalizeInputSequencePayload(input_sequence, collect_digits || 4)
       : [];
     const metadataPayload = parseMetadataJson(metadata_json) || {};
+    metadataPayload.business_context = metadataPayload.business_context || functionSystem.context || null;
     if (sanitizedCustomerName) {
       metadataPayload.customer_name = sanitizedCustomerName;
+    }
+    if (!metadataPayload.registered_phone_number) {
+      metadataPayload.registered_phone_number = number;
+      metadataPayload.registered_phone_last4 = number ? number.replace(/\D/g, '').slice(-4) : null;
+    }
+    metadataPayload.dual_channel_checks = metadataPayload.dual_channel_checks || {};
+    if (!metadataPayload.dual_channel_checks.OTP) {
+      metadataPayload.dual_channel_checks.OTP = ['registered_phone'];
+    }
+    if (!metadataPayload.dual_channel_checks.PIN && metadataPayload.crm_contact_id) {
+      metadataPayload.dual_channel_checks.PIN = ['crm_record'];
+    }
+    if (!metadataPayload.dual_channel_checks.CARD_LAST4 && metadataPayload.expected_card_last4) {
+      metadataPayload.dual_channel_checks.CARD_LAST4 = ['crm_shadow'];
+      metadataPayload.crm_shadow_values = metadataPayload.crm_shadow_values || {};
+      metadataPayload.crm_shadow_values.CARD_LAST4 = String(metadataPayload.expected_card_last4);
+    }
+    const secureInputHints = functionEngine.getSecureInputHints();
+    if (secureInputHints && Object.keys(secureInputHints).length) {
+      metadataPayload.secure_input_hints = {
+        ...(metadataPayload.secure_input_hints || {}),
+        ...secureInputHints,
+      };
     }
     if (callType === 'collect_input') {
       metadataPayload.input_sequence = sanitizedInputSequence;

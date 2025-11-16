@@ -5,6 +5,84 @@ const { getUser, isAdmin } = require('../db/db');
 const MAX_PREVIEW_MESSAGES = 12;
 const MAX_CHUNK_LENGTH = 3800;
 
+const MD_V2_SPECIAL = /([_*\[\]()~`>#+\-=|{}.!\\])/g;
+
+function escapeMarkdownV2(text = '') {
+    return String(text)
+        .replace(/\\/g, '\\\\')
+        .replace(MD_V2_SPECIAL, '\\$1');
+}
+
+function formatPhoneDisplay(phone) {
+    if (!phone) return 'Unknown';
+    const trimmed = phone.trim();
+    if (!trimmed.startsWith('+')) {
+        return trimmed;
+    }
+    const digits = trimmed.replace(/[^\d]/g, '');
+    if (digits.length <= 4) return trimmed;
+    const country = digits.slice(0, digits.length - 10);
+    const rest = digits.slice(-10);
+    const formatted =
+        (country ? `+${country} ` : '+') +
+        `${rest.slice(0, 3)}-${rest.slice(3, 6)}-${rest.slice(6)}`;
+    return formatted;
+}
+
+function safeJsonParse(raw) {
+    if (!raw) return null;
+    if (typeof raw === 'object') return raw;
+    try {
+        return JSON.parse(raw);
+    } catch (error) {
+        console.warn('Failed to parse JSON payload in transcript command:', error.message);
+        return null;
+    }
+}
+
+function extractPersona(metadata = {}, call = {}) {
+    return (
+        metadata?.persona?.businessDisplayName ||
+        metadata?.persona?.label ||
+        metadata?.businessDisplayName ||
+        metadata?.companyName ||
+        call.business_function ||
+        'Adaptive Agent'
+    );
+}
+
+function extractIntent(metadata = {}, call = {}) {
+    return (
+        metadata?.intent ||
+        metadata?.call_intent ||
+        call.business_function ||
+        metadata?.purpose ||
+        'General'
+    );
+}
+
+function extractSentiment(rawAnalysis) {
+    if (!rawAnalysis) {
+        return { label: 'neutral', emoji: '😐' };
+    }
+    let analysis = rawAnalysis;
+    if (typeof rawAnalysis === 'string') {
+        try {
+            analysis = JSON.parse(rawAnalysis);
+        } catch (error) {
+            analysis = {};
+        }
+    }
+    const sentiment = (analysis?.sentiment || analysis?.analysis?.sentiment || 'neutral').toLowerCase();
+    if (sentiment.includes('pos')) {
+        return { label: 'positive', emoji: '🙂' };
+    }
+    if (sentiment.includes('neg')) {
+        return { label: 'negative', emoji: '⚠️' };
+    }
+    return { label: 'neutral', emoji: '😐' };
+}
+
 function getDtmfLabel(input = {}) {
     if (input.label && typeof input.label === 'string') {
         return input.label;
@@ -25,10 +103,12 @@ function hasRawDigits(input = {}) {
     return raw !== masked;
 }
 
-function buildDtmfSection(dtmfInputs = [], { useHtml = true } = {}) {
+function buildDtmfSection(dtmfInputs = [], { useHtml = true, format = null } = {}) {
     if (!Array.isArray(dtmfInputs) || dtmfInputs.length === 0) {
         return '';
     }
+
+    const resolvedFormat = format || (useHtml ? 'html' : 'text');
 
     const lines = dtmfInputs.map((input) => {
         const label = getDtmfLabel(input);
@@ -43,13 +123,22 @@ function buildDtmfSection(dtmfInputs = [], { useHtml = true } = {}) {
         const hasTimestamp = timestamp && timestamp !== 'Unknown time';
         const showMasked = hasRawDigits(input) && maskedDigits && maskedDigits !== displayDigits;
 
-        if (useHtml) {
+        if (resolvedFormat === 'html') {
             let line = `• <b>${escapeHtml(label)}</b>: <code>${escapeHtml(displayDigits)}</code>`;
             if (showMasked) {
                 line += ` (masked: <code>${escapeHtml(maskedDigits)}</code>)`;
             }
             if (hasTimestamp) {
                 line += ` <i>(${escapeHtml(timestamp)})</i>`;
+            }
+            return line;
+        } else if (resolvedFormat === 'markdown') {
+            let line = `• *${escapeMarkdownV2(label)}*: ${escapeMarkdownV2(displayDigits)}`;
+            if (showMasked) {
+                line += ` _(masked: ${escapeMarkdownV2(maskedDigits)})_`;
+            }
+            if (hasTimestamp) {
+                line += ` _( ${escapeMarkdownV2(timestamp)} )_`;
             }
             return line;
         }
@@ -66,17 +155,19 @@ function buildDtmfSection(dtmfInputs = [], { useHtml = true } = {}) {
 
     const rawPresent = dtmfInputs.some((input) => hasRawDigits(input));
     const complianceNote = rawPresent
-        ? (useHtml
-            ? '<i>🚧 Dev compliance mode — raw keypad digits displayed. Handle with care.</i>'
-            : '🚧 Dev compliance mode — raw keypad digits displayed. Handle with care.')
-        : (useHtml
-            ? '<i>Digits masked per active compliance policy.</i>'
-            : 'Digits masked per active compliance policy.');
+        ? (resolvedFormat === 'markdown'
+            ? '_🚧 Dev compliance mode — raw keypad digits displayed. Handle with care._'
+            : resolvedFormat === 'html'
+                ? '<i>🚧 Dev compliance mode — raw keypad digits displayed. Handle with care.</i>'
+                : '🚧 Dev compliance mode — raw keypad digits displayed. Handle with care.')
+        : (resolvedFormat === 'markdown'
+            ? '_Digits masked per active compliance policy._'
+            : resolvedFormat === 'html'
+                ? '<i>Digits masked per active compliance policy.</i>'
+                : 'Digits masked per active compliance policy.');
 
-    const separator = useHtml ? '\n' : '\n';
-    const sectionHeader = '🔢 Keypad Inputs:\n';
-
-    return `${sectionHeader}${lines.join(separator)}\n${complianceNote}\n`;
+    const sectionHeader = resolvedFormat === 'markdown' ? '*🔢 Keypad Inputs*\n' : '🔢 Keypad Inputs:\n';
+    return `${sectionHeader}${lines.join('\n')}\n${complianceNote}\n`;
 }
 
 function escapeHtml(text = '') {
@@ -105,6 +196,50 @@ function formatTimestamp(value) {
     }
 }
 
+function resolveCustomerName(call = {}, metadata = {}) {
+    return (
+        metadata.customer_name ||
+        metadata.client_name ||
+        call.customer_name ||
+        call.client_name ||
+        metadata.contact_name ||
+        'Client'
+    );
+}
+
+function formatStatusBadge(status) {
+    const normalized = (status || 'unknown').toLowerCase();
+    const badges = {
+        initiated: '📞 Initiated',
+        ringing: '🔔 Ringing',
+        'in-progress': '☎️ In Progress',
+        answered: '☎️ Answered',
+        completed: '🏁 Completed',
+        busy: '📵 Busy',
+        'no-answer': '❌ No Answer',
+        failed: '❌ Failed',
+        canceled: '🚫 Canceled'
+    };
+    return badges[normalized] || `📊 ${normalized.split('_').join(' ')}`;
+}
+
+function buildActionKeyboard(callSid) {
+    if (!callSid) return null;
+    const base = `FOLLOWUP_CALL:${callSid}:`;
+    return {
+        inline_keyboard: [
+            [
+                { text: '☎️ Call Back', callback_data: `${base}callagain` },
+                { text: '💬 Send SMS Recap', callback_data: `${base}recap` }
+            ],
+            [
+                { text: '📋 View Transcript', callback_data: `${base}transcript` },
+                { text: '⏰ Schedule Follow-Up', callback_data: `${base}schedule` }
+            ]
+        ]
+    };
+}
+
 async function getTranscript(ctx, callSid) {
     try {
         const response = await axios.get(`${config.apiUrl}/api/calls/${callSid}`, {
@@ -118,61 +253,60 @@ async function getTranscript(ctx, callSid) {
             return;
         }
 
-        const dtmfSection = buildDtmfSection(dtmfInputs, { useHtml: true }).trim();
+        const metadata = safeJsonParse(call.metadata_json) || {};
+        const customerName = resolveCustomerName(call, metadata);
+        const phoneLabel = formatPhoneDisplay(call.phone_number);
+        const personaLabel = extractPersona(metadata, call);
+        const intentLabel = extractIntent(metadata, call);
+        const sentimentInfo = extractSentiment(call.ai_analysis);
+        const dtmfSection = buildDtmfSection(dtmfInputs, { format: 'markdown' }).trim();
+        const statusBadge = formatStatusBadge(call.status);
+        const statsLines = [];
 
-        if (!transcripts.length) {
-            let message = `<b>Call Details</b>\n\n`;
-            message += `📞 Phone: <b>${escapeHtml(call.phone_number)}</b>\n`;
-            message += `🆔 Call ID: <code>${escapeHtml(callSid)}</code>\n`;
-            message += `📡 Provider: ${escapeHtml((call.provider || 'Unknown').toUpperCase())}\n`;
-            message += `⏱️ Duration: ${formatDuration(call.duration)}\n`;
-            message += `📊 Status: ${escapeHtml(call.status || 'Unknown')}\n`;
-            if (dtmfSection) {
-                message += `\n${dtmfSection}\n`;
-            }
-            if (dtmfInputs.length) {
-                message += '\n❌ Transcript not ready yet, but keypad inputs were captured.';
-            } else {
-                message += `\n❌ No transcript available yet.`;
-            }
+        statsLines.push(`*Status:* ${escapeMarkdownV2(statusBadge)}`);
+        statsLines.push(`*Duration:* ${escapeMarkdownV2(formatDuration(call.duration))}`);
+        statsLines.push(`*Provider:* ${escapeMarkdownV2((call.provider || 'Unknown').toUpperCase())}`);
+        statsLines.push(`*Messages:* ${escapeMarkdownV2(transcripts.length)}`);
 
-            await ctx.reply(message, { parse_mode: 'HTML' });
-            return;
-        }
+        let message = `*🗂️ Call Card*\n`;
+        message += `*Client:* ${escapeMarkdownV2(customerName)} \\(${escapeMarkdownV2(phoneLabel)}\\)\n`;
+        message += `*Call ID:* ${escapeMarkdownV2(callSid)}\n`;
+        message += `*Persona:* ${escapeMarkdownV2(personaLabel)}\n`;
+        message += `*Intent:* ${escapeMarkdownV2(intentLabel)}\n`;
+        message += `*Sentiment:* ${sentimentInfo.emoji} ${escapeMarkdownV2(sentimentInfo.label)}\n\n`;
+        message += `${statsLines.join('\n')}\n`;
 
-        let message = `<b>Call Transcript</b>\n\n`;
-        message += `📞 Phone: <b>${escapeHtml(call.phone_number)}</b>\n`;
-        message += `🆔 Call ID: <code>${escapeHtml(callSid)}</code>\n`;
-        message += `📡 Provider: ${escapeHtml((call.provider || 'Unknown').toUpperCase())}\n`;
-        message += `⏱️ Duration: ${formatDuration(call.duration)}\n`;
-        message += `📊 Status: ${escapeHtml(call.status || 'Unknown')}\n`;
-        message += `💬 Messages: ${transcripts.length}\n`;
         if (dtmfSection) {
             message += `\n${dtmfSection}\n`;
         }
 
         if (call.call_summary) {
-            message += `\n<b>Summary</b>\n${escapeHtml(call.call_summary)}\n`;
+            message += `\n*Summary*\n${escapeMarkdownV2(call.call_summary)}\n`;
         }
 
-        message += `\n<b>Conversation</b>\n`;
-
         const previewMessages = transcripts.slice(0, MAX_PREVIEW_MESSAGES);
-
-        previewMessages.forEach((entry) => {
-            const speakerLabel = entry.speaker === 'user' ? '👤 User' : '🤖 AI';
-            const timestamp = formatTimestamp(entry.timestamp);
-            message += `\n<b>${speakerLabel}</b> <i>${escapeHtml(timestamp)}</i>\n`;
-            const cleanMessage = entry.clean_message || entry.message || entry.raw_message || '';
-            message += `${escapeHtml(cleanMessage)}\n`;
-        });
+        if (previewMessages.length) {
+            message += `\n*Conversation Preview*\n`;
+            previewMessages.forEach((entry) => {
+                const speakerLabel = entry.speaker === 'user' ? '👤 Customer' : '🤖 AI';
+                const timestamp = formatTimestamp(entry.timestamp);
+                const cleanMessage = entry.clean_message || entry.message || entry.raw_message || '';
+                message += `\n*${escapeMarkdownV2(speakerLabel)}* _(${escapeMarkdownV2(timestamp)})_\n`;
+                message += `${escapeMarkdownV2(cleanMessage)}\n`;
+            });
+        }
 
         if (transcripts.length > previewMessages.length) {
             const remaining = transcripts.length - previewMessages.length;
-            message += `\n… ${remaining} more message${remaining === 1 ? '' : 's'} (use /fullTranscript ${escapeHtml(callSid)} for full log)`;
+            message += `\n_${escapeMarkdownV2(`… ${remaining} more message${remaining === 1 ? '' : 's'} (use /fullTranscript ${callSid} for full log)`) }_\n`;
         }
 
-        await ctx.reply(message, { parse_mode: 'HTML' });
+        if (!transcripts.length && !call.call_summary) {
+            message += `\n_${escapeMarkdownV2('Transcript not ready yet. Check back soon!')}_\n`;
+        }
+
+        const replyMarkup = buildActionKeyboard(callSid);
+        await ctx.reply(message, { parse_mode: 'MarkdownV2', reply_markup: replyMarkup });
     } catch (error) {
         console.error('Error fetching transcript:', error);
 
@@ -225,31 +359,32 @@ async function getCallsList(ctx, limit = 10) {
             return;
         }
 
-        let message = `<b>Recent Calls (${calls.length})</b>\n\n`;
+        let message = `*Recent Calls (${calls.length})*\n\n`;
 
         calls.forEach((call, index) => {
-            const phone = escapeHtml(call.phone_number || 'Unknown');
-            const status = escapeHtml(call.status || 'Unknown');
-            const callId = escapeHtml(call.call_sid || 'N/A');
-            const createdDate = escapeHtml(call.created_date || (call.created_at ? new Date(call.created_at).toLocaleDateString() : 'Unknown'));
-            const durationLabel = escapeHtml(call.duration_formatted || formatDuration(call.duration));
+            const phone = escapeMarkdownV2(call.phone_number || 'Unknown');
+            const status = escapeMarkdownV2(call.status || 'Unknown');
+            const callId = escapeMarkdownV2(call.call_sid || 'N/A');
+            const createdDate = escapeMarkdownV2(call.created_date || (call.created_at ? new Date(call.created_at).toLocaleDateString() : 'Unknown'));
+            const durationLabel = escapeMarkdownV2(call.duration_formatted || formatDuration(call.duration));
             const transcriptCount = call.transcript_count || 0;
             const dtmfCount = call.dtmf_input_count || 0;
-            const provider = escapeHtml((call.provider || 'unknown').toUpperCase());
+            const provider = escapeMarkdownV2((call.provider || 'unknown').toUpperCase());
 
-            message += `${index + 1}. 📞 <b>${phone}</b>\n`;
-            message += `&nbsp;&nbsp;🆔 <code>${callId}</code>\n`;
-            message += `&nbsp;&nbsp;📅 ${createdDate} | ⏱️ ${durationLabel} | 📊 ${status}\n`;
-            message += `&nbsp;&nbsp;📡 Provider: ${provider}\n`;
+            message += `${index + 1}\\.\n`;
+            message += `• *Phone:* ${phone}\n`;
+            message += `• *Call ID:* ${callId}\n`;
+            message += `• *When:* ${createdDate} — ⏱️ ${durationLabel}\n`;
+            message += `• *Status:* ${status} | 📡 ${provider}\n`;
             if (dtmfCount > 0) {
-                message += `&nbsp;&nbsp;🔢 Keypad entries: ${dtmfCount}\n`;
+                message += `• 🔢 Keypad entries: ${escapeMarkdownV2(dtmfCount)}\n`;
             }
-            message += `&nbsp;&nbsp;💬 ${transcriptCount} message${transcriptCount === 1 ? '' : 's'}\n\n`;
+            message += `• 💬 ${escapeMarkdownV2(transcriptCount)} message${transcriptCount === 1 ? '' : 's'}\n\n`;
         });
 
-        message += `Use /transcript &lt;call_id&gt; to view details.`;
+        message += escapeMarkdownV2('\nUse /transcript <call_id> to view details.');
 
-        await ctx.reply(message, { parse_mode: 'HTML' });
+        await ctx.reply(message, { parse_mode: 'MarkdownV2' });
     } catch (error) {
         console.error('Error fetching calls list:', error);
 
