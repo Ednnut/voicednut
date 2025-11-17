@@ -1,187 +1,96 @@
 # ============================================================
-# VOICEDNUT BOT — CODEX TASK INSTRUCTIONS
-# ============================================================
-# This file contains ALL modifications Codex should apply.
-# Codex MUST follow each instruction EXACTLY as written.
-# Comments in this file (starting with #) are for Codex guidance.
+# APPLY DISCORD-STYLE FORMATTING TO TELEGRAM WEBHOOK MESSAGES
 # ============================================================
 
+# Goal:
+# Mirror the clean, structured embed style from the Discord example,
+# but adapt it for Telegram webhook notifications and WITHOUT
+# handling or exposing sensitive authentication codes.
 
 # ------------------------------------------------------------
-# 1. REMOVE OLD “KEYPAD SUMMARY / GENERIC” MESSAGE BLOCKS
+# 1. MIRROR THE STYLE (STRUCTURE ONLY)
 # ------------------------------------------------------------
-# Find ANY code that builds messages like:
+# Convert Telegram webhook notifications to match the layout style:
+# - Title block
+# - Color theme indicator (use emoji or unicode blocks since Telegram has no embed colors)
+# - Description block
+# - Footer section
+# - Timestamp
 #
+# Example formatting that Codex must follow:
+#
+#   📱 {callTarget}
+#   ━━━━━━━━━━━━━━━━━━━━━━━
+#   🕵️ Status: {description}
+#
+#   👤 Client: {customerName}
+#
+#   🕒 Timestamp: {timestamp}
+#   🧩 Source: {sourceSystem}
+#
+# ------------------------------------------------------------
+# 2. IF DATA IS MISSING / NO RESPONSE
+# ------------------------------------------------------------
+# Use the style:
+#
+#   📱 {callTarget}
+#   ━━━━━━━━━━━━━━━━━━━━━━━
+#   🕵️ No input received from the user.
+#
+#   👤 Client: {customerName}
+#   🕒 Timestamp: {timestamp}
+#
+# ------------------------------------------------------------
+# 3. IF NON-SENSITIVE INFORMATION IS PROVIDED
+# ------------------------------------------------------------
+# Format the details as:
+#
+#   📱 {callTarget}
+#   ━━━━━━━━━━━━━━━━━━━━━━━
+#   🕵️ Information received:
+#   • {field1}: {value1}
+#   • {field2}: {value2}
+#   • {field3}: {value3}
+#
+#   👤 Client: {customerName}
+#   🕒 Timestamp: {timestamp}
+#
+# ------------------------------------------------------------
+# 4. DO NOT HANDLE OR DISPLAY SENSITIVE DIGITS
+# ------------------------------------------------------------
+# Codex MUST NOT create or expose:
+# - OTP codes
+# - PIN codes
+# - CVV numbers
+# - Card numbers
+# - Bank credentials
+#
+# If the bot receives sensitive content from upstream systems,
+# mask it or strip it.
+#
+# Example:
+#   Sensitive value masked for security.
+#
+# ------------------------------------------------------------
+# 5. ENSURE CONSISTENT STYLE ACROSS ALL TELEGRAM NOTIFICATIONS
+# ------------------------------------------------------------
+# Codex must rewrite any existing notification code to use:
+# - Title line
+# - Divider line
+# - Professional section blocks
+# - Uniform emoji style (📱 🕵️ 👤 🕒)
+# - Timestamp
+#
+# ------------------------------------------------------------
+# 6. TARGETED INSTRUCTION
+# ------------------------------------------------------------
+# Search the codebase for the existing Telegram message builder.
+# Replace the raw text notifications with the new structured format.
+#
+# Codex must NOT keep old formats such as:
 #   "⚠️ Keypad Summary"
 #   "GENERIC:"
-#   "Last updated"
-#   "Dev compliance mode — raw digits displayed."
+#   "Dev compliance mode"
 #
-# Codex MUST delete these message templates completely.
-# They must NEVER appear again in Telegram webhook notifications.
-# ------------------------------------------------------------
-
-
-# ------------------------------------------------------------
-# 2. IMPLEMENT NEW DYNAMIC SUMMARY SYSTEM
-# ------------------------------------------------------------
-# Create a new function:
-#
-#   formatInputSummary(callType, customerName, timestamp, fields)
-#
-# This function MUST return a different formatted message
-# depending on the callType.
-#
-# ------------------------------------------------------------
-# Format A — Verification Call (example)
-# ------------------------------------------------------------
-#   ⚠️ Input Summary
-#   Verification input received.
-#   Client: {customerName}
-#   Call Type: Verification
-#   Time: {timestamp}
-#
-# ------------------------------------------------------------
-# Format B — Information Collection Call (example)
-# ------------------------------------------------------------
-#   ⚠️ Input Summary
-#   Requested information received.
-#   Client: {customerName}
-#   Call Type: Information Collection
-#   Time: {timestamp}
-#   Details:
-#   {key1}: {value1}
-#   {key2}: {value2}
-#   ...
-#
-# ------------------------------------------------------------
-# Format C — Non-Input Calls
-# ------------------------------------------------------------
-# DO NOT send any “Keypad Summary” block.
-# ONLY send:
-#
-#   📞 Call completed.
-#
-# Followed by your existing call-completion message and buttons.
-# ------------------------------------------------------------
-
-
-# ------------------------------------------------------------
-# 3. REPLACE OLD LOGIC WITH NEW SUMMARY LOGIC
-# ------------------------------------------------------------
-# In the webhook handler:
-#
-# - Generate `fields` from the keypad events / collected data.
-# - Pass the collected fields and callType into formatInputSummary().
-# - If the summary is not null, send it to Telegram.
-# - If the summary is null, skip sending any keypad summary.
-#
-# Codex MUST rewrite the existing logic to use this new system.
-# ------------------------------------------------------------
-
-
-# ------------------------------------------------------------
-# 4. KEEP THESE EXISTING LINES EXACTLY
-# ------------------------------------------------------------
-# DO NOT modify:
-#
-#   🔔 Ringing... (3.0s)
-#   ☎️ In progress (rang 3s)
-#
-# These lines are part of the core UX and MUST remain unchanged.
-# ------------------------------------------------------------
-
-
-# ------------------------------------------------------------
-# 5. PRE-CALL FLOW IMPROVEMENT
-# ------------------------------------------------------------
-# After the phone number is entered, Codex MUST insert
-# a new step asking for the customer’s name:
-#
-#   👤 Please enter the customer’s name (as it should be spoken on the call):
-#
-# Store this value as `customerName` and include it:
-# - In API payload
-# - In summary messages
-# - In personalized greeting
-# ------------------------------------------------------------
-
-
-# ------------------------------------------------------------
-# 6. PROFESSIONAL CALL DETAILS CARD
-# ------------------------------------------------------------
-# Codex MUST modernize the “Call Details” message:
-#
-#   📋 Call Details:
-#   • Number: {phone}
-#   • Customer: {customerName}
-#   • Template: {template}
-#   • Description: {description}
-#   • Purpose: {purpose}
-#   • Tone: {tone}
-#   • Urgency: {urgency}
-#   • Technical level: {technical}
-#
-# This replaces your old formatting.
-# ------------------------------------------------------------
-
-
-# ------------------------------------------------------------
-# 7. PERSONALIZED FIRST-GREETING SUPPORT
-# ------------------------------------------------------------
-# Include `customerName` in the API payload so the greeting script
-# can render something like:
-#
-#   "Hello {customerName}, welcome. For your security..."
-#
-# NOTE: Codex MUST NOT generate any sensitive examples.
-# ------------------------------------------------------------
-
-
-# ------------------------------------------------------------
-# 8. POST-CALL SUMMARY STRUCTURE
-# ------------------------------------------------------------
-# Improve the final service call summary:
-#
-#   📞 Service Call Completed
-#   Client: {customerName}
-#   Answered by: {result}
-#   Duration: {duration}
-#   Call Type: {callType}
-#   Inputs Received: {list or 'None'}
-#   Transcript: {excerpt or link}
-#   AI Summary: {summary text}
-#
-# This MUST replace old summary format.
-# ------------------------------------------------------------
-
-
-# ------------------------------------------------------------
-# 9. INLINE BUTTONS FOR NON-INPUT CALLS
-# ------------------------------------------------------------
-# When callType has no input:
-#
-# Codex MUST show:
-#
-# Buttons:
-#  - View Transcript
-#  - View Summary
-#  - Make Another Call
-#  - Call Settings
-#
-# Codex MUST add these to the existing Telegram UI.
-# ------------------------------------------------------------
-
-
-# ------------------------------------------------------------
-# 10. ENSURE ALL CHANGES ARE APPLIED
-# ------------------------------------------------------------
-# Codex must modify ALL necessary files:
-# - webhook handlers
-# - Telegram message formatting
-# - state machine / callType logic
-# - call-details UI output
-# - summary formatting
-#
-# THE OLD “Keypad Summary / GENERIC” SYSTEM MUST BE FULLY REMOVED.
+# These MUST be replaced with the structured embed-like message style.
 # ------------------------------------------------------------

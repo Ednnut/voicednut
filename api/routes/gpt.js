@@ -43,6 +43,7 @@ class EnhancedGptService extends EventEmitter {
     
     this.partialResponseIndex = 0;
     this.conversationHistory = []; // Track full conversation for personality analysis
+    this.structuredInputs = [];
 
     // Store prompts for debugging/logging
     this.systemPrompt = this.baseSystemPrompt;
@@ -80,6 +81,53 @@ class EnhancedGptService extends EventEmitter {
     this.userContext.push({
       role: 'system',
       content: `persona_profile: ${JSON.stringify(metadata)}`
+    });
+  }
+
+  setStructuredInputSequence(sequence = []) {
+    if (!Array.isArray(sequence) || sequence.length === 0) {
+      return;
+    }
+    this.structuredInputs = sequence.map((entry, index) => {
+      const label = entry.label || entry.stage || entry.stage_key || `Step ${index + 1}`;
+      return {
+        step: index + 1,
+        label,
+        stage: entry.stage || entry.stage_key || label,
+        prompt: entry.prompt || '',
+        instructions: entry.instructions || '',
+        hint: entry.hint || '',
+        expectedDigits: entry.numDigits || entry.expectedLength || null,
+      };
+    });
+
+    const planLines = this.structuredInputs.map((step) => {
+      const parts = [`Step ${step.step}: ${step.label}`];
+      if (step.expectedDigits) {
+        parts.push(`expect ${step.expectedDigits} digits`);
+      }
+      if (step.prompt) {
+        parts.push(`Prompt: ${step.prompt}`);
+      }
+      if (step.instructions) {
+        parts.push(`Agent instructions: ${step.instructions}`);
+      }
+      if (step.hint) {
+        parts.push(`Hint: ${step.hint}`);
+      }
+      return parts.join(' | ');
+    });
+
+    const guidance = [
+      'Structured input workflow in effect. Follow each step carefully, confirm digits back to the caller, and listen for mistakes.',
+      planLines.join('\n'),
+      'If digits are missing or incorrect, politely explain the issue, remind them how many digits are required, and offer to let them speak the digits aloud.',
+      'Never skip steps; acknowledge successful entries before moving forward.'
+    ].join('\n');
+
+    this.userContext.push({
+      role: 'system',
+      content: guidance,
     });
   }
 

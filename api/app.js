@@ -1264,6 +1264,15 @@ function buildGptService(callSid, callConfig, functionSystem) {
   if (callConfig?.persona_metadata) {
     gptService.setPersonaMetadata(callConfig.persona_metadata);
   }
+  const metadataPayload = parseMetadataJson(callConfig?.metadata_json) || {};
+  const structuredSequence =
+    (Array.isArray(callConfig?.collect_input_sequence) && callConfig.collect_input_sequence.length
+      ? callConfig.collect_input_sequence
+      : null) ||
+    (Array.isArray(metadataPayload.input_sequence) ? metadataPayload.input_sequence : null);
+  if (Array.isArray(structuredSequence) && structuredSequence.length) {
+    gptService.setStructuredInputSequence(structuredSequence);
+  }
 
   return gptService;
 }

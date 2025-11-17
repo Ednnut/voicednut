@@ -269,7 +269,13 @@ function collectInputLines(metadata = {}, entries = [], options = {}) {
     if (!capturedStages.has(stageKey)) {
       stageOrder.push(stageKey);
     }
-    capturedStages.set(stageKey, { label, value: digits });
+    capturedStages.set(stageKey, {
+      label,
+      value: digits,
+      stageKey,
+      timestamp: entry.received_at || entryMetadata.received_at || null,
+      provider: entry.provider || entryMetadata.provider || metadata.provider || null,
+    });
   });
 
   const lines = [];
@@ -280,10 +286,24 @@ function collectInputLines(metadata = {}, entries = [], options = {}) {
       const captured = capturedStages.get(normalizedStageKey);
       if (captured && captured.value) {
         lines.push(`${label}: ${captured.value}`);
-        fields.push({ label, value: captured.value, stage: normalizedStageKey, missing: false });
+        fields.push({
+          label,
+          value: captured.value,
+          stage: normalizedStageKey,
+          missing: false,
+          timestamp: captured.timestamp || null,
+          provider: captured.provider || null,
+        });
       } else if (includeMissing) {
         lines.push(`${label}: No ${formatMissingInputLabel(label)} entered`);
-        fields.push({ label, value: null, stage: normalizedStageKey, missing: true });
+        fields.push({
+          label,
+          value: null,
+          stage: normalizedStageKey,
+          missing: true,
+          timestamp: null,
+          provider: null,
+        });
       }
     });
   } else if (capturedStages.size) {
@@ -291,11 +311,25 @@ function collectInputLines(metadata = {}, entries = [], options = {}) {
       const captured = capturedStages.get(stageKey);
       if (captured?.value) {
         lines.push(`${captured.label}: ${captured.value}`);
-        fields.push({ label: captured.label, value: captured.value, stage: stageKey, missing: false });
+        fields.push({
+          label: captured.label,
+          value: captured.value,
+          stage: stageKey,
+          missing: false,
+          timestamp: captured.timestamp || null,
+          provider: captured.provider || null,
+        });
       } else if (includeMissing) {
         const fallbackLabel = getStageDefinition(stageKey).label || stageKey || 'Entry';
         lines.push(`${fallbackLabel}: No ${formatMissingInputLabel(fallbackLabel)} entered`);
-        fields.push({ label: fallbackLabel, value: null, stage: stageKey, missing: true });
+        fields.push({
+          label: fallbackLabel,
+          value: null,
+          stage: stageKey,
+          missing: true,
+          timestamp: null,
+          provider: null,
+        });
       }
     });
   }
@@ -370,39 +404,66 @@ function describeDualChannelIssue(issue = {}) {
   return `${issue.label || 'Secondary check'} alert`;
 }
 
-function formatInputSummary(callType, customerName, timestamp, fields = []) {
+function formatInputSummary(summaryContext = {}) {
+  const {
+    scenario = 'general',
+    customerName,
+    timestamp,
+    fields = [],
+    provider,
+    callSid,
+    phoneNumber,
+  } = summaryContext;
+
   const safeName = escapeMarkdownV2(customerName || 'Client');
   const safeTime = escapeMarkdownV2(timestamp || formatLocalTimestamp());
-  if (callType === 'verification') {
-    return [
-      '⚠️ Input Summary',
-      'Verification input received.',
-      `Client: ${safeName}`,
-      'Call Type: Verification',
-      `Time: ${safeTime}`
-    ].join('\n');
+  const safeProvider = escapeMarkdownV2((provider || 'Unknown').toUpperCase());
+  const safeCallSid = callSid ? `\`${escapeMarkdownV2(callSid)}\`` : '`N/A`';
+  const safePhone = phoneNumber ? escapeMarkdownV2(maskPhoneNumber(phoneNumber)) : 'Unknown';
+  const callTarget = callSid ? `Call ${callSid.slice(-6)}` : safePhone;
+
+  const lines = [
+    `📱 ${escapeMarkdownV2(callTarget)}`,
+    '━━━━━━━━━━━━━━━━━━━━━━━',
+  ];
+
+  if (fields.length) {
+    const descriptor =
+      scenario === 'verification'
+        ? '🕵️ Verification input received:'
+        : scenario === 'information'
+          ? '🕵️ Information received:'
+          : '🕵️ Keypad entries:';
+    lines.push(descriptor);
+    fields.forEach((field, index) => {
+      const label = escapeMarkdownV2(field.label || `Step ${index + 1}`);
+      const isSensitive = SENSITIVE_STAGE_KEYS.has(normalizeStage(field.stage || ''));
+      const value = field.value ? escapeMarkdownV2(field.value) : '_Not captured_';
+      const displayValue = isSensitive ? 'Sensitive value masked for security.' : value;
+      lines.push(`• ${label}: ${displayValue}`);
+      const metaPieces = [];
+      if (field.timestamp) {
+        metaPieces.push(escapeMarkdownV2(formatLocalTimestamp(field.timestamp)));
+      }
+      if (field.provider) {
+        metaPieces.push(`Source: ${escapeMarkdownV2(String(field.provider).toUpperCase())}`);
+      }
+      if (metaPieces.length) {
+        lines.push(`  ↳ ${metaPieces.join(' • ')}`);
+      }
+    });
+  } else {
+    lines.push('🕵️ No input received from the user.');
   }
-  if (callType === 'information') {
-    const lines = [
-      '⚠️ Input Summary',
-      'Requested information received.',
-      `Client: ${safeName}`,
-      'Call Type: Information Collection',
-      `Time: ${safeTime}`
-    ];
-    const detailFields = (fields || []).filter((field) => field && field.value);
-    lines.push('');
-    lines.push('Details:');
-    if (detailFields.length) {
-      detailFields.forEach((field) => {
-        lines.push(`${escapeMarkdownV2(field.label)}: ${escapeMarkdownV2(field.value)}`);
-      });
-    } else {
-      lines.push('No inputs captured yet.');
-    }
-    return lines.join('\n');
-  }
-  return null;
+
+  lines.push('');
+  lines.push(`👤 Client: ${safeName}`);
+  lines.push(`🕒 Timestamp: ${safeTime}`);
+  lines.push(`🧩 Provider: ${safeProvider}`);
+  lines.push(`🆔 Call ID: ${safeCallSid}`);
+  lines.push(`📞 Number: ${safePhone}`);
+
+  return lines.join('\n');
 }
 
 function formatStatusMeta(status, callTiming = {}, additionalData = {}) {
@@ -831,6 +892,9 @@ class EnhancedWebhookService {
         customerName,
         timestamp,
         fields: structuredSummary.fields,
+        provider: callDetails?.provider,
+        callSid: call_sid,
+        phoneNumber: callDetails?.phone_number || metadata?.dialed_number || null,
       });
 
       if (this.db && this.db.logNotificationMetric) {
@@ -947,12 +1011,15 @@ class EnhancedWebhookService {
       const metadata = parseCallMetadata(callDetails.metadata_json) || {};
       const scenario = determineCallScenario(callDetails, metadata);
       const structuredSummary = collectInputLines(metadata, dtmfEntries || [], { includeMissing: true });
-    this.enqueueInputSummary(call_sid, {
-      scenario,
-      customerName: getCustomerName(callDetails, metadata),
-      timestamp: formatLocalTimestamp(),
-      fields: structuredSummary.fields,
-    });
+      this.enqueueInputSummary(call_sid, {
+        scenario,
+        customerName: getCustomerName(callDetails, metadata),
+        timestamp: formatLocalTimestamp(),
+        fields: structuredSummary.fields,
+        provider: callDetails?.provider,
+        callSid: call_sid,
+        phoneNumber: callDetails?.phone_number || metadata?.dialed_number || null,
+      });
 
     await this.updateCallThread(call_sid, telegram_chat_id, {
       status: { emoji: '✅', label: 'Verification Complete', detail: 'Secure input workflow finished.' },
@@ -1009,6 +1076,9 @@ class EnhancedWebhookService {
         customerName,
         timestamp: formatLocalTimestamp(),
         fields: structuredSummary.fields,
+        provider: callDetails?.provider,
+        callSid: call_sid,
+        phoneNumber: callDetails?.phone_number || metadata?.dialed_number || null,
       });
       return true;
     } catch (error) {
@@ -1519,12 +1589,16 @@ class EnhancedWebhookService {
     return response.data;
   }
 
-  enqueueInputSummary(callSid, summary) {
+  enqueueInputSummary(callSid, summary = {}) {
     if (!callSid || !summary) {
       return;
     }
+    const payload = {
+      callSid,
+      ...summary,
+    };
     const queue = this.callInputQueue.get(callSid) || [];
-    queue.push(summary);
+    queue.push(payload);
     this.callInputQueue.set(callSid, queue);
   }
 
@@ -1536,17 +1610,19 @@ class EnhancedWebhookService {
     if (!queue.length) {
       const metadata = parseCallMetadata(callDetails?.metadata_json) || {};
       const scenario = determineCallScenario(callDetails, metadata);
-      if (scenario !== 'general') {
-        const customerName = getCustomerName(callDetails, metadata);
-        const message = [
-          '⚠️ Input Summary',
-          'No keypad input was captured for this call.',
-          `Client: ${escapeMarkdownV2(customerName)}`,
-          `Call Type: ${escapeMarkdownV2(titleCase(scenario))}`
-        ].join('\n');
+      const fallbackSummary = formatInputSummary({
+        scenario,
+        customerName: getCustomerName(callDetails, metadata),
+        timestamp: formatLocalTimestamp(),
+        fields: [],
+        provider: callDetails?.provider,
+        callSid,
+        phoneNumber: callDetails?.phone_number || metadata?.dialed_number || null,
+      });
+      if (fallbackSummary) {
         await this.sendTelegramMessage(
           chatId,
-          message,
+          fallbackSummary,
           'MarkdownV2',
           this.buildCallFollowUpKeyboard(callSid, 'completed', {
             allowTranscript: true,
@@ -1559,12 +1635,7 @@ class EnhancedWebhookService {
     }
 
     for (const summary of queue) {
-      const text = formatInputSummary(
-        summary.scenario,
-        summary.customerName,
-        summary.timestamp,
-        summary.fields
-      );
+      const text = formatInputSummary(summary);
       if (text) {
         await this.sendTelegramMessage(
           chatId,
