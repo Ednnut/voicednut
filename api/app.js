@@ -16,6 +16,7 @@ const { TranscriptionService } = require('./routes/transcription');
 const { TextToSpeechService } = require('./routes/tts');
 const { recordingService } = require('./routes/recording');
 const { EnhancedSmsService } = require('./routes/sms.js');
+const validateTwilioRequest = require('./middleware/twilioSignature');
 const Database = require('./db/db');
 const { webhookService } = require('./routes/status');
 const DynamicFunctionEngine = require('./functions/DynamicFunctionEngine');
@@ -2150,7 +2151,7 @@ function generateCallSummary(transcripts, duration) {
 }
 
 // Incoming endpoint used by Twilio to connect the call to our websocket stream
-app.post('/incoming', async (req, res) => {
+app.post('/incoming', validateTwilioRequest(), async (req, res) => {
   if (currentProvider !== 'twilio') {
     res.status(404).json({ error: 'Incoming calls are handled by the active provider' });
     return;
@@ -2831,17 +2832,24 @@ app.post('/vonage/event', async (req, res) => {
   }
 });
 
-app.post('/webhook/amd-status', async (req, res) => {
-  if (currentProvider !== 'twilio') {
-    res.status(404).json({ error: 'AMD webhook disabled for current provider' });
-    return;
-  }
+  app.post('/webhook/amd-status', validateTwilioRequest(), async (req, res) => {
+    if (currentProvider !== 'twilio') {
+      res.status(404).json({ error: 'AMD webhook disabled for current provider' });
+      return;
+    }
 
   try {
     const { CallSid, AnsweredBy, AnsweredByStatus, Confidence } = req.body || {};
     if (!CallSid) {
       res.status(400).json({ error: 'Missing CallSid' });
       return;
+    }
+
+    if (db && typeof db.logCallEvent === 'function') {
+      await db.logCallEvent(CallSid, 'twilio_amd_webhook', req.body, {
+        provider: 'twilio',
+        raw_status: AnsweredBy || AnsweredByStatus || null
+      });
     }
 
     const call = await db.getCall(CallSid);
@@ -2886,24 +2894,24 @@ app.post('/webhook/amd-status', async (req, res) => {
 
 // Enhanced webhook endpoint for call status updates
 
-app.post('/webhook/call-status', async (req, res) => {
-  if (currentProvider !== 'twilio') {
-    res.status(404).json({ error: 'Twilio call status webhook disabled for current provider' });
-    return;
-  }
-  try {
-    const { 
-      CallSid, 
-      CallStatus, 
-      Duration, 
-      From, 
-      To, 
-      CallDuration,
-      AnsweredBy,
-      ErrorCode,
-      ErrorMessage,
-      DialCallDuration // This is key for detecting actual answer vs no-answer
-    } = req.body;
+  app.post('/webhook/call-status', validateTwilioRequest(), async (req, res) => {
+    if (currentProvider !== 'twilio') {
+      res.status(404).json({ error: 'Twilio call status webhook disabled for current provider' });
+      return;
+    }
+    try {
+      const { 
+        CallSid, 
+        CallStatus, 
+        Duration, 
+        From, 
+        To, 
+        CallDuration,
+        AnsweredBy,
+        ErrorCode,
+        ErrorMessage,
+        DialCallDuration // This is key for detecting actual answer vs no-answer
+      } = req.body;
     
     console.log(`📱 Fixed Webhook: Call ${CallSid} status: ${CallStatus}`.blue);
     console.log(`📊 Debug Info:`.cyan);
@@ -2912,6 +2920,13 @@ app.post('/webhook/call-status', async (req, res) => {
     console.log(`   DialCallDuration: ${DialCallDuration || 'N/A'}`);
     console.log(`   AnsweredBy: ${AnsweredBy || 'N/A'}`);
     
+    if (db && typeof db.logCallEvent === 'function') {
+      await db.logCallEvent(CallSid, 'twilio_status_webhook', req.body, {
+        provider: 'twilio',
+        raw_status: CallStatus
+      });
+    }
+
     // Get call details from database
     const call = await db.getCall(CallSid);
     if (!call) {
@@ -2920,7 +2935,7 @@ app.post('/webhook/call-status', async (req, res) => {
       return;
     }
 
-    const normalizedStatus = (CallStatus || '').toLowerCase();
+    let normalizedStatus = (CallStatus || '').toLowerCase();
     const durationValue = parseInt(Duration || CallDuration || DialCallDuration || 0);
     const updateData = {
       duration: durationValue,
@@ -2928,7 +2943,10 @@ app.post('/webhook/call-status', async (req, res) => {
       answered_by: AnsweredBy,
       error_code: ErrorCode,
       error_message: ErrorMessage,
+      ring_duration: DialCallDuration ? parseInt(DialCallDuration) : undefined,
     };
+
+    const isTerminal = ['completed', 'no-answer', 'failed', 'busy', 'canceled'].includes(normalizedStatus);
 
     if (['answered', 'in-progress'].includes(normalizedStatus) || (normalizedStatus === 'completed' && durationValue > 0)) {
       updateData.was_answered = 1;
@@ -2937,25 +2955,60 @@ app.post('/webhook/call-status', async (req, res) => {
       }
     }
 
-    if (['completed', 'no-answer', 'failed', 'busy', 'canceled'].includes(normalizedStatus) && !call.ended_at) {
+    if (isTerminal && !call.ended_at) {
       updateData.ended_at = new Date().toISOString();
     }
 
-    if (normalizedStatus === 'no-answer' && call.created_at) {
+    // Reconcile with Twilio REST for terminal states
+    if (isTerminal && twilioRestClient) {
+      try {
+        const restCall = await twilioRestClient.calls(CallSid).fetch();
+        if (restCall) {
+          const restStatus = (restCall.status || '').toLowerCase();
+          const restDuration = parseInt(restCall.duration || 0);
+          const restAnsweredBy = restCall.answeredBy || AnsweredBy;
+
+          if (restStatus === 'no-answer') {
+            normalizedStatus = 'no-answer';
+          }
+          if (!normalizedStatus && restStatus) {
+            normalizedStatus = restStatus;
+          }
+          if (restDuration > 0) {
+            updateData.duration = restDuration;
+          }
+          if (restAnsweredBy) {
+            updateData.answered_by = restAnsweredBy;
+          }
+          if (restCall.startTime && !updateData.started_at) {
+            updateData.started_at = new Date(restCall.startTime).toISOString();
+          }
+          if (restCall.endTime) {
+            updateData.ended_at = new Date(restCall.endTime).toISOString();
+          }
+        }
+      } catch (restError) {
+        console.warn(`Unable to reconcile call ${CallSid} with Twilio REST:`, restError.message);
+      }
+    }
+
+    const finalStatus = normalizedStatus || 'completed';
+    if (finalStatus === 'no-answer' && !updateData.ring_duration && call.created_at) {
       const callStart = new Date(call.created_at);
       const now = new Date();
       updateData.ring_duration = Math.round((now - callStart) / 1000);
     }
+    updateData.final_outcome = finalStatus.toUpperCase();
 
-    await db.updateCallStatus(CallSid, normalizedStatus, updateData);
+    await db.updateCallStatus(CallSid, finalStatus, updateData);
 
-    await callHintStateMachine.handleTwilioStatus(CallSid, normalizedStatus, {
+    await callHintStateMachine.handleTwilioStatus(CallSid, finalStatus, {
       call,
-      answeredBy: AnsweredBy,
+      answeredBy: updateData.answered_by,
       provider: 'twilio'
     });
 
-    if (call.call_type === 'collect_input' && ['completed', 'no-answer', 'failed', 'canceled'].includes(normalizedStatus)) {
+    if (call.call_type === 'collect_input' && ['completed', 'no-answer', 'failed', 'canceled', 'busy'].includes(finalStatus)) {
       await finalizeCollectInputCall(CallSid, call);
     }
 
@@ -2967,26 +3020,28 @@ app.post('/webhook/call-status', async (req, res) => {
       await db.createEnhancedWebhookNotification(CallSid, type, targetChat);
     };
 
-    if (['queued', 'initiated'].includes(normalizedStatus)) {
+    if (['queued', 'initiated'].includes(finalStatus)) {
       await enqueueStatus('call_initiated');
-    } else if (normalizedStatus === 'ringing') {
+    } else if (finalStatus === 'ringing') {
       await enqueueStatus('call_ringing');
-    } else if (['in-progress', 'answered'].includes(normalizedStatus)) {
+    } else if (['in-progress', 'answered'].includes(finalStatus)) {
       await enqueueStatus('call_answered');
-    } else if (['busy', 'failed', 'canceled', 'completed', 'no-answer'].includes(normalizedStatus)) {
+    } else if (['busy', 'failed', 'canceled', 'completed', 'no-answer'].includes(finalStatus)) {
       await finalizeCallOutcome(CallSid, {
-        finalStatus: normalizedStatus,
-        answeredBy: AnsweredBy,
+        finalStatus,
+        answeredBy: updateData.answered_by,
       });
+      // Ensure final status notification is emitted for terminal state
+      await enqueueStatus(`call_${finalStatus.replace('-', '_')}`);
     }
 
     await db.logServiceHealth('webhook_system', 'status_received', {
       call_sid: CallSid,
       original_status: CallStatus,
-      final_status: normalizedStatus,
-      duration: durationValue,
-      answered_by: AnsweredBy,
-      correction_applied: false
+      final_status: finalStatus,
+      duration: updateData.duration,
+      answered_by: updateData.answered_by,
+      correction_applied: finalStatus !== (CallStatus || '').toLowerCase()
     });
     
     res.status(200).send('OK');
@@ -3161,7 +3216,7 @@ app.get('/api/calls/:callSid/status', async (req, res) => {
 });
 
 // Manual notification trigger endpoint (for testing)
-app.post('/api/calls/:callSid/notify', async (req, res) => {
+app.post('/api/calls/:callSid/notify', requireAdminAuth, async (req, res) => {
   try {
     const { callSid } = req.params;
     const { status, user_chat_id } = req.body;
@@ -3892,7 +3947,7 @@ app.get('/api/calls/search', async (req, res) => {
 });
 
 // SMS webhook endpoints
-app.post('/webhook/sms', async (req, res) => {
+app.post('/webhook/sms', validateTwilioRequest(), async (req, res) => {
     try {
         const { From, Body, MessageSid, SmsStatus } = req.body;
 

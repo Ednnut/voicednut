@@ -5,7 +5,26 @@ const {
   getStageDefinition,
   normalizeStage,
   isSensitiveStage,
+  maskDigits,
+  shouldRevealRawDigits,
 } = require('../utils/dtmf');
+
+const STATUS_LINE_MAP = {
+  initiated: '📤 Call initiated',
+  'in-progress': '🟢 In progress',
+  answered: '✅ Answered',
+  completed: '🏁 Completed',
+  busy: '🚫 Busy',
+  'no-answer': '⏳ No answer',
+  canceled: '⚠️ Canceled',
+  failed: '❌ Failed',
+  ringing: '🔔 Ringing…',
+};
+
+const AMD_STATUS_LINE = {
+  human: '👤 Human detected',
+  machine: '🤖 Machine/voicemail detected',
+};
 
 function parseDtmfMetadata(metadata) {
   if (!metadata) {
@@ -180,14 +199,17 @@ function formatAnsweredLabel(value) {
 }
 
 function formatDtmfEntries(entries = []) {
-  const revealRaw = true;
+  const revealRaw = shouldRevealRawDigits();
   return entries.map((entry) => {
     const stageKey = normalizeStage(entry.stage_key || 'generic');
     const metadata = parseDtmfMetadata(entry.metadata);
     const stageDefinition = getStageDefinition(stageKey);
-    const decrypted = entry.encrypted_digits ? decryptDigits(entry.encrypted_digits) : null;
-    const rawDigits = revealRaw ? (decrypted || metadata.raw_digits_preview || null) : null;
-    const fallbackDigits = metadata.raw_digits_preview || entry.masked_digits;
+    const allowRaw = revealRaw && !isSensitiveStage(stageKey);
+    const decrypted = allowRaw && entry.encrypted_digits ? decryptDigits(entry.encrypted_digits) : null;
+    const rawDigits = allowRaw ? (decrypted || metadata.raw_digits_preview || null) : null;
+    const fallbackDigits = allowRaw
+      ? (metadata.raw_digits_preview || entry.masked_digits)
+      : (entry.masked_digits || maskDigits(stageKey, metadata.raw_digits_preview || ''));
     const label = metadata.stage_label || stageDefinition.label || stageKey || 'Entry';
     return {
       id: entry.id,
@@ -262,7 +284,11 @@ function collectInputLines(metadata = {}, entries = [], options = {}) {
       fallbackDefinition.label ||
       entry.stage_key ||
       'Entry';
-    const digits = decryptDigits(entry.encrypted_digits) || entryMetadata.raw_digits_preview || entry.masked_digits || '';
+    const allowRaw = shouldRevealRawDigits() && !isSensitiveStage(stageKey);
+    const rawDigits = allowRaw
+      ? (decryptDigits(entry.encrypted_digits) || entryMetadata.raw_digits_preview || '')
+      : '';
+    const digits = rawDigits || entry.masked_digits || maskDigits(stageKey, entryMetadata.raw_digits_preview || '');
     if (!digits) {
       return;
     }
@@ -404,6 +430,60 @@ function describeDualChannelIssue(issue = {}) {
   return `${issue.label || 'Secondary check'} alert`;
 }
 
+function getStatusLine(status = '') {
+  const normalized = (status || '').toLowerCase();
+  return STATUS_LINE_MAP[normalized] || `📱 ${titleCase(normalized || 'Update')}`;
+}
+
+function getAmdLine(label = '') {
+  const normalized = (label || '').toLowerCase();
+  return AMD_STATUS_LINE[normalized] || null;
+}
+
+function buildStructuredTelegramMessage(options = {}) {
+  const {
+    callTarget = 'Call Update',
+    statusLine = '🕵️ Status: Update',
+    bodyLines = [],
+    clientName = 'Client',
+    timestamp = formatLocalTimestamp(),
+    sourceLabel = 'System',
+    phoneNumber = null,
+    extraMeta = [],
+  } = options;
+
+  const safeCallTarget = escapeMarkdownV2(callTarget);
+  const safeClient = escapeMarkdownV2(clientName);
+  const safeTime = escapeMarkdownV2(timestamp || formatLocalTimestamp());
+  const safeSource = sourceLabel ? escapeMarkdownV2(sourceLabel) : null;
+  const safeNumber = phoneNumber ? escapeMarkdownV2(maskPhoneNumber(phoneNumber)) : null;
+
+  const lines = [
+    `📱 ${safeCallTarget}`,
+    '━━━━━━━━━━━━━━━━━━━━━━━',
+    statusLine,
+  ];
+
+  if (Array.isArray(bodyLines) && bodyLines.length) {
+    bodyLines.filter(Boolean).forEach((line) => lines.push(line));
+  }
+
+  lines.push('');
+  lines.push(`👤 Client: ${safeClient}`);
+  if (safeNumber) {
+    lines.push(`📞 Number: ${safeNumber}`);
+  }
+  lines.push(`🕒 Timestamp: ${safeTime}`);
+  if (safeSource) {
+    lines.push(`🧩 Source: ${safeSource}`);
+  }
+  if (Array.isArray(extraMeta) && extraMeta.length) {
+    extraMeta.filter(Boolean).forEach((line) => lines.push(line));
+  }
+
+  return lines.join('\n');
+}
+
 function formatInputSummary(summaryContext = {}) {
   const {
     scenario = 'general',
@@ -416,16 +496,7 @@ function formatInputSummary(summaryContext = {}) {
   } = summaryContext;
 
   const safeName = escapeMarkdownV2(customerName || 'Client');
-  const safeTime = escapeMarkdownV2(timestamp || formatLocalTimestamp());
-  const safeProvider = escapeMarkdownV2((provider || 'Unknown').toUpperCase());
-  const safeCallSid = callSid ? `\`${escapeMarkdownV2(callSid)}\`` : '`N/A`';
-  const safePhone = phoneNumber ? escapeMarkdownV2(maskPhoneNumber(phoneNumber)) : 'Unknown';
-  const callTarget = callSid ? `Call ${callSid.slice(-6)}` : safePhone;
-
-  const lines = [
-    `📱 ${escapeMarkdownV2(callTarget)}`,
-    '━━━━━━━━━━━━━━━━━━━━━━━',
-  ];
+  const callTarget = callSid ? `Call ${callSid.slice(-6)}` : maskPhoneNumber(phoneNumber || '');
 
   if (fields.length) {
     const descriptor =
@@ -434,13 +505,13 @@ function formatInputSummary(summaryContext = {}) {
         : scenario === 'information'
           ? '🕵️ Information received:'
           : '🕵️ Keypad entries:';
-    lines.push(descriptor);
+    const bodyLines = [descriptor];
     fields.forEach((field, index) => {
       const label = escapeMarkdownV2(field.label || `Step ${index + 1}`);
       const isSensitive = SENSITIVE_STAGE_KEYS.has(normalizeStage(field.stage || ''));
       const value = field.value ? escapeMarkdownV2(field.value) : '_Not captured_';
       const displayValue = isSensitive ? 'Sensitive value masked for security.' : value;
-      lines.push(`• ${label}: ${displayValue}`);
+      bodyLines.push(`• ${label}: ${displayValue}`);
       const metaPieces = [];
       if (field.timestamp) {
         metaPieces.push(escapeMarkdownV2(formatLocalTimestamp(field.timestamp)));
@@ -449,21 +520,94 @@ function formatInputSummary(summaryContext = {}) {
         metaPieces.push(`Source: ${escapeMarkdownV2(String(field.provider).toUpperCase())}`);
       }
       if (metaPieces.length) {
-        lines.push(`  ↳ ${metaPieces.join(' • ')}`);
+        bodyLines.push(`  ↳ ${metaPieces.join(' • ')}`);
       }
     });
+    return buildStructuredTelegramMessage({
+      callTarget,
+      statusLine: descriptor,
+      bodyLines,
+      clientName: safeName,
+      timestamp,
+      sourceLabel: provider || 'Inputs',
+      phoneNumber,
+      extraMeta: callSid ? [`🆔 Call ID: \`${escapeMarkdownV2(callSid)}\``] : []
+    });
   } else {
-    lines.push('🕵️ No input received from the user.');
+    return buildStructuredTelegramMessage({
+      callTarget,
+      statusLine: '🕵️ No input received from the user.',
+      clientName: safeName,
+      timestamp,
+      sourceLabel: provider || 'Inputs',
+      phoneNumber,
+      extraMeta: callSid ? [`🆔 Call ID: \`${escapeMarkdownV2(callSid)}\``] : []
+    });
+  }
+}
+
+function formatTranscriptNotification(callDetails, transcripts = [], dtmfSummary = null) {
+  const metadata = parseCallMetadata(callDetails?.metadata_json) || {};
+  const callTarget = callDetails?.call_sid ? `Call ${callDetails.call_sid.slice(-6)}` : maskPhoneNumber(callDetails?.phone_number || metadata?.dialed_number || '');
+  const statusLine = '🕵️ Status: Transcript ready';
+  const bodyLines = [];
+
+  const durationText = callDetails?.duration ? formatDurationShort(callDetails.duration) : null;
+  const statusEmoji = callDetails?.status ? `${getStatusEmoji(callDetails.status)} ${escapeMarkdownV2(callDetails.status)}` : null;
+
+  const detailLines = [];
+  if (statusEmoji) detailLines.push(`• Status: ${statusEmoji}`);
+  if (durationText) detailLines.push(`• Duration: ${escapeMarkdownV2(durationText)}`);
+  if (callDetails?.started_at) detailLines.push(`• Started: ${escapeMarkdownV2(formatLocalTimestamp(callDetails.started_at))}`);
+  if (callDetails?.ai_summary) detailLines.push(`• AI Summary: ${escapeMarkdownV2(callDetails.ai_summary)}`);
+  if (detailLines.length) {
+    bodyLines.push('📝 Call details:');
+    bodyLines.push(...detailLines);
   }
 
-  lines.push('');
-  lines.push(`👤 Client: ${safeName}`);
-  lines.push(`🕒 Timestamp: ${safeTime}`);
-  lines.push(`🧩 Provider: ${safeProvider}`);
-  lines.push(`🆔 Call ID: ${safeCallSid}`);
-  lines.push(`📞 Number: ${safePhone}`);
+  if (dtmfSummary?.summaryLines?.length) {
+    bodyLines.push('');
+    bodyLines.push('🔢 Keypad entries:');
+    dtmfSummary.summaryLines.forEach((line) => bodyLines.push(`• ${escapeMarkdownV2(line)}`));
+  }
 
-  return lines.join('\n');
+  if (transcripts.length) {
+    bodyLines.push('');
+    bodyLines.push('💬 Conversation:');
+    const maxMessages = 12;
+    for (let i = 0; i < Math.min(transcripts.length, maxMessages); i++) {
+      const entry = transcripts[i];
+      const speakerLabel = entry.speaker === 'user' ? '👤 Customer' : '🤖 AI';
+      const timestampText = entry.timestamp ? formatLocalTimestamp(entry.timestamp) : null;
+      const messageText = entry.clean_message || entry.message || entry.raw_message || '';
+      const body = escapeMarkdownV2(messageText.split('\n').map((line) => line.trim()).filter(Boolean).join(' '));
+      bodyLines.push(timestampText ? `• ${speakerLabel} (${escapeMarkdownV2(timestampText)}): ${body}` : `• ${speakerLabel}: ${body}`);
+    }
+    if (transcripts.length > maxMessages) {
+      bodyLines.push(`• … and ${transcripts.length - maxMessages} more messages`);
+      bodyLines.push(`• Use /transcript ${escapeMarkdownV2(callDetails.call_sid)} for full details.`);
+    }
+  } else {
+    bodyLines.push('');
+    bodyLines.push('💬 No conversation recorded.');
+  }
+
+  if (callDetails?.call_summary) {
+    bodyLines.push('');
+    bodyLines.push('🧭 Summary:');
+    bodyLines.push(escapeMarkdownV2(callDetails.call_summary));
+  }
+
+  return buildStructuredTelegramMessage({
+    callTarget,
+    statusLine,
+    bodyLines,
+    clientName: getCustomerName(callDetails, metadata),
+    timestamp: formatLocalTimestamp(callDetails?.started_at || callDetails?.created_at),
+    sourceLabel: 'Call Transcript',
+    phoneNumber: callDetails?.phone_number || metadata?.dialed_number || null,
+    extraMeta: callDetails?.call_sid ? [`🆔 Call ID: \`${escapeMarkdownV2(callDetails.call_sid)}\``] : []
+  });
 }
 
 function formatStatusMeta(status, callTiming = {}, additionalData = {}) {
@@ -584,6 +728,8 @@ class EnhancedWebhookService {
     this.callInputQueue = new Map(); // Queue keypad summaries until call completion
     this.callTimestamps = new Map(); // Track call timing for better status management
     this.statusOrder = ['queued', 'initiated', 'ringing', 'in-progress', 'answered', 'completed', 'busy', 'no-answer', 'failed', 'canceled'];
+    this.callStatusThreads = new Map(); // Track header + message queue per call
+    this.statusSendDelayMs = 200;
   }
 
   start(database) {
@@ -721,24 +867,13 @@ class EnhancedWebhookService {
         return true;
       }
 
-      const personaLabel = callDetails ? getPersonaLabel(callDetails) : 'Adaptive Agent';
-      const intentLabel = resolveIntentLabel(callDetails || {}, metadata);
-      const sentimentInfo = extractSentimentInfo(callDetails?.ai_analysis);
-
-      await this.updateCallThread(call_sid, chatId, {
-        customer: {
-          name: getCustomerName(callDetails, metadata),
-          phone: callDetails?.phone_number || metadata?.dialed_number || null
-        },
-        persona: personaLabel,
-        intent: intentLabel,
-        sentiment: sentimentInfo,
-        status: statusMeta,
-        provider: callDetails?.provider || 'UNKNOWN',
-        summary: normalizedStatus === 'completed'
-          ? (callDetails?.call_summary || additionalData.summary || null)
-          : undefined
-      }, callDetails);
+      const statusLine = getStatusLine(normalizedStatus);
+      const headerId = await this.ensureCallHeader(call_sid, chatId, callDetails);
+      await this.enqueueStatusMessage(call_sid, chatId, statusLine, { status: normalizedStatus });
+      const finalOutcome = additionalData.finalOutcome || (normalizedStatus === 'no-answer' ? '❌ Not completed: no-answer' : null);
+      if (finalOutcome) {
+        await this.enqueueStatusMessage(call_sid, chatId, finalOutcome, { status: `${normalizedStatus}-final` });
+      }
 
       if (normalizedStatus === 'completed') {
         await this.flushInputQueue(call_sid, chatId, callDetails);
@@ -772,82 +907,32 @@ class EnhancedWebhookService {
       const callDetails = await this.db.getCall(call_sid);
       const transcripts = await this.db.getCallTranscripts(call_sid);
       const dtmfEntries = await this.db.getCallDtmfEntries(call_sid);
-      const formattedDtmf = formatDtmfEntries(dtmfEntries);
       const dtmfSummary = dtmfEntries.length ? formatSummary(dtmfEntries) : { summaryLines: [], containsRaw: false };
       
       if (!callDetails || !transcripts || transcripts.length === 0) {
-        await this.sendTelegramMessage(telegram_chat_id, buildTelegramMessage([
-          '📋 No transcript available for this call'
-        ]));
+        const messageText = buildStructuredTelegramMessage({
+          callTarget: call_sid ? `Call ${call_sid.slice(-6)}` : 'Call',
+          statusLine: '🕵️ No transcript available for this call.',
+          clientName: 'Client',
+          sourceLabel: 'Call Transcript',
+          timestamp: formatLocalTimestamp(),
+        });
+        await this.sendTelegramMessage(telegram_chat_id, messageText, 'MarkdownV2');
         return true;
       }
 
-      const lines = [];
-      lines.push('📋 Call Transcript');
-      lines.push('');
-      lines.push(`Phone: ${callDetails.phone_number || 'Unknown'}`);
-
-      if (callDetails.duration && callDetails.duration > 0) {
-        const minutes = Math.floor(callDetails.duration / 60);
-        const seconds = callDetails.duration % 60;
-        lines.push(`Duration: ${minutes}:${String(seconds).padStart(2, '0')}`);
-      }
-
-      if (callDetails.started_at) {
-        const startTime = new Date(callDetails.started_at).toLocaleTimeString();
-        lines.push(`Time: ${startTime}`);
-      }
-
-      lines.push(`Messages: ${transcripts.length}`);
-
-      if (callDetails.status) {
-        const statusEmoji = this.getStatusEmoji(callDetails.status);
-        lines.push(`Status: ${statusEmoji} ${callDetails.status}`);
-      }
-
-      if (formattedDtmf.length > 0) {
-        lines.push('');
-        lines.push('Keypad Entries:');
-        dtmfSummary.summaryLines.forEach((line) => lines.push(`• ${line}`));
-      }
-
-      lines.push('');
-      lines.push('Conversation:');
-
-      const maxMessages = 12;
-      for (let i = 0; i < Math.min(transcripts.length, maxMessages); i++) {
-        const entry = transcripts[i];
-        const speakerLabel = entry.speaker === 'user' ? '👤 Customer' : '🤖 AI';
-        const timestamp = entry.timestamp ? new Date(entry.timestamp).toLocaleTimeString() : null;
-        const messageText = entry.clean_message || entry.message || entry.raw_message || '';
-        const body = messageText.split('\n').map((line) => line.trim()).filter(Boolean).join('\n');
-        lines.push(timestamp ? `${speakerLabel} (${timestamp}):` : `${speakerLabel}:`);
-        lines.push(body);
-      }
-
-      if (transcripts.length > maxMessages) {
-        lines.push(`… and ${transcripts.length - maxMessages} more messages`);
-        lines.push(`Use /transcript ${call_sid} for full details.`);
-      }
-
-      if (callDetails.call_summary) {
-        lines.push('');
-        lines.push('Summary:');
-        lines.push(callDetails.call_summary);
-      }
-
-      const messageText = buildTelegramMessage(lines);
+      const messageText = formatTranscriptNotification(callDetails, transcripts, dtmfSummary);
 
       if (messageText.length > 4000) {
         const chunks = this.splitMessage(messageText, 3900);
         for (let i = 0; i < chunks.length; i++) {
-          await this.sendTelegramMessage(telegram_chat_id, chunks[i]);
+          await this.sendTelegramMessage(telegram_chat_id, chunks[i], 'MarkdownV2');
           if (i < chunks.length - 1) {
             await this.delay(1500);
           }
         }
       } else {
-        await this.sendTelegramMessage(telegram_chat_id, messageText);
+        await this.sendTelegramMessage(telegram_chat_id, messageText, 'MarkdownV2');
       }
 
       console.log(`✅ Sent enhanced transcript for call ${call_sid}`.green);
@@ -1271,14 +1356,12 @@ class EnhancedWebhookService {
             ? 'Likely voicemail or IVR detected. Pivot to a voicemail script or hang up.'
             : 'Monitoring audio channel for a final answer signal.';
 
-      await this.updateCallThread(call_sid, chatId, {
-        amd: {
-          label: titleCase(label),
-          emoji: label === 'human' ? '👂' : label === 'machine' ? '🤖' : '📡',
-          confidence: Number.isFinite(confidencePercent) ? `${confidencePercent.toFixed(1)}%` : null,
-          detail: amdDetail
-        }
-      }, call);
+      const amdLine = getAmdLine(label);
+      const thread = this.getStatusThread(call_sid, chatId);
+      if (amdLine && amdLine !== thread.lastStatus) {
+        await this.ensureCallHeader(call_sid, chatId, call);
+        await this.enqueueStatusMessage(call_sid, chatId, amdLine, { status: `amd-${label}` });
+      }
       return true;
     } catch (error) {
       console.error('❌ Failed to send AMD update notification:', error);
@@ -1516,7 +1599,7 @@ class EnhancedWebhookService {
   }
 
   // Enhanced Telegram message sending with markdown support
-  async sendTelegramMessage(chatId, message, parseMode = 'HTML', replyMarkup = null) {
+  async sendTelegramMessage(chatId, message, parseMode = 'HTML', replyMarkup = null, replyTo = null) {
     const url = `https://api.telegram.org/bot${this.telegramBotToken}/sendMessage`;
     const useMarkdown = parseMode === 'MarkdownV2';
     const sanitizedText = useMarkdown ? message : sanitizeTelegramText(message);
@@ -1543,6 +1626,10 @@ class EnhancedWebhookService {
 
     if (replyMarkup) {
       payload.reply_markup = replyMarkup;
+    }
+
+    if (replyTo) {
+      payload.reply_to_message_id = replyTo;
     }
 
     const response = await axios.post(url, payload, {
@@ -1819,6 +1906,80 @@ class EnhancedWebhookService {
     this.callTimestamps.delete(callSid);
     this.callThreads.delete(callSid);
     this.callInputQueue.delete(callSid);
+    this.callStatusThreads.delete(callSid);
+  }
+
+  getStatusThread(callSid, chatId) {
+    let thread = this.callStatusThreads.get(callSid);
+    if (!thread) {
+      thread = {
+        chatId,
+        headerMessageId: null,
+        queue: [],
+        sending: false,
+        lastStatus: null
+      };
+      this.callStatusThreads.set(callSid, thread);
+    } else if (chatId && thread.chatId !== chatId) {
+      thread.chatId = chatId;
+    }
+    return thread;
+  }
+
+  async ensureCallHeader(callSid, chatId, callDetails = null) {
+    const thread = this.getStatusThread(callSid, chatId);
+    if (thread.headerMessageId) {
+      return thread.headerMessageId;
+    }
+    const metadata = parseCallMetadata(callDetails?.metadata_json) || {};
+    const callLabel = callSid ? `Call ${callSid.slice(-6)}` : 'Call';
+    const phoneDisplay = callDetails?.phone_number || metadata?.dialed_number || 'Unknown';
+    const personaLabel = callDetails ? getPersonaLabel(callDetails) : 'Adaptive Agent';
+    const intentLabel = resolveIntentLabel(callDetails || {}, metadata);
+
+    const headerLines = [
+      `📞 ${escapeMarkdownV2(callLabel)} • ${escapeMarkdownV2(phoneDisplay)}`,
+      `Persona: ${escapeMarkdownV2(personaLabel)}`,
+      `Intent: ${escapeMarkdownV2(intentLabel)}`,
+    ];
+
+    const sent = await this.sendTelegramMessage(chatId, headerLines.join('\n'), 'MarkdownV2');
+    const messageId = sent?.result?.message_id || sent?.message_id || null;
+    thread.headerMessageId = messageId;
+    return messageId;
+  }
+
+  async enqueueStatusMessage(callSid, chatId, text, options = {}) {
+    const thread = this.getStatusThread(callSid, chatId);
+    if (options.status && thread.lastStatus === options.status) {
+      return;
+    }
+    thread.queue.push({ text, replyTo: thread.headerMessageId, status: options.status });
+    thread.lastStatus = options.status || thread.lastStatus;
+    if (!thread.sending) {
+      this.processStatusQueue(callSid);
+    }
+  }
+
+  async processStatusQueue(callSid) {
+    const thread = this.callStatusThreads.get(callSid);
+    if (!thread || thread.sending) {
+      return;
+    }
+    thread.sending = true;
+    try {
+      while (thread.queue.length > 0) {
+        const item = thread.queue.shift();
+        try {
+          await this.sendTelegramMessage(thread.chatId, item.text, 'MarkdownV2', null, item.replyTo);
+        } catch (error) {
+          console.error(`❌ Failed to send status message for ${callSid}:`, error.message);
+        }
+        await this.delay(this.statusSendDelayMs);
+      }
+    } finally {
+      thread.sending = false;
+    }
   }
 
   getOrCreateThread(callSid, chatId) {

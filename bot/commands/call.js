@@ -577,15 +577,15 @@ async function callFlow(conversation, ctx) {
 
     const data = response?.data;
     if (data?.success && data.call_sid) {
-      const successMsg = [
-        '✅ *Call Placed Successfully!*',
-        '',
+      const header = await ctx.reply('✅ *Call Placed Successfully!*', { parse_mode: 'Markdown' });
+      const details = [
         `📞 To: ${data.to}`,
-        `🆔 Call SID: \`${data.call_sid}\``,
         `📊 Status: ${data.status}`
       ].join('\n');
-
-      await ctx.reply(successMsg, { parse_mode: 'Markdown' });
+      await ctx.reply(details, {
+        parse_mode: 'Markdown',
+        reply_to_message_id: header?.message_id
+      });
       flow.touch('completed');
     } else {
       await ctx.reply('⚠️ Call was sent but response format unexpected. Check logs.');

@@ -270,6 +270,18 @@ class EnhancedDatabase {
                 FOREIGN KEY(call_sid) REFERENCES calls(call_sid)
             )`,
 
+            // Append-only log of all call events/webhooks for reconciliation
+            `CREATE TABLE IF NOT EXISTS call_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                call_sid TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                provider TEXT,
+                raw_status TEXT,
+                payload_json TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(call_sid) REFERENCES calls(call_sid)
+            )`,
+
             // System settings table for runtime configuration
             `CREATE TABLE IF NOT EXISTS system_settings (
                 key TEXT PRIMARY KEY,
@@ -1644,6 +1656,33 @@ class EnhancedDatabase {
                     resolve(this.lastID);
                 }
             });
+            stmt.finalize();
+        });
+    }
+
+    async logCallEvent(call_sid, event_type, payload = {}, options = {}) {
+        return new Promise((resolve, reject) => {
+            const stmt = this.db.prepare(`
+                INSERT INTO call_events (call_sid, event_type, provider, raw_status, payload_json)
+                VALUES (?, ?, ?, ?, ?)
+            `);
+
+            stmt.run(
+                [
+                    call_sid,
+                    event_type,
+                    options.provider || null,
+                    options.raw_status || null,
+                    JSON.stringify(payload || {})
+                ],
+                function(err) {
+                    if (err) {
+                        reject(err);
+                    } else {
+                        resolve(this.lastID);
+                    }
+                }
+            );
             stmt.finalize();
         });
     }

@@ -132,7 +132,7 @@ function formatSummary(entries = []) {
     };
   }
 
-  const revealRaw = true;
+  const revealRaw = shouldRevealRawDigits();
   const summaryLines = entries.map((entry) => {
     const stage = getStageDefinition(entry.stage_key);
     let label = stage.label || entry.stage_key || 'Entry';
@@ -147,8 +147,9 @@ function formatSummary(entries = []) {
         parsedMetadata = null;
       }
     }
-    let value = entry.masked_digits;
-    if (revealRaw) {
+    const allowRaw = revealRaw && !isSensitiveStage(entry.stage_key);
+    let value = entry.masked_digits || maskDigits(entry.stage_key, parsedMetadata?.raw_digits_preview || '');
+    if (allowRaw) {
       const decrypted = decryptDigits(entry.encrypted_digits);
       if (decrypted) {
         value = decrypted;
