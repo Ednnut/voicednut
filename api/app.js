@@ -2611,6 +2611,24 @@ app.post('/outbound-call', async (req, res) => {
     });
   } catch (error) {
     console.error('Error creating enhanced adaptive outbound call:', error);
+
+    // Notify requester via Telegram if available
+    try {
+      const chatId = requestedTelegramChatId || user_chat_id || null;
+      if (chatId && webhookService?.sendTelegramMessage) {
+        const details = error?.code === 21219
+          ? 'Twilio trial accounts may only call verified numbers.'
+          : error?.message || 'Unable to create outbound call.';
+        await webhookService.sendTelegramMessage(
+          chatId,
+          `❌ Call failed to start: ${details}`,
+          null
+        );
+      }
+    } catch (notifyError) {
+      console.warn('Failed to send Telegram failure notice:', notifyError.message);
+    }
+
     res.status(500).json({
       error: 'Failed to create outbound call',
       details: error.message

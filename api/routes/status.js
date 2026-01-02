@@ -1628,7 +1628,7 @@ class EnhancedWebhookService {
     } else if (typeof parseMode === 'string' && parseMode.trim().length > 0) {
       resolvedParseMode = parseMode;
     } else {
-      resolvedParseMode = 'HTML';
+      resolvedParseMode = null;
     }
 
     if (resolvedParseMode) {
@@ -1960,7 +1960,7 @@ class EnhancedWebhookService {
       while (thread.queue.length > 0) {
         const item = thread.queue.shift();
         try {
-          await this.sendTelegramMessage(thread.chatId, item.text, 'MarkdownV2', null, item.replyTo);
+          await this.sendTelegramMessage(thread.chatId, item.text, null, null, item.replyTo);
         } catch (error) {
           console.error(`❌ Failed to send status message for ${callSid}:`, error.message);
         }
@@ -2157,7 +2157,7 @@ class EnhancedWebhookService {
       console.error(`❌ Failed to send immediate status for ${call_sid}:`, error);
       // Try to send a generic notification
       try {
-        await this.sendTelegramMessage(telegram_chat_id, `📱 Call ${call_sid.slice(-6)} status: ${status}`);
+        await this.sendTelegramMessage(telegram_chat_id, `📱 Call ${call_sid.slice(-6)} status: ${status}`, null);
         return true;
       } catch (fallbackError) {
         console.error(`❌ Fallback notification also failed:`, fallbackError);
