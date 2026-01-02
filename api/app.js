@@ -3021,12 +3021,23 @@ app.post('/vonage/event', async (req, res) => {
       await db.createEnhancedWebhookNotification(CallSid, type, targetChat);
     };
 
+    const emitImmediateStatus = async (statusLabel) => {
+      if (!targetChat) {
+        console.warn(`⚠️ No Telegram chat on record for ${CallSid}; status ${statusLabel} not sent.`);
+        return;
+      }
+      await webhookService.sendImmediateStatus(CallSid, statusLabel, targetChat);
+    };
+
     if (['queued', 'initiated'].includes(finalStatus)) {
       await enqueueStatus('call_initiated');
+      await emitImmediateStatus('initiated');
     } else if (finalStatus === 'ringing') {
       await enqueueStatus('call_ringing');
+      await emitImmediateStatus('ringing');
     } else if (['in-progress', 'answered'].includes(finalStatus)) {
       await enqueueStatus('call_answered');
+      await emitImmediateStatus('answered');
     } else if (['busy', 'failed', 'canceled', 'completed', 'no-answer'].includes(finalStatus)) {
       await finalizeCallOutcome(CallSid, {
         finalStatus,
@@ -3034,6 +3045,7 @@ app.post('/vonage/event', async (req, res) => {
       });
       // Ensure final status notification is emitted for terminal state
       await enqueueStatus(`call_${finalStatus.replace('-', '_')}`);
+      await emitImmediateStatus(finalStatus.replace('_', '-'));
     }
 
     await db.logServiceHealth('webhook_system', 'status_received', {
