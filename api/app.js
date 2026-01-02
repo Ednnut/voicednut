@@ -2931,6 +2931,8 @@ app.post('/vonage/event', async (req, res) => {
         ErrorMessage,
         DialCallDuration // This is key for detecting actual answer vs no-answer
       } = req.body;
+
+      console.log(`[STATUS WEBHOOK HIT] ${CallSid || 'unknown'} :: ${CallStatus || 'unknown'} @ ${new Date().toISOString()}`);
     
     console.log(`📱 Fixed Webhook: Call ${CallSid} status: ${CallStatus}`.blue);
     console.log(`📊 Debug Info:`.cyan);
@@ -3032,6 +3034,19 @@ app.post('/vonage/event', async (req, res) => {
     }
 
     const targetChat = call.telegram_chat_id || call.user_chat_id;
+    if (targetChat && db?.upsertCallStatusThread) {
+      try {
+        await db.upsertCallStatusThread({
+          call_sid: CallSid,
+          telegram_chat_id: targetChat,
+          to_number: call.phone_number || metadata?.dialed_number || number,
+          from_number: twilioFromNumber,
+          call_type: call.call_type || callType || 'voice',
+        });
+      } catch (mapErr) {
+        console.warn('⚠️ Failed to persist call status thread mapping:', mapErr.message);
+      }
+    }
     const enqueueStatus = async (type) => {
       if (!targetChat) {
         return;

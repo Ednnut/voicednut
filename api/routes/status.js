@@ -871,7 +871,15 @@ class EnhancedWebhookService {
       const statusMeta = formatStatusMeta(normalizedStatus, callTiming, additionalData);
       const callDetails = await this.db.getCall(call_sid);
       const metadata = parseCallMetadata(callDetails?.metadata_json) || {};
-      const chatId = telegram_chat_id || callDetails?.telegram_chat_id;
+      let chatId = telegram_chat_id || callDetails?.telegram_chat_id;
+
+      // Attempt to recover mapping from DB if chatId missing
+      if (!chatId) {
+        const mapping = await this.ensureThreadFromDb(call_sid);
+        if (mapping?.telegram_chat_id) {
+          chatId = mapping.telegram_chat_id;
+        }
+      }
 
       if (!chatId) {
         console.warn(`No Telegram chat configured for call ${call_sid}; skipping status update.`);
@@ -881,10 +889,13 @@ class EnhancedWebhookService {
       const toNumber = callDetails?.phone_number || metadata?.dialed_number || 'Unknown';
       const fromNumber = metadata?.from_number || twilioConfig?.fromNumber || 'Unknown';
       const statusLine = getStatusLine(normalizedStatus, { to: toNumber, from: fromNumber });
-      await this.enqueueStatusMessage(call_sid, chatId, statusLine, { status: normalizedStatus, replyTo: null });
+      const threadMapping = await this.ensureThreadFromDb(call_sid);
+      const replyTo = threadMapping?.header_message_id || null;
+      await this.enqueueStatusMessage(call_sid, chatId, statusLine, { status: normalizedStatus, replyTo });
+      await this.persistThread(call_sid, chatId, threadMapping?.header_message_id || null, callDetails);
       const finalOutcome = additionalData.finalOutcome || (normalizedStatus === 'no-answer' ? '❌ Not completed: no-answer' : null);
       if (finalOutcome) {
-        await this.enqueueStatusMessage(call_sid, chatId, finalOutcome, { status: `${normalizedStatus}-final` });
+        await this.enqueueStatusMessage(call_sid, chatId, finalOutcome, { status: `${normalizedStatus}-final`, replyTo });
       }
 
       if (normalizedStatus === 'completed') {
@@ -1355,6 +1366,8 @@ class EnhancedWebhookService {
       }
 
       const chatId = telegram_chat_id || call?.telegram_chat_id;
+      const mapping = await this.ensureThreadFromDb(call_sid);
+      const replyTo = mapping?.header_message_id || null;
       if (!chatId) {
         return true;
       }
@@ -1371,7 +1384,7 @@ class EnhancedWebhookService {
       const amdLine = getAmdLine(label);
       const thread = this.getStatusThread(call_sid, chatId);
       if (amdLine && amdLine !== thread.lastStatus) {
-        await this.enqueueStatusMessage(call_sid, chatId, amdLine, { status: `amd-${label}`, replyTo: null });
+        await this.enqueueStatusMessage(call_sid, chatId, amdLine, { status: `amd-${label}`, replyTo });
       }
       return true;
     } catch (error) {
@@ -1643,17 +1656,28 @@ class EnhancedWebhookService {
       payload.reply_to_message_id = replyTo;
     }
 
-    const response = await axios.post(url, payload, {
-      timeout: 15000, // Longer timeout for better reliability
-      headers: {
-        'Content-Type': 'application/json'
+    const attemptSend = async (attempt = 1) => {
+      try {
+        const response = await axios.post(url, payload, {
+          timeout: 15000, // Longer timeout for better reliability
+          headers: {
+            'Content-Type': 'application/json'
+          }
+        });
+        return response;
+      } catch (error) {
+        const status = error.response?.status;
+        const desc = error.response?.data?.description || error.message;
+        console.error(`❌ Telegram send error (attempt ${attempt}) (${status || 'unknown'}): ${desc}`);
+        if (attempt < 2 && status && [429, 500, 502, 503, 504].includes(Number(status))) {
+          await this.delay(500);
+          return attemptSend(attempt + 1);
+        }
+        throw error;
       }
-    }).catch((error) => {
-      const status = error.response?.status;
-      const desc = error.response?.data?.description || error.message;
-      console.error(`❌ Telegram send error (${status || 'unknown'}): ${desc}`);
-      throw error;
-    });
+    };
+
+    const response = await attemptSend();
 
     if (!response.data.ok) {
       throw new Error(`Telegram API error: ${response.data.description || 'Unknown error'}`);
@@ -1940,6 +1964,36 @@ class EnhancedWebhookService {
       thread.chatId = chatId;
     }
     return thread;
+  }
+
+  async persistThread(callSid, chatId, headerMessageId, callDetails = null) {
+    if (!this.db || typeof this.db.upsertCallStatusThread !== 'function') return;
+    try {
+      await this.db.upsertCallStatusThread({
+        call_sid: callSid,
+        telegram_chat_id: chatId,
+        header_message_id: headerMessageId || null,
+        to_number: callDetails?.phone_number || null,
+        from_number: twilioConfig.fromNumber || null,
+        call_type: callDetails?.call_type || null
+      });
+    } catch (err) {
+      console.warn(`⚠️ Failed to persist status thread for ${callSid}: ${err.message}`);
+    }
+  }
+
+  async ensureThreadFromDb(callSid) {
+    if (!this.db || typeof this.db.getCallStatusThread !== 'function') return null;
+    try {
+      const mapping = await this.db.getCallStatusThread(callSid);
+      if (!mapping) return null;
+      const thread = this.getStatusThread(callSid, mapping.telegram_chat_id);
+      thread.headerMessageId = mapping.header_message_id || thread.headerMessageId;
+      return mapping;
+    } catch (err) {
+      console.warn(`⚠️ Failed to load thread mapping for ${callSid}: ${err.message}`);
+      return null;
+    }
   }
 
   async enqueueStatusMessage(callSid, chatId, text, options = {}) {

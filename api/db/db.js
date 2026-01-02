@@ -282,6 +282,17 @@ class EnhancedDatabase {
                 FOREIGN KEY(call_sid) REFERENCES calls(call_sid)
             )`,
 
+            // Store Telegram status thread anchor per call
+            `CREATE TABLE IF NOT EXISTS call_status_threads (
+                call_sid TEXT PRIMARY KEY,
+                telegram_chat_id TEXT NOT NULL,
+                header_message_id INTEGER,
+                to_number TEXT,
+                from_number TEXT,
+                call_type TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )`,
+
             // System settings table for runtime configuration
             `CREATE TABLE IF NOT EXISTS system_settings (
                 key TEXT PRIMARY KEY,
@@ -1684,6 +1695,64 @@ class EnhancedDatabase {
                 }
             );
             stmt.finalize();
+        });
+    }
+
+    async upsertCallStatusThread(mapping = {}) {
+        const {
+            call_sid,
+            telegram_chat_id,
+            header_message_id = null,
+            to_number = null,
+            from_number = null,
+            call_type = null,
+        } = mapping;
+
+        if (!call_sid || !telegram_chat_id) {
+            throw new Error('call_sid and telegram_chat_id are required for call_status_threads');
+        }
+
+        return new Promise((resolve, reject) => {
+            const stmt = this.db.prepare(`
+                INSERT INTO call_status_threads (call_sid, telegram_chat_id, header_message_id, to_number, from_number, call_type)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(call_sid) DO UPDATE SET
+                    telegram_chat_id = excluded.telegram_chat_id,
+                    header_message_id = COALESCE(excluded.header_message_id, call_status_threads.header_message_id),
+                    to_number = COALESCE(excluded.to_number, call_status_threads.to_number),
+                    from_number = COALESCE(excluded.from_number, call_status_threads.from_number),
+                    call_type = COALESCE(excluded.call_type, call_status_threads.call_type)
+            `);
+
+            stmt.run(
+                [call_sid, telegram_chat_id, header_message_id, to_number, from_number, call_type],
+                function(err) {
+                    if (err) {
+                        reject(err);
+                    } else {
+                        resolve(this.changes || 1);
+                    }
+                }
+            );
+            stmt.finalize();
+        });
+    }
+
+    async getCallStatusThread(call_sid) {
+        if (!call_sid) return null;
+        return new Promise((resolve, reject) => {
+            this.db.get(
+                `SELECT call_sid, telegram_chat_id, header_message_id, to_number, from_number, call_type, created_at
+                 FROM call_status_threads WHERE call_sid = ?`,
+                [call_sid],
+                (err, row) => {
+                    if (err) {
+                        reject(err);
+                    } else {
+                        resolve(row || null);
+                    }
+                }
+            );
         });
     }
 
