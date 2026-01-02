@@ -2402,7 +2402,6 @@ app.post('/outbound-call', async (req, res) => {
     if (callType === 'collect_input') {
       metadataPayload.input_sequence = sanitizedInputSequence;
     }
-    ensureStructuredInputSequence(callConfig, metadataPayload);
     const metadataSerialized = Object.keys(metadataPayload).length ? JSON.stringify(metadataPayload) : null;
     const resolvedTelegramChatId = requestedTelegramChatId || user_chat_id || null;
 
@@ -2430,6 +2429,8 @@ app.post('/outbound-call', async (req, res) => {
       telegram_chat_id: resolvedTelegramChatId,
       metadata_json: metadataSerialized
     };
+
+    ensureStructuredInputSequence(callConfig, metadataPayload);
 
     let callSid = null;
     let providerContactId = null;
