@@ -3,8 +3,11 @@ const twilio = require('twilio');
 
 module.exports = function validateTwilioRequestFactory() {
   return function validateTwilioRequest(req, res, next) {
-    const shouldValidate = String(process.env.TWILIO_VALIDATE_SIGNATURE || 'true').toLowerCase() !== 'false';
+    const shouldValidate = String(process.env.TWILIO_VALIDATE_SIGNATURE || 'false').toLowerCase() !== 'false';
     if (!shouldValidate || !process.env.TWILIO_AUTH_TOKEN) {
+      if (shouldValidate === false) {
+        console.warn('⚠️ Twilio signature validation disabled via TWILIO_VALIDATE_SIGNATURE=false'.yellow);
+      }
       return next();
     }
 
