@@ -20,8 +20,8 @@ module.exports = (bot) => {
 • /sms - Send an SMS message
 • /miniapp - Open web app for advanced actions
 • /smsconversation &lt;phone&gt; - View SMS conversation
-• /transcript &lt;call_sid&gt; - Get call transcript
-• /calls [limit] - List recent calls (max 50)
+• /search &lt;term&gt; - Find calls by ID/phone/intent
+• /recent [limit] - List recent calls (max 50)
 • /health or /ping - Check bot &amp; API health
 • /guide - Show detailed usage guide
 • /menu - Show quick action buttons
@@ -56,8 +56,8 @@ module.exports = (bot) => {
 
 💡 <b>Examples</b>
 • Phone format: +1234567890 (not 123-456-7890)
-• Get transcript: /transcript CA1234567890abcdef
-• List calls: /calls 20
+• Search: /search refund
+• List calls: /recent 20
 • Check health: /health
 
 🆘 <b>Support &amp; Info</b>

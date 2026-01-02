@@ -197,6 +197,160 @@ module.exports = (bot) => {
         }
     });
 
+    // Search calls
+    bot.command('search', async (ctx) => {
+        try {
+            const user = await new Promise(r => getUser(ctx.from.id, r));
+            if (!user) return ctx.reply('❌ You are not authorized.');
+
+            const parts = ctx.message.text.split(/\s+/).slice(1);
+            const query = parts.join(' ').trim();
+            if (!query || query.length < 2) {
+                return ctx.reply('🔍 Usage: /search <term>');
+            }
+
+            await ctx.reply(`🔍 Searching calls for “${query}”…`);
+            const res = await axios.get(`${config.apiUrl}/api/calls/search`, {
+                params: { q: query, limit: 10 },
+                timeout: 12000
+            });
+
+            const results = res.data?.results || [];
+            if (!results.length) {
+                return ctx.reply('ℹ️ No matches found.');
+            }
+
+            const lines = results.slice(0, 5).map((c) => {
+                const status = c.status || 'unknown';
+                const when = new Date(c.created_at).toLocaleString();
+                const phone = c.phone_number || 'N/A';
+                const summary = c.call_summary ? `\n📝 ${c.call_summary.slice(0, 120)}${c.call_summary.length > 120 ? '…' : ''}` : '';
+                return `• ${c.call_sid} (${status})\n📞 ${phone}\n🕒 ${when}${summary}`;
+            });
+            await ctx.reply(lines.join('\n\n'));
+        } catch (error) {
+            console.error('Search command error:', error?.message || error);
+            await ctx.reply('❌ Search failed.');
+        }
+    });
+
+    // Recent calls
+    bot.command('recent', async (ctx) => {
+        try {
+            const user = await new Promise(r => getUser(ctx.from.id, r));
+            if (!user) return ctx.reply('❌ You are not authorized.');
+
+            const parts = ctx.message.text.split(/\s+/).slice(1);
+            const limit = Math.min(parseInt(parts[0], 10) || 10, 30);
+            const filter = parts[1] || '';
+
+            const res = await axios.get(`${config.apiUrl}/api/calls/recent`, {
+                params: { limit, filter },
+                timeout: 10000
+            });
+            const calls = res.data?.calls || [];
+            if (!calls.length) {
+                return ctx.reply('ℹ️ No recent calls.');
+            }
+
+            const lines = calls.map((c) => {
+                const status = c.status || 'unknown';
+                const when = new Date(c.created_at).toLocaleString();
+                const duration = c.duration ? `${Math.floor(c.duration/60)}:${String(c.duration%60).padStart(2,'0')}` : 'N/A';
+                const lastMsg = c.last_message_at ? ` | 🗨️ ${new Date(c.last_message_at).toLocaleTimeString()}` : '';
+                return `• ${c.call_sid} (${status})\n📞 ${c.phone_number}\n⏱️ ${duration} | 🕒 ${when}${lastMsg}`;
+            });
+            await ctx.reply(lines.join('\n\n'));
+        } catch (error) {
+            console.error('Recent command error:', error?.message || error);
+            await ctx.reply('❌ Failed to fetch recent calls.');
+        }
+    });
+
+    // Call latency breakdown
+    bot.command('latency', async (ctx) => {
+        try {
+            const user = await new Promise(r => getUser(ctx.from.id, r));
+            if (!user) return ctx.reply('❌ You are not authorized.');
+
+            const parts = ctx.message.text.split(/\s+/).slice(1);
+            const callSid = parts[0];
+            if (!callSid) {
+                return ctx.reply('⏱️ Usage: /latency <callSid>');
+            }
+            const res = await axios.get(`${config.apiUrl}/api/calls/${callSid}/latency`, { timeout: 8000 });
+            const lat = res.data?.latency_metrics || {};
+            const lines = [
+                `⏱️ Latency for ${callSid}`,
+                `STT: ${lat.stt_ms ?? 'N/A'} ms`,
+                `GPT: ${lat.gpt_ms ?? 'N/A'} ms`,
+                `TTS: ${lat.tts_ms ?? 'N/A'} ms`,
+                `Duration: ${res.data?.call_duration ?? 'N/A'}s`
+            ];
+            await ctx.reply(lines.join('\n'));
+        } catch (error) {
+            console.error('Latency command error:', error?.message || error);
+            await ctx.reply('❌ Failed to fetch latency.');
+        }
+    });
+
+    // Version info
+    bot.command('version', async (ctx) => {
+        try {
+            const res = await axios.get(`${config.apiUrl}/api/version`, { timeout: 6000 });
+            const v = res.data;
+            const message = [
+                `🧭 Version: ${v.version || 'unknown'}`,
+                `📦 Service: ${v.name || 'api'}`,
+                `📡 Provider: ${v.provider || 'n/a'}`,
+                `⏰ ${new Date(v.timestamp).toLocaleString()}`
+            ].join('\n');
+            await ctx.reply(message);
+        } catch (error) {
+            console.error('Version command error:', error?.message || error);
+            await ctx.reply('❌ Failed to fetch version.');
+        }
+    });
+
+    // Daily digest (lightweight)
+    bot.command('digest', async (ctx) => {
+        try {
+            const user = await new Promise(r => getUser(ctx.from.id, r));
+            if (!user) return ctx.reply('❌ You are not authorized.');
+
+            const res = await axios.get(`${config.apiUrl}/api/analytics/notifications`, {
+                params: { hours: 24, limit: 50 },
+                timeout: 12000
+            });
+            const summary = res.data?.summary || {};
+            const callsRes = await axios.get(`${config.apiUrl}/api/calls/recent`, {
+                params: { limit: 10 },
+                timeout: 8000
+            });
+            const calls = callsRes.data?.calls || [];
+
+            const lines = [
+                `📊 24h Digest`,
+                `Notifications: ${summary.total_notifications ?? 0} (✅ ${summary.successful_notifications ?? 0}, ❌ ${(summary.total_notifications || 0) - (summary.successful_notifications || 0)})`,
+                `Success rate: ${summary.success_rate_percent ?? 0}%`,
+                `Avg delivery: ${summary.average_delivery_time_seconds ?? 'N/A'}s`,
+                '',
+                `Recent calls (${calls.length}):`
+            ];
+
+            calls.slice(0, 5).forEach((c) => {
+                const status = c.status || 'unknown';
+                const when = new Date(c.created_at).toLocaleTimeString();
+                lines.push(`• ${c.call_sid} (${status}) ${when}`);
+            });
+
+            await ctx.reply(lines.join('\n'));
+        } catch (error) {
+            console.error('Digest command error:', error?.message || error);
+            await ctx.reply('❌ Failed to fetch digest.');
+        }
+    });
+
     // Health check command (simple version for all users) - Enhanced
     bot.command(['health', 'ping'], async (ctx) => {
         try {

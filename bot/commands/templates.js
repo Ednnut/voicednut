@@ -23,7 +23,10 @@ const {
 const templatesApi = axios.create({
   baseURL: config.templatesApiUrl.replace(/\/+$/, ''),
   timeout: 15000,
-  headers: { 'Content-Type': 'application/json' }
+  headers: {
+    'Content-Type': 'application/json',
+    'x-admin-token': config.admin.apiToken
+  }
 });
 
 function nonJsonResponseError(endpoint, response) {

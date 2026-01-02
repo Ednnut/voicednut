@@ -1,1509 +1,185 @@
+require('dotenv').config();
 require('colors');
 
 const express = require('express');
 const ExpressWs = require('express-ws');
-const compression = require('compression');
-const cors = require('cors');
-const helmet = require('helmet');
-const rateLimit = require('express-rate-limit');
 const path = require('path');
+const OpenAI = require('openai');
 
-const { platform, server: serverConfig, twilio: twilioConfig, aws: awsConfig, vonage: vonageConfig, admin: adminConfig, compliance: complianceConfig, deepgram: deepgramConfig } = require('./config');
-const { EnhancedGptService, DEFAULT_SYSTEM_PROMPT, DEFAULT_FIRST_MESSAGE } = require('./routes/gpt');
-const { getBusinessProfile } = require('./config/business');
+const { EnhancedGptService } = require('./routes/gpt');
 const { StreamService } = require('./routes/stream');
 const { TranscriptionService } = require('./routes/transcription');
 const { TextToSpeechService } = require('./routes/tts');
 const { recordingService } = require('./routes/recording');
 const { EnhancedSmsService } = require('./routes/sms.js');
-const validateTwilioRequest = require('./middleware/twilioSignature');
 const Database = require('./db/db');
 const { webhookService } = require('./routes/status');
 const DynamicFunctionEngine = require('./functions/DynamicFunctionEngine');
-const PersonaComposer = require('./services/PersonaComposer');
-const CallHintStateMachine = require('./services/CallHintStateMachine');
-const InputOrchestrator = require('./services/InputOrchestrator');
-const DEFAULT_PERSONAS = require('./functions/personas');
-const { AwsConnectAdapter, AwsTtsAdapter, AwsSmsAdapter, VonageVoiceAdapter, VonageSmsAdapter } = require('./adapters');
-const { v4: uuidv4 } = require('uuid');
-const dtmfUtils = require('./utils/dtmf');
-const { normalizeAnsweredBy, isHumanAnsweredBy, isMachineAnsweredBy } = require('./utils/amd');
+const appConfig = require('./config');
 
-const twilioSdk = require('twilio');
-const VoiceResponse = twilioSdk.twiml.VoiceResponse;
+const VoiceResponse = require('twilio').twiml.VoiceResponse;
 
 const app = express();
 ExpressWs(app);
 
-app.set('trust proxy', 1);
-
-const corsOptions =
-  serverConfig.corsOrigins.length > 0
-    ? { origin: serverConfig.corsOrigins, credentials: true }
-    : { origin: true, credentials: true };
-
-const apiRateLimiter = rateLimit({
-  windowMs: serverConfig.rateLimit.windowMs,
-  max: serverConfig.rateLimit.max,
-  standardHeaders: true,
-  legacyHeaders: false,
-});
-
-app.use(helmet({ contentSecurityPolicy: false }));
-app.use(compression());
-app.use(cors(corsOptions));
-app.use(apiRateLimiter);
-
-app.use(express.json({ limit: '1mb' }));
+app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-const PORT = serverConfig.port;
-const publicHost = serverConfig.hostname;
-const publicHttpBase = publicHost ? `https://${publicHost}` : `http://localhost:${PORT}`;
-const publicWsBase = publicHost ? `wss://${publicHost}` : `ws://localhost:${PORT}`;
-const {
-  accountSid: twilioAccountSid,
-  authToken: twilioAuthToken,
-  fromNumber: twilioFromNumber,
-} = twilioConfig;
-const twilioRestClient =
-  twilioAccountSid && twilioAuthToken
-    ? twilioSdk(twilioAccountSid, twilioAuthToken)
-    : null;
-const missingTwilioEnv = [];
-if (!twilioAccountSid) missingTwilioEnv.push('TWILIO_ACCOUNT_SID');
-if (!twilioAuthToken) missingTwilioEnv.push('TWILIO_AUTH_TOKEN');
-if (!twilioFromNumber) missingTwilioEnv.push('FROM_NUMBER');
+const PORT = process.env.PORT || 3000;
 
 // Enhanced call configurations with function context
 const callConfigurations = new Map();
 const activeCalls = new Map();
 const callFunctionSystems = new Map(); // Store generated functions per call
-const inputOrchestrators = new Map();
+let currentProvider = appConfig.platform.provider || 'twilio';
 
 let db;
 const functionEngine = new DynamicFunctionEngine();
-const SUPPORTED_CALL_PROVIDERS = ['twilio', 'aws', 'vonage'];
-let currentProvider = SUPPORTED_CALL_PROVIDERS.includes(platform.provider)
-  ? platform.provider
-  : 'twilio';
-platform.provider = currentProvider;
-let isAwsProvider = currentProvider === 'aws';
-const smsService = new EnhancedSmsService({
-  provider: currentProvider
-});
-const personaComposer = new PersonaComposer();
-const callHintStateMachine = new CallHintStateMachine();
-const awsCallSessions = new Map();
-const awsContactIndex = new Map();
-const vonageCallIndex = new Map();
-const callDtmfBuffers = new Map();
-const DTMF_FLUSH_DELAY_MS = 1500;
-let awsAdapters = null;
-let vonageAdapters = null;
-
-const COLLECT_INPUT_FUNCTIONS = new Set(['ivr_survey', 'pin_entry', 'menu_selection', 'otp_collection', 'account_verification']);
-const collectInputCompletion = new Set();
-
-async function endProviderCall(callSid) {
-  if (!callSid) {
-    return;
-  }
-  try {
-    if (currentProvider === 'twilio' && twilioRestClient) {
-      await twilioRestClient.calls(callSid).update({ status: 'completed' });
-      console.log(`☎️ Requested Twilio hangup for ${callSid}`.gray);
-    } else if (currentProvider === 'vonage') {
-      await ensureVonageAdapters();
-      console.log(`☎️ Awaiting Vonage hangup for ${callSid}`.gray);
-    } else if (currentProvider === 'aws') {
-      console.log(`ℹ️ AWS Connect will handle hangup for ${callSid}`.gray);
-    }
-  } catch (error) {
-    console.error(`❌ Failed to end provider call ${callSid}:`, error.message);
-  }
-}
-
-const DEFAULT_SECURE_INPUT_TEMPLATE = [
-  {
-    stage: 'OTP',
-    label: 'One-Time Passcode',
-    numDigits: 6,
-    pattern: '^\\d{6}$',
-    confidenceThreshold: 0.9,
-    prompt: 'Please enter the one-time passcode we just sent you.',
-    instructions: 'Let the caller know you are listening for the code and confirm once it is received.',
-    successMessage: 'Great, the code looks good. Continue to the next verification step.',
-    failureMessage: 'That code did not match. Offer to resend and ask them to try again carefully.',
-    hint: 'This is the 6-digit SMS we just delivered; pause briefly between each digit.',
-    contextTags: ['otp', 'sms'],
-    speechFallbackScript: 'If typing is difficult, feel free to say the six digits aloud and I will record them.',
-    confirmDigits: true,
-    secondaryChecks: [{ type: 'registered_phone', label: 'Registered phone on file' }],
-  },
-  {
-    stage: 'PIN',
-    label: 'Account PIN',
-    numDigits: 4,
-    prompt: 'Please enter the 4-digit PIN on file with us.',
-    instructions: 'Remind the caller to take their time and speak clearly if they prefer.',
-    successMessage: 'Thanks! That PIN matches. Let’s verify one final detail.',
-    failureMessage: 'That PIN did not match our records. Ask if they want to try again or reset it.',
-    hint: 'Use the PIN you set up with our team. Say it slowly if needed.',
-    contextTags: ['pin', 'account'],
-    speechFallbackScript: 'You can speak the digits if that is easier than using the keypad.',
-    confirmDigits: true,
-    confidenceThreshold: 0.85,
-    secondaryChecks: [{ type: 'crm_record', label: 'CRM profile' }],
-  },
-  {
-    stage: 'CARD_LAST4',
-    label: 'Card Last 4',
-    numDigits: 4,
-    prompt: 'Finally, enter the last four digits of the card we have on file.',
-    instructions: 'Let them know this confirms the account ownership.',
-    successMessage: 'Perfect—verification is complete. Wrap up the call with a thank-you message.',
-    hint: 'This is the card linked to your account—we only need the final four digits.',
-    contextTags: ['billing', 'card'],
-    speechFallbackScript: 'Feel free to read the final four digits aloud for me to confirm.',
-    confirmDigits: true,
-    confidenceThreshold: 0.95,
-    secondaryChecks: [{ type: 'crm_shadow', label: 'Billing profile' }],
-  },
-];
-
-function getSecureInputHint(metadataPayload = {}, stageKey, fallback = null) {
-  if (!stageKey) {
-    return fallback;
-  }
-  const normalized = dtmfUtils.normalizeStage(stageKey);
-  const hints = metadataPayload.secure_input_hints || {};
-  return hints?.[normalized] || hints?.[stageKey] || fallback;
-}
-
-function buildStageContextTags(metadataPayload = {}, stageKey, defaultTags = []) {
-  const tags = new Set(Array.isArray(defaultTags) ? defaultTags : [defaultTags].filter(Boolean));
-  const context = metadataPayload.business_context || {};
-  if (stageKey) {
-    tags.add(stageKey.toLowerCase());
-  }
-  if (context.industry) {
-    tags.add(String(context.industry).toLowerCase());
-  }
-  if (context.businessType) {
-    tags.add(String(context.businessType).toLowerCase());
-  }
-  if (metadataPayload.secure_profile) {
-    tags.add(String(metadataPayload.secure_profile).toLowerCase());
-  }
-  return Array.from(tags).filter(Boolean);
-}
-
-function mergeSecondaryChecks(stageDefinition = {}, metadataPayload = {}) {
-  const normalizedStage = dtmfUtils.normalizeStage(
-    stageDefinition.stage || stageDefinition.stage_key || stageDefinition.label || 'GENERIC'
-  );
-  const metadataChecksRaw =
-    metadataPayload.dual_channel_checks?.[normalizedStage] ||
-    metadataPayload.dual_channel_checks?.[stageDefinition.stage] ||
-    metadataPayload.dual_channel_checks?.[stageDefinition.label];
-
-  const normalizeEntry = (entry) => {
-    if (!entry) {
-      return null;
-    }
-    if (typeof entry === 'string') {
-      return { type: entry };
-    }
-    if (typeof entry === 'object') {
-      return entry;
-    }
-    return null;
-  };
-
-  const baseChecks = Array.isArray(stageDefinition.secondaryChecks)
-    ? stageDefinition.secondaryChecks
-    : stageDefinition.secondaryChecks
-      ? [stageDefinition.secondaryChecks]
-      : [];
-
-  const metadataChecks = Array.isArray(metadataChecksRaw)
-    ? metadataChecksRaw
-    : metadataChecksRaw
-      ? [metadataChecksRaw]
-      : [];
-
-  return [...baseChecks, ...metadataChecks].map(normalizeEntry).filter(Boolean);
-}
-
-function enhanceStageDefinition(stageDefinition, metadataPayload = {}) {
-  if (!stageDefinition) {
-    return stageDefinition;
-  }
-  const normalizedKey = dtmfUtils.normalizeStage(
-    stageDefinition.stage || stageDefinition.stage_key || stageDefinition.label || 'GENERIC'
-  );
-  return {
-    ...stageDefinition,
-    hint: getSecureInputHint(metadataPayload, normalizedKey, stageDefinition.hint),
-    contextTags: buildStageContextTags(metadataPayload, normalizedKey, stageDefinition.contextTags),
-    secondaryChecks: mergeSecondaryChecks(stageDefinition, metadataPayload),
-  };
-}
-
-function buildStructuredInputSequence(metadataPayload = {}, fallbackDigits = 4) {
-  const stages = [];
-  const expectedOtp = metadataPayload.expected_otp || metadataPayload.otp_code || metadataPayload.one_time_passcode;
-  const otpDigits = Number(metadataPayload.otp_length || metadataPayload.otp_digits || (expectedOtp ? String(expectedOtp).length : 6));
-  const needOtp =
-    Boolean(expectedOtp) ||
-    Boolean(metadataPayload.require_otp) ||
-    Boolean(metadataPayload.enable_secure_inputs) ||
-    Boolean(metadataPayload.enable_structured_inputs);
-
-  if (needOtp) {
-    stages.push(enhanceStageDefinition({
-      stage: 'OTP',
-      label: metadataPayload.otp_label || 'One-Time Passcode',
-      numDigits: otpDigits || 6,
-      prompt:
-        metadataPayload.otp_prompt ||
-        'Please enter the one-time passcode we just sent to your phone.',
-      expectedValue: expectedOtp ? String(expectedOtp) : null,
-      instructions: 'Let the caller know you are waiting for the code and confirm once it is received.',
-      successMessage: 'Great, the code looks good. Continue with the next verification step.',
-      failureMessage: 'That code did not match. Offer to resend and ask them to try again carefully.',
-      hint: metadataPayload.otp_hint || undefined,
-    }, metadataPayload));
-  }
-
-  const expectedPin = metadataPayload.expected_pin;
-  const pinDigits = Number(metadataPayload.pin_length || metadataPayload.pin_digits || (expectedPin ? String(expectedPin).length : 4));
-  const needPin = Boolean(expectedPin) || Boolean(metadataPayload.require_pin) || metadataPayload.secure_profile === 'bank';
-
-  if (needPin) {
-    stages.push(enhanceStageDefinition({
-      stage: 'PIN',
-      label: metadataPayload.pin_label || 'Account PIN',
-      numDigits: pinDigits || fallbackDigits || 4,
-      prompt:
-        metadataPayload.pin_prompt ||
-        'Please enter the account PIN we have on file.',
-      expectedValue: expectedPin ? String(expectedPin) : null,
-      instructions: 'Remind the caller to take their time and to speak clearly if they prefer speech input.',
-      successMessage: 'Thank you, that PIN matches. Let’s verify one last detail.',
-      failureMessage: 'That PIN did not match our records. Offer to try again or reset it.',
-      hint: metadataPayload.pin_hint || undefined,
-    }, metadataPayload));
-  }
-
-  if (metadataPayload.require_card_type || metadataPayload.card_type_prompt) {
-    stages.push(enhanceStageDefinition({
-      stage: 'CARD_TYPE',
-      label: metadataPayload.card_type_label || 'Card Type',
-      prompt:
-        metadataPayload.card_type_prompt ||
-        'Tell me the card type on file (for example Visa, Mastercard, Amex).',
-      instructions: 'Listen for a short response and confirm the card type back to the caller.',
-      successMessage: 'Card type captured. Moving on.',
-      failureMessage: 'I did not catch that card type. Ask the caller to repeat it clearly.',
-      hint: metadataPayload.card_type_hint || undefined,
-    }, metadataPayload));
-  }
-
-  if (metadataPayload.require_card_last4 || metadataPayload.expected_card_last4) {
-    stages.push(enhanceStageDefinition({
-      stage: 'CARD_LAST4',
-      label: metadataPayload.card_last4_label || 'Card Last 4',
-      numDigits: 4,
-      prompt:
-        metadataPayload.card_last4_prompt ||
-        'Please enter the last four digits of the card we have on file.',
-      expectedValue: metadataPayload.expected_card_last4 ? String(metadataPayload.expected_card_last4) : null,
-      instructions: 'Let the caller know this confirms the account ownership.',
-      successMessage: 'Perfect—verification is complete.',
-      failureMessage: 'Those digits do not match. Offer a retry or alternate verification.',
-      hint: metadataPayload.card_last4_hint || undefined,
-    }, metadataPayload));
-  }
-
-  if (metadataPayload.require_zip || metadataPayload.billing_zip_prompt) {
-    stages.push(enhanceStageDefinition({
-      stage: 'BILLING_ZIP',
-      label: metadataPayload.billing_zip_label || 'Billing ZIP',
-      numDigits: Number(metadataPayload.billing_zip_length || 5),
-      prompt:
-        metadataPayload.billing_zip_prompt ||
-        'What is the billing ZIP code associated with your account?',
-      instructions: 'Repeat the ZIP code back to confirm before proceeding.',
-      hint: metadataPayload.billing_zip_hint || undefined,
-    }, metadataPayload));
-  }
-
-  if (!stages.length && (metadataPayload.enable_structured_inputs || metadataPayload.secure_profile === 'bank')) {
-    return DEFAULT_SECURE_INPUT_TEMPLATE.map((entry) => enhanceStageDefinition({ ...entry }, metadataPayload));
-  }
-
-  return stages;
-}
-
-function ensureStructuredInputSequence(callConfig, metadataPayload) {
-  const hasSequence =
-    Array.isArray(callConfig.collect_input_sequence) && callConfig.collect_input_sequence.length > 0;
-  const hasMetadataSequence =
-    Array.isArray(metadataPayload.input_sequence) && metadataPayload.input_sequence.length > 0;
-
-  if (hasSequence && !hasMetadataSequence) {
-    metadataPayload.input_sequence = callConfig.collect_input_sequence;
-    return;
-  }
-
-  if (hasSequence || hasMetadataSequence) {
-    return;
-  }
-
-  const structuredNeeded =
-    Boolean(metadataPayload.enable_structured_inputs) ||
-    Boolean(metadataPayload.expected_otp) ||
-    Boolean(metadataPayload.require_pin) ||
-    Boolean(metadataPayload.secure_profile);
-
-  if (!structuredNeeded) {
-    return;
-  }
-
-  const structuredSequence = buildStructuredInputSequence(metadataPayload, callConfig.collect_digits);
-  if (structuredSequence.length) {
-    callConfig.collect_input_sequence = structuredSequence;
-    metadataPayload.input_sequence = structuredSequence;
-  }
-}
-
-
-function normalizePhoneDigits(value) {
-  if (!value) {
-    return null;
-  }
-  const digits = String(value).replace(/\D/g, '');
-  return digits || null;
-}
-
-function describePhonePreview(value) {
-  const digits = normalizePhoneDigits(value);
-  if (!digits) {
-    return 'unknown';
-  }
-  if (digits.length <= 4) {
-    return digits;
-  }
-  return `•••${digits.slice(-4)}`;
-}
-
-function performDualChannelVerification(callRecord, stageDefinition, digits) {
-  if (
-    !callRecord ||
-    !stageDefinition ||
-    !Array.isArray(stageDefinition.secondaryChecks) ||
-    !stageDefinition.secondaryChecks.length
-  ) {
-    return null;
-  }
-
-  const metadata = parseMetadataJson(callRecord.metadata_json) || {};
-  const results = [];
-  const normalizedStage = dtmfUtils.normalizeStage(stageDefinition.stage || stageDefinition.stageKey || stageDefinition.label);
-
-  const checks = stageDefinition.secondaryChecks.map((entry) =>
-    typeof entry === 'string' ? { type: entry } : entry || {}
-  );
-
-  checks.forEach((check) => {
-    switch (check.type) {
-      case 'registered_phone': {
-        const registered = check.field ? metadata[check.field] : metadata.registered_phone_number;
-        const observed = callRecord.phone_number || metadata.dialed_number;
-        if (!registered || !observed) {
-          results.push({
-            type: 'registered_phone',
-            status: 'missing_reference',
-            label: check.label || 'Registered phone',
-          });
-        } else {
-          const match = normalizePhoneDigits(registered) === normalizePhoneDigits(observed);
-          results.push({
-            type: 'registered_phone',
-            status: match ? 'match' : 'mismatch',
-            label: check.label || 'Registered phone',
-            reference: describePhonePreview(registered),
-            observed: describePhonePreview(observed),
-          });
-        }
-        break;
-      }
-      case 'crm_record': {
-        const crmId = metadata.crm_contact_id || metadata.crm_id || metadata.customer_id;
-        if (!crmId) {
-          results.push({
-            type: 'crm_record',
-            status: 'missing_reference',
-            label: check.label || 'CRM record',
-          });
-        } else {
-          results.push({
-            type: 'crm_record',
-            status: 'match',
-            label: check.label || 'CRM record',
-            reference: crmId,
-          });
-        }
-        break;
-      }
-      case 'crm_shadow': {
-        const shadowValues = metadata.crm_shadow_values || {};
-        const expectedShadow =
-          shadowValues[normalizedStage] ||
-          shadowValues[stageDefinition.stageKey] ||
-          shadowValues[stageDefinition.stage];
-        if (!expectedShadow) {
-          results.push({
-            type: 'crm_shadow',
-            status: 'missing_reference',
-            label: check.label || 'CRM mirror',
-          });
-        } else {
-          const match = String(expectedShadow) === String(digits);
-          results.push({
-            type: 'crm_shadow',
-            status: match ? 'match' : 'mismatch',
-            label: check.label || 'CRM mirror',
-            reference: expectedShadow,
-          });
-        }
-        break;
-      }
-      default:
-        break;
-    }
-  });
-
-  if (!results.length) {
-    return null;
-  }
-
-  const failing = results.find((entry) => entry.status === 'mismatch');
-  const missing = results.find((entry) => entry.status === 'missing_reference');
-
-  return {
-    hasIssue: Boolean(failing || missing),
-    issue: failing || missing || null,
-    results,
-  };
-}
-
-function sanitizeDigits(rawInput) {
-  if (rawInput == null) {
-    return '';
-  }
-  return String(rawInput).replace(/[^0-9*#]/g, '');
-}
-
-function sanitizeCustomerName(rawName) {
-  if (!rawName) {
-    return null;
-  }
-  const cleaned = rawName
-    .toString()
-    .replace(/[^a-zA-Z0-9\s'\-]/g, '')
-    .replace(/\s{2,}/g, ' ')
-    .trim();
-  return cleaned || null;
-}
-
-function buildPersonalizedFirstMessage(baseMessage, customerName, personaLabel) {
-  if (!customerName) {
-    return baseMessage;
-  }
-  const greeting = `Hello ${customerName}!`;
-  const trimmedBase = (baseMessage || '').trim();
-  if (!trimmedBase) {
-    const brand = personaLabel || 'our team';
-    return `${greeting} Welcome to ${brand}! For your security, we'll complete a quick verification to help protect your account from online fraud. If you've received your 6-digit one-time password by SMS, please enter it now.`;
-  }
-  const withoutExistingGreeting = trimmedBase.replace(/^hello[^.!?]*[.!?]?\s*/i, '').trim();
-  const remainder = withoutExistingGreeting.length ? withoutExistingGreeting : trimmedBase;
-  return `${greeting} ${remainder}`;
-}
-
-async function persistDtmfCapture(callSid, digits, options = {}) {
-  if (!callSid || !db) {
-    return;
-  }
-
-  const sanitizedDigits = sanitizeDigits(digits);
-  if (!sanitizedDigits) {
-    return;
-  }
-
-  const {
-    source = currentProvider,
-    provider = currentProvider,
-    stage_key: stageKeyOverride = null,
-    stage_label: stageLabelOverride = null,
-    metadata: metadataOverride = {},
-    finished = undefined,
-    reason = undefined,
-    capture_method: captureMethod = 'stream',
-    skipCallInputInsert = false,
-    callInputStep: providedCallInputStep = null,
-  } = options;
-
-  try {
-    const callRecord = await db.getCall(callSid);
-    if (!callRecord) {
-      console.warn(`⚠️ DTMF capture skipped; missing call record for ${callSid}`);
-      return;
-    }
-
-    const callMetadata = parseMetadataJson(callRecord.metadata_json) || {};
-    const inputSequence = Array.isArray(callMetadata.input_sequence) ? callMetadata.input_sequence : [];
-
-    let callInputStep = typeof providedCallInputStep === 'number' ? providedCallInputStep : null;
-    if (callRecord.call_type === 'collect_input' && !skipCallInputInsert) {
-      callInputStep = await db.getNextCallInputStep(callSid);
-      await db.saveCallInput({
-        call_sid: callSid,
-        step: callInputStep,
-        input_type: 'digit',
-        value: sanitizedDigits,
-      });
-    }
-
-    const metadataEnvelope =
-      metadataOverride && typeof metadataOverride === 'object' && !Array.isArray(metadataOverride)
-        ? { ...metadataOverride }
-        : {};
-
-    if (callInputStep) {
-      metadataEnvelope.call_input_step = callInputStep;
-    }
-
-    let stageKey = stageKeyOverride ? dtmfUtils.normalizeStage(stageKeyOverride) : null;
-    let stageLabel = stageLabelOverride || null;
-
-    if (!stageKey && metadataEnvelope.stage_key) {
-      stageKey = dtmfUtils.normalizeStage(metadataEnvelope.stage_key);
-    }
-
-    if (callRecord.call_type === 'collect_input') {
-      const stepIndex = callInputStep && inputSequence.length ? callInputStep - 1 : 0;
-      const stageConfig =
-        (typeof stepIndex === 'number' && inputSequence[stepIndex]) || inputSequence[inputSequence.length - 1];
-      if (stageConfig) {
-        if (!stageKey && stageConfig.stage) {
-          stageKey = dtmfUtils.normalizeStage(stageConfig.stage);
-        } else if (!stageKey && stageConfig.label) {
-          stageKey = dtmfUtils.normalizeStage(stageConfig.label);
-        }
-        if (!stageLabel && stageConfig.label) {
-          stageLabel = stageConfig.label;
-        }
-      }
-    }
-
-    if (!stageKey) {
-      stageKey = 'GENERIC';
-    }
-    const stageDefinition = dtmfUtils.getStageDefinition(stageKey);
-    const resolvedStageLabel = stageLabel || stageDefinition.label;
-
-    const normalizedMetadata = {
-      ...metadataEnvelope,
-      source,
-      provider,
-      capture_method: captureMethod,
-      stage_label: resolvedStageLabel,
-    };
-
-    if (typeof finished === 'boolean') {
-      normalizedMetadata.finished = finished;
-    }
-    if (reason) {
-      normalizedMetadata.reason = reason;
-    }
-
-    Object.keys(normalizedMetadata).forEach((key) => {
-      if (normalizedMetadata[key] === undefined || normalizedMetadata[key] === null) {
-        delete normalizedMetadata[key];
-      }
-    });
-
-    const compliancePayload = dtmfUtils.savePayloadForCompliance(stageKey, sanitizedDigits, provider, normalizedMetadata);
-
-    await db.saveDtmfEntry({
-      call_sid: callSid,
-      stage_key: compliancePayload.metadata.stage_key,
-      masked_digits: compliancePayload.maskedDigits,
-      encrypted_digits: compliancePayload.encryptedDigits,
-      compliance_mode: complianceConfig?.mode || 'safe',
-      provider,
-      metadata: compliancePayload.metadata,
-    });
-
-    await db.updateCallState(callSid, 'dtmf_captured', {
-      stage_key: compliancePayload.metadata.stage_key,
-      masked_digits: compliancePayload.maskedDigits,
-      digits_preview: sanitizedDigits,
-      provider,
-      metadata: normalizedMetadata,
-    });
-
-    await db.markCallHasInput(callSid, sanitizedDigits);
-
-    const targetChatId = callRecord.telegram_chat_id || callRecord.user_chat_id;
-    if (callRecord.call_type !== 'collect_input' && targetChatId) {
-      await db.createEnhancedWebhookNotification(callSid, 'call_input_dtmf', targetChatId, 'high');
-    }
-
-    await db.logServiceHealth('call_system', 'dtmf_captured', {
-      call_sid: callSid,
-      digits_length: sanitizedDigits.length,
-      stage_key: compliancePayload.metadata.stage_key,
-      source,
-    });
-
-    await callHintStateMachine.handleDtmfCapture(callSid, {
-      call: callRecord,
-      provider,
-      metadata: normalizedMetadata
-    });
-
-    const digitsPreview = sanitizedDigits;
-    console.log(`🔢 Captured DTMF input for ${callSid}: ${digitsPreview}`.cyan);
-
-    return {
-      stageKey: compliancePayload.metadata.stage_key,
-      stageLabel: resolvedStageLabel,
-      digits: sanitizedDigits,
-      callRecord,
-    };
-  } catch (error) {
-    console.error('❌ Failed to persist DTMF input:', error);
-  }
-}
-
-async function evaluateInputStage(callSid, summary, metadataEnvelope = {}, interactionIndex = null) {
-  if (!callSid || !summary || !summary.digits) {
-    return null;
-  }
-
-  const orchestrator = inputOrchestrators.get(callSid);
-  const guidance = orchestrator ? orchestrator.handleInput(summary.stageKey, summary.digits, metadataEnvelope) : null;
-  const stageDefinition = orchestrator?.getStageDefinition
-    ? orchestrator.getStageDefinition(summary.stageKey)
-    : null;
-  const stageDisplay = guidance?.stageLabel || summary.stageLabel || summary.stageKey || 'Entry';
-  const transcriptLine = `[Keypad] ${stageDisplay}: ${summary.digits}`;
-  const callRecord = summary.callRecord || (await db.getCall(callSid));
-  const dualChannel = stageDefinition
-    ? performDualChannelVerification(callRecord, stageDefinition, summary.digits)
-    : null;
-
-  try {
-    await db.addTranscript({
-      call_sid: callSid,
-      speaker: 'user',
-      message: transcriptLine,
-      interaction_count: typeof interactionIndex === 'number' ? interactionIndex : null,
-    });
-
-    await db.updateCallState(callSid, 'dtmf_verified', {
-      stage_key: summary.stageKey,
-      digits_preview: summary.digits,
-      verification: guidance?.status || 'captured',
-      expected_value: guidance?.expectedValue || null,
-      expected_length: guidance?.expectedLength || null,
-      workflow_completed: guidance?.workflowComplete || false,
-      next_stage_key: guidance?.nextStage?.stageKey || null,
-      needs_retry: guidance?.needsRetry || false,
-      attempts: guidance?.attempts || 1,
-      clarification_prompt: guidance?.clarificationPrompt || null,
-      offer_speech: Boolean(guidance?.shouldOfferSpeechFallback),
-      confirm_digits: Boolean(guidance?.shouldConfirmDigits),
-      detected_issues: guidance?.detectedIssues || [],
-      provider_confidence: guidance?.providerConfidence ?? null,
-      dual_channel: dualChannel,
-      metadata: metadataEnvelope,
-    });
-  } catch (dbError) {
-    console.error('Database error logging keypad transcript:', dbError);
-  }
-
-  try {
-    await db.logServiceHealth('call_system', 'dtmf_forwarded', {
-      call_sid: callSid,
-      stage_key: summary.stageKey,
-      verification: guidance?.status || 'captured',
-    });
-  } catch (healthError) {
-    console.warn('Failed to log dtmf_forwarded health event:', healthError.message);
-  }
-  if (dualChannel?.hasIssue) {
-    try {
-      await db.logServiceHealth('call_system', 'dual_channel_alert', {
-        call_sid: callSid,
-        stage_key: summary.stageKey,
-        issue: dualChannel.issue || null,
-      });
-    } catch (dualLogError) {
-      console.warn('Failed to log dual channel alert:', dualLogError.message);
-    }
-  }
-
-  try {
-    const targetChatId = callRecord?.telegram_chat_id || callRecord?.user_chat_id;
-    if (targetChatId) {
-      const notificationType = guidance?.needsRetry ? 'call_step_retry' : 'call_step_complete';
-      const priority = guidance?.needsRetry ? 'urgent' : 'high';
-      await db.createEnhancedWebhookNotification(callSid, notificationType, targetChatId, priority);
-      if (guidance?.workflowComplete) {
-        await db.createEnhancedWebhookNotification(callSid, 'call_workflow_complete', targetChatId, 'high');
-      }
-      if (dualChannel?.hasIssue) {
-        await db.createEnhancedWebhookNotification(callSid, 'call_dual_channel_alert', targetChatId, 'urgent');
-      }
-    }
-  } catch (notificationError) {
-    console.error('Failed to enqueue structured input notification:', notificationError);
-  }
-
-  return { guidance, stageDisplay, callRecord, dualChannel };
-}
-
-function extractDigitsFromPayload(candidate) {
-  if (candidate == null) {
-    return '';
-  }
-  if (typeof candidate === 'string' || typeof candidate === 'number') {
-    return String(candidate);
-  }
-  if (typeof candidate === 'object') {
-    if (typeof candidate.digits === 'string') {
-      return candidate.digits;
-    }
-    if (typeof candidate.Digits === 'string') {
-      return candidate.Digits;
-    }
-    if (typeof candidate.value === 'string') {
-      return candidate.value;
-    }
-  }
-  return '';
-}
-
-function toBoolean(value) {
-  if (typeof value === 'boolean') return value;
-  if (typeof value === 'string') {
-    const normalized = value.trim().toLowerCase();
-    return ['true', '1', 'yes', 'y'].includes(normalized);
-  }
-  return false;
-}
-
-function getDefaultInputSequence(numDigits = 4) {
-  return [
-    {
-      stage: 'ENTRY',
-      label: 'Entry',
-      prompt: 'Please enter the requested digits followed by the pound key.',
-      numDigits: Number(numDigits) || null,
-      timeout: 5
-    }
-  ];
-}
-
-function normalizeInputSequencePayload(rawSequence, fallbackDigits = 4) {
-  if (!Array.isArray(rawSequence) || rawSequence.length === 0) {
-    return getDefaultInputSequence(fallbackDigits);
-  }
-
-  return rawSequence.map((step, index) => {
-    const normalizedStage = (step?.stage || `STEP_${index + 1}`).toString().toUpperCase();
-    return {
-      stage: normalizedStage,
-      label: step?.label || normalizedStage,
-      prompt: step?.prompt || `Please provide input for ${normalizedStage}.`,
-      numDigits: step?.numDigits ? Number(step.numDigits) : null,
-      timeout: step?.timeout ? Number(step.timeout) : 5,
-      thankYou: step?.thankYou || null
-    };
-  });
-}
-
-function parseMetadataJson(value) {
-  if (!value) return null;
-  if (typeof value === 'object') return value;
-  try {
-    return JSON.parse(value);
-  } catch (error) {
-    console.warn('Failed to parse metadata_json:', error.message);
-    return null;
-  }
-}
-
-function removeCallConfiguration(callSid) {
-  if (!callSid) {
-    return;
-  }
-  callConfigurations.delete(callSid);
-  inputOrchestrators.delete(callSid);
-}
-
-async function handleCollectInputRequest(req, res, callRecord) {
-  const callSid = req.body?.CallSid || req.query?.CallSid;
-  if (!callSid) {
-    res.status(400).send('Missing CallSid');
-    return;
-  }
-
-  const callConfig = callConfigurations.get(callSid) || {};
-  const metadata = parseMetadataJson(callRecord?.metadata_json) || {};
-  const sequenceFromConfig = Array.isArray(callConfig.collect_input_sequence) ? callConfig.collect_input_sequence : null;
-  const sequenceFromMetadata = Array.isArray(metadata.input_sequence) ? metadata.input_sequence : null;
-  const inputSequence = (sequenceFromConfig && sequenceFromConfig.length)
-    ? sequenceFromConfig
-    : (sequenceFromMetadata && sequenceFromMetadata.length)
-      ? sequenceFromMetadata
-      : getDefaultInputSequence(callConfig.collect_digits || 4);
-
-  const thankYouMessage = callConfig.collectThankYouMessage
-    || 'Thank you for verifying your information. Your data has been securely recorded. Have a great day.';
-
-  const digits = req.body?.Digits;
-  const speechResult = req.body?.SpeechResult;
-  const confidence = req.body?.Confidence ? Number(req.body.Confidence) : null;
-  const stageParam = parseInt(req.query?.gather_stage || req.body?.GatherStage || '0', 10);
-
-  if (digits || speechResult) {
-    const pendingStep = !Number.isNaN(stageParam) && stageParam > 0
-      ? stageParam
-      : await db.getNextCallInputStep(callSid);
-    const normalizedValue = digits ? String(digits) : String(speechResult);
-    const inputType = digits ? 'digit' : 'speech';
-
-    await db.saveCallInput({
-      call_sid: callSid,
-      step: pendingStep,
-      input_type: inputType,
-      value: normalizedValue,
-      confidence: digits ? null : confidence
-    });
-
-    await db.markCallHasInput(callSid, normalizedValue);
-
-    if (digits) {
-      const stageConfig = inputSequence[pendingStep - 1] || inputSequence[inputSequence.length - 1];
-      const stageKey = stageConfig?.stage || `STEP_${pendingStep}`;
-      const gatherMetadata = {
-        stage_label: stageConfig?.label,
-        gather_stage: pendingStep,
-        sequence_length: inputSequence.length,
-      };
-      const captureSummary = await persistDtmfCapture(callSid, digits, {
-        source: 'twilio',
-        provider: 'twilio',
-        stage_key: stageKey,
-        stage_label: stageConfig?.label,
-        callInputStep: pendingStep,
-        skipCallInputInsert: true,
-        capture_method: 'twilio_gather',
-        metadata: gatherMetadata,
-      });
-      if (captureSummary) {
-        await evaluateInputStage(callSid, captureSummary, gatherMetadata);
-      }
-    }
-  }
-
-  const collectedInputs = await db.getCallInputs(callSid);
-  if (collectedInputs.length >= inputSequence.length) {
-    const response = new VoiceResponse();
-    response.say(thankYouMessage);
-    response.hangup();
-    res.type('text/xml').send(response.toString());
-    await finalizeCollectInputCall(callSid, callRecord);
-    removeCallConfiguration(callSid);
-    return;
-  }
-
-  const nextStepIndex = collectedInputs.length;
-  const stepConfig = inputSequence[nextStepIndex] || inputSequence[inputSequence.length - 1];
-  const response = new VoiceResponse();
-  const gatherOptions = {
-    input: 'dtmf speech',
-    action: `${publicHttpBase}/incoming?CallSid=${encodeURIComponent(callSid)}&gather_stage=${nextStepIndex + 1}`,
-    method: 'POST',
-    timeout: stepConfig.timeout || 5
-  };
-  if (stepConfig.numDigits) {
-    gatherOptions.numDigits = Number(stepConfig.numDigits);
-  }
-  const gather = response.gather(gatherOptions);
-  gather.say(stepConfig.prompt || 'Please provide your input now.');
-  response.say('No input received, let\'s try again.');
-  response.redirect(`${publicHttpBase}/incoming?CallSid=${encodeURIComponent(callSid)}`);
-  res.type('text/xml').send(response.toString());
-}
-
-async function finalizeCollectInputCall(callSid, callDetails) {
-  if (!callSid || collectInputCompletion.has(callSid)) {
-    return;
-  }
-  collectInputCompletion.add(callSid);
-  try {
-    const details = callDetails || await db.getCall(callSid);
-    const targetChatId = details?.telegram_chat_id || details?.user_chat_id;
-    await db.updateCallStatus(callSid, 'completed', {
-      ended_at: new Date().toISOString()
-    });
-
-    if (targetChatId) {
-      // Summary notifications are handled once the final call outcome is classified.
-    }
-    if (callConfigurations.has(callSid)) {
-      removeCallConfiguration(callSid);
-    }
-    setTimeout(() => collectInputCompletion.delete(callSid), 60 * 60 * 1000);
-  } catch (error) {
-    console.error('Failed to finalize collect-input call:', error);
-  }
-}
-
-async function finalizeCallOutcome(callSid, options = {}) {
-  if (!db) {
-    return;
-  }
-
-  let callRecord = options.call || (await db.getCall(callSid));
-  if (!callRecord) {
-    return;
-  }
-
-  if (callRecord.final_outcome && !options.force) {
-    const pendingNotificationChat = callRecord.outcome_notified_at
-      ? null
-      : callRecord.telegram_chat_id || callRecord.user_chat_id;
-    if (pendingNotificationChat) {
-      await db.createEnhancedWebhookNotification(callSid, 'call_outcome_summary', pendingNotificationChat, 'high');
-    }
-    return;
-  }
-
-  const finalStatus = (options.finalStatus || callRecord.twilio_status || callRecord.status || '').toLowerCase();
-  const answeredCandidate = options.answeredBy || callRecord.answered_by || callRecord.amd_status;
-  const normalizedAnswer = normalizeAnsweredBy(answeredCandidate);
-
-  let hasInput = Boolean(callRecord.has_input) || Boolean(callRecord.latest_input_preview);
-  let latestInputPreview = callRecord.latest_input_preview;
-
-  if (!hasInput) {
-    const latestEntry = await db.getLatestDtmfEntry(callSid);
-    if (latestEntry) {
-      hasInput = true;
-      latestInputPreview =
-        dtmfUtils.decryptDigits(latestEntry.encrypted_digits) || latestEntry.masked_digits || latestInputPreview;
-    } else {
-      const callInputs = await db.getCallInputs(callSid);
-      if (callInputs.length > 0) {
-        hasInput = true;
-      }
-    }
-  }
-
-  const wasAnswered =
-    Boolean(callRecord.was_answered) ||
-    options.wasAnswered ||
-    ['answered', 'in-progress', 'completed'].includes(finalStatus) ||
-    Boolean(normalizedAnswer);
-
-  let outcome;
-  if (finalStatus === 'busy') {
-    outcome = 'BUSY';
-  } else if (finalStatus === 'failed') {
-    outcome = 'FAILED';
-  } else if (finalStatus === 'canceled') {
-    outcome = 'CANCELED';
-  } else if (hasInput) {
-    outcome = 'ANSWERED_WITH_INPUT';
-  } else if (isMachineAnsweredBy(normalizedAnswer)) {
-    outcome = 'ANSWERED_NO_INPUT_MACHINE';
-  } else if (isHumanAnsweredBy(normalizedAnswer) || wasAnswered) {
-    outcome = 'ANSWERED_NO_INPUT_HUMAN';
-  } else {
-    outcome = 'NO_ANSWER';
-  }
-
-  await db.setFinalOutcome(callSid, outcome, {
-    answered_by: answeredCandidate || callRecord.answered_by,
-    has_input: hasInput ? 1 : 0,
-    latest_input_preview: latestInputPreview,
-    was_answered: wasAnswered ? 1 : 0,
-  });
-
-  callRecord = await db.getCall(callSid);
-  const targetChatId = callRecord?.telegram_chat_id || callRecord?.user_chat_id;
-  if (targetChatId) {
-    await db.createEnhancedWebhookNotification(callSid, 'call_outcome_summary', targetChatId, 'high');
-  }
-}
-
-function parseDtmfMetadata(metadata) {
-  if (!metadata) {
-    return {};
-  }
-  if (typeof metadata === 'object' && !Array.isArray(metadata)) {
-    return metadata;
-  }
-  try {
-    return JSON.parse(metadata);
-  } catch (error) {
-    console.warn('Failed to parse DTMF metadata payload:', error.message);
-    return { raw: metadata };
-  }
-}
-
-function formatDtmfEntriesForResponse(entries = []) {
-  const revealRaw = true;
-
-  return entries.map((entry) => {
-    const stageKey = dtmfUtils.normalizeStage(entry.stage_key || 'generic');
-    const metadata = parseDtmfMetadata(entry.metadata);
-    const decrypted = entry.encrypted_digits ? dtmfUtils.decryptDigits(entry.encrypted_digits) : null;
-    const rawDigits = revealRaw ? decrypted : null;
-    const displayDigits = rawDigits || entry.masked_digits;
-    const stageDefinition = dtmfUtils.getStageDefinition(stageKey);
-
-    const formatted = {
-      id: entry.id,
-      call_sid: entry.call_sid,
-      stage_key: stageKey,
-      label: stageDefinition.label,
-      digits: displayDigits,
-      masked_digits: entry.masked_digits,
-      received_at: entry.received_at,
-      compliance_mode: entry.compliance_mode,
-      provider: entry.provider,
-      metadata
-    };
-
-    if (rawDigits) {
-      formatted.raw_digits = rawDigits;
-    }
-
-    if (typeof metadata?.length === 'number') {
-      formatted.length = metadata.length;
-    } else if (entry.masked_digits) {
-      formatted.length = String(entry.masked_digits).replace(/[^*•0-9]/g, '').length;
-    }
-
-    return formatted;
-  });
-}
-
-async function ensureAwsAdapters() {
-  if (awsAdapters) {
-    return awsAdapters;
-  }
-  try {
-    awsAdapters = {
-      connect: new AwsConnectAdapter(awsConfig),
-      tts: new AwsTtsAdapter(awsConfig),
-      sms: new AwsSmsAdapter(awsConfig)
-    };
-    console.log('✅ AWS adapters initialized (Connect, Polly, Pinpoint)'.green);
-    return awsAdapters;
-  } catch (error) {
-    awsAdapters = null;
-    console.error('❌ Failed to initialize AWS adapters:', error.message);
-    throw error;
-  }
-}
-
-async function ensureVonageAdapters() {
-  if (vonageAdapters) {
-    return vonageAdapters;
-  }
-
-  const { apiKey, apiSecret, applicationId, privateKey } = vonageConfig || {};
-  if (!apiKey || !apiSecret || !applicationId || !privateKey) {
-    throw new Error('Vonage configuration is incomplete. Set VONAGE_API_KEY, VONAGE_API_SECRET, VONAGE_APPLICATION_ID, and VONAGE_PRIVATE_KEY.');
-  }
-
-  try {
-    vonageAdapters = {
-      voice: new VonageVoiceAdapter(vonageConfig),
-      sms: new VonageSmsAdapter(vonageConfig),
-    };
-    console.log('✅ Vonage adapters initialized (Voice, SMS)'.green);
-    return vonageAdapters;
-  } catch (error) {
-    vonageAdapters = null;
-    console.error('❌ Failed to initialize Vonage adapters:', error.message);
-    throw error;
-  }
-}
-
-async function applyProvider(provider, options = {}) {
-  const normalized = SUPPORTED_CALL_PROVIDERS.includes((provider || '').toLowerCase())
-    ? provider.toLowerCase()
-    : 'twilio';
-  const { persist = true } = options;
-  const previousProvider = currentProvider;
-
-  if (normalized === 'twilio' && previousProvider !== 'twilio') {
-    if (!twilioAccountSid || !twilioAuthToken || !twilioFromNumber) {
-      throw new Error('Twilio credentials are required to activate the Twilio provider');
-    }
-  }
-
-  if (normalized === 'aws') {
-    await ensureAwsAdapters();
-    smsService.setProvider('aws', awsAdapters?.sms || null);
-    vonageCallIndex.clear();
-  } else if (normalized === 'vonage') {
-    const adapters = await ensureVonageAdapters();
-    if (!vonageConfig?.voice?.fromNumber) {
-      console.warn('⚠️ Vonage voice from number not configured. Calls may fail.'.yellow);
-    }
-    smsService.setProvider('vonage', adapters?.sms || null);
-    awsCallSessions.clear();
-    awsContactIndex.clear();
-  } else {
-    if (!twilioAccountSid || !twilioAuthToken || !twilioFromNumber) {
-      console.warn('⚠️ Twilio provider active but Twilio credentials appear incomplete. Outbound calls may fail.'.yellow);
-    }
-    smsService.setProvider('twilio');
-    awsCallSessions.clear();
-    awsContactIndex.clear();
-    if (normalized === 'twilio') {
-      vonageCallIndex.clear();
-    }
-  }
-
-  currentProvider = normalized;
-  isAwsProvider = normalized === 'aws';
-  platform.provider = currentProvider;
-
-  if (persist && db && typeof db.setSystemSetting === 'function') {
-    try {
-      await db.setSystemSetting('call_provider', currentProvider);
-    } catch (error) {
-      console.error('Failed to persist call provider setting:', error);
-    }
-  }
-
-  if (previousProvider !== currentProvider) {
-    console.log(`🔁 Switched active call provider: ${previousProvider?.toUpperCase()} → ${currentProvider.toUpperCase()}`.cyan);
-  } else {
-    console.log(`ℹ️ Call provider remains ${currentProvider.toUpperCase()}`.gray);
-  }
-
-  return { changed: previousProvider !== currentProvider, provider: currentProvider };
-}
-
-async function synchronizeProviderFromSettings() {
-  if (!db || typeof db.getSystemSetting !== 'function') {
-    return;
-  }
-  try {
-    const storedProvider = await db.getSystemSetting('call_provider');
-    if (storedProvider) {
-      await applyProvider(storedProvider, { persist: false });
-    } else {
-      await applyProvider(currentProvider, { persist: true });
-    }
-  } catch (error) {
-    console.error('Failed to synchronize call provider from settings:', error);
-  }
-}
-
-function requireAdminAuth(req, res, next) {
-  if (!adminConfig?.apiToken) {
-    res.status(503).json({ error: 'Admin API token not configured' });
-    return;
-  }
-
-  const headerToken = req.headers['x-admin-token'] || req.headers['x-admin-secret'];
-  const queryToken = req.query?.admin_token;
-  const providedToken = (headerToken || queryToken || '').toString();
-
-  if (providedToken !== adminConfig.apiToken) {
-    res.status(401).json({ error: 'Unauthorized' });
-    return;
-  }
-
-  next();
-}
-
-function buildGptService(callSid, callConfig, functionSystem) {
-  let gptService;
-  const hasAdaptiveConfig = callConfig && functionSystem;
-  if (hasAdaptiveConfig) {
-    const context = functionSystem.context || {};
-    console.log(`🎭 Using adaptive configuration for ${context.industry || 'general'} industry`.green);
-    console.log(`🔧 Available functions: ${Object.keys(functionSystem.implementations).join(', ')}`.cyan);
-
-    const promptOverride = callConfig.promptOverride ?? null;
-    const firstMessageOverride = callConfig.firstMessageOverride ?? null;
-    gptService = new EnhancedGptService(promptOverride, firstMessageOverride);
-    gptService.setDynamicFunctions(functionSystem.functions, functionSystem.implementations);
-  } else {
-    console.log(`🎯 Standard call detected: ${callSid}`.yellow);
-    gptService = new EnhancedGptService();
-  }
-
-  gptService.setCallSid(callSid);
-  if (callConfig?.persona_metadata) {
-    gptService.setPersonaMetadata(callConfig.persona_metadata);
-  }
-  const metadataPayload = parseMetadataJson(callConfig?.metadata_json) || {};
-  const structuredSequence =
-    (Array.isArray(callConfig?.collect_input_sequence) && callConfig.collect_input_sequence.length
-      ? callConfig.collect_input_sequence
-      : null) ||
-    (Array.isArray(metadataPayload.input_sequence) ? metadataPayload.input_sequence : null);
-  if (Array.isArray(structuredSequence) && structuredSequence.length) {
-    gptService.setStructuredInputSequence(structuredSequence);
-  }
-
-  return gptService;
-}
-
-async function synthesizeAndQueueAwsSpeech(session, message, interactionCount, options = {}) {
-  if (!message || !awsAdapters?.tts || !awsAdapters?.connect) {
-    return;
-  }
-
-  try {
-    const voiceOptions = {};
-    if (options.voiceId || session.voiceModel) {
-      voiceOptions.voiceId = options.voiceId || session.voiceModel;
-    }
-
-    const metadata = {
-      call_sid: session.callSid,
-      interaction_index: interactionCount,
-      personality: options.personalityName || 'default'
-    };
-
-    const result = await awsAdapters.tts.synthesizeToS3(message, {
-      ...metadata,
-      ...voiceOptions
-    });
-
-    await awsAdapters.connect.enqueueAudioPlayback({
-      contactId: session.contactId,
-      audioKey: result.key,
-      additionalAttributes: {
-        NEXT_PROMPT_BUCKET: result.bucket,
-        NEXT_PROMPT_TEXT: message,
-        INTERACTION_INDEX: String(interactionCount),
-        CALL_SID: session.callSid
-      }
-    });
-
-    await db.updateCallState(session.callSid, 'ai_audio_enqueued', {
-      interaction_count: interactionCount,
-      s3_bucket: result.bucket,
-      s3_key: result.key
-    });
-  } catch (error) {
-    console.error('Failed to synthesize or enqueue AWS speech:', error);
-    await db.logServiceHealth('aws_tts', 'error', {
-      call_sid: session.callSid,
-      message: error.message
-    });
-  }
-}
-
-async function handleAwsGptReply(session, gptReply, interactionIndex) {
-  const personalityInfo = gptReply.personalityInfo || {};
-  const message = gptReply.partialResponse;
-  if (!message) {
-    return;
-  }
-
-  try {
-    await db.addTranscript({
-      call_sid: session.callSid,
-      speaker: 'ai',
-      message,
-      interaction_count: interactionIndex,
-      personality_used: personalityInfo.name || 'default',
-      adaptation_data: JSON.stringify(gptReply.adaptationHistory || [])
-    });
-
-    await db.updateCallState(session.callSid, 'ai_responded', {
-      message,
-      interaction_count: interactionIndex,
-      personality: personalityInfo.name || 'default'
-    });
-  } catch (dbError) {
-    console.error('Database error adding AWS AI transcript:', dbError);
-  }
-
-  await synthesizeAndQueueAwsSpeech(session, message, interactionIndex, {
-    personalityName: personalityInfo.name || 'default',
-    voiceId: session.voiceModel
-  });
-}
-
-async function initializeAwsCallSession({
-  callSid,
-  contactId,
-  callConfig,
-  functionSystem,
-  firstMessage,
-  voiceModel,
-  phoneNumber
-}) {
-  if (!awsAdapters?.tts || !awsAdapters?.connect) {
-    console.warn('AWS adapters unavailable, cannot initialize call session');
-    return null;
-  }
-
-  const gptService = buildGptService(callSid, callConfig, functionSystem);
-  const session = {
-    callSid,
-    contactId,
-    callConfig,
-    functionSystem,
-    gptService,
-    interactionCount: 0,
-    startTime: new Date(),
-    voiceModel: voiceModel || callConfig.voice_model || null,
-    phoneNumber
-  };
-
-  gptService.on('gptreply', async (gptReply, icount) => {
-    await handleAwsGptReply(session, gptReply, icount);
-  });
-
-  gptService.on('personalityChanged', async (changeData) => {
-    try {
-      await db.updateCallState(callSid, 'personality_changed', {
-        from: changeData.from,
-        to: changeData.to,
-        reason: changeData.reason,
-        interaction_count: session.interactionCount
-      });
-    } catch (dbError) {
-      console.error('Database error logging personality change (AWS):', dbError);
-    }
-  });
-
-  awsCallSessions.set(callSid, session);
-  activeCalls.set(callSid, {
-    startTime: session.startTime,
-    transcripts: [],
-    gptService,
-    callConfig,
-    functionSystem,
-    personalityChanges: []
-  });
-
-  await db.updateCallState(callSid, 'connect_contact_started', {
-    contact_id: contactId,
-    phone_number: phoneNumber
-  });
-
-  if (firstMessage) {
-    try {
-      await db.addTranscript({
-        call_sid: callSid,
-        speaker: 'ai',
-        message: firstMessage,
-        interaction_count: 0,
-        personality_used: 'default'
-      });
-    } catch (dbError) {
-      console.error('Database error adding AWS initial transcript:', dbError);
-    }
-
-    await db.updateCallState(callSid, 'ai_intro_ready', {
-      message: firstMessage
-    });
-
-    await synthesizeAndQueueAwsSpeech(session, firstMessage, 0, {
-      personalityName: 'default',
-      voiceId: session.voiceModel
-    });
-  }
-
-  return session;
-}
+const smsService = new EnhancedSmsService();
 
 async function startServer() {
   try {
-    console.log('🚀 Initializing Adaptive AI Call System...'.blue);
+    console.log('ð Initializing Adaptive AI Call System...'.blue);
 
     // Initialize database first
     console.log('Initializing enhanced database...'.yellow);
     db = new Database();
     await db.initialize();
-    console.log('✅ Enhanced database initialized successfully'.green);
-    callHintStateMachine.setDatabase(db);
-
-    if (smsService && typeof smsService.setDatabase === 'function') {
-      smsService.setDatabase(db);
-    }
-
-    if (currentProvider === 'twilio' && missingTwilioEnv.length > 0) {
-      const guidance = [
-        'Twilio provider selected but required credentials are missing:',
-        ` - Missing: ${missingTwilioEnv.join(', ')}`,
-        'Edit api/.env (or set environment variables) with your Twilio Account SID, Auth Token, and FROM_NUMBER.',
-        'Example:',
-        '  TWILIO_ACCOUNT_SID=ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx',
-        '  TWILIO_AUTH_TOKEN=your_twilio_auth_token',
-        '  FROM_NUMBER=+1234567890',
-        'Alternatively, run `npm run setup --prefix api` from the repo root to scaffold the .env file.',
-      ].join('\n');
-      throw new Error(guidance);
-    }
-
-    await synchronizeProviderFromSettings();
+    console.log('â Enhanced database initialized successfully'.green);
 
     // Start webhook service after database is ready
     console.log('Starting enhanced webhook service...'.yellow);
     webhookService.start(db);
-    console.log('✅ Enhanced webhook service started'.green);
+    console.log('â Enhanced webhook service started'.green);
 
     // Initialize function engine
-    console.log('✅ Dynamic Function Engine ready'.green);
+    console.log('â Dynamic Function Engine ready'.green);
 
     // Start HTTP server
     app.listen(PORT, () => {
-      console.log(`✅ Enhanced Adaptive API server running on port ${PORT}`.green);
-      console.log(`🎭 System ready - Personality Engine & Dynamic Functions active`.green);
-      console.log(`📱 Enhanced webhook notifications enabled`.green);
+      console.log(`â Enhanced Adaptive API server running on port ${PORT}`.green);
+      console.log(`ð­ System ready - Personality Engine & Dynamic Functions active`.green);
+      console.log(`ð± Enhanced webhook notifications enabled`.green);
     });
 
   } catch (error) {
-    if (error.migration) {
-      console.error(`❌ Failed to start server: database migration failed during "${error.migration}"`);
-    }
-    console.error('❌ Failed to start server:', error);
+    console.error('â Failed to start server:', error);
     process.exit(1);
   }
 }
 
+// -----------------------------
+// Telegram control surface (Inline keyboard callbacks)
+// -----------------------------
+
+function parseLiveConsoleCallback(data) {
+  // Expected formats:
+  //   lc:int:<callSid>
+  //   lc:end:<callSid>
+  //   lc:xfer:<callSid>
+  if (typeof data !== 'string') return null;
+  const parts = data.split(':');
+  if (parts.length < 3) return null;
+  if (parts[0] !== 'lc') return null;
+  const action = parts[1];
+  const callSid = parts.slice(2).join(':');
+  if (!callSid.startsWith('CA')) return null;
+  if (!['int', 'end', 'xfer'].includes(action)) return null;
+  return { action, callSid };
+}
+
+async function endTwilioCall(callSid) {
+  const accountSid = process.env.TWILIO_ACCOUNT_SID;
+  const authToken = process.env.TWILIO_AUTH_TOKEN;
+  if (!accountSid || !authToken) {
+    throw new Error('Twilio credentials not configured');
+  }
+  const client = require('twilio')(accountSid, authToken);
+  await client.calls(callSid).update({ status: 'completed' });
+}
+
+// Telegram webhook endpoint (set this URL as your bot webhook)
+app.post('/webhook/telegram', async (req, res) => {
+  try {
+    const update = req.body;
+    // Fast ACK to Telegram to avoid retries.
+    res.status(200).send('OK');
+
+    if (!update) return;
+
+    const cb = update.callback_query;
+    if (!cb) return;
+
+    const parsed = parseLiveConsoleCallback(cb.data);
+    if (!parsed) {
+      // Always answer callback to stop the "loading" state.
+      webhookService.answerCallbackQuery(cb.id, 'Unsupported action').catch(() => {});
+      return;
+    }
+
+    const { action, callSid } = parsed;
+
+    // Basic authorization: only allow the chat that owns the call (if known)
+    const callRecord = await db.getCall(callSid).catch(() => null);
+    const chatId = cb.message?.chat?.id;
+    if (callRecord?.user_chat_id && chatId && String(callRecord.user_chat_id) !== String(chatId)) {
+      webhookService.answerCallbackQuery(cb.id, 'Not authorized for this call').catch(() => {});
+      return;
+    }
+
+    // Execute action
+    if (action === 'int') {
+      const session = activeCalls.get(callSid);
+      if (!session?.ws || session.ws.readyState !== 1) {
+        webhookService.answerCallbackQuery(cb.id, 'Call stream not active').catch(() => {});
+        return;
+      }
+      try {
+        session.ws.send(JSON.stringify({ streamSid: session.streamSid, event: 'clear' }));
+      } catch {
+        // ignore
+      }
+      webhookService.setLiveCallPhase(callSid, 'interrupted').catch(() => {});
+      webhookService.answerCallbackQuery(cb.id, 'Interrupted').catch(() => {});
+      return;
+    }
+
+    if (action === 'end') {
+      try {
+        await endTwilioCall(callSid);
+        webhookService.setLiveCallPhase(callSid, 'ended').catch(() => {});
+        webhookService.answerCallbackQuery(cb.id, 'Ending callâ¦').catch(() => {});
+      } catch (e) {
+        webhookService.answerCallbackQuery(cb.id, `Failed: ${e.message}`.slice(0, 180)).catch(() => {});
+      }
+      return;
+    }
+
+    if (action === 'xfer') {
+      if (!process.env.TRANSFER_NUMBER) {
+        webhookService.answerCallbackQuery(cb.id, 'Transfer not configured').catch(() => {});
+        return;
+      }
+      try {
+        const transferCall = require('./transferCall');
+        await transferCall({ callSid });
+        webhookService.markToolInvocation(callSid, 'transferCall').catch(() => {});
+        webhookService.answerCallbackQuery(cb.id, 'Transferringâ¦').catch(() => {});
+      } catch (e) {
+        webhookService.answerCallbackQuery(cb.id, `Transfer failed: ${e.message}`.slice(0, 180)).catch(() => {});
+      }
+      return;
+    }
+  } catch (error) {
+    // If we haven't responded yet, best-effort.
+    try { res.status(200).send('OK'); } catch {}
+    console.error('Telegram webhook error:', error);
+  }
+});
+
 // Enhanced WebSocket connection handler with dynamic functions
 app.ws('/connection', (ws) => {
-  if (isAwsProvider) {
-    ws.close(1011, 'AWS Connect does not use Twilio media streams');
-    return;
-  }
-  console.log('🔌 New WebSocket connection established'.cyan);
+  console.log('ð New WebSocket connection established'.cyan);
   
   try {
     ws.on('error', (error) => {
@@ -1524,160 +200,17 @@ app.ws('/connection', (ws) => {
     let marks = [];
     let interactionCount = 0;
     let isInitialized = false;
-
-    let wrapUpScheduled = false;
-
-    const scheduleCallWrapUp = async () => {
-      if (wrapUpScheduled || !gptService) {
-        return;
-      }
-      wrapUpScheduled = true;
-      const callerName = callConfig?.customer_name || 'the caller';
-      const closingSegments = [
-        `All required information has been collected for ${callerName}.`,
-        'Deliver a warm closing message, confirm any next steps, and let them know the call is ending now.'
-      ];
-      gptService.completion(closingSegments.join(' '), interactionCount, 'user', 'call_wrapup');
-      interactionCount += 1;
-      setTimeout(() => {
-        endProviderCall(callSid);
-      }, 6000);
-    };
-
-    const emitRealtimeDtmfInsights = async (summary, metadataEnvelope = {}) => {
-      if (!summary || !summary.digits || !gptService) {
-        return;
-      }
-
-      const evaluation = await evaluateInputStage(callSid, summary, metadataEnvelope, interactionCount);
-      const stageDisplay = evaluation?.stageDisplay || summary.stageLabel || summary.stageKey || 'Entry';
-      const guidance = evaluation?.guidance;
-      const promptSegments = [
-        `Caller entered keypad input for ${stageDisplay}.`,
-        `Digits: ${summary.digits}.`,
-      ];
-
-      if (guidance?.agentPrompt) {
-        promptSegments.push(guidance.agentPrompt);
-      } else {
-        promptSegments.push('Acknowledge the keypad entry and continue guiding the caller just like a live agent would.');
-      }
-      if (guidance?.clarificationPrompt) {
-        promptSegments.push(guidance.clarificationPrompt);
-      }
-      if (guidance?.shouldConfirmDigits) {
-        promptSegments.push('Repeat the digits back with a pause between each number and confirm before moving on.');
-      }
-      if (guidance?.shouldOfferSpeechFallback) {
-        promptSegments.push(
-          guidance.speechFallbackScript ||
-            'Offer that they can simply say the digits out loud if entering them is difficult.'
-        );
-      }
-
-      if (guidance?.needsRetry) {
-        promptSegments.push(
-          `Let them know the entry did not match and this was attempt ${guidance.attempts}. Offer to resend the code or let them speak it slowly.`
-        );
-      } else if (guidance?.workflowComplete) {
-        promptSegments.push('Let the caller know that verification is complete and transition into your closing/thank-you script.');
-        await scheduleCallWrapUp();
-      } else if (guidance?.nextStage) {
-        const nextLabel = guidance.nextStage.label || guidance.nextStage.stageKey || 'the next item';
-        if (guidance.nextStage.prompt) {
-          promptSegments.push(`Guide them immediately into ${nextLabel} by saying: "${guidance.nextStage.prompt}".`);
-        } else {
-          promptSegments.push(`Guide them straight into collecting ${nextLabel} just like a live agent would.`);
-        }
-      }
-
-      gptService.completion(promptSegments.join(' '), interactionCount, 'user', 'dtmf_input');
-      interactionCount += 1;
-    };
-
-    const promptForMissingDigits = async (reasonLabel = 'timeout') => {
-      if (!gptService) {
-        return;
-      }
-      const orchestrator = inputOrchestrators.get(callSid);
-      const pendingStage = orchestrator?.getNextPendingStage();
-      const pendingLabel = pendingStage?.label || pendingStage?.stageKey || 'the requested input';
-      const message = [
-        `No keypad digits were received for ${pendingLabel} (${reasonLabel}).`,
-        'Politely let the caller know nothing was detected, and guide them to enter the digits slowly or speak them aloud.'
-      ].join(' ');
-      gptService.completion(message, interactionCount, 'user', 'dtmf_input');
-      interactionCount += 1;
-    };
-
-    const recordDtmfInput = async (digits, source = 'twilio', extraMeta = {}) => {
-      if (!callSid) {
-        return;
-      }
-
-      const dtmfDetails = extraMeta?.dtmf || {};
-      const stageCandidate =
-        extraMeta.stage_key ||
-        extraMeta.stage ||
-        dtmfDetails.stage_key ||
-        dtmfDetails.stage ||
-        dtmfDetails.prompt_key ||
-        null;
-
-      const metadataEnvelope = {};
-      if (dtmfDetails?.timestamp) {
-        metadataEnvelope.provider_timestamp = dtmfDetails.timestamp;
-      }
-      if (typeof dtmfDetails?.confidence === 'number') {
-        metadataEnvelope.confidence = dtmfDetails.confidence;
-      }
-      if (extraMeta?.reason) {
-        metadataEnvelope.reason = extraMeta.reason;
-      }
-      if (typeof extraMeta?.finished === 'boolean') {
-        metadataEnvelope.finished = extraMeta.finished;
-      }
-      if (dtmfDetails?.type) {
-        metadataEnvelope.provider_type = dtmfDetails.type;
-      }
-      if (extraMeta?.metadata && typeof extraMeta.metadata === 'object') {
-        metadataEnvelope.provider_metadata = extraMeta.metadata;
-      }
-      if (extraMeta?.captured_at) {
-        metadataEnvelope.captured_at = extraMeta.captured_at;
-      }
-
-      const summary = await persistDtmfCapture(callSid, digits, {
-        source,
-        provider: currentProvider,
-        stage_key: stageCandidate,
-        stage_label: extraMeta.stage_label,
-        metadata: metadataEnvelope,
-        finished: extraMeta.finished === true,
-        reason: extraMeta.reason,
-        capture_method: 'twilio_stream',
-      });
-
-      await emitRealtimeDtmfInsights(summary, metadataEnvelope);
-    };
-
+  
     ws.on('message', async function message(data) {
       try {
         const msg = JSON.parse(data);
         
         if (msg.event === 'start') {
-          streamSid = msg.start.streamSid || msg.start.uuid || streamSid;
-          callSid = msg.start.callSid || msg.start?.customParameters?.call_sid || callSid;
-          const startUuid = msg.start?.uuid || msg.start?.conversationUuid || msg.start?.streamSid;
-          if (!callSid && startUuid && vonageCallIndex.has(startUuid)) {
-            callSid = vonageCallIndex.get(startUuid);
-          }
-          if (!callSid && msg.start?.conversationUuid && vonageCallIndex.has(msg.start.conversationUuid)) {
-            callSid = vonageCallIndex.get(msg.start.conversationUuid);
-          }
+          streamSid = msg.start.streamSid;
+          callSid = msg.start.callSid;
           callStartTime = new Date();
           
-          console.log(`🎯 Adaptive call started - SID: ${callSid}`.green);
+          console.log(`ð¯ Adaptive call started - SID: ${callSid}`.green);
           
           streamService.setStreamSid(streamSid);
 
@@ -1695,6 +228,16 @@ app.ws('/connection', (ws) => {
             const call = await db.getCall(callSid);
             if (call && call.user_chat_id) {
               await db.createEnhancedWebhookNotification(callSid, 'call_stream_started', call.user_chat_id);
+
+              // Option 1: initialize a single "live console" message that will be edited in-place
+              try {
+                await webhookService.initLiveCallConsole(callSid, call.user_chat_id, {
+                  phoneNumber: call.phone_number
+                });
+                await webhookService.setLiveCallPhase(callSid, 'started');
+              } catch (telegramError) {
+                console.error('Telegram live console init error:', telegramError);
+              }
             }
           } catch (dbError) {
             console.error('Database error on call start:', dbError);
@@ -1703,19 +246,45 @@ app.ws('/connection', (ws) => {
           // Get call configuration and function system
           callConfig = callConfigurations.get(callSid);
           functionSystem = callFunctionSystems.get(callSid);
-
-          if (callConfig?.voice_model) {
-            ttsService.setVoiceModel(callConfig.voice_model);
-          } else {
-            ttsService.resetVoiceModel();
+          
+        if (callConfig && functionSystem) {
+          console.log(`ð­ Using adaptive configuration for ${functionSystem.context.industry} industry`.green);
+          console.log(`ð§ Available functions: ${Object.keys(functionSystem.implementations).join(', ')}`.cyan);
+          
+          // Initialize Enhanced GPT service with dynamic functions
+          gptService = new EnhancedGptService(callConfig.prompt, callConfig.first_message);
+          
+          // Inject the dynamic function system
+          gptService.setDynamicFunctions(functionSystem.functions, functionSystem.implementations);
+          if (callConfig.personaMetadata) {
+            gptService.setPersonaMetadata(callConfig.personaMetadata);
           }
-
-          gptService = buildGptService(callSid, callConfig, functionSystem);
+          
+        } else {
+          console.log(`ð¯ Standard call detected: ${callSid}`.yellow);
+          // Use default configuration for regular calls
+          gptService = new EnhancedGptService();
+        }
+          
+          gptService.setCallSid(callSid);
 
           // Set up GPT reply handler with personality tracking
           gptService.on('gptreply', async (gptReply, icount) => {
             const personalityInfo = gptReply.personalityInfo || {};
-            console.log(`🎭 ${personalityInfo.name || 'Default'} Personality: ${gptReply.partialResponse.substring(0, 50)}...`.green);
+            console.log(`ð­ ${personalityInfo.name || 'Default'} Personality: ${gptReply.partialResponse.substring(0, 50)}...`.green);
+            const session = activeCalls.get(callSid);
+            if (session) {
+              session.lastAgentMessage = gptReply.partialResponse;
+              session.interactionCount = icount;
+            }
+
+            // Live console: show agent is responding and append AI turn (best-effort)
+            webhookService.setLiveCallPhase(callSid, 'speaking').catch(() => {});
+            webhookService.appendLiveTranscript(callSid, 'ai', gptReply.partialResponse).catch(() => {});
+            // After a short delay, revert back to listening (helps the UI feel real-time)
+            setTimeout(() => {
+              webhookService.setLiveCallPhase(callSid, 'listening').catch(() => {});
+            }, 1500);
             
             // Save AI response to database with personality context
             try {
@@ -1736,14 +305,26 @@ app.ws('/connection', (ws) => {
             } catch (dbError) {
               console.error('Database error adding AI transcript:', dbError);
             }
+
+            // Option 1: update live console with AI turn
+            try {
+              await webhookService.setLiveCallPhase(callSid, 'speaking');
+              await webhookService.appendLiveTranscript(callSid, 'ai', gptReply.partialResponse);
+              // After a short delay, revert to listening so users see the system ready for input
+              setTimeout(() => {
+                webhookService.setLiveCallPhase(callSid, 'listening').catch(() => {});
+              }, 1500);
+            } catch (telegramError) {
+              // best-effort
+            }
             
-            ttsService.generate(gptReply, icount);
-          });
+          ttsService.generate(gptReply, icount);
+        });
 
           // Listen for personality changes
           gptService.on('personalityChanged', async (changeData) => {
-            console.log(`🎭 Personality adapted: ${changeData.from} → ${changeData.to}`.magenta);
-            console.log(`📊 Reason: ${JSON.stringify(changeData.reason)}`.blue);
+            console.log(`ð­ Personality adapted: ${changeData.from} â ${changeData.to}`.magenta);
+            console.log(`ð Reason: ${JSON.stringify(changeData.reason)}`.blue);
             
             // Log personality change to database
             try {
@@ -1764,7 +345,14 @@ app.ws('/connection', (ws) => {
             gptService,
             callConfig,
             functionSystem,
-            personalityChanges: []
+            personalityChanges: [],
+            ws,
+            streamSid,
+            streamService,
+            ttsService,
+            interactionCount: 0,
+            paused: false,
+            lastAgentMessage: null
           });
 
           // Initialize call with recording
@@ -1773,9 +361,9 @@ app.ws('/connection', (ws) => {
             
             const firstMessage = callConfig ? 
               callConfig.first_message : 
-              DEFAULT_FIRST_MESSAGE;
+              'Hello! what\'s your name and how can i help you today?';
             
-            console.log(`🗣️ First message (${functionSystem?.context.industry || 'default'}): ${firstMessage.substring(0, 50)}...`.magenta);
+            console.log(`ð£ï¸ First message (${functionSystem?.context.industry || 'default'}): ${firstMessage.substring(0, 50)}...`.magenta);
             
             try {
               await db.addTranscript({
@@ -1795,14 +383,14 @@ app.ws('/connection', (ws) => {
             }, 0);
             
             isInitialized = true;
-            console.log('✅ Adaptive call initialization complete'.green);
+            console.log('â Adaptive call initialization complete'.green);
             
           } catch (recordingError) {
-            console.error('❌ Recording service error:', recordingError);
+            console.error('â Recording service error:', recordingError);
             
             const firstMessage = callConfig ? 
               callConfig.first_message : 
-              DEFAULT_FIRST_MESSAGE;
+              'Hello! what\'s your name and how can i help you today?';
             
             try {
               await db.addTranscript({
@@ -1816,6 +404,14 @@ app.ws('/connection', (ws) => {
               console.error('Database error adding AI transcript:', dbError);
             }
             
+            if (callConfig?.voice_model) {
+              try {
+                ttsService.setVoiceModel(callConfig.voice_model);
+              } catch (e) {
+                console.warn('Unable to set custom voice model:', e.message);
+              }
+            }
+
             await ttsService.generate({
               partialResponseIndex: null, 
               partialResponse: firstMessage
@@ -1828,86 +424,11 @@ app.ws('/connection', (ws) => {
           const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000);
           for (const [sid, config] of callConfigurations.entries()) {
             if (new Date(config.created_at) < oneHourAgo) {
-              removeCallConfiguration(sid);
+              callConfigurations.delete(sid);
               callFunctionSystems.delete(sid);
             }
           }
 
-        } else if (msg.event === 'dtmf') {
-          if (!callSid) {
-            return;
-          }
-
-          try {
-            const dtmfInfo = msg.dtmf || {};
-            const rawDigits = dtmfInfo.digits ?? dtmfInfo.digit ?? msg.digits ?? msg.digit ?? '';
-            const source = dtmfInfo.source || dtmfInfo.direction || 'twilio';
-            const buffer = callDtmfBuffers.get(callSid) || { digits: '', lastRaw: '', timer: null };
-            callDtmfBuffers.set(callSid, buffer);
-
-            if (buffer.timer) {
-              clearTimeout(buffer.timer);
-              buffer.timer = null;
-            }
-
-            const normalizedRaw = typeof rawDigits === 'string'
-              ? rawDigits.trim()
-              : typeof rawDigits === 'number'
-                ? String(rawDigits)
-                : '';
-            const sanitized = normalizedRaw.replace(/[^0-9*#]/g, '');
-            const containsTerminator = /#/.test(normalizedRaw) || normalizedRaw.toLowerCase() === 'finish';
-
-            if (sanitized) {
-              if (!buffer.digits) {
-                buffer.digits = sanitized.replace(/#/g, '');
-              } else if (sanitized.length === 1 && sanitized !== '#') {
-                buffer.digits += sanitized;
-              } else if (sanitized.startsWith(buffer.digits)) {
-                const suffix = sanitized.slice(buffer.digits.length).replace(/#/g, '');
-                buffer.digits += suffix;
-              } else {
-                buffer.digits = sanitized.replace(/#/g, '');
-              }
-            }
-
-            buffer.lastRaw = normalizedRaw;
-
-            const finished = containsTerminator || dtmfInfo.finished === true || dtmfInfo.complete === true || dtmfInfo.terminator === true || msg.finished === true;
-
-            const flushBuffer = async (reason) => {
-              if (!buffer.digits) {
-                await promptForMissingDigits(reason);
-                return;
-              }
-
-              const digitsToPersist = buffer.digits;
-              if (buffer.timer) {
-                clearTimeout(buffer.timer);
-                buffer.timer = null;
-              }
-              callDtmfBuffers.delete(callSid);
-
-              await recordDtmfInput(digitsToPersist, source, {
-                dtmf: dtmfInfo,
-                reason,
-                finished: reason === 'terminator'
-              });
-            };
-
-            if (finished) {
-              await flushBuffer('terminator');
-            } else {
-              buffer.timer = setTimeout(() => {
-                flushBuffer('timeout').catch((error) => {
-                  console.error('❌ Failed to persist buffered DTMF digits:', error);
-                });
-              }, DTMF_FLUSH_DELAY_MS);
-              callDtmfBuffers.set(callSid, buffer);
-            }
-          } catch (dtmfError) {
-            console.error('❌ Error handling DTMF input:', dtmfError);
-          }
         } else if (msg.event === 'media') {
           if (isInitialized && transcriptionService) {
             transcriptionService.send(msg.media.payload);
@@ -1916,40 +437,44 @@ app.ws('/connection', (ws) => {
           const label = msg.mark.name;
           marks = marks.filter(m => m !== msg.mark.name);
         } else if (msg.event === 'stop') {
-          console.log(`🔚 Adaptive call stream ${streamSid} ended`.red);
-          const pendingDigits = callDtmfBuffers.get(callSid);
-          if (pendingDigits?.timer) {
-            clearTimeout(pendingDigits.timer);
-          }
-          if (pendingDigits?.digits) {
-            await recordDtmfInput(pendingDigits.digits, 'twilio', { finished: false, reason: 'stream_stopped' });
-          }
-          callDtmfBuffers.delete(callSid);
+          console.log(`ð Adaptive call stream ${streamSid} ended`.red);
 
+          // Option 1: mark live console ended (best-effort)
+          try {
+            await webhookService.endLiveCallConsole(callSid, 'ended');
+          } catch (telegramError) {
+            // best-effort
+          }
+          
           await handleCallEnd(callSid, callStartTime);
           
           // Clean up
           activeCalls.delete(callSid);
           if (callSid && callConfigurations.has(callSid)) {
-            removeCallConfiguration(callSid);
+            callConfigurations.delete(callSid);
             callFunctionSystems.delete(callSid);
-            console.log(`🧹 Cleaned up adaptive configuration for call: ${callSid}`.yellow);
+            console.log(`ð§¹ Cleaned up adaptive configuration for call: ${callSid}`.yellow);
           }
         }
       } catch (messageError) {
-        console.error('❌ Error processing WebSocket message:', messageError);
+        console.error('â Error processing WebSocket message:', messageError);
       }
     });
   
     transcriptionService.on('utterance', async (text) => {
       if(marks.length > 0 && text?.length > 5) {
-        console.log('🔄 Interruption detected, clearing stream'.red);
+        console.log('ð Interruption detected, clearing stream'.red);
+        // Update live console (best-effort)
+        webhookService.setLiveCallPhase(callSid, 'interrupted').catch(() => {});
         ws.send(
           JSON.stringify({
             streamSid,
             event: 'clear',
           })
         );
+      } else if (text?.trim?.().length > 2) {
+        // User is speaking (interim results) â keep it light and debounced server-side
+        webhookService.setLiveCallPhase(callSid, 'listening').catch(() => {});
       }
     });
   
@@ -1957,8 +482,17 @@ app.ws('/connection', (ws) => {
       if (!text || !gptService || !isInitialized) { 
         return; 
       }
+      const session = activeCalls.get(callSid);
+      if (session?.paused) {
+        console.log(`⏸️ Call ${callSid} paused by operator; skipping AI response.`);
+        return;
+      }
       
-      console.log(`👤 Customer: ${text}`.yellow);
+      console.log(`ð¤ Customer: ${text}`.yellow);
+
+      // Live console: append customer turn + mark agent as thinking
+      webhookService.appendLiveTranscript(callSid, 'user', text).catch(() => {});
+      webhookService.setLiveCallPhase(callSid, 'thinking').catch(() => {});
       
       // Save user transcript with enhanced context
       try {
@@ -1980,6 +514,9 @@ app.ws('/connection', (ws) => {
       // Process with adaptive personality and functions
       gptService.completion(text, interactionCount);
       interactionCount += 1;
+      if (session) {
+        session.interactionCount = interactionCount;
+      }
     });
     
     ttsService.on('speech', (responseIndex, audio, label, icount) => {
@@ -1991,43 +528,26 @@ app.ws('/connection', (ws) => {
     });
 
     ws.on('close', () => {
-      console.log(`🔌 WebSocket connection closed for adaptive call: ${callSid || 'unknown'}`.yellow);
-
-      if (callSid) {
-        if (callConfigurations.has(callSid)) {
-          removeCallConfiguration(callSid);
-        }
-        if (callFunctionSystems.has(callSid)) {
-          callFunctionSystems.delete(callSid);
-        }
-      }
-
-      const pendingDigits = callSid ? callDtmfBuffers.get(callSid) : undefined;
-      if (pendingDigits?.timer) {
-        clearTimeout(pendingDigits.timer);
-      }
-      if (pendingDigits?.digits) {
-        recordDtmfInput(pendingDigits.digits, 'twilio', { finished: false, reason: 'socket_closed' })
-          .catch((error) => console.error('❌ Failed to persist buffered DTMF digits on close:', error));
-      }
-      if (callSid) {
-        callDtmfBuffers.delete(callSid);
-      }
-
-      const session = callSid ? activeCalls.get(callSid) : undefined;
-      if (callSid && session) {
-        activeCalls.delete(callSid);
-        const startedAt = session.startTime || callStartTime || new Date();
-        void handleCallEnd(callSid, startedAt).catch((error) => {
-          console.error('Error completing call on close event:', error);
-        });
-      }
+      console.log(`ð WebSocket connection closed for adaptive call: ${callSid || 'unknown'}`.yellow);
     });
 
   } catch (err) {
-    console.error('❌ WebSocket handler error:', err);
+    console.error('â WebSocket handler error:', err);
   }
 });
+
+function isAdminRequest(req) {
+  const token = req.headers['x-admin-token'] || req.headers['x-admin-key'];
+  if (!token || !appConfig.admin?.apiToken) return false;
+  return token === appConfig.admin.apiToken;
+}
+
+function requireAdmin(req, res, next) {
+  if (!isAdminRequest(req)) {
+    return res.status(403).json({ success: false, error: 'Admin token required' });
+  }
+  return next();
+}
 
 // Enhanced call end handler with adaptation analytics
 async function handleCallEnd(callSid, callStartTime) {
@@ -2035,28 +555,26 @@ async function handleCallEnd(callSid, callStartTime) {
     const callEndTime = new Date();
     const duration = Math.round((callEndTime - callStartTime) / 1000);
 
-    const callDetails = await db.getCall(callSid);
-    if (callDetails?.call_type === 'collect_input') {
-      await finalizeCollectInputCall(callSid, callDetails);
-      return;
-    }
-    const transcripts = await db.getCallTranscripts(callSid);
-    const dtmfEntries = await db.getCallDtmfEntries(callSid);
-
-    if (callDetails) {
-      if (callDetails.business_context) {
-        try {
-          callDetails.business_context = JSON.parse(callDetails.business_context);
-        } catch (contextError) {
-          console.warn('Failed to parse business context for call', callSid, contextError.message);
-        }
-      }
-
-      callDetails.dtmf_input_count = dtmfEntries.length;
-      callDetails.latest_dtmf_digits = dtmfEntries.length ? dtmfEntries[dtmfEntries.length - 1].masked_digits : null;
-    }
+    const [callDetails, transcripts] = await Promise.all([
+      db.getCall(callSid).catch(() => null),
+      db.getCallTranscripts(callSid)
+    ]);
 
     const summary = generateCallSummary(transcripts, duration);
+    const transcriptPlainText = transcripts
+      .map((t) => {
+        const ts = t.timestamp ? new Date(t.timestamp).toISOString() : '';
+        const speaker = t.speaker === 'user' ? 'Customer' : 'AI';
+        return `${ts ? `[${ts}] ` : ''}${speaker}: ${t.message}`;
+      })
+      .join('\n');
+    const smartSummary = await generateSmartSummary({
+      callSid,
+      transcripts,
+      duration,
+      callDetails,
+      baselineSummary: summary
+    });
     
     // Get personality adaptation data
     const callSession = activeCalls.get(callSid);
@@ -2072,11 +590,51 @@ async function handleCallEnd(callSid, callStartTime) {
       };
     }
     
+    const callSummaryText = smartSummary.summaryText || summary.summary;
+    const analysisPayload = { ...summary.analysis, adaptation: adaptationAnalysis };
+
+    if (smartSummary.structured) {
+      analysisPayload.smart_summary = {
+        version: 'v1',
+        generated_at: new Date().toISOString(),
+        ...smartSummary.structured
+      };
+      if (smartSummary.structured.sentiment?.trend) {
+        analysisPayload.sentiment = smartSummary.structured.sentiment.trend;
+      }
+      if (smartSummary.structured.latency_metrics) {
+        analysisPayload.latency = smartSummary.structured.latency_metrics;
+      }
+      if (smartSummary.structured.auto_tags) {
+        analysisPayload.auto_tags = smartSummary.structured.auto_tags;
+      }
+      if (smartSummary.structured.follow_up_sms) {
+        analysisPayload.follow_up_sms = smartSummary.structured.follow_up_sms;
+      }
+    }
+
+    if (smartSummary.raw) {
+      analysisPayload.smart_summary_raw = smartSummary.raw;
+    }
+    if (transcriptPlainText) {
+      analysisPayload.transcript_plain = transcriptPlainText.slice(-15000); // keep reasonable size
+    }
+
+    const alerts = evaluateCallAlerts({
+      smartSummary: smartSummary.structured,
+      duration,
+      transcripts,
+      callDetails
+    });
+    if (alerts.length) {
+      analysisPayload.alerts = alerts;
+    }
+    
     await db.updateCallStatus(callSid, 'completed', {
       ended_at: callEndTime.toISOString(),
       duration: duration,
-      call_summary: summary.summary,
-      ai_analysis: JSON.stringify({...summary.analysis, adaptation: adaptationAnalysis})
+      call_summary: callSummaryText,
+      ai_analysis: JSON.stringify(analysisPayload)
     });
 
     await db.updateCallState(callSid, 'call_ended', {
@@ -2085,20 +643,34 @@ async function handleCallEnd(callSid, callStartTime) {
       total_interactions: transcripts.length,
       personality_adaptations: adaptationAnalysis.personalityChanges || 0
     });
-
-    if (callDetails?.provider !== 'twilio') {
-      await finalizeCallOutcome(callSid, {
-        call: callDetails,
-        finalStatus: 'completed',
-        answeredBy: callDetails?.answered_by,
-        wasAnswered: true,
-      });
+    if (transcriptPlainText) {
+      await db.updateCallState(callSid, 'transcript_export', { text: transcriptPlainText });
+    }
+    
+    // Create enhanced webhook notification for completion
+    if (callDetails && callDetails.user_chat_id) {
+      await db.createEnhancedWebhookNotification(callSid, 'call_completed', callDetails.user_chat_id);
+      await db.createEnhancedWebhookNotification(callSid, 'call_summary', callDetails.user_chat_id, 'high');
+      if (alerts.length) {
+        for (const alert of alerts) {
+          await db.createEnhancedWebhookNotification(callSid, 'call_alert', callDetails.user_chat_id, 'urgent');
+        }
+      }
+      
+      // Schedule transcript notification with delay
+      setTimeout(async () => {
+        try {
+          await db.createEnhancedWebhookNotification(callSid, 'call_transcript', callDetails.user_chat_id);
+        } catch (transcriptError) {
+          console.error('Error creating transcript notification:', transcriptError);
+        }
+      }, 2000);
     }
 
-    console.log(`✅ Enhanced adaptive call ${callSid} completed`.green);
-    console.log(`📊 Duration: ${duration}s | Messages: ${transcripts.length} | Adaptations: ${adaptationAnalysis.personalityChanges || 0}`.cyan);
+    console.log(`â Enhanced adaptive call ${callSid} completed`.green);
+    console.log(`ð Duration: ${duration}s | Messages: ${transcripts.length} | Adaptations: ${adaptationAnalysis.personalityChanges || 0}`.cyan);
     if (adaptationAnalysis.finalPersonality) {
-      console.log(`🎭 Final personality: ${adaptationAnalysis.finalPersonality}`.magenta);
+      console.log(`ð­ Final personality: ${adaptationAnalysis.finalPersonality}`.magenta);
     }
 
     // Log service health
@@ -2122,6 +694,351 @@ async function handleCallEnd(callSid, callStartTime) {
     } catch (logError) {
       console.error('Failed to log service health error:', logError);
     }
+  }
+}
+
+function formatDurationLabel(seconds = 0) {
+  if (!seconds || Number.isNaN(seconds)) return '0s';
+  const totalSeconds = Math.max(0, parseInt(seconds, 10));
+  const minutes = Math.floor(totalSeconds / 60);
+  const remainder = totalSeconds % 60;
+  if (minutes === 0) return `${remainder}s`;
+  return `${minutes}m ${String(remainder).padStart(2, '0')}s`;
+}
+
+function safeJsonParse(payload, fallback = null) {
+  if (!payload) return fallback;
+  if (typeof payload === 'object') return payload;
+  try {
+    return JSON.parse(payload);
+  } catch (error) {
+    return fallback;
+  }
+}
+
+function buildTranscriptExcerpt(transcripts = [], maxLines = 80, maxChars = 5000) {
+  if (!Array.isArray(transcripts) || transcripts.length === 0) return '';
+  const recent = transcripts.slice(-maxLines).map((entry) => {
+    const speaker = entry.speaker === 'user' ? 'Customer' : 'Agent';
+    return `${speaker}: ${entry.message}`;
+  });
+
+  let joined = recent.join('\n');
+  if (joined.length > maxChars) {
+    joined = joined.slice(joined.length - maxChars);
+  }
+  return joined;
+}
+
+function normalizeStructuredSummary(raw = {}, duration = 0) {
+  const sentiment = raw.sentiment || {};
+  const attachments = raw.attachments || {};
+  const latency = raw.latency_metrics || {};
+  const nextActions = Array.isArray(raw.suggested_next_actions) ? raw.suggested_next_actions : [];
+  const entities = Array.isArray(raw.entities) ? raw.entities : [];
+  const tags = Array.isArray(raw.auto_tags) ? raw.auto_tags : [];
+
+  return {
+    call_sid: raw.call_sid || null,
+    summary: raw.summary || raw.overview || '',
+    duration_label: raw.duration_label || formatDurationLabel(duration),
+    outcome: raw.outcome || 'completed',
+    key_intent: raw.primary_intent || raw.key_intent || raw.intent || 'General inquiry',
+    primary_intent: raw.primary_intent || raw.key_intent || raw.intent || 'General inquiry',
+    escalation_reason: raw.escalation_reason || raw.escalation || null,
+    call_quality_score: typeof raw.call_quality_score === 'number'
+      ? Math.max(0, Math.min(100, raw.call_quality_score))
+      : null,
+    latency_metrics: {
+      stt_ms: typeof latency.stt_ms === 'number' ? latency.stt_ms : null,
+      gpt_ms: typeof latency.gpt_ms === 'number' ? latency.gpt_ms : null,
+      tts_ms: typeof latency.tts_ms === 'number' ? latency.tts_ms : null
+    },
+    entities: entities.map((e) => ({
+      type: e.type || 'text',
+      value: e.value || '',
+      role: e.role || null
+    })),
+    suggested_next_actions: nextActions.map((a) => ({
+      action: a.action || a.text || '',
+      urgency: a.urgency || a.priority || 'normal'
+    })),
+    auto_tags: tags.filter(Boolean),
+    highlights: Array.isArray(raw.highlights) ? raw.highlights : [],
+    actions: Array.isArray(raw.actions) ? raw.actions : [],
+    alerts: Array.isArray(raw.alerts) ? raw.alerts : [],
+    next_steps: Array.isArray(raw.next_steps) ? raw.next_steps : [],
+    confidence: typeof raw.confidence === 'number' ? raw.confidence : null,
+    sentiment: {
+      start: sentiment.start || 'neutral',
+      end: sentiment.end || sentiment.final || 'neutral',
+      trend: sentiment.trend || 'steady',
+      emoji: sentiment.emoji || sentiment.display || ''
+    },
+    attachments: {
+      include_transcript: attachments.include_transcript !== false,
+      include_json: attachments.include_json !== false
+    },
+    follow_up_sms: raw.follow_up_sms || null,
+    language: raw.language || 'en'
+  };
+}
+
+async function generateSmartSummary({
+  callSid,
+  transcripts,
+  duration,
+  callDetails,
+  baselineSummary
+}) {
+  const fallbackText = baselineSummary?.summary || 'No conversation recorded';
+
+  if (!transcripts || transcripts.length === 0) {
+    return {
+      summaryText: fallbackText,
+      structured: null,
+      raw: null
+    };
+  }
+
+  if (!appConfig?.openRouter?.apiKey) {
+    console.warn('Missing OpenRouter API key; skipping smart summary generation.');
+    return {
+      summaryText: fallbackText,
+      structured: null,
+      raw: null
+    };
+  }
+
+  try {
+    const aiClient = new OpenAI({
+      baseURL: 'https://openrouter.ai/api/v1',
+      apiKey: appConfig.openRouter.apiKey,
+      defaultHeaders: {
+        'HTTP-Referer': appConfig.openRouter.siteUrl || 'http://localhost:3000',
+        'X-Title': appConfig.openRouter.siteName || 'Adaptive Voice AI'
+      }
+    });
+
+    const transcriptExcerpt = buildTranscriptExcerpt(transcripts);
+    const businessContext = safeJsonParse(callDetails?.business_context, {});
+    const metadata = {
+      call_sid: callSid,
+      duration_seconds: duration,
+      duration_label: formatDurationLabel(duration),
+      phone_number: callDetails?.phone_number,
+      status: callDetails?.status,
+      business_context: businessContext
+    };
+
+const schema = `
+Return JSON in this exact shape (all fields required):
+{
+  "call_sid": "${callSid}",
+  "summary": "1-3 sentences recapping the call in plain text",
+  "duration_label": "${formatDurationLabel(duration)}",
+  "outcome": "resolved|transferred|failed|abandoned|completed",
+  "primary_intent": "Primary customer intent/purpose",
+  "sentiment": {
+    "start": "positive|neutral|negative|angry|frustrated",
+    "end": "positive|neutral|negative|angry|frustrated",
+    "trend": "improved|steady|worsened",
+    "emoji": "🙂 → 😐"
+  },
+  "escalation_reason": "Short reason if escalated or null/\"none\"",
+  "call_quality_score": 0,
+  "latency_metrics": { "stt_ms": 0, "gpt_ms": 0, "tts_ms": 0 },
+  "entities": [ { "type": "name|amount|reference|date|other", "value": "string", "role": "optional" } ],
+  "suggested_next_actions": [ { "action": "string", "urgency": "low|normal|high|immediate" } ],
+  "auto_tags": ["billing","support","sales","fraud","retention","payment","technical"],
+  "highlights": ["Top 2-4 facts or requests"],
+  "actions": ["Actions taken during the call"],
+  "alerts": ["Risks, blockers, or sentiment warnings"],
+  "next_steps": ["Follow-ups promised to the caller"],
+  "confidence": 0.0,
+  "follow_up_sms": "Short SMS-ready recap to send the customer",
+  "language": "Detected caller language, e.g. en, es, fr",
+  "attachments": { "include_transcript": true, "include_json": true }
+}`;
+
+    const completion = await aiClient.chat.completions.create({
+      model: appConfig.openRouter.model || 'meta-llama/llama-3.1-8b-instruct:free',
+      temperature: 0.2,
+      max_tokens: 600,
+      response_format: { type: 'json_object' },
+      messages: [
+        {
+          role: 'system',
+          content: 'You are a QA assistant for phone calls. Return JSON only, matching the provided schema, with concise, non-sensitive summaries. Mask any OTP/PIN/card numbers; do not invent facts.'
+        },
+        {
+          role: 'user',
+          content: `Call metadata:\n${JSON.stringify(metadata, null, 2)}`
+        },
+        {
+          role: 'user',
+          content: `Transcript (speaker: text):\n${transcriptExcerpt}`
+        },
+        {
+          role: 'user',
+          content: schema
+        }
+      ]
+    });
+
+    const raw = completion?.choices?.[0]?.message?.content || '';
+    const parsed = safeJsonParse(raw, null);
+
+    if (!parsed) {
+      throw new Error('Smart summary parser could not read model output');
+    }
+
+    const structured = normalizeStructuredSummary(parsed, duration);
+    const summaryText = structured.summary || fallbackText;
+
+    return { structured, raw, summaryText };
+  } catch (error) {
+    console.error('Smart summary generation failed:', error.message);
+    return {
+      summaryText: fallbackText,
+      structured: null,
+      raw: null
+    };
+  }
+}
+
+function evaluateCallAlerts({ smartSummary, duration, transcripts = [], callDetails }) {
+  const alerts = [];
+  const summary = smartSummary || {};
+
+  const sentimentEnd = (summary.sentiment?.end || '').toLowerCase();
+  if (sentimentEnd.includes('angry') || sentimentEnd.includes('frustrated') || sentimentEnd.includes('negative')) {
+    alerts.push({
+      callSid: callDetails?.call_sid || null,
+      severity: 'high',
+      reason: 'Customer sentiment degraded',
+      recommended_action: 'Escalate to human agent and follow up immediately'
+    });
+  }
+
+  if (typeof summary.call_quality_score === 'number' && summary.call_quality_score < 50) {
+    alerts.push({
+      callSid: callDetails?.call_sid || null,
+      severity: 'medium',
+      reason: `Low quality score (${summary.call_quality_score})`,
+      recommended_action: 'Review transcript and contact customer if needed'
+    });
+  }
+
+  if (summary.latency_metrics) {
+    const { stt_ms, gpt_ms, tts_ms } = summary.latency_metrics;
+    if ((stt_ms && stt_ms > 5000) || (gpt_ms && gpt_ms > 8000) || (tts_ms && tts_ms > 5000)) {
+      alerts.push({
+        callSid: callDetails?.call_sid || null,
+        severity: 'medium',
+        reason: 'System latency spike detected',
+        recommended_action: 'Check STT/GPT/TTS services and retry if needed'
+      });
+    }
+  }
+
+  if (duration && duration > 900) {
+    alerts.push({
+      callSid: callDetails?.call_sid || null,
+      severity: 'low',
+      reason: `Call duration high (${Math.round(duration / 60)}m)`,
+      recommended_action: 'Confirm resolution or schedule follow-up'
+    });
+  }
+
+  // Simple loop detection: repeated recent turns
+  const recent = transcripts.slice(-6).map(t => t.message?.trim?.().toLowerCase()).filter(Boolean);
+  if (recent.length >= 4) {
+    const unique = new Set(recent);
+    if (unique.size <= 2) {
+      alerts.push({
+        callSid: callDetails?.call_sid || null,
+        severity: 'medium',
+        reason: 'Conversation may be looping',
+        recommended_action: 'Provide a direct resolution or escalate'
+      });
+    }
+  }
+
+  return alerts;
+}
+
+// Operator control utilities
+function getCallSession(callSid) {
+  return activeCalls.get(callSid);
+}
+
+async function speakToCall(callSid, text, interactionCount = 0) {
+  const session = getCallSession(callSid);
+  if (!session?.ttsService || !session?.streamService || !text) return false;
+  try {
+    await session.ttsService.generate(
+      { partialResponseIndex: null, partialResponse: text },
+      interactionCount
+    );
+    await db.addTranscript({
+      call_sid: callSid,
+      speaker: 'ai',
+      message: text,
+      interaction_count: interactionCount,
+      personality_used: 'operator_injected'
+    });
+    await db.updateCallState(callSid, 'operator_say', { text });
+    session.lastAgentMessage = text;
+    return true;
+  } catch (error) {
+    console.error('Operator say failed:', error.message);
+    return false;
+  }
+}
+
+function setCallPause(callSid, paused) {
+  const session = getCallSession(callSid);
+  if (!session) return false;
+  session.paused = paused;
+  return true;
+}
+
+async function replayLastAgentSpeech(callSid) {
+  const session = getCallSession(callSid);
+  let lastMessage = session?.lastAgentMessage;
+  if (!lastMessage) {
+    const transcripts = await db.getCallTranscripts(callSid);
+    const lastAi = [...transcripts].reverse().find(t => t.speaker === 'ai');
+    lastMessage = lastAi?.message || null;
+  }
+  if (!lastMessage) return false;
+  return speakToCall(callSid, lastMessage, session?.interactionCount || 0);
+}
+
+async function handleOperatorAction(callSid, action, payload = {}) {
+  switch (action) {
+    case 'say':
+      return speakToCall(callSid, payload.text || '');
+    case 'pause':
+      return setCallPause(callSid, true);
+    case 'resume':
+      return setCallPause(callSid, false);
+    case 'replay':
+      return replayLastAgentSpeech(callSid);
+    case 'clarify':
+      return speakToCall(callSid, payload.text || 'Could you clarify that for me?');
+    case 'transfer':
+      await db.updateCallState(callSid, 'operator_transfer_requested', { target: payload.target || null });
+      return true;
+    case 'mute_alerts':
+      webhookService.setCallAlertMute(callSid, true);
+      return true;
+    case 'unmute_alerts':
+      webhookService.setCallAlertMute(callSid, false);
+      return true;
+    default:
+      return false;
   }
 }
 
@@ -2151,30 +1068,11 @@ function generateCallSummary(transcripts, duration) {
 }
 
 // Incoming endpoint used by Twilio to connect the call to our websocket stream
-app.post('/incoming', validateTwilioRequest(), async (req, res) => {
-  if (currentProvider !== 'twilio') {
-    res.status(404).json({ error: 'Incoming calls are handled by the active provider' });
-    return;
-  }
+app.post('/incoming', (req, res) => {
   try {
-    const callSid = req.body?.CallSid || req.query?.CallSid;
-    let callRecord = null;
-    if (callSid) {
-      try {
-        callRecord = await db.getCall(callSid);
-      } catch (error) {
-        console.warn('Unable to load call record for incoming request:', error.message);
-      }
-    }
-
-    if (callRecord?.call_type === 'collect_input') {
-      await handleCollectInputRequest(req, res, callRecord);
-      return;
-    }
-
     const response = new VoiceResponse();
     const connect = response.connect();
-    connect.stream({ url: `${publicWsBase}/connection` });
+    connect.stream({ url: `wss://${process.env.SERVER}/connection` });
 
     res.type('text/xml');
     res.end(response.toString());
@@ -2192,28 +1090,21 @@ app.post('/outbound-call', async (req, res) => {
       prompt,
       first_message,
       user_chat_id,
+      customer_name,
       business_id,
-      business_function: businessFunctionRaw,
-      call_type: requestedCallType,
-      requires_input,
       purpose,
-      channel: rawChannel,
       emotion,
       urgency,
-      technical_level: technicalLevel,
+      technical_level,
       voice_model,
       template,
-      telegram_chat_id: requestedTelegramChatId,
-      metadata_json,
-      input_sequence,
-      collect_digits,
-      collect_thank_you_message,
-      customer_name
+      template_id,
+      metadata
     } = req.body;
 
-    if (!number) {
+    if (!number || !prompt || !first_message) {
       return res.status(400).json({
-        error: 'Missing required field: number'
+        error: 'Missing required fields: number, prompt, and first_message are required'
       });
     }
 
@@ -2223,431 +1114,118 @@ app.post('/outbound-call', async (req, res) => {
       });
     }
 
-    const isTwilioProvider = currentProvider === 'twilio';
-    const isVonageProvider = currentProvider === 'vonage';
-
-    const accountSid = twilioAccountSid;
-    const authToken = twilioAuthToken;
-
-    if (isAwsProvider) {
-      if (!awsAdapters || !awsAdapters.connect) {
-        return res.status(500).json({
-          error: 'AWS Connect adapter not configured'
-        });
-      }
-    } else if (isVonageProvider) {
-      try {
-        await ensureVonageAdapters();
-      } catch (error) {
-        return res.status(500).json({
-          error: 'Vonage adapters not configured',
-          details: error.message
-        });
-      }
-    } else {
-      if (!accountSid || !authToken) {
-        return res.status(500).json({
-          error: 'Twilio credentials not configured'
-        });
-      }
-      if (!twilioFromNumber) {
-        return res.status(500).json({
-          error: 'Twilio FROM_NUMBER not configured'
-        });
-      }
-    }
-
-    let businessProfile = null;
-    const templateName = template || null;
-
-    if (business_id && !['general', 'custom'].includes(String(business_id).toLowerCase())) {
-      businessProfile = getBusinessProfile(business_id);
-      if (!businessProfile) {
-        return res.status(400).json({
-          error: `Unknown business_id "${business_id}"`
-        });
-      }
-    }
-
-    const resolvedBusinessId = businessProfile ? businessProfile.id : (business_id || 'general');
-    const sanitizedCustomerName = sanitizeCustomerName(customer_name);
-    const businessFunction = businessFunctionRaw ? businessFunctionRaw.toString().trim().toLowerCase() : null;
-    let callType = (requestedCallType || '').toString().trim().toLowerCase();
-    const requiresInputFlag = toBoolean(requires_input);
-    if (!['collect_input', 'service'].includes(callType)) {
-      callType = (requiresInputFlag || (businessFunction && COLLECT_INPUT_FUNCTIONS.has(businessFunction)))
-        ? 'collect_input'
-        : 'service';
-    }
-
-    const normalizeKey = (value, fallback) =>
-      (value || fallback || '')
-        .toString()
-        .trim()
-        .toLowerCase()
-        .replace(/\s+/g, '_');
-
-    const channel = normalizeKey(rawChannel, 'voice');
-    const normalizedPurpose = normalizeKey(purpose, 'general');
-    const normalizedEmotion = normalizeKey(
-      emotion,
-      businessProfile?.purposes?.[normalizedPurpose]?.recommendedEmotion || 'neutral'
-    );
-    const normalizedUrgency = normalizeKey(
-      urgency,
-      businessProfile?.purposes?.[normalizedPurpose]?.defaultUrgency || 'normal'
-    );
-    const normalizedTechnicalLevel = normalizeKey(technicalLevel, 'general');
-
-    const personaOptions = {
-      businessId: businessProfile?.id || null,
-      customPrompt: prompt || null,
-      customFirstMessage: first_message || null,
-      purpose: normalizedPurpose,
-      channel,
-      emotion: normalizedEmotion,
-      urgency: normalizedUrgency,
-      technicalLevel: normalizedTechnicalLevel
-    };
-
-    const shouldCompose =
-      personaOptions.businessId ||
-      !prompt ||
-      !first_message ||
-      personaOptions.purpose !== 'general' ||
-      personaOptions.channel !== 'voice' ||
-      personaOptions.emotion !== 'neutral' ||
-      personaOptions.urgency !== 'normal' ||
-      personaOptions.technicalLevel !== 'general';
-
-    let composition = null;
-    if (shouldCompose) {
-      composition = personaComposer.compose(personaOptions);
-    }
-
-    let selectedPrompt = composition
-      ? composition.systemPrompt
-      : prompt || (businessProfile ? businessProfile.prompt : null);
-    let selectedFirstMessage = composition
-      ? composition.firstMessage
-      : first_message || (businessProfile ? businessProfile.firstMessage : null);
-
-    if (!selectedPrompt || !selectedFirstMessage) {
-      return res.status(400).json({
-        error: 'Provide prompt and first_message or supply a supported business_id'
+    const accountSid = process.env.TWILIO_ACCOUNT_SID;
+    const authToken = process.env.TWILIO_AUTH_TOKEN;
+    
+    if (!accountSid || !authToken) {
+      return res.status(500).json({
+        error: 'Twilio credentials not configured'
       });
     }
 
-    const usingDefaultPrompt = selectedPrompt === DEFAULT_SYSTEM_PROMPT;
-    const usingDefaultFirstMessage = selectedFirstMessage === DEFAULT_FIRST_MESSAGE;
+    console.log('ð§ Generating adaptive function system for call...'.blue);
+    
+    // Generate dynamic functions based on the prompt
+    const functionSystem = functionEngine.generateAdaptiveFunctionSystem(prompt, first_message);
+    
+    console.log(`â Generated ${functionSystem.functions.length} functions for ${functionSystem.context.industry} industry`.green);
 
-    const personaDisplayName =
-      businessProfile?.displayName ||
-      templateName ||
-      'our team';
-    selectedFirstMessage = buildPersonalizedFirstMessage(
-      selectedFirstMessage,
-      sanitizedCustomerName,
-      personaDisplayName
-    );
+    const client = require('twilio')(accountSid, authToken);
 
-    console.log('🔧 Generating adaptive function system for call...'.blue);
-    const functionSystem = functionEngine.generateAdaptiveFunctionSystem(selectedPrompt, selectedFirstMessage);
-    console.log(
-      `✅ Generated ${functionSystem.functions.length} functions for ${functionSystem.context.industry} industry`.green
-    );
+    // Create the outbound call with enhanced callbacks
+    const call = await client.calls.create({
+      url: `https://${process.env.SERVER}/incoming`,
+      to: number,
+      from: process.env.FROM_NUMBER,
+      statusCallback: `https://${process.env.SERVER}/webhook/call-status`,
+      statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed', 'busy', 'no-answer', 'canceled', 'failed'],
+      statusCallbackMethod: 'POST'
+    });
 
-    const promptSource = composition
-      ? 'persona_composer'
-      : businessProfile
-        ? usingDefaultPrompt && usingDefaultFirstMessage
-          ? 'business_profile_default'
-          : 'business_profile_custom'
-        : usingDefaultPrompt && usingDefaultFirstMessage
-          ? 'default'
-          : 'custom';
-
-    const effectiveVoiceModel = voice_model || deepgramConfig.voiceModel;
-    const sanitizedInputSequence = callType === 'collect_input'
-      ? normalizeInputSequencePayload(input_sequence, collect_digits || 4)
-      : [];
-    const metadataPayload = parseMetadataJson(metadata_json) || {};
-    metadataPayload.business_context = metadataPayload.business_context || functionSystem.context || null;
-    if (sanitizedCustomerName) {
-      metadataPayload.customer_name = sanitizedCustomerName;
-    }
-    if (!metadataPayload.registered_phone_number) {
-      metadataPayload.registered_phone_number = number;
-      metadataPayload.registered_phone_last4 = number ? number.replace(/\D/g, '').slice(-4) : null;
-    }
-    metadataPayload.dual_channel_checks = metadataPayload.dual_channel_checks || {};
-    if (!metadataPayload.dual_channel_checks.OTP) {
-      metadataPayload.dual_channel_checks.OTP = ['registered_phone'];
-    }
-    if (!metadataPayload.dual_channel_checks.PIN && metadataPayload.crm_contact_id) {
-      metadataPayload.dual_channel_checks.PIN = ['crm_record'];
-    }
-    if (!metadataPayload.dual_channel_checks.CARD_LAST4 && metadataPayload.expected_card_last4) {
-      metadataPayload.dual_channel_checks.CARD_LAST4 = ['crm_shadow'];
-      metadataPayload.crm_shadow_values = metadataPayload.crm_shadow_values || {};
-      metadataPayload.crm_shadow_values.CARD_LAST4 = String(metadataPayload.expected_card_last4);
-    }
-    const secureInputHints = functionEngine.getSecureInputHints();
-    if (secureInputHints && Object.keys(secureInputHints).length) {
-      metadataPayload.secure_input_hints = {
-        ...(metadataPayload.secure_input_hints || {}),
-        ...secureInputHints,
-      };
-    }
-    if (callType === 'collect_input') {
-      metadataPayload.input_sequence = sanitizedInputSequence;
-    }
-    const metadataSerialized = Object.keys(metadataPayload).length ? JSON.stringify(metadataPayload) : null;
-    const resolvedTelegramChatId = requestedTelegramChatId || user_chat_id || null;
+    const personaMetadata = {
+      customer_name: customer_name || null,
+      business_id: business_id || null,
+      purpose: purpose || null,
+      emotion: emotion || null,
+      urgency: urgency || null,
+      technical_level: technical_level || null,
+      voice_model: voice_model || null,
+      template: template || null,
+      template_id: template_id || null,
+      extra: metadata || null
+    };
 
     const callConfig = {
-      prompt: selectedPrompt,
-      first_message: selectedFirstMessage,
-      promptOverride: usingDefaultPrompt ? null : selectedPrompt,
-      firstMessageOverride: usingDefaultFirstMessage ? null : selectedFirstMessage,
+      prompt: prompt,
+      first_message: first_message,
       created_at: new Date().toISOString(),
       user_chat_id: user_chat_id,
       business_context: functionSystem.context,
-      business_id: resolvedBusinessId,
-      business_display_name: businessProfile ? businessProfile.displayName : null,
       function_count: functionSystem.functions.length,
-      prompt_source: promptSource,
-      persona_metadata: composition ? composition.metadata : null,
-      voice_model: effectiveVoiceModel,
-      template_name: templateName,
-      customer_name: sanitizedCustomerName,
-      call_type: callType,
-      business_function: businessFunction,
-      collect_input_sequence: sanitizedInputSequence,
-      collect_digits: collect_digits || 4,
-      collectThankYouMessage: collect_thank_you_message,
-      telegram_chat_id: resolvedTelegramChatId,
-      metadata_json: metadataSerialized
+      personaMetadata,
+      voice_model: voice_model || null,
+      customer_name: customer_name || null
     };
+    
+    callConfigurations.set(call.sid, callConfig);
+    
+    // Store the generated function system for this call
+    callFunctionSystems.set(call.sid, functionSystem);
 
-    ensureStructuredInputSequence(callConfig, metadataPayload);
-
-    let callSid = null;
-    let providerContactId = null;
-    let providerMetadata = {};
-    let providerStatus = 'initiated';
-    let providerResponse;
-
-    if (isAwsProvider) {
-      callSid = `aws-${uuidv4()}`;
-      const attributes = {
-        CALL_SID: callSid,
-        USER_CHAT_ID: user_chat_id || '',
-        PROMPT_SOURCE: promptSource,
-        BUSINESS_CONTEXT: JSON.stringify(functionSystem.context || {}),
-        FIRST_MESSAGE: selectedFirstMessage,
-        VOICE_MODEL: effectiveVoiceModel || '',
-        TEMPLATE_NAME: templateName || ''
-      };
-
-      providerResponse = await awsAdapters.connect.startOutboundCall({
-        destinationPhoneNumber: number,
-        clientToken: callSid,
-        attributes
-      });
-
-      providerContactId = providerResponse.ContactId;
-      providerMetadata = {
-        connect: {
-          contactId: providerResponse.ContactId,
-          initialContactId: providerResponse.InitialContactId || null
-        },
-        attributes
-      };
-      awsContactIndex.set(providerResponse.ContactId, callSid);
-      console.log(`📞 Amazon Connect contact started: ${providerResponse.ContactId} (call ${callSid})`.green);
-    } else if (isVonageProvider) {
-      callSid = `vonage-${uuidv4()}`;
-      const adapters = await ensureVonageAdapters();
-      const answerUrl = `${publicHttpBase}/vonage/answer?call_sid=${callSid}`;
-      const eventUrl = `${publicHttpBase}/vonage/event`;
-
-      providerResponse = await adapters.voice.createOutboundCall({
-        to: number,
-        callSid,
-        answerUrl,
-        eventUrl,
-      });
-
-      providerContactId = providerResponse.uuid || providerResponse?.data?.uuid || null;
-      providerStatus = providerResponse.status || 'started';
-      providerMetadata = {
-        vonage: {
-          uuid: providerResponse.uuid || null,
-          conversation_uuid: providerResponse.conversation_uuid || providerResponse.conversationUuid || null,
-          answer_url: answerUrl,
-          event_url: eventUrl,
-        },
-      };
-
-      if (providerContactId) {
-        vonageCallIndex.set(providerContactId, callSid);
-      }
-      if (providerResponse.conversation_uuid) {
-        vonageCallIndex.set(providerResponse.conversation_uuid, callSid);
-      }
-
-      console.log(`📞 Vonage outbound call started: ${providerContactId || 'unknown'} (call ${callSid})`.green);
-    } else {
-      const client = require('twilio')(accountSid, authToken);
-      providerResponse = await client.calls.create({
-        url: `${publicHttpBase}/incoming`,
-        to: number,
-        from: twilioFromNumber,
-        statusCallback: `${publicHttpBase}/webhook/call-status`,
-        statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed', 'busy', 'no-answer', 'canceled', 'failed'],
-        statusCallbackMethod: 'POST',
-        machineDetection: 'Enable',
-        machineDetectionTimeout: 8,
-        machineDetectionSpeechThreshold: 2400,
-        machineDetectionSpeechEndThreshold: 1200,
-        asyncAmd: true,
-        asyncAmdStatusCallback: `${publicHttpBase}/webhook/amd-status`,
-        asyncAmdStatusCallbackMethod: 'POST'
-      });
-      callSid = providerResponse.sid;
-      providerContactId = providerResponse.sid;
-      providerStatus = providerResponse.status;
-      providerMetadata = {
-        twilio: {
-          statusCallback: `${publicHttpBase}/webhook/call-status`
-        }
-      };
-      console.log(`📞 Twilio call created: ${callSid} to ${number}`.green);
-    }
-
-    callConfigurations.set(callSid, callConfig);
+    // Save call to database with enhanced metadata
     try {
-      const orchestrator = new InputOrchestrator(callConfig);
-      inputOrchestrators.set(callSid, orchestrator);
-    } catch (orchestratorError) {
-      console.warn(`Failed to initialize input orchestrator for ${callSid}:`, orchestratorError.message);
-    }
-    callFunctionSystems.set(callSid, functionSystem);
-
-    try {
-      const businessContextRecord = {
+      const businessContext = {
         ...functionSystem.context,
-        persona: composition ? composition.metadata : null,
-        voice_model: effectiveVoiceModel || null
+        persona: personaMetadata
       };
 
       await db.createCall({
-        call_sid: callSid,
+        call_sid: call.sid,
         phone_number: number,
-        prompt: selectedPrompt,
-        first_message: selectedFirstMessage,
-        user_chat_id,
-        business_context: JSON.stringify(businessContextRecord),
-        generated_functions: JSON.stringify(functionSystem.functions.map((f) => f.function.name)),
-        provider: currentProvider,
-        provider_contact_id: providerContactId,
-        provider_metadata: {
-          ...providerMetadata,
-          promptSource,
-          voice_model: effectiveVoiceModel || null,
-          template_name: templateName || null
-        },
-        call_type: callType,
-        business_function: businessFunction,
-        telegram_chat_id: resolvedTelegramChatId,
-        metadata_json: metadataSerialized
+        prompt: prompt,
+        first_message: first_message,
+        user_chat_id: user_chat_id,
+        business_context: JSON.stringify(businessContext),
+        generated_functions: JSON.stringify(functionSystem.functions.map(f => f.function.name))
       });
 
-      // Create call status thread mapping immediately so webhooks can find chat/message anchor
-      if (resolvedTelegramChatId && db?.upsertCallStatusThread) {
-        try {
-          await db.upsertCallStatusThread({
-            call_sid: callSid,
-            telegram_chat_id: resolvedTelegramChatId,
-            to_number: number,
-            from_number: twilioFromNumber || providerMetadata?.from_number,
-            call_type: callType,
-            created_at: new Date().toISOString()
-          });
-          console.log(`✅ Created status thread mapping: ${callSid} -> ${resolvedTelegramChatId}`.green);
-        } catch (mappingError) {
-          console.error('❌ Failed to create status thread mapping:', mappingError);
-        }
-      } else {
-        console.warn('⚠️ Cannot create status thread mapping: missing chatId or upsertCallStatusThread function'.yellow);
-      }
+      await db.updateCallState(call.sid, 'call_created', {
+        customer_name: customer_name || null,
+        business_id: business_id || null,
+        purpose: purpose || null,
+        emotion: emotion || null,
+        urgency: urgency || null,
+        technical_level: technical_level || null,
+        voice_model: voice_model || null,
+        template: template || null,
+        template_id: template_id || null
+      });
 
+      // Create initial webhook notification
       if (user_chat_id) {
-        await db.createEnhancedWebhookNotification(callSid, 'call_initiated', user_chat_id);
+        await db.createEnhancedWebhookNotification(call.sid, 'call_initiated', user_chat_id);
       }
 
-      console.log(
-        `🎯 Business context: ${functionSystem.context.industry} - ${functionSystem.context.businessType}`.cyan
-      );
-      console.log(`🧾 Prompt source: ${promptSource}${businessProfile ? ` (${businessProfile.displayName})` : ''}`.cyan);
-      if (composition?.metadata) {
-        console.log(`🧬 Persona metadata: ${JSON.stringify(composition.metadata)}`.gray);
-      }
+      console.log(`ð Enhanced adaptive call created: ${call.sid} to ${number}`.green);
+      console.log(`ð¯ Business context: ${functionSystem.context.industry} - ${functionSystem.context.businessType}`.cyan);
+      
     } catch (dbError) {
       console.error('Database error:', dbError);
     }
 
-    if (isAwsProvider) {
-      await initializeAwsCallSession({
-        callSid,
-        contactId: providerContactId,
-        callConfig,
-        functionSystem,
-        firstMessage: selectedFirstMessage,
-        voiceModel: effectiveVoiceModel || null,
-        phoneNumber: number
-      });
-    }
-
     res.json({
       success: true,
-      call_sid: callSid,
+      call_sid: call.sid,
       to: number,
-      status: providerStatus,
-      provider: currentProvider,
-      provider_contact_id: providerContactId,
+      status: call.status,
       business_context: functionSystem.context,
-      business_id: resolvedBusinessId,
-      business_display_name: businessProfile ? businessProfile.displayName : null,
-      prompt_source: promptSource,
       generated_functions: functionSystem.functions.length,
-      function_types: functionSystem.functions.map((f) => f.function.name),
-      enhanced_webhooks: true,
-      persona: composition ? composition.metadata : null,
-      voice_model: effectiveVoiceModel || null,
-      template: templateName
+      function_types: functionSystem.functions.map(f => f.function.name),
+      enhanced_webhooks: true
     });
+
   } catch (error) {
     console.error('Error creating enhanced adaptive outbound call:', error);
-
-    // Notify requester via Telegram if available
-    try {
-      const chatId = requestedTelegramChatId || user_chat_id || null;
-      if (chatId && webhookService?.sendTelegramMessage) {
-        const details = error?.code === 21219
-          ? 'Twilio trial accounts may only call verified numbers.'
-          : error?.message || 'Unable to create outbound call.';
-        await webhookService.sendTelegramMessage(
-          chatId,
-          `❌ Call failed to start: ${details}`,
-          null
-        );
-      }
-    } catch (notifyError) {
-      console.warn('Failed to send Telegram failure notice:', notifyError.message);
-    }
-
     res.status(500).json({
       error: 'Failed to create outbound call',
       details: error.message
@@ -2655,569 +1233,207 @@ app.post('/outbound-call', async (req, res) => {
   }
 });
 
-app.get('/admin/provider', requireAdminAuth, async (req, res) => {
-  try {
-    const storedProvider = db && typeof db.getSystemSetting === 'function'
-      ? await db.getSystemSetting('call_provider')
-      : currentProvider;
-
-    const twilioReady = Boolean(twilioAccountSid && twilioAuthToken && twilioFromNumber);
-    const vonageReady = Boolean(
-      vonageConfig?.apiKey &&
-      vonageConfig?.apiSecret &&
-      vonageConfig?.applicationId &&
-      vonageConfig?.privateKey &&
-      (vonageAdapters?.voice || vonageConfig?.voice?.fromNumber)
-    );
-
-    res.json({
-      provider: currentProvider,
-      stored_provider: storedProvider || currentProvider,
-      is_aws: isAwsProvider,
-      is_vonage: currentProvider === 'vonage',
-      supported_providers: SUPPORTED_CALL_PROVIDERS,
-      aws_ready: !!awsAdapters,
-      twilio_ready: twilioReady,
-      vonage_ready: vonageReady
-    });
-  } catch (error) {
-    console.error('Failed to load provider status:', error);
-    res.status(500).json({ error: 'Failed to load provider status', details: error.message });
-  }
-});
-
-app.post('/admin/provider', requireAdminAuth, async (req, res) => {
-  const requestProvider = (req.body?.provider || req.query?.provider || '').toString().toLowerCase();
-
-  if (!SUPPORTED_CALL_PROVIDERS.includes(requestProvider)) {
-    return res.status(400).json({
-      error: 'Unsupported provider',
-      supported_providers: SUPPORTED_CALL_PROVIDERS
-    });
-  }
-
-  try {
-    const result = await applyProvider(requestProvider, { persist: true });
-    res.json({
-      success: true,
-      provider: currentProvider,
-      changed: result.changed,
-      is_aws: isAwsProvider,
-      is_vonage: currentProvider === 'vonage',
-      vonage_ready: currentProvider === 'vonage' ? !!vonageAdapters : false
-    });
-  } catch (error) {
-    console.error('Failed to update call provider:', error);
-    res.status(500).json({ error: 'Failed to update provider', details: error.message });
-  }
-});
-
-app.all('/vonage/answer', (req, res) => {
-  if (currentProvider !== 'vonage') {
-    res.status(404).json({ error: 'Vonage provider not active' });
-    return;
-  }
-
-  const callSid = req.query?.call_sid || req.body?.call_sid;
-  if (!callSid) {
-    res.status(400).json({ error: 'Missing call_sid parameter' });
-    return;
-  }
-
-  const ncco = [
-    {
-      action: 'connect',
-      endpoint: [
-        {
-          type: 'websocket',
-          uri: `${publicWsBase}/connection`,
-          contentType: 'audio/l16;rate=16000',
-          headers: {
-            call_sid: callSid,
-          },
-        },
-      ],
-    },
-  ];
-
-  res.json(ncco);
-});
-
-app.post('/vonage/event', async (req, res) => {
-  if (currentProvider !== 'vonage') {
-    res.status(404).json({ error: 'Vonage provider not active' });
-    return;
-  }
-
-  try {
-    const event = req.body || {};
-    const { uuid, conversation_uuid: conversationUuid, status } = event;
-    const callSid = event.call_sid || vonageCallIndex.get(uuid);
-
-    if (!callSid) {
-      console.warn('Vonage event received for unknown call', event);
-      res.json({ received: true, ignored: true });
-      return;
-    }
-
-    const vonageDigitsCandidate =
-      extractDigitsFromPayload(event.dtmf) ||
-      extractDigitsFromPayload(event.dtmf_digits) ||
-      extractDigitsFromPayload(event.dtmfDigits) ||
-      extractDigitsFromPayload(event.digits) ||
-      extractDigitsFromPayload(event.payload?.dtmf) ||
-      extractDigitsFromPayload(event.payload?.digits);
-
-    if (vonageDigitsCandidate) {
-      await persistDtmfCapture(callSid, vonageDigitsCandidate, {
-        source: 'vonage',
-        provider: 'vonage',
-        capture_method: 'vonage_event',
-        metadata: {
-          event_status: status,
-          uuid,
-          conversation_uuid: conversationUuid,
-        },
-      });
-    }
-
-    const normalizedStatusRaw = (status || '').toLowerCase();
-    let normalizedStatus = null;
-    let notificationType = null;
-
-    switch (normalizedStatusRaw) {
-      case 'started':
-      case 'initiated':
-      case 'ringing':
-        normalizedStatus = 'ringing';
-        notificationType = 'call_ringing';
-        break;
-      case 'answered':
-        normalizedStatus = 'in-progress';
-        notificationType = 'call_answered';
-        break;
-      case 'completed':
-      case 'hangup':
-      case 'finished':
-        normalizedStatus = 'completed';
-        notificationType = 'call_completed';
-        break;
-      case 'busy':
-        normalizedStatus = 'busy';
-        notificationType = 'call_busy';
-        break;
-      case 'failed':
-      case 'cancelled':
-      case 'canceled':
-        normalizedStatus = 'failed';
-        notificationType = 'call_failed';
-        break;
-      case 'timeout':
-      case 'unanswered':
-        normalizedStatus = 'no-answer';
-        notificationType = 'call_no_answer';
-        break;
-      default:
-        normalizedStatus = normalizedStatusRaw || 'unknown';
-        notificationType = `call_${normalizedStatus}`;
-    }
-
-    await db.updateCallStatus(callSid, normalizedStatus, {
-      provider: currentProvider,
-      provider_contact_id: uuid,
-      provider_metadata: {
-        vonage_event: event,
-      },
-    });
-
-    const callRecord = await db.getCall(callSid);
-    const realtimeTypes = new Set(['call_initiated', 'call_ringing', 'call_answered']);
-    if (callRecord?.user_chat_id && notificationType && realtimeTypes.has(notificationType)) {
-      await db.createEnhancedWebhookNotification(callSid, notificationType, callRecord.user_chat_id);
-    }
-
-    if (['completed', 'no-answer', 'failed', 'busy'].includes(normalizedStatus)) {
-      vonageCallIndex.delete(uuid);
-      if (event.conversation_uuid) {
-        vonageCallIndex.delete(event.conversation_uuid);
-      }
-      if (activeCalls.has(callSid)) {
-        const session = activeCalls.get(callSid);
-        const startTime = session?.startTime || (callRecord?.started_at ? new Date(callRecord.started_at) : new Date());
-        await handleCallEnd(callSid, startTime);
-        activeCalls.delete(callSid);
-      }
-      removeCallConfiguration(callSid);
-      callFunctionSystems.delete(callSid);
-      await finalizeCallOutcome(callSid, {
-        call: callRecord,
-        finalStatus: normalizedStatus,
-        answeredBy: callRecord?.answered_by,
-      });
-    }
-
-    await db.logServiceHealth('vonage_voice', 'event_received', {
-      call_sid: callSid,
-      status: normalizedStatus,
-      uuid,
-      conversation_uuid: conversationUuid,
-    });
-
-    res.json({ received: true });
-  } catch (error) {
-    console.error('Error processing Vonage event:', error);
-    res.status(500).json({ error: 'Failed to process Vonage event', details: error.message });
-  }
-});
-
-  app.post('/webhook/amd-status', validateTwilioRequest(), async (req, res) => {
-    if (currentProvider !== 'twilio') {
-      res.status(404).json({ error: 'AMD webhook disabled for current provider' });
-      return;
-    }
-
-  try {
-    const { CallSid, AnsweredBy, AnsweredByStatus, Confidence } = req.body || {};
-    if (!CallSid) {
-      res.status(400).json({ error: 'Missing CallSid' });
-      return;
-    }
-
-    if (db && typeof db.logCallEvent === 'function') {
-      await db.logCallEvent(CallSid, 'twilio_amd_webhook', req.body, {
-        provider: 'twilio',
-        raw_status: AnsweredBy || AnsweredByStatus || null
-      });
-    }
-
-    const call = await db.getCall(CallSid);
-    if (!call) {
-      console.warn(`⚠️ AMD webhook received for unknown call: ${CallSid}`.yellow);
-      res.status(200).send('OK');
-      return;
-    }
-
-    const answeredValue = AnsweredBy || AnsweredByStatus || null;
-    const normalizedAnswer = normalizeAnsweredBy(answeredValue);
-    const confidenceValue =
-      Confidence !== undefined && Confidence !== null && Confidence !== ''
-        ? Number(Confidence)
-        : undefined;
-
-    await db.updateAmdStatus(CallSid, answeredValue, {
-      confidence: Number.isFinite(confidenceValue) ? confidenceValue : undefined,
-      answeredBy: answeredValue,
-      markAnswered: Boolean(normalizedAnswer),
-    });
-
-    await callHintStateMachine.handleAmdUpdate(CallSid, answeredValue, {
-      call,
-      provider: 'twilio',
-      metadata: {
-        confidence: Number.isFinite(confidenceValue) ? confidenceValue : undefined
-      }
-    });
-
-    const targetChatId = call.telegram_chat_id || call.user_chat_id;
-    if (targetChatId && answeredValue) {
-      await db.createEnhancedWebhookNotification(CallSid, 'call_amd_update', targetChatId, 'high');
-    }
-
-    res.status(200).send('OK');
-  } catch (error) {
-    console.error('Error processing AMD webhook:', error);
-    res.status(200).send('OK');
-  }
-});
-
 // Enhanced webhook endpoint for call status updates
 
-  app.post('/webhook/call-status', validateTwilioRequest(), async (req, res) => {
-    // CRITICAL: Log every webhook hit immediately
-    const {
-      CallSid,
-      CallStatus,
-      Duration,
-      From,
-      To,
+app.post('/webhook/call-status', async (req, res) => {
+  try {
+    const { 
+      CallSid, 
+      CallStatus, 
+      Duration, 
+      From, 
+      To, 
       CallDuration,
       AnsweredBy,
       ErrorCode,
       ErrorMessage,
-      DialCallDuration
+      DialCallDuration // This is key for detecting actual answer vs no-answer
     } = req.body;
-
-    const timestamp = new Date().toISOString();
-    console.log(`[STATUS WEBHOOK HIT] ${CallSid || 'unknown'} :: ${CallStatus || 'unknown'} @ ${timestamp}`);
-    console.log(`[WEBHOOK DETAILS] Duration=${Duration} DialDuration=${DialCallDuration} AnsweredBy=${AnsweredBy}`);
-
-    try {
-      // Log the webhook event to database for debugging
-      if (db && typeof db.logCallEvent === 'function') {
-        await db.logCallEvent(CallSid, 'twilio_status_webhook', req.body, {
-          provider: 'twilio',
-          raw_status: CallStatus
-        });
-      }
-
-      // Get call details from database
-      const call = await db.getCall(CallSid);
-      if (!call) {
-        console.warn(`⚠️ Webhook received for unknown call: ${CallSid}`.yellow);
-        res.status(200).send('OK'); // Still return 200 to prevent retries
-        return;
-      }
-
-      let normalizedStatus = (CallStatus || '').toLowerCase();
-      const durationValue = parseInt(Duration || CallDuration || DialCallDuration || 0);
-
-      // Build update data
-      const updateData = {
-        duration: durationValue,
-        twilio_status: CallStatus,
-        answered_by: AnsweredBy,
-        error_code: ErrorCode,
-        error_message: ErrorMessage,
-        ring_duration: DialCallDuration ? parseInt(DialCallDuration) : undefined
-      };
-
-      const isTerminal = ['completed', 'no-answer', 'failed', 'busy', 'canceled'].includes(normalizedStatus);
-
-      // Mark as answered if in progress or completed
-      if (
-        ['answered', 'in-progress'].includes(normalizedStatus) ||
-        (normalizedStatus === 'completed' && durationValue > 0)
-      ) {
-        updateData.was_answered = 1;
-        if (!call.started_at) {
-          updateData.started_at = new Date().toISOString();
-        }
-      }
-
-      if (isTerminal && !call.ended_at) {
-        updateData.ended_at = new Date().toISOString();
-      }
-
-      // CRITICAL: Reconcile with Twilio REST for terminal states to catch no-answer
-      if (isTerminal && twilioRestClient) {
-        try {
-          console.log(`[RECONCILE] Fetching final status from Twilio REST for ${CallSid}`);
-          const restCall = await twilioRestClient.calls(CallSid).fetch();
-          if (restCall) {
-            const restStatus = (restCall.status || '').toLowerCase();
-            const restDuration = parseInt(restCall.duration || 0);
-            const restAnsweredBy = restCall.answeredBy || AnsweredBy;
-
-            console.log(`[RECONCILE] REST status=${restStatus} duration=${restDuration} answeredBy=${restAnsweredBy}`);
-
-            // Trust REST API for final status
-            if (restStatus === 'no-answer') {
-              normalizedStatus = 'no-answer';
-              console.log(`[RECONCILE] Corrected to no-answer`);
-            }
-            if (!normalizedStatus && restStatus) {
-              normalizedStatus = restStatus;
-            }
-            if (restDuration > 0) {
-              updateData.duration = restDuration;
-            }
-            if (restAnsweredBy) {
-              updateData.answered_by = restAnsweredBy;
-            }
-            if (restCall.startTime && !updateData.started_at) {
-              updateData.started_at = new Date(restCall.startTime).toISOString();
-            }
-            if (restCall.endTime) {
-              updateData.ended_at = new Date(restCall.endTime).toISOString();
-            }
-          }
-        } catch (restError) {
-          console.warn(`Unable to reconcile call ${CallSid} with Twilio REST:`, restError.message);
-        }
-      }
-
-      const finalStatus = normalizedStatus || 'completed';
-
-      // Calculate ring duration for no-answer if not provided
-      if (finalStatus === 'no-answer' && !updateData.ring_duration && call.created_at) {
-        const callStart = new Date(call.created_at);
-        const now = new Date();
-        updateData.ring_duration = Math.round((now - callStart) / 1000);
-        console.log(`[NO-ANSWER] Calculated ring duration: ${updateData.ring_duration}s`);
-      }
-
-      // Update database
-      await db.updateCallStatus(CallSid, finalStatus, updateData);
-      console.log(`[DB UPDATE] Status updated to: ${finalStatus}`);
-
-      // Update call hint state machine
-      await callHintStateMachine.handleTwilioStatus(CallSid, finalStatus, {
-        call,
-        answeredBy: updateData.answered_by,
-        provider: 'twilio'
-      });
-
-      // Handle collect_input calls
-      if (
-        call.call_type === 'collect_input' &&
-        ['completed', 'no-answer', 'failed', 'canceled', 'busy'].includes(finalStatus)
-      ) {
-        await finalizeCollectInputCall(CallSid, call);
-      }
-
-      // CRITICAL: Get or create Telegram chat mapping
-      let targetChat = call.telegram_chat_id || call.user_chat_id;
-
-      // Try to get from call status thread table
-      if (!targetChat && db?.getCallStatusThread) {
-        try {
-          const threadMapping = await db.getCallStatusThread(CallSid);
-          if (threadMapping?.telegram_chat_id) {
-            targetChat = threadMapping.telegram_chat_id;
-            console.log(`[MAPPING] Found chat from thread table: ${targetChat}`);
-          }
-        } catch (mappingError) {
-          console.warn(`Failed to get thread mapping: ${mappingError.message}`);
-        }
-      }
-
-      // If still no chat, try to find from recent calls by same user
-      if (!targetChat && call.user_chat_id) {
-        targetChat = call.user_chat_id;
-        console.log(`[MAPPING] Using user_chat_id: ${targetChat}`);
-      }
-
-      if (!targetChat) {
-        console.error(`❌ NO TELEGRAM CHAT FOUND for call ${CallSid}. Cannot send updates!`);
-        res.status(200).send('OK');
-        return;
-      }
-
-      // CRITICAL: Ensure thread mapping exists in database
-      if (db?.upsertCallStatusThread) {
-        try {
-          await db.upsertCallStatusThread({
-            call_sid: CallSid,
-            telegram_chat_id: targetChat,
-            to_number: call.phone_number || To,
-            from_number: call.from_number || From || twilioFromNumber,
-            call_type: call.call_type || 'voice'
-          });
-          console.log(`[MAPPING] Persisted thread mapping for ${CallSid} -> ${targetChat}`);
-        } catch (mapErr) {
-          console.warn('⚠️ Failed to persist call status thread mapping:', mapErr.message);
-        }
-      } else {
-        console.warn('⚠️ upsertCallStatusThread not available in database');
-      }
-
-      // CRITICAL: Send immediate Telegram notification
-      console.log(`[TELEGRAM] Sending ${finalStatus} update to chat ${targetChat}`);
-
-      // Map status to user-friendly message
-      const statusMessages = {
-        initiated: '📤 Call initiated',
-        queued: '📤 Call initiated',
-        ringing: '🔔 Ringing…',
-        answered: '✅ Answered',
-        'in-progress': '🟢 In progress',
-        completed: '🏁 Completed',
-        busy: '🚫 Busy',
-        'no-answer': '⏳ No answer',
-        canceled: '⚠️ Canceled',
-        failed: '❌ Failed'
-      };
-
-      const statusMessage = statusMessages[finalStatus] || `📱 ${finalStatus}`;
-
-      // Send immediate status update
-      try {
-        await webhookService.sendImmediateStatus(CallSid, finalStatus, targetChat);
-        console.log(`[TELEGRAM] ✅ Status sent successfully`);
-      } catch (telegramError) {
-        console.error(`[TELEGRAM] ❌ Failed to send status:`, telegramError.message);
-
-        // Fallback: try direct send
-        try {
-          const fallbackMessage = `${statusMessage}\nCall: ${call.phone_number || To}`;
-          await webhookService.sendTelegramMessage(targetChat, fallbackMessage);
-          console.log(`[TELEGRAM] ✅ Fallback message sent`);
-        } catch (fallbackError) {
-          console.error(`[TELEGRAM] ❌ Fallback also failed:`, fallbackError.message);
-        }
-      }
-
-      // For terminal states, send final outcome
-      if (isTerminal) {
-        console.log(`[TERMINAL] Finalizing outcome for ${finalStatus}`);
-
-        // Send final outcome message
-        let outcomeMessage = '';
-        if (finalStatus === 'no-answer') {
-          const ringTime = updateData.ring_duration || 0;
-          outcomeMessage = `❌ Not completed: no-answer\n\nThe call rang for ${ringTime} seconds but was not answered.`;
-        } else if (finalStatus === 'busy') {
-          outcomeMessage = `🚫 Line was busy`;
-        } else if (finalStatus === 'failed') {
-          outcomeMessage = `❌ Call failed${ErrorMessage ? `: ${ErrorMessage}` : ''}`;
-        } else if (finalStatus === 'canceled') {
-          outcomeMessage = `⚠️ Call was canceled`;
-        } else if (finalStatus === 'completed' && durationValue > 0) {
-          const minutes = Math.floor(durationValue / 60);
-          const seconds = durationValue % 60;
-          outcomeMessage = `✅ Call completed (${minutes}:${String(seconds).padStart(2, '0')})`;
-        }
-
-        if (outcomeMessage) {
-          try {
-            await webhookService.sendTelegramMessage(targetChat, outcomeMessage);
-            console.log(`[TELEGRAM] ✅ Outcome message sent`);
-          } catch (outcomeError) {
-            console.error(`[TELEGRAM] ❌ Failed to send outcome:`, outcomeError.message);
-          }
-        }
-
-        // Finalize call outcome in database
-        await finalizeCallOutcome(CallSid, {
-          finalStatus,
-          answeredBy: updateData.answered_by,
-          call
-        });
-      }
-
-      // Log to service health
-      await db.logServiceHealth('webhook_system', 'status_received', {
-        call_sid: CallSid,
-        original_status: CallStatus,
-        final_status: finalStatus,
-        duration: updateData.duration,
-        answered_by: updateData.answered_by,
-        correction_applied: finalStatus !== (CallStatus || '').toLowerCase(),
-        telegram_chat_id: targetChat
-      });
-
+    
+    console.log(`ð± Fixed Webhook: Call ${CallSid} status: ${CallStatus}`.blue);
+    console.log(`ð Debug Info:`.cyan);
+    console.log(`   Duration: ${Duration || 'N/A'}`);
+    console.log(`   CallDuration: ${CallDuration || 'N/A'}`);
+    console.log(`   DialCallDuration: ${DialCallDuration || 'N/A'}`);
+    console.log(`   AnsweredBy: ${AnsweredBy || 'N/A'}`);
+    
+    // Get call details from database
+    const call = await db.getCall(CallSid);
+    if (!call) {
+      console.warn(`â ï¸ Webhook received for unknown call: ${CallSid}`.yellow);
       res.status(200).send('OK');
-      console.log(`[WEBHOOK] ✅ Processing complete for ${CallSid}`);
-    } catch (error) {
-      console.error('❌ Error processing call status webhook:', error);
-      console.error('Stack:', error.stack);
-
-      // Log error to service health
-      try {
-        await db.logServiceHealth('webhook_system', 'error', {
-          operation: 'process_webhook',
-          error: error.message,
-          call_sid: CallSid,
-          stack: error.stack
-        });
-      } catch (logError) {
-        console.error('Failed to log webhook error:', logError);
-      }
-
-      // Always return 200 to prevent Twilio retries
-      res.status(200).send('OK');
+      return;
     }
-  });
+
+    // Enhanced logic for determining actual call outcome
+    let notificationType = null;
+    let actualStatus = CallStatus.toLowerCase();
+    
+    // Special handling for "completed" status - check if it was actually answered
+    if (actualStatus === 'completed') {
+      const duration = parseInt(Duration || CallDuration || DialCallDuration || 0);
+      
+      console.log(`ð Analyzing completed call: Duration = ${duration}s`.yellow);
+      
+      // If call completed but duration is very short (< 3 seconds), it's likely no-answer
+      // or if AnsweredBy is specifically 'machine_start' without actual conversation
+      if (duration === 0 || duration < 3) {
+        console.log(`â Short duration detected (${duration}s) - treating as no-answer`.red);
+        actualStatus = 'no-answer';
+        notificationType = 'call_no_answer';
+      } else if (AnsweredBy === 'machine_start' && duration < 10) {
+        console.log(`ð Voicemail detected with short duration - treating as no-answer`.red);
+        actualStatus = 'no-answer';
+        notificationType = 'call_no_answer';
+      } else {
+        console.log(`â Valid call duration (${duration}s) - confirmed answered`.green);
+        actualStatus = 'completed';
+        notificationType = 'call_completed';
+      }
+    } else {
+      // Handle other statuses normally
+      switch (actualStatus) {
+        case 'queued':
+        case 'initiated':
+          notificationType = 'call_initiated';
+          break;
+        case 'ringing':
+          notificationType = 'call_ringing';
+          break;
+        case 'in-progress':
+          notificationType = 'call_answered';
+          break;
+        case 'busy':
+          notificationType = 'call_busy';
+          break;
+        case 'no-answer':
+          notificationType = 'call_no_answer';
+          break;
+        case 'failed':
+          notificationType = 'call_failed';
+          break;
+        case 'canceled':
+          notificationType = 'call_canceled';
+          break;
+        default:
+          console.warn(`â ï¸ Unknown call status: ${CallStatus}`.yellow);
+          notificationType = `call_${actualStatus}`;
+      }
+    }
+
+    console.log(`ð¯ Final determination: ${CallStatus} â ${actualStatus} â ${notificationType}`.green);
+
+    // Update call status in database with enhanced data
+    const updateData = {
+      duration: parseInt(Duration || CallDuration || DialCallDuration || 0),
+      twilio_status: CallStatus,
+      answered_by: AnsweredBy,
+      error_code: ErrorCode,
+      error_message: ErrorMessage
+    };
+
+    // Calculate ring duration for no-answer cases
+    if (actualStatus === 'no-answer' && call.created_at) {
+      const callStart = new Date(call.created_at);
+      const now = new Date();
+      const ringDuration = Math.round((now - callStart) / 1000);
+      updateData.ring_duration = ringDuration;
+      console.log(`ð Calculated ring duration: ${ringDuration}s`.cyan);
+    }
+
+    // Set timestamps based on actual status (not original CallStatus)
+    if (actualStatus === 'in-progress' && !call.started_at) {
+      updateData.started_at = new Date().toISOString();
+    } else if (['completed', 'no-answer', 'failed', 'busy', 'canceled'].includes(actualStatus) && !call.ended_at) {
+      updateData.ended_at = new Date().toISOString();
+    }
+
+    await db.updateCallStatus(CallSid, actualStatus, updateData);
+
+    // Live ticker message (single edited message per call)
+    try {
+      if (call.user_chat_id) {
+        await webhookService.initLiveCallConsole(CallSid, call.user_chat_id, {
+          phoneNumber: call.phone_number || To
+        });
+        const phaseMap = {
+          queued: 'started',
+          initiated: 'started',
+          ringing: 'started',
+          'in-progress': 'speaking',
+          completed: 'ended',
+          'no-answer': 'ended',
+          failed: 'ended',
+          busy: 'ended',
+          canceled: 'ended'
+        };
+        const mappedPhase = phaseMap[actualStatus] || null;
+        if (mappedPhase) {
+          await webhookService.setLiveCallPhase(CallSid, mappedPhase);
+        }
+      }
+    } catch (tickerError) {
+      console.warn('Live ticker update failed:', tickerError.message);
+    }
+
+    // Create enhanced webhook notification with corrected status
+    if (call.user_chat_id && notificationType) {
+      try {
+        await db.createEnhancedWebhookNotification(CallSid, notificationType, call.user_chat_id);
+        console.log(`ð¨ Created corrected ${notificationType} notification for call ${CallSid}`.green);
+        
+        // Log the correction if we changed the status
+        if (actualStatus !== CallStatus.toLowerCase()) {
+          await db.logServiceHealth('webhook_system', 'status_corrected', {
+            call_sid: CallSid,
+            original_status: CallStatus,
+            corrected_status: actualStatus,
+            duration: updateData.duration,
+            reason: 'Short duration analysis'
+          });
+        }
+      } catch (notificationError) {
+        console.error('Error creating enhanced webhook notification:', notificationError);
+      }
+    }
+    
+    // Log comprehensive status update
+    console.log(`â Fixed webhook processed: ${CallSid} -> ${CallStatus} (corrected to: ${actualStatus})`.green);
+    if (updateData.duration) {
+      const minutes = Math.floor(updateData.duration / 60);
+      const seconds = updateData.duration % 60;
+      console.log(`ð Call metrics: ${minutes}:${String(seconds).padStart(2, '0')} duration`.cyan);
+    }
+
+    // Log to service health with correction info
+    await db.logServiceHealth('webhook_system', 'status_received', {
+      call_sid: CallSid,
+      original_status: CallStatus,
+      final_status: actualStatus,
+      duration: updateData.duration,
+      answered_by: AnsweredBy,
+      correction_applied: actualStatus !== CallStatus.toLowerCase()
+    });
+    
+    res.status(200).send('OK');
+    
+  } catch (error) {
+    console.error('â Error processing fixed call status webhook:', error);
+    
+    // Log error to service health
+    try {
+      await db.logServiceHealth('webhook_system', 'error', {
+        operation: 'process_webhook',
+        error: error.message,
+        call_sid: req.body.CallSid
+      });
+    } catch (logError) {
+      console.error('Failed to log webhook error:', logError);
+    }
+    
+    res.status(200).send('OK');
+  }
+});
 
 
 // Enhanced API endpoints with adaptation analytics
@@ -3233,19 +1449,7 @@ app.get('/api/calls/:callSid', async (req, res) => {
     }
 
     const transcripts = await db.getCallTranscripts(callSid);
-    const dtmfEntries = await db.getCallDtmfEntries(callSid);
-    const dtmfInputs = formatDtmfEntriesForResponse(dtmfEntries);
-    const callInputs = await db.getCallInputs(callSid);
-
-    let businessContext = null;
-    if (call.business_context) {
-      try {
-        businessContext = JSON.parse(call.business_context);
-      } catch (contextError) {
-        console.warn('Failed to parse business context for call detail response:', contextError.message);
-      }
-    }
-
+    
     // Parse adaptation data
     let adaptationData = {};
     try {
@@ -3272,15 +1476,9 @@ app.get('/api/calls/:callSid', async (req, res) => {
     res.json({
       call,
       transcripts,
-      dtmf_inputs: dtmfInputs,
-      inputs: callInputs,
       transcript_count: transcripts.length,
-      transcript_preview: transcripts
-        .map((entry) => entry.clean_message || entry.message || entry.raw_message || '')
-        .join('\n')
-        .slice(0, 500),
       adaptation_analytics: adaptationData,
-      business_context: businessContext,
+      business_context: call.business_context ? JSON.parse(call.business_context) : null,
       webhook_notifications: webhookNotifications,
       enhanced_features: true
     });
@@ -3370,8 +1568,93 @@ app.get('/api/calls/:callSid/status', async (req, res) => {
   }
 });
 
+// Call latency and version helpers
+app.get('/api/calls/:callSid/latency', async (req, res) => {
+  try {
+    const { callSid } = req.params;
+    const call = await db.getCall(callSid);
+    if (!call) {
+      return res.status(404).json({ success: false, error: 'Call not found' });
+    }
+    const analysis = call.ai_analysis ? safeJsonParse(call.ai_analysis, {}) : {};
+    const smart = analysis.smart_summary || {};
+    const latency = smart.latency_metrics || analysis.latency || {};
+    res.json({
+      success: true,
+      call_sid: callSid,
+      latency_metrics: latency,
+      call_duration: call.duration || null,
+      recorded_at: call.ended_at || call.created_at || null
+    });
+  } catch (error) {
+    console.error('Error fetching call latency:', error);
+    res.status(500).json({ success: false, error: 'Failed to fetch latency', details: error.message });
+  }
+});
+
+app.get('/api/version', (req, res) => {
+  try {
+    const pkg = require('./package.json');
+    res.json({
+      success: true,
+      version: pkg.version,
+      name: pkg.name,
+      timestamp: new Date().toISOString(),
+      provider: currentProvider
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, error: 'Failed to read version', details: error.message });
+  }
+});
+
+app.get('/api/calls/recent', async (req, res) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit) || 10, 50);
+    const filter = (req.query.filter || '').toLowerCase();
+    const calls = await db.getRecentCalls(limit, 0);
+    const filtered = calls.filter((call) => {
+      if (!filter) return true;
+      switch (filter) {
+        case 'failed':
+          return ['failed', 'busy', 'no-answer', 'canceled'].includes((call.status || '').toLowerCase());
+        case 'completed':
+          return (call.status || '').toLowerCase() === 'completed';
+        case 'angry':
+          try {
+            const analysis = call.ai_analysis ? JSON.parse(call.ai_analysis) : {};
+            const sentimentEnd = analysis?.smart_summary?.sentiment?.end || '';
+            return typeof sentimentEnd === 'string' && sentimentEnd.toLowerCase().includes('angry');
+          } catch {
+            return false;
+          }
+        case 'longest':
+          return true; // sort later
+        case 'transferred':
+          try {
+            const analysis = call.ai_analysis ? JSON.parse(call.ai_analysis) : {};
+            const outcome = analysis?.smart_summary?.outcome || '';
+            return outcome.toLowerCase().includes('transfer');
+          } catch {
+            return false;
+          }
+        default:
+          return true;
+      }
+    });
+
+    const sorted = filter === 'longest'
+      ? [...filtered].sort((a, b) => (b.duration || 0) - (a.duration || 0))
+      : filtered;
+
+    res.json({ success: true, calls: sorted.slice(0, limit), limit, filter });
+  } catch (error) {
+    console.error('Error fetching recent calls:', error);
+    res.status(500).json({ success: false, error: 'Failed to fetch recent calls', details: error.message });
+  }
+});
+
 // Manual notification trigger endpoint (for testing)
-app.post('/api/calls/:callSid/notify', requireAdminAuth, async (req, res) => {
+app.post('/api/calls/:callSid/notify', async (req, res) => {
   try {
     const { callSid } = req.params;
     const { status, user_chat_id } = req.body;
@@ -3411,6 +1694,165 @@ app.post('/api/calls/:callSid/notify', requireAdminAuth, async (req, res) => {
       error: 'Failed to send notification',
       details: error.message 
     });
+  }
+});
+
+// Call templates API (used by Telegram bot)
+app.get('/api/call-templates', async (req, res) => {
+  try {
+    const templates = await db.listCallTemplates();
+    res.json({ success: true, templates });
+  } catch (error) {
+    console.error('Error listing call templates:', error);
+    res.status(500).json({ success: false, error: 'Failed to list templates' });
+  }
+});
+
+app.get('/api/call-templates/:id', async (req, res) => {
+  try {
+    const template = await db.getCallTemplateById(req.params.id);
+    if (!template) {
+      return res.status(404).json({ success: false, error: 'Template not found' });
+    }
+    res.json({ success: true, template });
+  } catch (error) {
+    console.error('Error fetching call template:', error);
+    res.status(500).json({ success: false, error: 'Failed to fetch template' });
+  }
+});
+
+app.post('/api/call-templates', requireAdmin, async (req, res) => {
+  try {
+    const { name, description, business_id, prompt, first_message, voice_model } = req.body || {};
+    if (!name || !prompt) {
+      return res.status(400).json({ success: false, error: 'name and prompt are required' });
+    }
+    const id = await db.createCallTemplate({ name, description, business_id, prompt, first_message, voice_model });
+    const template = await db.getCallTemplateById(id);
+    res.status(201).json({ success: true, template });
+  } catch (error) {
+    console.error('Error creating call template:', error);
+    const status = /UNIQUE constraint failed/i.test(error.message) ? 409 : 500;
+    res.status(status).json({ success: false, error: 'Failed to create template', details: error.message });
+  }
+});
+
+app.put('/api/call-templates/:id', requireAdmin, async (req, res) => {
+  try {
+    const changes = await db.updateCallTemplate(req.params.id, req.body || {});
+    if (!changes) {
+      return res.status(404).json({ success: false, error: 'Template not found' });
+    }
+    const template = await db.getCallTemplateById(req.params.id);
+    res.json({ success: true, template });
+  } catch (error) {
+    console.error('Error updating call template:', error);
+    res.status(500).json({ success: false, error: 'Failed to update template', details: error.message });
+  }
+});
+
+app.delete('/api/call-templates/:id', requireAdmin, async (req, res) => {
+  try {
+    const changes = await db.deleteCallTemplate(req.params.id);
+    if (!changes) {
+      return res.status(404).json({ success: false, error: 'Template not found' });
+    }
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Error deleting call template:', error);
+    res.status(500).json({ success: false, error: 'Failed to delete template', details: error.message });
+  }
+});
+
+app.post('/api/call-templates/:id/clone', requireAdmin, async (req, res) => {
+  try {
+    const template = await db.getCallTemplateById(req.params.id);
+    if (!template) {
+      return res.status(404).json({ success: false, error: 'Template not found' });
+    }
+    const suffix = req.body?.name || `${template.name}-copy`;
+    const newName = suffix.trim();
+    const id = await db.createCallTemplate({
+      name: newName,
+      description: template.description,
+      business_id: template.business_id,
+      prompt: template.prompt,
+      first_message: template.first_message,
+      voice_model: template.voice_model
+    });
+    const cloned = await db.getCallTemplateById(id);
+    res.status(201).json({ success: true, template: cloned });
+  } catch (error) {
+    console.error('Error cloning call template:', error);
+    res.status(500).json({ success: false, error: 'Failed to clone template', details: error.message });
+  }
+});
+
+// Provider admin endpoints (used by bot /provider)
+function computeProviderStatus() {
+  const twilioReady = !!(process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN && process.env.FROM_NUMBER);
+  const awsReady = !!(appConfig.aws?.connect?.instanceId);
+  const vonageReady = !!(appConfig.vonage?.apiKey && appConfig.vonage?.apiSecret && appConfig.vonage?.voice?.fromNumber);
+  return {
+    provider: currentProvider,
+    stored_provider: appConfig.platform.provider || currentProvider,
+    supported_providers: ['twilio', 'aws', 'vonage'],
+    twilio_ready: twilioReady,
+    aws_ready: awsReady,
+    vonage_ready: vonageReady
+  };
+}
+
+app.get('/admin/provider', requireAdmin, (req, res) => {
+  try {
+    const status = computeProviderStatus();
+    res.json(status);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch provider status', details: error.message });
+  }
+});
+
+app.post('/admin/provider', requireAdmin, (req, res) => {
+  try {
+    const { provider } = req.body || {};
+    const allowed = ['twilio', 'aws', 'vonage'];
+    if (!provider || !allowed.includes(provider.toLowerCase())) {
+      return res.status(400).json({ error: 'Invalid provider' });
+    }
+    const normalized = provider.toLowerCase();
+    const changed = normalized !== currentProvider;
+    currentProvider = normalized;
+    const status = computeProviderStatus();
+    res.json({ success: true, provider: currentProvider, changed, status });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to update provider', details: error.message });
+  }
+});
+// Operator control endpoint
+app.post('/api/calls/:callSid/operator', async (req, res) => {
+  try {
+    const { callSid } = req.params;
+    const { action, text, target } = req.body || {};
+
+    if (!action) {
+      return res.status(400).json({ success: false, error: 'action is required' });
+    }
+
+    const call = await db.getCall(callSid);
+    if (!call) {
+      return res.status(404).json({ success: false, error: 'Call not found' });
+    }
+
+    const ok = await handleOperatorAction(callSid, action, { text, target });
+    if (!ok) {
+      return res.status(400).json({ success: false, error: 'Unsupported operator action or failed to execute' });
+    }
+
+    await db.updateCallState(callSid, 'operator_action', { action, text, target });
+    return res.json({ success: true, action });
+  } catch (error) {
+    console.error('Operator control error:', error);
+    return res.status(500).json({ success: false, error: 'Failed to execute operator action', details: error.message });
   }
 });
 
@@ -3610,12 +2052,6 @@ app.get('/health', async (req, res) => {
       status: 'healthy', 
       timestamp: new Date().toISOString(),
       enhanced_features: true,
-      call_provider: {
-        active: currentProvider,
-        is_aws: isAwsProvider,
-        is_vonage: currentProvider === 'vonage',
-        supported: SUPPORTED_CALL_PROVIDERS
-      },
       services: {
         database: {
           connected: true,
@@ -3663,7 +2099,7 @@ app.post('/api/system/cleanup', async (req, res) => {
   try {
     const { days_to_keep = 30 } = req.body;
     
-    console.log(`🧹 Starting enhanced system cleanup (keeping ${days_to_keep} days)...`.yellow);
+    console.log(`ð§¹ Starting enhanced system cleanup (keeping ${days_to_keep} days)...`.yellow);
     
     const cleanedRecords = await db.cleanupOldRecords(days_to_keep);
     
@@ -3712,8 +2148,6 @@ app.get('/api/calls', async (req, res) => {
     const formattedCalls = calls.map(call => ({
       ...call,
       transcript_count: call.transcript_count || 0,
-      dtmf_input_count: call.dtmf_input_count || 0,
-      has_dtmf_input: (call.dtmf_input_count || 0) > 0,
       created_date: new Date(call.created_at).toLocaleDateString(),
       duration_formatted: call.duration ? 
         `${Math.floor(call.duration/60)}:${String(call.duration%60).padStart(2,'0')}` : 
@@ -3792,14 +2226,12 @@ app.get('/api/calls/list', async (req, res) => {
     const query = `
       SELECT 
         c.*,
-        COUNT(DISTINCT t.id) as transcript_count,
-        COUNT(DISTINCT d.id) as dtmf_input_count,
+        COUNT(t.id) as transcript_count,
         GROUP_CONCAT(DISTINCT t.speaker) as speakers,
         MIN(t.timestamp) as conversation_start,
         MAX(t.timestamp) as conversation_end
       FROM calls c
       LEFT JOIN transcripts t ON c.call_sid = t.call_sid
-      LEFT JOIN dtmf_entries d ON c.call_sid = d.call_sid
       ${whereClause}
       GROUP BY c.call_sid
       ORDER BY c.created_at DESC
@@ -3848,8 +2280,6 @@ app.get('/api/calls/list', async (req, res) => {
         ended_at: call.ended_at,
         duration: call.duration,
         transcript_count: call.transcript_count || 0,
-        dtmf_input_count: call.dtmf_input_count || 0,
-        has_dtmf_input: (call.dtmf_input_count || 0) > 0,
         has_conversation: hasConversation,
         conversation_duration: conversationDuration,
         call_summary: call.call_summary,
@@ -3902,15 +2332,15 @@ app.get('/api/calls/list', async (req, res) => {
 // Helper function for status icons
 function getStatusIcon(status) {
   const icons = {
-    'completed': '✅',
-    'no-answer': '📵',
-    'busy': '📞',
-    'failed': '❌',
-    'canceled': '🚫',
-    'in-progress': '🔄',
-    'ringing': '📲'
+    'completed': 'â',
+    'no-answer': 'ðµ',
+    'busy': 'ð',
+    'failed': 'â',
+    'canceled': 'ð«',
+    'in-progress': 'ð',
+    'ringing': 'ð²'
   };
-  return icons[status] || '❓';
+  return icons[status] || 'â';
 }
 
 // Add calls analytics endpoint
@@ -4102,11 +2532,11 @@ app.get('/api/calls/search', async (req, res) => {
 });
 
 // SMS webhook endpoints
-app.post('/webhook/sms', validateTwilioRequest(), async (req, res) => {
+app.post('/webhook/sms', async (req, res) => {
     try {
         const { From, Body, MessageSid, SmsStatus } = req.body;
 
-        console.log(`📨 SMS webhook: ${From} -> ${Body}`);
+        console.log(`ð¨ SMS webhook: ${From} -> ${Body}`);
 
         // Handle incoming SMS with AI
         const result = await smsService.handleIncomingSMS(From, Body, MessageSid);
@@ -4126,180 +2556,16 @@ app.post('/webhook/sms', validateTwilioRequest(), async (req, res) => {
 
         res.status(200).send('OK');
     } catch (error) {
-        console.error('❌ SMS webhook error:', error);
-    res.status(500).send('Error');
-  }
-});
-
-app.post('/aws/transcripts', async (req, res) => {
-  if (!isAwsProvider) {
-    return res.status(404).json({ error: 'AWS transcription endpoint disabled for current provider' });
-  }
-
-  try {
-    const { callSid, contactId, transcript, isPartial } = req.body || {};
-    const resolvedCallSid = callSid || (contactId ? awsContactIndex.get(contactId) : undefined);
-
-    if (!resolvedCallSid) {
-      return res.status(404).json({ error: 'Unknown call session for transcript payload' });
+        console.error('â SMS webhook error:', error);
+        res.status(500).send('Error');
     }
-
-    const session = awsCallSessions.get(resolvedCallSid);
-    if (!session) {
-      return res.status(404).json({ error: 'Call session not initialized' });
-    }
-
-    if (!transcript) {
-      return res.status(200).json({ received: true, ignored: true });
-    }
-
-    if (isPartial) {
-      session.lastPartial = transcript;
-      return res.json({ received: true, partial: true });
-    }
-
-    console.log(`👤 (AWS) Customer: ${transcript}`.yellow);
-
-    try {
-      await db.addTranscript({
-        call_sid: resolvedCallSid,
-        speaker: 'user',
-        message: transcript,
-        interaction_count: session.interactionCount
-      });
-
-      await db.updateCallState(resolvedCallSid, 'user_spoke', {
-        message: transcript,
-        interaction_count: session.interactionCount,
-        contact_id: session.contactId
-      });
-    } catch (dbError) {
-      console.error('Database error adding AWS user transcript:', dbError);
-    }
-
-    session.gptService.completion(transcript, session.interactionCount);
-    session.interactionCount += 1;
-
-    res.json({ received: true });
-  } catch (error) {
-    console.error('Error processing AWS transcript payload:', error);
-    res.status(500).json({ error: 'Failed to process transcript' });
-  }
-});
-
-app.post('/aws/contact-events', async (req, res) => {
-  if (!isAwsProvider) {
-    return res.status(404).json({ error: 'AWS contact events endpoint disabled for current provider' });
-  }
-
-  try {
-    const payload = req.body || {};
-    const contactId = payload.contactId || payload.ContactId || payload.detail?.contactId || payload.detail?.ContactId;
-    const resolvedCallSid = payload.callSid || (contactId ? awsContactIndex.get(contactId) : undefined);
-    const eventTypeRaw = payload.eventType || payload.EventType || payload.detail?.eventType || payload.detail?.ContactStatus || '';
-    const eventType = (eventTypeRaw || '').toLowerCase();
-
-    if (!contactId) {
-      return res.status(400).json({ error: 'Missing contactId in contact event payload' });
-    }
-
-    if (resolvedCallSid) {
-      await db.updateCallState(resolvedCallSid, 'connect_event', {
-        event_type: eventType,
-        payload: JSON.stringify(payload)
-      });
-    }
-
-    const awsDigitsCandidate =
-      extractDigitsFromPayload(payload.dtmfDigits) ||
-      extractDigitsFromPayload(payload.dtmf) ||
-      extractDigitsFromPayload(payload.customerInput) ||
-      extractDigitsFromPayload(payload.detail?.dtmfDigits) ||
-      extractDigitsFromPayload(payload.detail?.customerInput) ||
-      extractDigitsFromPayload(payload.detail?.customer_input) ||
-      extractDigitsFromPayload(payload.detail?.dtmf) ||
-      extractDigitsFromPayload(payload.detail?.input);
-
-    if (resolvedCallSid && awsDigitsCandidate) {
-      await persistDtmfCapture(resolvedCallSid, awsDigitsCandidate, {
-        source: 'aws',
-        provider: 'aws',
-        capture_method: 'aws_event',
-        metadata: {
-          contact_id: contactId,
-          event_type: eventType,
-        },
-      });
-    }
-
-    let normalizedStatus = null;
-    let notificationType = null;
-
-    switch (eventType) {
-      case 'queued':
-      case 'queue':
-        normalizedStatus = 'initiated';
-        notificationType = 'call_initiated';
-        break;
-      case 'connected':
-      case 'customer_connected':
-      case 'agent_connected':
-      case 'connected_to_customer':
-        normalizedStatus = 'in-progress';
-        notificationType = 'call_answered';
-        break;
-      case 'disconnected':
-      case 'completed':
-      case 'contact_disconnected':
-        normalizedStatus = 'completed';
-        notificationType = 'call_completed';
-        break;
-      default:
-        break;
-    }
-
-    if (resolvedCallSid && normalizedStatus) {
-      await db.updateCallStatus(resolvedCallSid, normalizedStatus, {
-        provider: currentProvider,
-        provider_contact_id: contactId
-      });
-
-      const callRecord = await db.getCall(resolvedCallSid);
-      const realtimeTypes = new Set(['call_initiated', 'call_ringing', 'call_answered']);
-      if (callRecord?.user_chat_id && notificationType && realtimeTypes.has(notificationType)) {
-        await db.createEnhancedWebhookNotification(resolvedCallSid, notificationType, callRecord.user_chat_id);
-      }
-
-      if (normalizedStatus === 'completed') {
-        const session = awsCallSessions.get(resolvedCallSid);
-        const startTime = session?.startTime || new Date();
-        await handleCallEnd(resolvedCallSid, startTime);
-        awsCallSessions.delete(resolvedCallSid);
-        activeCalls.delete(resolvedCallSid);
-        awsContactIndex.delete(contactId);
-        removeCallConfiguration(resolvedCallSid);
-        callFunctionSystems.delete(resolvedCallSid);
-        await finalizeCallOutcome(resolvedCallSid, {
-          call: callRecord,
-          finalStatus: normalizedStatus,
-          answeredBy: callRecord?.answered_by,
-          wasAnswered: true,
-        });
-      }
-    }
-
-    res.json({ received: true, call_sid: resolvedCallSid || null, contact_id: contactId });
-  } catch (error) {
-    console.error('Error processing AWS contact event:', error);
-    res.status(500).json({ error: 'Failed to process contact event' });
-  }
 });
 
 app.post('/webhook/sms-status', async (req, res) => {
     try {
         const { MessageSid, MessageStatus, ErrorCode, ErrorMessage } = req.body;
 
-        console.log(`📱 SMS status update: ${MessageSid} -> ${MessageStatus}`);
+        console.log(`ð± SMS status update: ${MessageSid} -> ${MessageStatus}`);
 
         if (db) {
             await db.updateSMSStatus(MessageSid, {
@@ -4312,7 +2578,7 @@ app.post('/webhook/sms-status', async (req, res) => {
 
         res.status(200).send('OK');
     } catch (error) {
-        console.error('❌ SMS status webhook error:', error);
+        console.error('â SMS status webhook error:', error);
         res.status(500).send('OK'); // Return OK to prevent retries
     }
 });
@@ -4320,23 +2586,7 @@ app.post('/webhook/sms-status', async (req, res) => {
 // Send single SMS endpoint
 app.post('/api/sms/send', async (req, res) => {
     try {
-        const {
-            to,
-            message,
-            from,
-            user_chat_id,
-            business_id,
-            purpose,
-            emotion,
-            urgency,
-            technical_level,
-            channel,
-            template_name,
-            template_variables = {}
-        } = req.body;
-
-        const templateName = template_name;
-        const templateVariables = template_variables || {};
+        const { to, message, from, user_chat_id } = req.body;
 
         if (!to || !message) {
             return res.status(400).json({
@@ -4353,22 +2603,7 @@ app.post('/api/sms/send', async (req, res) => {
             });
         }
 
-        const personaOverrides = {};
-        if (business_id) personaOverrides.business_id = business_id;
-        if (purpose) personaOverrides.purpose = purpose;
-        if (emotion) personaOverrides.emotion = emotion;
-        if (urgency) personaOverrides.urgency = urgency;
-        if (technical_level) personaOverrides.technical_level = technical_level;
-        if (channel) personaOverrides.channel = channel;
-
-        const hasPersonaOverrides = Object.keys(personaOverrides).length > 0;
-
-        const result = await smsService.sendSMS(
-            to,
-            message,
-            from,
-            hasPersonaOverrides ? personaOverrides : null
-        );
+        const result = await smsService.sendSMS(to, message, from);
 
         // Save to database
         if (db) {
@@ -4379,8 +2614,6 @@ app.post('/api/sms/send', async (req, res) => {
                 body: message,
                 status: result.status,
                 direction: 'outbound',
-                template_name: templateName || null,
-                template_variables: Object.keys(templateVariables || {}).length > 0 ? templateVariables : null,
                 user_chat_id: user_chat_id
             });
 
@@ -4399,15 +2632,7 @@ app.post('/api/sms/send', async (req, res) => {
             ...result
         });
     } catch (error) {
-        console.error('❌ SMS send error:', error);
-        if (error.status) {
-            return res.status(error.status).json({
-                success: false,
-                error: error.message,
-                code: error.code,
-                moreInfo: error.moreInfo
-            });
-        }
+        console.error('â SMS send error:', error);
         res.status(500).json({
             success: false,
             error: 'Failed to send SMS',
@@ -4461,7 +2686,7 @@ app.post('/api/sms/bulk', async (req, res) => {
             ...result
         });
     } catch (error) {
-        console.error('❌ Bulk SMS error:', error);
+        console.error('â Bulk SMS error:', error);
         res.status(500).json({
             success: false,
             error: 'Failed to send bulk SMS',
@@ -4497,7 +2722,7 @@ app.post('/api/sms/schedule', async (req, res) => {
             ...result
         });
     } catch (error) {
-        console.error('❌ SMS schedule error:', error);
+        console.error('â SMS schedule error:', error);
         res.status(500).json({
             success: false,
             error: 'Failed to schedule SMS',
@@ -4506,207 +2731,44 @@ app.post('/api/sms/schedule', async (req, res) => {
     }
 });
 
-// SMS templates API
+// SMS templates endpoint
 app.get('/api/sms/templates', async (req, res) => {
     try {
-        const includeBuiltin = req.query.include_builtins !== 'false';
-        const detailed = req.query.detailed === 'true';
+        const { template_name, variables } = req.query;
 
-        const { custom, builtin } = await smsService.listTemplates({
-            includeContent: detailed,
-            includeBuiltin
-        });
+        if (template_name) {
+            try {
+                const parsedVariables = variables ? JSON.parse(variables) : {};
+                const template = smsService.getTemplate(template_name, parsedVariables);
 
-        res.json({
-            success: true,
-            templates: custom,
-            builtin
-        });
-    } catch (error) {
-        console.error('❌ SMS templates error:', error);
-        res.status(500).json({
-            success: false,
-            error: 'Failed to fetch templates',
-            details: error.message
-        });
-    }
-});
-
-app.get('/api/sms/templates/:templateName', async (req, res) => {
-    try {
-        const { templateName } = req.params;
-        const detailed = req.query.detailed !== 'false';
-
-        const template = await smsService.fetchTemplateDefinition(templateName);
-        if (!template) {
-            return res.status(404).json({
-                success: false,
-                error: `Template '${templateName}' not found`
-            });
-        }
-
-        if (!detailed) {
-            delete template.content;
-        }
-
-        res.json({
-            success: true,
-            template
-        });
-    } catch (error) {
-        console.error('❌ Error fetching template:', error);
-        res.status(500).json({
-            success: false,
-            error: 'Failed to fetch template',
-            details: error.message
-        });
-    }
-});
-
-app.post('/api/sms/templates', async (req, res) => {
-    try {
-        const { name, description, content, metadata, created_by } = req.body;
-
-        if (!name || !content) {
-            return res.status(400).json({
-                success: false,
-                error: 'Template name and content are required'
-            });
-        }
-
-        const existing = await smsService.fetchTemplateDefinition(name);
-        if (existing) {
-            return res.status(409).json({
-                success: false,
-                error: 'A template with that name already exists'
-            });
-        }
-
-        if (!db) {
-            return res.status(500).json({ success: false, error: 'Database not initialised' });
-        }
-
-        await db.createTemplate({
-            name,
-            description,
-            content,
-            metadata,
-            created_by
-        });
-
-        const template = await smsService.fetchTemplateDefinition(name);
-
-        res.status(201).json({
-            success: true,
-            template
-        });
-    } catch (error) {
-        console.error('❌ Error creating template:', error);
-        res.status(500).json({
-            success: false,
-            error: 'Failed to create template',
-            details: error.message
-        });
-    }
-});
-
-app.put('/api/sms/templates/:templateName', async (req, res) => {
-    try {
-        const { templateName } = req.params;
-        const { description, content, metadata, updated_by } = req.body;
-
-        if (!db) {
-            return res.status(500).json({ success: false, error: 'Database not initialised' });
-        }
-
-        const existing = await smsService.fetchTemplateDefinition(templateName);
-        if (!existing) {
-            return res.status(404).json({ success: false, error: 'Template not found' });
-        }
-        if (existing.is_builtin) {
-            return res.status(400).json({ success: false, error: 'Built-in templates cannot be edited' });
-        }
-
-        const updates = { updated_by };
-        if (description !== undefined) updates.description = description;
-        if (content !== undefined) updates.content = content;
-        if (metadata !== undefined) updates.metadata = metadata;
-
-        await db.updateTemplate(templateName, updates);
-
-        const template = await smsService.fetchTemplateDefinition(templateName);
-
-        res.json({ success: true, template });
-    } catch (error) {
-        console.error('❌ Error updating template:', error);
-        res.status(500).json({ success: false, error: 'Failed to update template', details: error.message });
-    }
-});
-
-app.delete('/api/sms/templates/:templateName', async (req, res) => {
-    try {
-        const { templateName } = req.params;
-
-        if (!db) {
-            return res.status(500).json({ success: false, error: 'Database not initialised' });
-        }
-
-        const existing = await smsService.fetchTemplateDefinition(templateName);
-        if (!existing) {
-            return res.status(404).json({ success: false, error: 'Template not found' });
-        }
-        if (existing.is_builtin) {
-            return res.status(400).json({ success: false, error: 'Built-in templates cannot be deleted' });
-        }
-
-        await db.deleteTemplate(templateName);
-        res.json({ success: true });
-    } catch (error) {
-        console.error('❌ Error deleting template:', error);
-        res.status(500).json({ success: false, error: 'Failed to delete template', details: error.message });
-    }
-});
-
-app.post('/api/sms/templates/:templateName/preview', async (req, res) => {
-    try {
-        const { templateName } = req.params;
-        const { to, variables = {}, from, persona_overrides = {} } = req.body;
-
-        if (!to) {
-            return res.status(400).json({ success: false, error: 'Preview destination number is required' });
-        }
-
-        const rendered = await smsService.renderTemplate(templateName, variables);
-        const result = await smsService.sendSMS(to, rendered.rendered, from, persona_overrides);
-
-        res.json({
-            success: true,
-            preview: {
-                to: result.to,
-                message_sid: result.message_sid,
-                content: rendered.rendered,
-                template: rendered.name,
-                variables: rendered.variables
+                res.json({
+                    success: true,
+                    template_name,
+                    template,
+                    variables: parsedVariables
+                });
+            } catch (templateError) {
+                res.status(400).json({
+                    success: false,
+                    error: templateError.message
+                });
             }
-        });
+        } else {
+            // Return available templates
+            res.json({
+                success: true,
+                available_templates: [
+                    'welcome', 'appointment_reminder', 'verification', 'order_update',
+                    'payment_reminder', 'promotional', 'customer_service', 'survey'
+                ]
+            });
+        }
     } catch (error) {
-        console.error('❌ Error sending template preview:', error);
-        if (error.status) {
-            return res.status(error.status).json({
-                success: false,
-                error: error.message,
-                code: error.code,
-                moreInfo: error.moreInfo
-            });
-        }
-        if (error.response) {
-            return res.status(error.response.status || 400).json({
-                success: false,
-                error: error.message,
-                details: error.response.data || error.response
-            });
-        }
-        res.status(500).json({ success: false, error: 'Failed to send preview', details: error.message });
+        console.error('â SMS templates error:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Failed to get templates'
+        });
     }
 });
 
@@ -4733,511 +2795,12 @@ app.get('/api/sms/messages/conversation/:phone', async (req, res) => {
         });
 
     } catch (error) {
-        console.error('❌ Error fetching SMS conversation from database:', error);
+        console.error('â Error fetching SMS conversation from database:', error);
         res.status(500).json({
             success: false,
             error: 'Failed to fetch conversation',
             details: error.message
         });
-    }
-});
-
-// Call template management endpoints
-function normalizeTemplatePayload(body) {
-    const {
-        name,
-        description,
-        business_id,
-        prompt,
-        first_message,
-        voice_model,
-        persona_config
-    } = body;
-
-    const cleanVoiceModel = typeof voice_model === 'string' && voice_model.trim().length > 0
-        ? voice_model.trim()
-        : null;
-
-    let parsedPersona = null;
-    if (persona_config) {
-        if (typeof persona_config === 'string') {
-            try {
-                parsedPersona = JSON.parse(persona_config);
-            } catch (error) {
-                throw new Error('persona_config must be valid JSON');
-            }
-        } else if (typeof persona_config === 'object') {
-            parsedPersona = persona_config;
-        }
-    }
-
-    let canonicalBusinessId = null;
-    if (business_id) {
-        const profile = getBusinessProfile(business_id);
-        canonicalBusinessId = profile ? profile.id : business_id;
-    }
-
-    return {
-        name,
-        description,
-        business_id: canonicalBusinessId,
-        prompt,
-        first_message,
-        voice_model: cleanVoiceModel,
-        persona_config: parsedPersona
-    };
-}
-
-function isTemplateNameConstraint(error) {
-    if (!error) {
-        return false;
-    }
-    const message = error.message || '';
-    return error.code === 'SQLITE_CONSTRAINT' || /UNIQUE constraint failed: call_templates\.name/i.test(message);
-}
-
-async function suggestTemplateName(baseName = 'template') {
-    const sanitized = (baseName || 'template').trim() || 'template';
-    const suffixMatch = sanitized.match(/-(\d+)$/);
-    const prefix = suffixMatch ? sanitized.slice(0, -suffixMatch[0].length) : sanitized;
-    let counter = suffixMatch ? parseInt(suffixMatch[1], 10) + 1 : 1;
-    let attempts = 0;
-    const maxAttempts = 50;
-
-    while (attempts < maxAttempts) {
-        const candidate = `${prefix}-${counter}`;
-        // eslint-disable-next-line no-await-in-loop
-        const existing = await db.getCallTemplateByName(candidate);
-        if (!existing) {
-            return candidate;
-        }
-        counter += 1;
-        attempts += 1;
-    }
-
-    return `${prefix}-${Date.now()}`;
-}
-
-app.get('/api/call-templates', async (req, res) => {
-    try {
-        const templates = await db.getCallTemplates();
-        res.json({ success: true, templates });
-    } catch (error) {
-        console.error('❌ Failed to list call templates:', error);
-        res.status(500).json({ success: false, error: 'Failed to list call templates' });
-    }
-});
-
-app.get('/api/call-templates/:id', async (req, res) => {
-    try {
-        const id = Number(req.params.id);
-        if (Number.isNaN(id)) {
-            return res.status(400).json({ success: false, error: 'Invalid template ID' });
-        }
-
-        const template = await db.getCallTemplateById(id);
-        if (!template) {
-            return res.status(404).json({ success: false, error: 'Template not found' });
-        }
-
-        res.json({ success: true, template });
-    } catch (error) {
-        console.error('❌ Failed to fetch call template:', error);
-        res.status(500).json({ success: false, error: 'Failed to fetch call template' });
-    }
-});
-
-app.post('/api/call-templates', async (req, res) => {
-    let payload;
-    try {
-        payload = normalizeTemplatePayload(req.body);
-
-        if (!payload.name || payload.name.trim().length === 0) {
-            return res.status(400).json({ success: false, error: 'Template name is required' });
-        }
-
-        await db.createCallTemplate(payload);
-        const template = await db.getCallTemplateByName(payload.name);
-
-        res.status(201).json({ success: true, template });
-    } catch (error) {
-        if (isTemplateNameConstraint(error)) {
-            const suggestion = await suggestTemplateName(payload?.name || 'template');
-            return res.status(409).json({
-                success: false,
-                error: 'Template name already exists',
-                code: 'TEMPLATE_NAME_DUPLICATE',
-                suggested_name: suggestion
-            });
-        }
-        console.error('❌ Failed to create call template:', error);
-        res.status(500).json({ success: false, error: 'Failed to create call template', details: error.message });
-    }
-});
-
-app.put('/api/call-templates/:id', async (req, res) => {
-    let payload;
-    try {
-        const id = Number(req.params.id);
-        if (Number.isNaN(id)) {
-            return res.status(400).json({ success: false, error: 'Invalid template ID' });
-        }
-
-        const existing = await db.getCallTemplateById(id);
-        if (!existing) {
-            return res.status(404).json({ success: false, error: 'Template not found' });
-        }
-
-        payload = normalizeTemplatePayload(req.body);
-        await db.updateCallTemplate(id, payload);
-        const updated = await db.getCallTemplateById(id);
-
-        res.json({ success: true, template: updated });
-    } catch (error) {
-        if (isTemplateNameConstraint(error)) {
-            const suggestion = await suggestTemplateName(payload?.name || 'template');
-            return res.status(409).json({
-                success: false,
-                error: 'Template name already exists',
-                code: 'TEMPLATE_NAME_DUPLICATE',
-                suggested_name: suggestion
-            });
-        }
-        console.error('❌ Failed to update call template:', error);
-        res.status(500).json({ success: false, error: 'Failed to update call template', details: error.message });
-    }
-});
-
-app.post('/api/call-templates/:id/clone', async (req, res) => {
-    let cloneName;
-    try {
-        const id = Number(req.params.id);
-        if (Number.isNaN(id)) {
-            return res.status(400).json({ success: false, error: 'Invalid template ID' });
-        }
-
-        const template = await db.getCallTemplateById(id);
-        if (!template) {
-            return res.status(404).json({ success: false, error: 'Template not found' });
-        }
-
-        const { name, description } = req.body;
-        cloneName = name;
-
-        if (!name || name.trim().length === 0) {
-            return res.status(400).json({ success: false, error: 'Clone name is required' });
-        }
-
-        await db.createCallTemplate({
-            name,
-            description: description || template.description,
-            business_id: template.business_id,
-            prompt: template.prompt,
-            first_message: template.first_message,
-            persona_config: template.persona_config,
-            voice_model: template.voice_model
-        });
-
-        const cloned = await db.getCallTemplateByName(name);
-        res.status(201).json({ success: true, template: cloned });
-    } catch (error) {
-        if (isTemplateNameConstraint(error)) {
-            const suggestion = await suggestTemplateName(cloneName || 'template');
-            return res.status(409).json({
-                success: false,
-                error: 'Template name already exists',
-                code: 'TEMPLATE_NAME_DUPLICATE',
-                suggested_name: suggestion
-            });
-        }
-        console.error('❌ Failed to clone call template:', error);
-        res.status(500).json({ success: false, error: 'Failed to clone call template', details: error.message });
-    }
-});
-
-app.delete('/api/call-templates/:id', async (req, res) => {
-    try {
-        const id = Number(req.params.id);
-        if (Number.isNaN(id)) {
-            return res.status(400).json({ success: false, error: 'Invalid template ID' });
-        }
-
-        const existing = await db.getCallTemplateById(id);
-        if (!existing) {
-            return res.status(404).json({ success: false, error: 'Template not found' });
-        }
-
-        await db.deleteCallTemplate(id);
-        res.json({ success: true });
-    } catch (error) {
-        console.error('❌ Failed to delete call template:', error);
-        res.status(500).json({ success: false, error: 'Failed to delete call template', details: error.message });
-    }
-});
-
-const PERSONA_SLUG_PATTERN = /^[a-z0-9_-]{3,64}$/;
-
-function isBuiltinPersona(slug) {
-    return DEFAULT_PERSONAS.some((persona) => persona.id === slug);
-}
-
-function sanitizePurposes(input) {
-    if (!input) {
-        return [];
-    }
-
-    if (!Array.isArray(input)) {
-        throw new Error('purposes must be an array');
-    }
-
-    return input
-        .map((item) => {
-            if (!item || typeof item !== 'object') {
-                return null;
-            }
-            const id = typeof item.id === 'string' ? item.id.trim().toLowerCase() : null;
-            const label = typeof item.label === 'string' ? item.label.trim() : null;
-            if (!id || !label) {
-                return null;
-            }
-            return {
-                id,
-                label,
-                emoji: typeof item.emoji === 'string' ? item.emoji : undefined,
-                defaultEmotion: item.defaultEmotion || item.default_emotion || null,
-                defaultUrgency: item.defaultUrgency || item.default_urgency || null,
-                defaultTechnicalLevel: item.defaultTechnicalLevel || item.default_technical_level || null
-            };
-        })
-        .filter(Boolean);
-}
-
-function sanitizeMetadata(input) {
-    if (!input) {
-        return null;
-    }
-    if (typeof input !== 'object') {
-        throw new Error('metadata must be an object');
-    }
-    return input;
-}
-
-app.get('/api/personas', async (req, res) => {
-    try {
-        const custom = await db.listPersonaProfiles();
-        res.json({
-            success: true,
-            builtin: DEFAULT_PERSONAS,
-            custom,
-            counts: {
-                builtin: DEFAULT_PERSONAS.length,
-                custom: custom.length,
-                total: DEFAULT_PERSONAS.length + custom.length
-            }
-        });
-    } catch (error) {
-        console.error('❌ Failed to list personas:', error);
-        res.status(500).json({ success: false, error: 'Failed to list personas', details: error.message });
-    }
-});
-
-app.get('/api/personas/:slug', async (req, res) => {
-    try {
-        const slug = req.params.slug.trim().toLowerCase();
-        const builtin = DEFAULT_PERSONAS.find((persona) => persona.id === slug);
-        if (builtin) {
-            return res.json({ success: true, persona: builtin, source: 'builtin' });
-        }
-
-        const profile = await db.getPersonaProfileBySlug(slug);
-        if (!profile) {
-            return res.status(404).json({ success: false, error: 'Persona not found' });
-        }
-
-        res.json({ success: true, persona: profile, source: 'custom' });
-    } catch (error) {
-        console.error('❌ Failed to fetch persona:', error);
-        res.status(500).json({ success: false, error: 'Failed to fetch persona', details: error.message });
-    }
-});
-
-app.post('/api/personas', async (req, res) => {
-    try {
-        const {
-            slug,
-            label,
-            description = null,
-            purposes,
-            default_purpose,
-            default_emotion,
-            default_urgency,
-            default_technical_level,
-            call_template_id,
-            sms_template_name,
-            metadata,
-            created_by,
-            updated_by
-        } = req.body || {};
-
-        if (typeof slug !== 'string' || !PERSONA_SLUG_PATTERN.test(slug)) {
-            return res.status(400).json({ success: false, error: 'slug must be 3-64 characters (lowercase, digits, hyphen, underscore)' });
-        }
-
-        if (isBuiltinPersona(slug)) {
-            return res.status(409).json({ success: false, error: 'Cannot override built-in persona' });
-        }
-
-        const existing = await db.getPersonaProfileBySlug(slug);
-        if (existing) {
-            return res.status(409).json({ success: false, error: 'Persona with this slug already exists' });
-        }
-
-        if (typeof label !== 'string' || !label.trim()) {
-            return res.status(400).json({ success: false, error: 'label is required' });
-        }
-
-        const sanitizedPurposes = sanitizePurposes(purposes);
-        const sanitizedMetadata = sanitizeMetadata(metadata);
-
-        await db.createPersonaProfile({
-            slug,
-            label: label.trim(),
-            description: typeof description === 'string' ? description.trim() : null,
-            purposes: sanitizedPurposes,
-            default_purpose: default_purpose || null,
-            default_emotion: default_emotion || null,
-            default_urgency: default_urgency || null,
-            default_technical_level: default_technical_level || null,
-            call_template_id: Number.isInteger(call_template_id) ? call_template_id : null,
-            sms_template_name: typeof sms_template_name === 'string' ? sms_template_name.trim() || null : null,
-            metadata: sanitizedMetadata,
-            created_by: created_by || 'api',
-            updated_by: updated_by || created_by || 'api'
-        });
-
-        const persona = await db.getPersonaProfileBySlug(slug);
-        res.status(201).json({ success: true, persona });
-    } catch (error) {
-        if (error instanceof Error && error.message && error.message.includes('must be')) {
-            return res.status(400).json({ success: false, error: error.message });
-        }
-        console.error('❌ Failed to create persona:', error);
-        res.status(500).json({ success: false, error: 'Failed to create persona', details: error.message });
-    }
-});
-
-app.put('/api/personas/:slug', async (req, res) => {
-    try {
-        const slug = req.params.slug.trim().toLowerCase();
-        if (isBuiltinPersona(slug)) {
-            return res.status(403).json({ success: false, error: 'Built-in personas cannot be modified' });
-        }
-
-        const existing = await db.getPersonaProfileBySlug(slug);
-        if (!existing) {
-            return res.status(404).json({ success: false, error: 'Persona not found' });
-        }
-
-        const updates = {};
-        const {
-            label,
-            description,
-            purposes,
-            default_purpose,
-            default_emotion,
-            default_urgency,
-            default_technical_level,
-            call_template_id,
-            sms_template_name,
-            metadata,
-            updated_by
-        } = req.body || {};
-
-        if (label !== undefined) {
-            if (typeof label !== 'string' || !label.trim()) {
-                return res.status(400).json({ success: false, error: 'label must be a non-empty string' });
-            }
-            updates.label = label.trim();
-        }
-
-        if (description !== undefined) {
-            if (description !== null && typeof description !== 'string') {
-                return res.status(400).json({ success: false, error: 'description must be a string or null' });
-            }
-            updates.description = typeof description === 'string' ? description.trim() : null;
-        }
-
-        if (purposes !== undefined) {
-            try {
-                updates.purposes = sanitizePurposes(purposes);
-            } catch (validationError) {
-                return res.status(400).json({ success: false, error: validationError.message });
-            }
-        }
-
-        if (default_purpose !== undefined) updates.default_purpose = default_purpose || null;
-        if (default_emotion !== undefined) updates.default_emotion = default_emotion || null;
-        if (default_urgency !== undefined) updates.default_urgency = default_urgency || null;
-        if (default_technical_level !== undefined) updates.default_technical_level = default_technical_level || null;
-
-        if (call_template_id !== undefined) {
-            if (call_template_id === null || Number.isInteger(call_template_id)) {
-                updates.call_template_id = call_template_id;
-            } else {
-                return res.status(400).json({ success: false, error: 'call_template_id must be an integer or null' });
-            }
-        }
-
-        if (sms_template_name !== undefined) {
-            if (sms_template_name === null || typeof sms_template_name === 'string') {
-                updates.sms_template_name = sms_template_name ? sms_template_name.trim() : null;
-            } else {
-                return res.status(400).json({ success: false, error: 'sms_template_name must be a string or null' });
-            }
-        }
-
-        if (metadata !== undefined) {
-            try {
-                updates.metadata = sanitizeMetadata(metadata);
-            } catch (validationError) {
-                return res.status(400).json({ success: false, error: validationError.message });
-            }
-        }
-
-        if (updated_by !== undefined) {
-            updates.updated_by = updated_by;
-        }
-
-        if (Object.keys(updates).length === 0) {
-            return res.status(400).json({ success: false, error: 'No updates provided' });
-        }
-
-        await db.updatePersonaProfile(slug, updates);
-        const persona = await db.getPersonaProfileBySlug(slug);
-        res.json({ success: true, persona });
-    } catch (error) {
-        console.error('❌ Failed to update persona:', error);
-        res.status(500).json({ success: false, error: 'Failed to update persona', details: error.message });
-    }
-});
-
-app.delete('/api/personas/:slug', async (req, res) => {
-    try {
-        const slug = req.params.slug.trim().toLowerCase();
-        if (isBuiltinPersona(slug)) {
-            return res.status(403).json({ success: false, error: 'Built-in personas cannot be deleted' });
-        }
-
-        const existing = await db.getPersonaProfileBySlug(slug);
-        if (!existing) {
-            return res.status(404).json({ success: false, error: 'Persona not found' });
-        }
-
-        await db.deletePersonaProfile(slug);
-        res.json({ success: true });
-    } catch (error) {
-        console.error('❌ Failed to delete persona:', error);
-        res.status(500).json({ success: false, error: 'Failed to delete persona', details: error.message });
     }
 });
 
@@ -5258,7 +2821,7 @@ app.get('/api/sms/messages/recent', async (req, res) => {
         });
 
     } catch (error) {
-        console.error('❌ Error fetching recent SMS messages:', error);
+        console.error('â Error fetching recent SMS messages:', error);
         res.status(500).json({
             success: false,
             error: 'Failed to fetch recent messages',
@@ -5365,7 +2928,7 @@ app.get('/api/sms/database-stats', async (req, res) => {
         });
 
     } catch (error) {
-        console.error('❌ Error fetching SMS database statistics:', error);
+        console.error('â Error fetching SMS database statistics:', error);
         res.status(500).json({
             success: false,
             error: 'Failed to fetch database statistics',
@@ -5406,10 +2969,82 @@ app.get('/api/sms/status/:messageSid', async (req, res) => {
         });
 
     } catch (error) {
-        console.error('❌ Error fetching SMS status:', error);
+        console.error('â Error fetching SMS status:', error);
         res.status(500).json({
             success: false,
             error: 'Failed to fetch message status',
+            details: error.message
+        });
+    }
+});
+
+// Enhanced SMS templates endpoint with better error handling
+app.get('/api/sms/templates/:templateName?', async (req, res) => {
+    try {
+        const { templateName } = req.params;
+        const { variables } = req.query;
+
+        // Built-in templates (fallback)
+        const builtInTemplates = {
+            welcome: 'Welcome to our service! We\'re excited to have you aboard. Reply HELP for assistance or STOP to unsubscribe.',
+            appointment_reminder: 'Reminder: You have an appointment on {date} at {time}. Reply CONFIRM to confirm or RESCHEDULE to change.',
+            verification: 'Your verification code is: {code}. This code will expire in 10 minutes. Do not share this code with anyone.',
+            order_update: 'Order #{order_id} update: {status}. Track your order at {tracking_url}',
+            payment_reminder: 'Payment reminder: Your payment of {amount} is due on {due_date}. Pay now: {payment_url}',
+            promotional: 'ð Special offer just for you! {offer_text} Use code {promo_code}. Valid until {expiry_date}. Reply STOP to opt out.',
+            customer_service: 'Thanks for contacting us! We\'ve received your message and will respond within 24 hours. For urgent matters, call {phone}.',
+            survey: 'How was your experience with us? Rate us 1-5 stars by replying with a number. Your feedback helps us improve!'
+        };
+
+        if (templateName) {
+            // Get specific template
+            if (!builtInTemplates[templateName]) {
+                return res.status(404).json({
+                    success: false,
+                    error: `Template '${templateName}' not found`
+                });
+            }
+
+            let template = builtInTemplates[templateName];
+            let parsedVariables = {};
+
+            // Parse and apply variables if provided
+            if (variables) {
+                try {
+                    parsedVariables = JSON.parse(variables);
+                    
+                    // Replace variables in template
+                    for (const [key, value] of Object.entries(parsedVariables)) {
+                        template = template.replace(new RegExp(`{${key}}`, 'g'), value);
+                    }
+                } catch (parseError) {
+                    console.error('Error parsing template variables:', parseError);
+                    // Continue with template without variable substitution
+                }
+            }
+
+            res.json({
+                success: true,
+                template_name: templateName,
+                template: template,
+                original_template: builtInTemplates[templateName],
+                variables: parsedVariables
+            });
+
+        } else {
+            // Get list of available templates
+            res.json({
+                success: true,
+                available_templates: Object.keys(builtInTemplates),
+                template_count: Object.keys(builtInTemplates).length
+            });
+        }
+
+    } catch (error) {
+        console.error('â Error handling SMS templates:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Failed to process template request',
             details: error.message
         });
     }
@@ -5420,7 +3055,7 @@ app.post('/webhook/sms-delivery', async (req, res) => {
     try {
         const { MessageSid, MessageStatus, ErrorCode, ErrorMessage, To, From } = req.body;
 
-        console.log(`📱 SMS Delivery Status: ${MessageSid} -> ${MessageStatus}`);
+        console.log(`ð± SMS Delivery Status: ${MessageSid} -> ${MessageStatus}`);
 
         // Update message status in database
         if (db) {
@@ -5455,13 +3090,13 @@ app.post('/webhook/sms-delivery', async (req, res) => {
                     MessageStatus === 'failed' ? 'high' : 'normal'
                 );
 
-                console.log(`📨 Created ${notificationType} notification for user ${message.user_chat_id}`);
+                console.log(`ð¨ Created ${notificationType} notification for user ${message.user_chat_id}`);
             }
         }
 
         res.status(200).send('OK');
     } catch (error) {
-        console.error('❌ SMS delivery webhook error:', error);
+        console.error('â SMS delivery webhook error:', error);
         res.status(200).send('OK'); // Always return 200 to prevent retries
     }
 });
@@ -5480,7 +3115,7 @@ app.get('/api/sms/stats', async (req, res) => {
     });
     
   } catch (error) {
-    console.error('❌ SMS stats error:', error);
+    console.error('â SMS stats error:', error);
     res.status(500).json({
       success: false,
       error: 'Failed to get SMS statistics'
@@ -5535,7 +3170,7 @@ app.get('/api/sms/bulk/status', async (req, res) => {
         });
 
     } catch (error) {
-        console.error('❌ Error fetching bulk SMS status:', error);
+        console.error('â Error fetching bulk SMS status:', error);
         res.status(500).json({
             success: false,
             error: 'Failed to fetch bulk SMS status',
@@ -5665,7 +3300,7 @@ app.get('/api/sms/analytics', async (req, res) => {
         });
 
     } catch (error) {
-        console.error('❌ Error fetching SMS analytics:', error);
+        console.error('â Error fetching SMS analytics:', error);
         res.status(500).json({
             success: false,
             error: 'Failed to fetch SMS analytics',
@@ -5753,7 +3388,7 @@ app.get('/api/sms/search', async (req, res) => {
         });
 
     } catch (error) {
-        console.error('❌ Error in SMS search:', error);
+        console.error('â Error in SMS search:', error);
         res.status(500).json({
             success: false,
             error: 'Search failed',
@@ -5843,7 +3478,7 @@ app.get('/api/sms/export', async (req, res) => {
         }
 
     } catch (error) {
-        console.error('❌ Error exporting SMS data:', error);
+        console.error('â Error exporting SMS data:', error);
         res.status(500).json({
             success: false,
             error: 'Failed to export SMS data',
@@ -5860,9 +3495,7 @@ app.get('/api/sms/health', async (req, res) => {
             status: 'healthy',
             services: {
                 database: { status: 'unknown' },
-                twilio: { status: currentProvider === 'twilio' ? 'unknown' : 'disabled' },
-                pinpoint: { status: currentProvider === 'aws' ? 'unknown' : 'disabled' },
-                vonage: { status: currentProvider === 'vonage' ? 'unknown' : 'disabled' },
+                twilio: { status: 'unknown' },
                 sms_service: { status: 'unknown' }
             },
             statistics: {
@@ -5924,44 +3557,23 @@ app.get('/api/sms/health', async (req, res) => {
         }
 
         // Check Twilio connectivity (basic check)
-        if (currentProvider === 'twilio') {
-            try {
-                if (twilioAccountSid && twilioAuthToken) {
-                    health.services.twilio.status = 'configured';
-                    health.services.twilio.account_sid = `${twilioAccountSid.substring(0, 8)}...`;
-                } else {
-                    health.services.twilio.status = 'not_configured';
-                    health.status = 'degraded';
-                }
-            } catch (twilioError) {
-                health.services.twilio.status = 'error';
-                health.services.twilio.error = twilioError.message;
-            }
-        }
-
-        if (currentProvider === 'aws') {
-            if (awsAdapters?.sms) {
-                health.services.pinpoint.status = 'configured';
-                health.services.pinpoint.application_id = awsAdapters.sms.config.pinpoint.applicationId;
-                health.services.pinpoint.region = awsAdapters.sms.config.pinpoint.region;
+        try {
+            if (process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN) {
+                health.services.twilio.status = 'configured';
+                health.services.twilio.account_sid = process.env.TWILIO_ACCOUNT_SID.substring(0, 8) + '...';
             } else {
-                health.services.pinpoint.status = 'not_configured';
+                health.services.twilio.status = 'not_configured';
                 health.status = 'degraded';
             }
-        } else if (currentProvider === 'vonage') {
-            if (vonageAdapters?.sms) {
-                health.services.vonage.status = 'configured';
-                health.services.vonage.from_number = vonageAdapters.sms.fromNumber || vonageConfig?.sms?.fromNumber;
-            } else {
-                health.services.vonage.status = 'not_configured';
-                health.status = 'degraded';
-            }
+        } catch (twilioError) {
+            health.services.twilio.status = 'error';
+            health.services.twilio.error = twilioError.message;
         }
 
         res.json(health);
 
     } catch (error) {
-        console.error('❌ SMS health check error:', error);
+        console.error('â SMS health check error:', error);
         res.status(500).json({
             timestamp: new Date().toISOString(),
             status: 'unhealthy',
@@ -5992,7 +3604,7 @@ app.post('/api/sms/cleanup-conversations', async (req, res) => {
         });
 
     } catch (error) {
-        console.error('❌ Error cleaning up SMS conversations:', error);
+        console.error('â Error cleaning up SMS conversations:', error);
         res.status(500).json({
             success: false,
             error: 'Failed to cleanup conversations',
@@ -6004,7 +3616,7 @@ app.post('/api/sms/cleanup-conversations', async (req, res) => {
 // Start scheduled message processor
 setInterval(() => {
     smsService.processScheduledMessages().catch(error => {
-        console.error('❌ Scheduled SMS processing error:', error);
+        console.error('â Scheduled SMS processing error:', error);
     });
 }, 60000); // Check every minute
 
@@ -6017,7 +3629,7 @@ startServer();
 
 // Enhanced graceful shutdown with comprehensive cleanup
 process.on('SIGINT', async () => {
-  console.log('\n🛑 Shutting down enhanced adaptive system gracefully...'.yellow);
+  console.log('\nð Shutting down enhanced adaptive system gracefully...'.yellow);
   
   try {
     // Log shutdown start
@@ -6037,16 +3649,16 @@ process.on('SIGINT', async () => {
     });
     
     await db.close();
-    console.log('✅ Enhanced adaptive system shutdown complete'.green);
+    console.log('â Enhanced adaptive system shutdown complete'.green);
   } catch (shutdownError) {
-    console.error('❌ Error during shutdown:', shutdownError);
+    console.error('â Error during shutdown:', shutdownError);
   }
   
   process.exit(0);
 });
 
 process.on('SIGTERM', async () => {
-  console.log('\n🛑 Shutting down enhanced adaptive system gracefully...'.yellow);
+  console.log('\nð Shutting down enhanced adaptive system gracefully...'.yellow);
   
   try {
     // Log shutdown start
@@ -6067,9 +3679,9 @@ process.on('SIGTERM', async () => {
     });
     
     await db.close();
-    console.log('✅ Enhanced adaptive system shutdown complete'.green);
+    console.log('â Enhanced adaptive system shutdown complete'.green);
   } catch (shutdownError) {
-    console.error('❌ Error during shutdown:', shutdownError);
+    console.error('â Error during shutdown:', shutdownError);
   }
   
   process.exit(0);

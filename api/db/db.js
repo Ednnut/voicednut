@@ -1,6 +1,5 @@
 const sqlite3 = require('sqlite3').verbose();
 const path = require('path');
-const { cleanTranscript } = require('../utils/transcript');
 
 class EnhancedDatabase {
     constructor() {
@@ -9,142 +8,24 @@ class EnhancedDatabase {
         this.dbPath = path.join(__dirname, 'data.db');
     }
 
-    async connect() {
-        if (this.db) {
-            return;
-        }
-
-        await new Promise((resolve, reject) => {
+    async initialize() {
+        return new Promise((resolve, reject) => {
             this.db = new sqlite3.Database(this.dbPath, (err) => {
                 if (err) {
                     console.error('Error opening enhanced database:', err);
                     reject(err);
-                } else {
-                    console.log('Connected to enhanced SQLite database');
-                    resolve();
+                    return;
                 }
-            });
-        });
-    }
-
-    async execute(sql, context, options = {}) {
-        const { ignoreErrors = [], successMessage } = options;
-        await new Promise((resolve, reject) => {
-            this.db.run(sql, (err) => {
-                if (err) {
-                    const message = err.message || err.toString();
-                    const shouldIgnore = ignoreErrors.some((pattern) => message.includes(pattern));
-                    if (shouldIgnore) {
-                        console.warn(`⚠️ ${context}: ${message}`);
+                console.log('Connected to enhanced SQLite database');
+                this.createEnhancedTables().then(() => {
+                    this.initializeSMSTables().then(() => {
+                        this.isInitialized = true;
+                        console.log('✅ Enhanced database initialization complete');
                         resolve();
-                        return;
-                    }
-                    console.error(`❌ ${context}: ${message}`);
-                    console.error(`   SQL: ${sql}`);
-                    reject(err);
-                } else {
-                    if (successMessage) {
-                        console.log(successMessage);
-                    }
-                    resolve();
-                }
+                    }).catch(reject);
+                }).catch(reject);
             });
         });
-    }
-
-    async runMigrations() {
-        const migrations = [
-            {
-                name: 'create_call_templates_table',
-                sql: `CREATE TABLE IF NOT EXISTS call_templates (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    name TEXT UNIQUE NOT NULL,
-                    description TEXT,
-                    business_id TEXT,
-                    prompt TEXT,
-                    first_message TEXT,
-                    persona_config TEXT,
-                    voice_model TEXT,
-                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-                )`
-            },
-            {
-                name: 'create_sms_templates_table',
-                sql: `CREATE TABLE IF NOT EXISTS sms_templates (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    name TEXT UNIQUE NOT NULL,
-                    description TEXT,
-                    content TEXT NOT NULL,
-                    metadata TEXT,
-                    is_builtin INTEGER DEFAULT 0,
-                    created_by TEXT,
-                    updated_by TEXT,
-                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-                )`
-            },
-            {
-                name: 'idx_call_templates_name',
-                sql: 'CREATE UNIQUE INDEX IF NOT EXISTS idx_call_templates_name ON call_templates(name)'
-            },
-            {
-                name: 'idx_call_templates_updated_at',
-                sql: 'CREATE INDEX IF NOT EXISTS idx_call_templates_updated_at ON call_templates(updated_at)'
-            },
-            {
-                name: 'idx_sms_templates_name',
-                sql: 'CREATE INDEX IF NOT EXISTS idx_sms_templates_name ON sms_templates(name)'
-            },
-            {
-                name: 'create_persona_profiles_table',
-                sql: `CREATE TABLE IF NOT EXISTS persona_profiles (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    slug TEXT UNIQUE NOT NULL,
-                    label TEXT NOT NULL,
-                    description TEXT,
-                    purposes TEXT,
-                    default_purpose TEXT,
-                    default_emotion TEXT,
-                    default_urgency TEXT,
-                    default_technical_level TEXT,
-                    call_template_id INTEGER,
-                    sms_template_name TEXT,
-                    metadata TEXT,
-                    created_by TEXT,
-                    updated_by TEXT,
-                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY(call_template_id) REFERENCES call_templates(id)
-                )`
-            },
-            {
-                name: 'idx_persona_profiles_slug',
-                sql: 'CREATE UNIQUE INDEX IF NOT EXISTS idx_persona_profiles_slug ON persona_profiles(slug)'
-            }
-        ];
-
-        for (const migration of migrations) {
-            try {
-                await this.execute(
-                    migration.sql,
-                    `migration failed [${migration.name}]`,
-                    { successMessage: `✅ Migration applied: ${migration.name}` }
-                );
-            } catch (error) {
-                error.migration = migration.name;
-                throw error;
-            }
-        }
-    }
-
-    async initialize() {
-        await this.connect();
-        await this.runMigrations();
-        await this.createEnhancedTables();
-        await this.initializeSMSTables();
-        this.isInitialized = true;
-        console.log('✅ Enhanced database initialization complete');
     }
 
     async createEnhancedTables() {
@@ -167,23 +48,11 @@ class EnhancedDatabase {
                 ai_analysis TEXT,
                 business_context TEXT,
                 generated_functions TEXT,
-                provider TEXT DEFAULT 'twilio',
-                provider_contact_id TEXT,
-                provider_metadata TEXT,
                 answered_by TEXT,
                 error_code TEXT,
                 error_message TEXT,
                 ring_duration INTEGER,
-                answer_delay INTEGER,
-                final_outcome TEXT,
-                has_input INTEGER DEFAULT 0,
-                latest_input_preview TEXT,
-                last_input_at DATETIME,
-                amd_status TEXT,
-                amd_confidence REAL,
-                amd_event_at DATETIME,
-                was_answered INTEGER DEFAULT 0,
-                outcome_notified_at DATETIME
+                answer_delay INTEGER
             )`,
 
             // Enhanced call transcripts table with personality tracking
@@ -192,37 +61,11 @@ class EnhancedDatabase {
                 call_sid TEXT NOT NULL,
                 speaker TEXT NOT NULL CHECK(speaker IN ('user', 'ai')),
                 message TEXT NOT NULL,
-                raw_message TEXT,
-                clean_message TEXT,
                 interaction_count INTEGER,
                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
                 personality_used TEXT,
                 adaptation_data TEXT,
                 confidence_score REAL,
-                FOREIGN KEY(call_sid) REFERENCES calls(call_sid)
-            )`,
-
-            // Captured DTMF keypad input per call with compliance metadata
-            `CREATE TABLE IF NOT EXISTS dtmf_entries (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                call_sid TEXT NOT NULL,
-                stage_key TEXT DEFAULT 'generic',
-                masked_digits TEXT NOT NULL,
-                encrypted_digits TEXT,
-                compliance_mode TEXT DEFAULT 'safe',
-                provider TEXT,
-                metadata TEXT,
-                received_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY(call_sid) REFERENCES calls(call_sid)
-            )`,
-            `CREATE TABLE IF NOT EXISTS call_inputs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                call_sid TEXT NOT NULL,
-                step INTEGER NOT NULL,
-                input_type TEXT NOT NULL CHECK(input_type IN ('speech','digit')),
-                value TEXT NOT NULL,
-                confidence REAL,
-                captured_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY(call_sid) REFERENCES calls(call_sid)
             )`,
 
@@ -232,8 +75,6 @@ class EnhancedDatabase {
                 call_sid TEXT NOT NULL,
                 speaker TEXT NOT NULL CHECK(speaker IN ('user', 'ai')),
                 message TEXT NOT NULL,
-                raw_message TEXT,
-                clean_message TEXT,
                 interaction_count INTEGER,
                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
                 personality_used TEXT,
@@ -270,36 +111,6 @@ class EnhancedDatabase {
                 FOREIGN KEY(call_sid) REFERENCES calls(call_sid)
             )`,
 
-            // Append-only log of all call events/webhooks for reconciliation
-            `CREATE TABLE IF NOT EXISTS call_events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                call_sid TEXT NOT NULL,
-                event_type TEXT NOT NULL,
-                provider TEXT,
-                raw_status TEXT,
-                payload_json TEXT,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY(call_sid) REFERENCES calls(call_sid)
-            )`,
-
-            // Store Telegram status thread anchor per call
-            `CREATE TABLE IF NOT EXISTS call_status_threads (
-                call_sid TEXT PRIMARY KEY,
-                telegram_chat_id TEXT NOT NULL,
-                header_message_id INTEGER,
-                to_number TEXT,
-                from_number TEXT,
-                call_type TEXT,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-            )`,
-
-            // System settings table for runtime configuration
-            `CREATE TABLE IF NOT EXISTS system_settings (
-                key TEXT PRIMARY KEY,
-                value TEXT,
-                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-            )`,
-
             // Notification delivery metrics for analytics - FIXED: Added UNIQUE constraint
             `CREATE TABLE IF NOT EXISTS notification_metrics (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -312,6 +123,19 @@ class EnhancedDatabase {
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(date, notification_type)
+            )`,
+
+            // Call templates (bot-managed prompt templates)
+            `CREATE TABLE IF NOT EXISTS call_templates (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT UNIQUE NOT NULL,
+                description TEXT,
+                business_id TEXT,
+                prompt TEXT,
+                first_message TEXT,
+                voice_model TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )`,
 
             // Service health monitoring logs
@@ -361,47 +185,6 @@ class EnhancedDatabase {
             });
         }
 
-        const columnMigrations = [
-            { sql: "ALTER TABLE calls ADD COLUMN provider TEXT DEFAULT 'twilio'", column: 'provider' },
-            { sql: 'ALTER TABLE calls ADD COLUMN provider_contact_id TEXT', column: 'provider_contact_id' },
-            { sql: 'ALTER TABLE calls ADD COLUMN provider_metadata TEXT', column: 'provider_metadata' },
-            { sql: "ALTER TABLE calls ADD COLUMN call_type TEXT DEFAULT 'service'", column: 'call_type' },
-            { sql: 'ALTER TABLE calls ADD COLUMN business_function TEXT', column: 'business_function' },
-            { sql: 'ALTER TABLE calls ADD COLUMN telegram_chat_id TEXT', column: 'telegram_chat_id' },
-            { sql: 'ALTER TABLE calls ADD COLUMN bot_webhook_url TEXT', column: 'bot_webhook_url' },
-            { sql: 'ALTER TABLE calls ADD COLUMN metadata_json TEXT', column: 'metadata_json' },
-            { sql: 'ALTER TABLE calls ADD COLUMN final_outcome TEXT', column: 'final_outcome' },
-            { sql: 'ALTER TABLE calls ADD COLUMN has_input INTEGER DEFAULT 0', column: 'has_input' },
-            { sql: 'ALTER TABLE calls ADD COLUMN latest_input_preview TEXT', column: 'latest_input_preview' },
-            { sql: 'ALTER TABLE calls ADD COLUMN last_input_at DATETIME', column: 'last_input_at' },
-            { sql: 'ALTER TABLE calls ADD COLUMN amd_status TEXT', column: 'amd_status' },
-            { sql: 'ALTER TABLE calls ADD COLUMN amd_confidence REAL', column: 'amd_confidence' },
-            { sql: 'ALTER TABLE calls ADD COLUMN amd_event_at DATETIME', column: 'amd_event_at' },
-            { sql: 'ALTER TABLE calls ADD COLUMN was_answered INTEGER DEFAULT 0', column: 'was_answered' },
-            { sql: 'ALTER TABLE calls ADD COLUMN outcome_notified_at DATETIME', column: 'outcome_notified_at' },
-            { sql: 'ALTER TABLE call_transcripts ADD COLUMN raw_message TEXT', column: 'call_transcripts.raw_message' },
-            { sql: 'ALTER TABLE call_transcripts ADD COLUMN clean_message TEXT', column: 'call_transcripts.clean_message' },
-            { sql: 'ALTER TABLE transcripts ADD COLUMN raw_message TEXT', column: 'transcripts.raw_message' },
-            { sql: 'ALTER TABLE transcripts ADD COLUMN clean_message TEXT', column: 'transcripts.clean_message' }
-        ];
-
-        for (const migration of columnMigrations) {
-            await new Promise((resolve, reject) => {
-                this.db.run(migration.sql, (err) => {
-                    if (err) {
-                        if (err.message.includes('duplicate column name')) {
-                            resolve();
-                        } else {
-                            console.error(`Error applying column migration for ${migration.column}:`, err);
-                            reject(err);
-                        }
-                    } else {
-                        resolve();
-                    }
-                });
-            });
-        }
-
         // Create comprehensive indexes for optimal performance
         const indexes = [
             // Call indexes
@@ -411,6 +194,7 @@ class EnhancedDatabase {
             'CREATE INDEX IF NOT EXISTS idx_calls_created_at ON calls(created_at)',
             'CREATE INDEX IF NOT EXISTS idx_calls_twilio_status ON calls(twilio_status)',
             'CREATE INDEX IF NOT EXISTS idx_calls_phone_number ON calls(phone_number)',
+            
             // Transcript indexes for both table names
             'CREATE INDEX IF NOT EXISTS idx_transcripts_call_sid ON call_transcripts(call_sid)',
             'CREATE INDEX IF NOT EXISTS idx_transcripts_timestamp ON call_transcripts(timestamp)',
@@ -419,11 +203,6 @@ class EnhancedDatabase {
             'CREATE INDEX IF NOT EXISTS idx_legacy_transcripts_call_sid ON transcripts(call_sid)',
             'CREATE INDEX IF NOT EXISTS idx_legacy_transcripts_timestamp ON transcripts(timestamp)',
             'CREATE INDEX IF NOT EXISTS idx_legacy_transcripts_speaker ON transcripts(speaker)',
-
-            // DTMF indexes
-            'CREATE INDEX IF NOT EXISTS idx_dtmf_call_sid ON dtmf_entries(call_sid)',
-            'CREATE INDEX IF NOT EXISTS idx_dtmf_stage_key ON dtmf_entries(stage_key)',
-            'CREATE INDEX IF NOT EXISTS idx_dtmf_received_at ON dtmf_entries(received_at)',
             
             // State indexes
             'CREATE INDEX IF NOT EXISTS idx_states_call_sid ON call_states(call_sid)',
@@ -437,17 +216,16 @@ class EnhancedDatabase {
             'CREATE INDEX IF NOT EXISTS idx_notifications_created_at ON webhook_notifications(created_at)',
             'CREATE INDEX IF NOT EXISTS idx_notifications_chat_id ON webhook_notifications(telegram_chat_id)',
             'CREATE INDEX IF NOT EXISTS idx_notifications_priority ON webhook_notifications(priority)',
-            'CREATE INDEX IF NOT EXISTS idx_call_inputs_call_sid ON call_inputs(call_sid)',
-            'CREATE INDEX IF NOT EXISTS idx_call_inputs_step ON call_inputs(call_sid, step)',
+
+            // Call templates
+            'CREATE INDEX IF NOT EXISTS idx_call_templates_name ON call_templates(name)',
+            'CREATE INDEX IF NOT EXISTS idx_call_templates_business ON call_templates(business_id)',
             
             // Metrics indexes
             'CREATE INDEX IF NOT EXISTS idx_metrics_date ON notification_metrics(date)',
             'CREATE INDEX IF NOT EXISTS idx_metrics_type ON notification_metrics(notification_type)',
             'CREATE INDEX IF NOT EXISTS idx_call_metrics_call_sid ON call_metrics(call_sid)',
             'CREATE INDEX IF NOT EXISTS idx_call_metrics_type ON call_metrics(metric_type)',
-
-            // Settings indexes
-            'CREATE INDEX IF NOT EXISTS idx_system_settings_updated ON system_settings(updated_at)',
             
             // Health indexes
             'CREATE INDEX IF NOT EXISTS idx_health_service ON service_health_logs(service_name)',
@@ -485,26 +263,16 @@ class EnhancedDatabase {
             first_message, 
             user_chat_id, 
             business_context = null,
-            generated_functions = null,
-            provider = 'twilio',
-            provider_contact_id = null,
-            provider_metadata = null,
-            call_type = 'service',
-            business_function = null,
-            telegram_chat_id = null,
-            bot_webhook_url = null,
-            metadata_json = null
+            generated_functions = null 
         } = callData;
         
         return new Promise((resolve, reject) => {
             const stmt = this.db.prepare(`
                 INSERT INTO calls (
                     call_sid, phone_number, prompt, first_message, 
-                    user_chat_id, business_context, generated_functions,
-                    provider, provider_contact_id, provider_metadata,
-                    call_type, business_function, telegram_chat_id, bot_webhook_url, metadata_json
+                    user_chat_id, status, business_context, generated_functions
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, 'initiated', ?, ?)
             `);
             
             stmt.run([
@@ -514,15 +282,7 @@ class EnhancedDatabase {
                 first_message, 
                 user_chat_id, 
                 business_context,
-                generated_functions,
-                provider,
-                provider_contact_id,
-                provider_metadata ? JSON.stringify(provider_metadata) : null,
-                call_type || 'service',
-                business_function || null,
-                telegram_chat_id || null,
-                bot_webhook_url || null,
-                metadata_json ? (typeof metadata_json === 'string' ? metadata_json : JSON.stringify(metadata_json)) : null
+                generated_functions
             ], function(err) {
                 if (err) {
                     reject(err);
@@ -540,10 +300,6 @@ class EnhancedDatabase {
             let updateFields = ['status = ?'];
             let values = [status];
 
-            if (additionalData.provider_metadata && typeof additionalData.provider_metadata === 'object') {
-                additionalData.provider_metadata = JSON.stringify(additionalData.provider_metadata);
-            }
-
             // Handle all possible additional data fields
             const fieldMappings = {
                 'started_at': 'started_at',
@@ -556,19 +312,7 @@ class EnhancedDatabase {
                 'error_code': 'error_code',
                 'error_message': 'error_message',
                 'ring_duration': 'ring_duration',
-                'answer_delay': 'answer_delay',
-                'provider': 'provider',
-                'provider_contact_id': 'provider_contact_id',
-                'provider_metadata': 'provider_metadata',
-                'has_input': 'has_input',
-                'latest_input_preview': 'latest_input_preview',
-                'last_input_at': 'last_input_at',
-                'final_outcome': 'final_outcome',
-                'amd_status': 'amd_status',
-                'amd_confidence': 'amd_confidence',
-                'amd_event_at': 'amd_event_at',
-                'was_answered': 'was_answered',
-                'outcome_notified_at': 'outcome_notified_at'
+                'answer_delay': 'answer_delay'
             };
 
             Object.entries(fieldMappings).forEach(([key, field]) => {
@@ -589,442 +333,6 @@ class EnhancedDatabase {
                     resolve(this.changes);
                 }
             });
-        });
-    }
-
-    async getSystemSetting(key) {
-        if (!key) {
-            return null;
-        }
-        return new Promise((resolve, reject) => {
-            this.db.get(
-                `SELECT value FROM system_settings WHERE key = ?`,
-                [key],
-                (err, row) => {
-                    if (err) {
-                        reject(err);
-                    } else {
-                        resolve(row ? row.value : null);
-                    }
-                }
-            );
-        });
-    }
-
-    async setSystemSetting(key, value) {
-        if (!key) {
-            throw new Error('System setting key is required');
-        }
-        return new Promise((resolve, reject) => {
-            this.db.run(
-                `INSERT INTO system_settings (key, value, updated_at)
-                 VALUES (?, ?, CURRENT_TIMESTAMP)
-                 ON CONFLICT(key) DO UPDATE SET
-                    value = excluded.value,
-                    updated_at = CURRENT_TIMESTAMP`,
-                [key, value],
-                function (err) {
-                    if (err) {
-                        reject(err);
-                    } else {
-                        resolve({ changes: this.changes });
-                    }
-                }
-            );
-        });
-    }
-
-    async getSystemSettings() {
-        return new Promise((resolve, reject) => {
-            this.db.all(
-                `SELECT key, value, updated_at FROM system_settings`,
-                [],
-                (err, rows) => {
-                    if (err) {
-                        reject(err);
-                    } else {
-                        const settings = {};
-                        (rows || []).forEach((row) => {
-                            settings[row.key] = {
-                                value: row.value,
-                                updated_at: row.updated_at
-                            };
-                        });
-                        resolve(settings);
-                    }
-                }
-            );
-        });
-    }
-
-    formatCallTemplate(row) {
-        if (!row) return null;
-        let personaConfig = null;
-        if (row.persona_config) {
-            try {
-                personaConfig = JSON.parse(row.persona_config);
-            } catch (error) {
-                console.warn('Failed to parse persona_config for call template:', error);
-                personaConfig = null;
-            }
-        }
-
-        return {
-            id: row.id,
-            name: row.name,
-            description: row.description,
-            business_id: row.business_id,
-            prompt: row.prompt,
-            first_message: row.first_message,
-            persona_config: personaConfig,
-            voice_model: row.voice_model,
-            created_at: row.created_at,
-            updated_at: row.updated_at
-        };
-    }
-
-    async getCallTemplates() {
-        return new Promise((resolve, reject) => {
-            this.db.all(
-                `SELECT * FROM call_templates ORDER BY updated_at DESC`,
-                [],
-                (err, rows) => {
-                    if (err) {
-                        reject(err);
-                    } else {
-                        resolve(rows.map((row) => this.formatCallTemplate(row)));
-                    }
-                }
-            );
-        });
-    }
-
-    async getCallTemplateById(id) {
-        return new Promise((resolve, reject) => {
-            this.db.get(
-                `SELECT * FROM call_templates WHERE id = ?`,
-                [id],
-                (err, row) => {
-                    if (err) {
-                        reject(err);
-                    } else {
-                        resolve(this.formatCallTemplate(row));
-                    }
-                }
-            );
-        });
-    }
-
-    async getCallTemplateByName(name) {
-        return new Promise((resolve, reject) => {
-            this.db.get(
-                `SELECT * FROM call_templates WHERE name = ?`,
-                [name],
-                (err, row) => {
-                    if (err) {
-                        reject(err);
-                    } else {
-                        resolve(this.formatCallTemplate(row));
-                    }
-                }
-            );
-        });
-    }
-
-    async createCallTemplate(templateData) {
-        const {
-            name,
-            description,
-            business_id,
-            prompt,
-            first_message,
-            persona_config,
-            voice_model
-        } = templateData;
-
-        const personaJson = persona_config ? JSON.stringify(persona_config) : null;
-
-        return new Promise((resolve, reject) => {
-            const sql = `INSERT INTO call_templates (
-                name, description, business_id, prompt, first_message, persona_config, voice_model
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)`;
-
-            this.db.run(
-                sql,
-                [
-                    name,
-                    description || null,
-                    business_id || null,
-                    prompt || null,
-                    first_message || null,
-                    personaJson,
-                    voice_model || null
-                ],
-                function (err) {
-                    if (err) {
-                        reject(err);
-                    } else {
-                        resolve({ id: this.lastID });
-                    }
-                }
-            );
-        });
-    }
-
-    async updateCallTemplate(id, updates) {
-        const fields = [];
-        const values = [];
-
-        const allowedFields = ['name', 'description', 'business_id', 'prompt', 'first_message', 'voice_model'];
-
-        for (const field of allowedFields) {
-            if (updates[field] !== undefined) {
-                fields.push(`${field} = ?`);
-                values.push(updates[field]);
-            }
-        }
-
-        if (updates.persona_config !== undefined) {
-            fields.push(`persona_config = ?`);
-            values.push(updates.persona_config ? JSON.stringify(updates.persona_config) : null);
-        }
-
-        if (fields.length === 0) {
-            return { changes: 0 };
-        }
-
-        fields.push('updated_at = CURRENT_TIMESTAMP');
-
-        values.push(id);
-
-        return new Promise((resolve, reject) => {
-            const sql = `UPDATE call_templates SET ${fields.join(', ')} WHERE id = ?`;
-
-            this.db.run(sql, values, function (err) {
-                if (err) {
-                    reject(err);
-                } else {
-                    resolve({ changes: this.changes });
-                }
-            });
-        });
-    }
-
-    async deleteCallTemplate(id) {
-        return new Promise((resolve, reject) => {
-            this.db.run(
-                `DELETE FROM call_templates WHERE id = ?`,
-                [id],
-                function (err) {
-                    if (err) {
-                        reject(err);
-                    } else {
-                        resolve({ changes: this.changes });
-                    }
-                }
-            );
-        });
-    }
-
-    formatPersonaProfile(row) {
-        if (!row) return null;
-
-        const safeParse = (value, label) => {
-            if (!value) return null;
-            try {
-                return JSON.parse(value);
-            } catch (error) {
-                console.warn(`Failed to parse ${label} for persona profile ${row.slug}:`, error);
-                return null;
-            }
-        };
-
-        return {
-            id: row.id,
-            slug: row.slug,
-            label: row.label,
-            description: row.description,
-            purposes: safeParse(row.purposes, 'purposes'),
-            default_purpose: row.default_purpose,
-            default_emotion: row.default_emotion,
-            default_urgency: row.default_urgency,
-            default_technical_level: row.default_technical_level,
-            call_template_id: row.call_template_id,
-            sms_template_name: row.sms_template_name,
-            metadata: safeParse(row.metadata, 'metadata'),
-            created_by: row.created_by,
-            updated_by: row.updated_by,
-            created_at: row.created_at,
-            updated_at: row.updated_at
-        };
-    }
-
-    async listPersonaProfiles() {
-        return new Promise((resolve, reject) => {
-            this.db.all(
-                `SELECT * FROM persona_profiles ORDER BY label ASC`,
-                [],
-                (err, rows) => {
-                    if (err) {
-                        reject(err);
-                    } else {
-                        resolve(rows.map((row) => this.formatPersonaProfile(row)));
-                    }
-                }
-            );
-        });
-    }
-
-    async getPersonaProfileBySlug(slug) {
-        return new Promise((resolve, reject) => {
-            this.db.get(
-                `SELECT * FROM persona_profiles WHERE slug = ?`,
-                [slug],
-                (err, row) => {
-                    if (err) {
-                        reject(err);
-                    } else {
-                        resolve(this.formatPersonaProfile(row));
-                    }
-                }
-            );
-        });
-    }
-
-    async createPersonaProfile(persona) {
-        const {
-            slug,
-            label,
-            description,
-            purposes,
-            default_purpose,
-            default_emotion,
-            default_urgency,
-            default_technical_level,
-            call_template_id,
-            sms_template_name,
-            metadata,
-            created_by,
-            updated_by
-        } = persona;
-
-        const purposesJson = purposes ? JSON.stringify(purposes) : null;
-        const metadataJson = metadata ? JSON.stringify(metadata) : null;
-
-        return new Promise((resolve, reject) => {
-            const sql = `
-                INSERT INTO persona_profiles (
-                    slug,
-                    label,
-                    description,
-                    purposes,
-                    default_purpose,
-                    default_emotion,
-                    default_urgency,
-                    default_technical_level,
-                    call_template_id,
-                    sms_template_name,
-                    metadata,
-                    created_by,
-                    updated_by
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            `;
-
-            this.db.run(
-                sql,
-                [
-                    slug,
-                    label,
-                    description || null,
-                    purposesJson,
-                    default_purpose || null,
-                    default_emotion || null,
-                    default_urgency || null,
-                    default_technical_level || null,
-                    call_template_id || null,
-                    sms_template_name || null,
-                    metadataJson,
-                    created_by || null,
-                    updated_by || created_by || null
-                ],
-                function (err) {
-                    if (err) {
-                        reject(err);
-                    } else {
-                        resolve({ id: this.lastID });
-                    }
-                }
-            );
-        });
-    }
-
-    async updatePersonaProfile(slug, updates) {
-        const fields = [];
-        const values = [];
-
-        const directFields = [
-            'label',
-            'description',
-            'default_purpose',
-            'default_emotion',
-            'default_urgency',
-            'default_technical_level',
-            'call_template_id',
-            'sms_template_name',
-            'created_by',
-            'updated_by'
-        ];
-
-        for (const field of directFields) {
-            if (updates[field] !== undefined) {
-                fields.push(`${field} = ?`);
-                values.push(updates[field]);
-            }
-        }
-
-        if (updates.purposes !== undefined) {
-            fields.push('purposes = ?');
-            values.push(updates.purposes ? JSON.stringify(updates.purposes) : null);
-        }
-
-        if (updates.metadata !== undefined) {
-            fields.push('metadata = ?');
-            values.push(updates.metadata ? JSON.stringify(updates.metadata) : null);
-        }
-
-        if (fields.length === 0) {
-            return { changes: 0 };
-        }
-
-        fields.push('updated_at = CURRENT_TIMESTAMP');
-        values.push(slug);
-
-        return new Promise((resolve, reject) => {
-            const sql = `UPDATE persona_profiles SET ${fields.join(', ')} WHERE slug = ?`;
-
-            this.db.run(sql, values, function (err) {
-                if (err) {
-                    reject(err);
-                } else {
-                    resolve({ changes: this.changes });
-                }
-            });
-        });
-    }
-
-    async deletePersonaProfile(slug) {
-        return new Promise((resolve, reject) => {
-            this.db.run(
-                `DELETE FROM persona_profiles WHERE slug = ?`,
-                [slug],
-                function (err) {
-                    if (err) {
-                        reject(err);
-                    } else {
-                        resolve({ changes: this.changes });
-                    }
-                }
-            );
         });
     }
 
@@ -1051,79 +359,34 @@ class EnhancedDatabase {
         });
     }
 
-    async getRecentCallStates(call_sid, state = null, limit = 5) {
-        if (!call_sid) {
-            return [];
-        }
-        return new Promise((resolve, reject) => {
-            let sql = `
-                SELECT id, call_sid, state, data, timestamp, sequence_number
-                FROM call_states
-                WHERE call_sid = ?
-            `;
-            const params = [call_sid];
-            if (state) {
-                sql += ' AND state = ?';
-                params.push(state);
-            }
-            sql += ' ORDER BY timestamp DESC LIMIT ?';
-            params.push(limit);
-
-            this.db.all(sql, params, (err, rows) => {
-                if (err) {
-                    reject(err);
-                } else {
-                    resolve(rows || []);
-                }
-            });
-        });
-    }
-
-    async getLatestCallState(call_sid, state = null) {
-        const rows = await this.getRecentCallStates(call_sid, state, 1);
-        return rows.length ? rows[0] : null;
-    }
-
     // Enhanced transcript with personality tracking (supports both table names)
     async addTranscript(transcriptData) {
-        const {
-            call_sid,
-            speaker,
-            message,
+        const { 
+            call_sid, 
+            speaker, 
+            message, 
             interaction_count,
             personality_used = null,
             adaptation_data = null,
             confidence_score = null
         } = transcriptData;
-
-        const rawMessage = message == null ? '' : String(message);
-        const cleanMessage = cleanTranscript(rawMessage);
-        const storedMessage = cleanMessage || rawMessage;
-
+        
         return new Promise((resolve, reject) => {
+            // Insert into both tables for backward compatibility
             const insertIntoTable = (tableName) => {
                 return new Promise((resolve, reject) => {
                     const stmt = this.db.prepare(`
                         INSERT INTO ${tableName} (
-                            call_sid,
-                            speaker,
-                            message,
-                            raw_message,
-                            clean_message,
-                            interaction_count,
-                            personality_used,
-                            adaptation_data,
-                            confidence_score
+                            call_sid, speaker, message, interaction_count, 
+                            personality_used, adaptation_data, confidence_score
                         )
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
                     `);
-
+                    
                     stmt.run([
-                        call_sid,
-                        speaker,
-                        storedMessage,
-                        rawMessage,
-                        cleanMessage,
+                        call_sid, 
+                        speaker, 
+                        message, 
                         interaction_count,
                         personality_used,
                         adaptation_data,
@@ -1139,280 +402,13 @@ class EnhancedDatabase {
                 });
             };
 
+            // Insert into both tables
             Promise.all([
                 insertIntoTable('call_transcripts'),
                 insertIntoTable('transcripts')
-            ])
-                .then((results) => resolve(results[0]))
-                .catch(reject);
-        });
-    }
-
-    async saveDtmfEntry(entry) {
-        const {
-            call_sid,
-            stage_key = 'generic',
-            masked_digits,
-            encrypted_digits = null,
-            compliance_mode = 'safe',
-            provider = null,
-            metadata = null
-        } = entry;
-
-        const metadataValue = metadata && typeof metadata === 'object' ? JSON.stringify(metadata) : metadata;
-
-        return new Promise((resolve, reject) => {
-            const stmt = this.db.prepare(`
-                INSERT INTO dtmf_entries (call_sid, stage_key, masked_digits, encrypted_digits, compliance_mode, provider, metadata)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            `);
-
-            stmt.run([call_sid, stage_key, masked_digits, encrypted_digits, compliance_mode, provider, metadataValue], function(err) {
-                if (err) {
-                    reject(err);
-                } else {
-                    resolve(this.lastID);
-                }
-            });
-            stmt.finalize();
-        });
-    }
-
-    async saveCallInput(entry) {
-        const {
-            call_sid,
-            step,
-            input_type,
-            value,
-            confidence = null
-        } = entry;
-
-        return new Promise((resolve, reject) => {
-            const stmt = this.db.prepare(`
-                INSERT INTO call_inputs (call_sid, step, input_type, value, confidence)
-                VALUES (?, ?, ?, ?, ?)
-            `);
-
-            stmt.run([call_sid, step, input_type, value, confidence], function(err) {
-                if (err) {
-                    reject(err);
-                } else {
-                    resolve(this.lastID);
-                }
-            });
-            stmt.finalize();
-        });
-    }
-
-    async markCallHasInput(call_sid, preview = null, options = {}) {
-        if (!call_sid) {
-            return false;
-        }
-
-        const sanitizedPreview = typeof preview === 'string' && preview.length ? preview : null;
-        const timestamp = options.timestamp || new Date().toISOString();
-
-        return new Promise((resolve, reject) => {
-            const updates = ['has_input = 1'];
-            const values = [];
-
-            if (sanitizedPreview) {
-                updates.push('latest_input_preview = ?');
-                values.push(sanitizedPreview);
-            }
-
-            if (timestamp) {
-                updates.push('last_input_at = ?');
-                values.push(timestamp);
-            }
-
-            const sql = `UPDATE calls SET ${updates.join(', ')} WHERE call_sid = ?`;
-            values.push(call_sid);
-
-            this.db.run(sql, values, function(err) {
-                if (err) {
-                    reject(err);
-                } else {
-                    resolve(this.changes);
-                }
-            });
-        });
-    }
-
-    async updateAmdStatus(call_sid, amdStatus = null, options = {}) {
-        if (!call_sid) {
-            return false;
-        }
-
-        return new Promise((resolve, reject) => {
-            const updates = [];
-            const values = [];
-
-            if (amdStatus !== null && amdStatus !== undefined) {
-                updates.push('amd_status = ?');
-                values.push(amdStatus);
-            }
-
-            if (options.confidence !== undefined) {
-                updates.push('amd_confidence = ?');
-                values.push(options.confidence);
-            }
-
-            updates.push('amd_event_at = ?');
-            values.push(options.eventAt || new Date().toISOString());
-
-            if (options.answeredBy) {
-                updates.push('answered_by = ?');
-                values.push(options.answeredBy);
-            }
-
-            if (options.markAnswered) {
-                updates.push('was_answered = 1');
-            }
-
-            if (updates.length === 0) {
-                resolve(true);
-                return;
-            }
-
-            const sql = `UPDATE calls SET ${updates.join(', ')} WHERE call_sid = ?`;
-            values.push(call_sid);
-
-            this.db.run(sql, values, function(err) {
-                if (err) {
-                    reject(err);
-                } else {
-                    resolve(this.changes);
-                }
-            });
-        });
-    }
-
-    async setFinalOutcome(call_sid, outcome, extra = {}) {
-        if (!call_sid || !outcome) {
-            return false;
-        }
-
-        return new Promise((resolve, reject) => {
-            const updates = ['final_outcome = ?'];
-            const values = [outcome];
-
-            if (extra.outcome_notified_at) {
-                updates.push('outcome_notified_at = ?');
-                values.push(extra.outcome_notified_at);
-            }
-
-            if (extra.has_input !== undefined) {
-                updates.push('has_input = ?');
-                values.push(extra.has_input ? 1 : 0);
-            }
-
-            if (extra.latest_input_preview !== undefined) {
-                updates.push('latest_input_preview = ?');
-                values.push(extra.latest_input_preview);
-            }
-
-            if (extra.answered_by) {
-                updates.push('answered_by = ?');
-                values.push(extra.answered_by);
-            }
-
-            if (extra.twilio_status) {
-                updates.push('twilio_status = ?');
-                values.push(extra.twilio_status);
-            }
-
-            if (extra.was_answered !== undefined) {
-                updates.push('was_answered = ?');
-                values.push(extra.was_answered ? 1 : 0);
-            }
-
-            if (extra.last_input_at) {
-                updates.push('last_input_at = ?');
-                values.push(extra.last_input_at);
-            }
-
-            const sql = `UPDATE calls SET ${updates.join(', ')} WHERE call_sid = ?`;
-            values.push(call_sid);
-
-            this.db.run(sql, values, function(err) {
-                if (err) {
-                    reject(err);
-                } else {
-                    resolve(this.changes);
-                }
-            });
-        });
-    }
-
-    async getCallInputs(call_sid) {
-        return new Promise((resolve, reject) => {
-            const sql = `
-                SELECT * FROM call_inputs
-                WHERE call_sid = ?
-                ORDER BY step ASC, captured_at ASC, id ASC
-            `;
-
-            this.db.all(sql, [call_sid], (err, rows) => {
-                if (err) {
-                    reject(err);
-                } else {
-                    resolve(rows || []);
-                }
-            });
-        });
-    }
-
-    async getNextCallInputStep(call_sid) {
-        return new Promise((resolve, reject) => {
-            this.db.get(
-                `SELECT COALESCE(MAX(step), 0) as max_step FROM call_inputs WHERE call_sid = ?`,
-                [call_sid],
-                (err, row) => {
-                    if (err) {
-                        reject(err);
-                    } else {
-                        resolve((row?.max_step || 0) + 1);
-                    }
-                }
-            );
-        });
-    }
-
-    async getCallDtmfEntries(call_sid) {
-        return new Promise((resolve, reject) => {
-            const sql = `
-                SELECT * FROM dtmf_entries
-                WHERE call_sid = ?
-                ORDER BY received_at ASC, id ASC
-            `;
-
-            this.db.all(sql, [call_sid], (err, rows) => {
-                if (err) {
-                    reject(err);
-                } else {
-                    resolve(rows || []);
-                }
-            });
-        });
-    }
-
-    async getLatestDtmfEntry(call_sid) {
-        return new Promise((resolve, reject) => {
-            const sql = `
-                SELECT * FROM dtmf_entries
-                WHERE call_sid = ?
-                ORDER BY received_at DESC, id DESC
-                LIMIT 1
-            `;
-
-            this.db.get(sql, [call_sid], (err, row) => {
-                if (err) {
-                    reject(err);
-                } else {
-                    resolve(row || null);
-                }
-            });
+            ]).then((results) => {
+                resolve(results[0]); // Return the first table's lastID
+            }).catch(reject);
         });
     }
 
@@ -1422,16 +418,15 @@ class EnhancedDatabase {
             const query = `
                 SELECT 
                     c.*,
-                    COUNT(DISTINCT t.id) as transcript_count,
-                    COUNT(DISTINCT d.id) as dtmf_input_count
+                    COUNT(t.id) as transcript_count,
+                    MAX(t.timestamp) as last_message_at
                 FROM calls c
                 LEFT JOIN transcripts t ON c.call_sid = t.call_sid
-                LEFT JOIN dtmf_entries d ON c.call_sid = d.call_sid
                 GROUP BY c.call_sid
                 ORDER BY c.created_at DESC
                 LIMIT ? OFFSET ?
             `;
-
+            
             this.db.all(query, [limit, offset], (err, rows) => {
                 if (err) {
                     console.error('Database error in getRecentCalls:', err);
@@ -1565,10 +560,12 @@ class EnhancedDatabase {
                         ELSE 5
                     END,
                     CASE wn.notification_type
+                        WHEN 'call_alert' THEN 0
                         WHEN 'call_failed' THEN 1
                         WHEN 'call_completed' THEN 2
-                        WHEN 'call_transcript' THEN 3
-                        ELSE 4
+                        WHEN 'call_summary' THEN 3
+                        WHEN 'call_transcript' THEN 4
+                        ELSE 5
                     END,
                     wn.created_at ASC
                 LIMIT ?
@@ -1671,88 +668,76 @@ class EnhancedDatabase {
         });
     }
 
-    async logCallEvent(call_sid, event_type, payload = {}, options = {}) {
+    // Call templates CRUD
+    async listCallTemplates() {
         return new Promise((resolve, reject) => {
-            const stmt = this.db.prepare(`
-                INSERT INTO call_events (call_sid, event_type, provider, raw_status, payload_json)
-                VALUES (?, ?, ?, ?, ?)
-            `);
-
-            stmt.run(
-                [
-                    call_sid,
-                    event_type,
-                    options.provider || null,
-                    options.raw_status || null,
-                    JSON.stringify(payload || {})
-                ],
-                function(err) {
-                    if (err) {
-                        reject(err);
-                    } else {
-                        resolve(this.lastID);
-                    }
+            this.db.all(
+                `SELECT * FROM call_templates ORDER BY updated_at DESC, created_at DESC`,
+                (err, rows) => {
+                    if (err) reject(err);
+                    else resolve(rows || []);
                 }
             );
-            stmt.finalize();
         });
     }
 
-    async upsertCallStatusThread(mapping = {}) {
-        const {
-            call_sid,
-            telegram_chat_id,
-            header_message_id = null,
-            to_number = null,
-            from_number = null,
-            call_type = null,
-        } = mapping;
+    async getCallTemplateById(id) {
+        return new Promise((resolve, reject) => {
+            this.db.get(`SELECT * FROM call_templates WHERE id = ?`, [id], (err, row) => {
+                if (err) reject(err);
+                else resolve(row || null);
+            });
+        });
+    }
 
-        if (!call_sid || !telegram_chat_id) {
-            throw new Error('call_sid and telegram_chat_id are required for call_status_threads');
-        }
-
+    async createCallTemplate(payload) {
+        const { name, description, business_id, prompt, first_message, voice_model } = payload;
         return new Promise((resolve, reject) => {
             const stmt = this.db.prepare(`
-                INSERT INTO call_status_threads (call_sid, telegram_chat_id, header_message_id, to_number, from_number, call_type)
+                INSERT INTO call_templates (name, description, business_id, prompt, first_message, voice_model)
                 VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(call_sid) DO UPDATE SET
-                    telegram_chat_id = excluded.telegram_chat_id,
-                    header_message_id = COALESCE(excluded.header_message_id, call_status_threads.header_message_id),
-                    to_number = COALESCE(excluded.to_number, call_status_threads.to_number),
-                    from_number = COALESCE(excluded.from_number, call_status_threads.from_number),
-                    call_type = COALESCE(excluded.call_type, call_status_threads.call_type)
             `);
-
-            stmt.run(
-                [call_sid, telegram_chat_id, header_message_id, to_number, from_number, call_type],
-                function(err) {
-                    if (err) {
-                        reject(err);
-                    } else {
-                        resolve(this.changes || 1);
-                    }
-                }
-            );
+            stmt.run([name, description, business_id, prompt, first_message, voice_model], function(err) {
+                if (err) reject(err);
+                else resolve(this.lastID);
+            });
             stmt.finalize();
         });
     }
 
-    async getCallStatusThread(call_sid) {
-        if (!call_sid) return null;
+    async updateCallTemplate(id, payload) {
+        const fields = [];
+        const values = [];
+        const allowed = ['name', 'description', 'business_id', 'prompt', 'first_message', 'voice_model'];
+        allowed.forEach((key) => {
+            if (payload[key] !== undefined) {
+                fields.push(`${key} = ?`);
+                values.push(payload[key]);
+            }
+        });
+        fields.push('updated_at = CURRENT_TIMESTAMP');
+        values.push(id);
+
         return new Promise((resolve, reject) => {
-            this.db.get(
-                `SELECT call_sid, telegram_chat_id, header_message_id, to_number, from_number, call_type, created_at
-                 FROM call_status_threads WHERE call_sid = ?`,
-                [call_sid],
-                (err, row) => {
-                    if (err) {
-                        reject(err);
-                    } else {
-                        resolve(row || null);
-                    }
-                }
+            const stmt = this.db.prepare(
+                `UPDATE call_templates SET ${fields.join(', ')} WHERE id = ?`
             );
+            stmt.run(values, function(err) {
+                if (err) reject(err);
+                else resolve(this.changes);
+            });
+            stmt.finalize();
+        });
+    }
+
+    async deleteCallTemplate(id) {
+        return new Promise((resolve, reject) => {
+            const stmt = this.db.prepare(`DELETE FROM call_templates WHERE id = ?`);
+            stmt.run([id], function(err) {
+                if (err) reject(err);
+                else resolve(this.changes);
+            });
+            stmt.finalize();
         });
     }
 
@@ -1850,26 +835,18 @@ class EnhancedDatabase {
     // Get enhanced call transcripts (supports both table names)
     async getCallTranscripts(call_sid) {
         return new Promise((resolve, reject) => {
+            // Try the legacy table first for backward compatibility
             const sql = `
-                SELECT * FROM transcripts
-                WHERE call_sid = ?
+                SELECT * FROM transcripts 
+                WHERE call_sid = ? 
                 ORDER BY interaction_count ASC, timestamp ASC
             `;
-
+            
             this.db.all(sql, [call_sid], (err, rows) => {
                 if (err) {
                     reject(err);
                 } else {
-                    const result = (rows || []).map((row) => {
-                        const cleanMessage = row.clean_message || cleanTranscript(row.message || row.raw_message || '');
-                        return {
-                            ...row,
-                            raw_message: row.raw_message || row.message || '',
-                            clean_message: cleanMessage,
-                            message: cleanMessage,
-                        };
-                    });
-                    resolve(result);
+                    resolve(rows || []);
                 }
             });
         });
@@ -2041,79 +1018,63 @@ class EnhancedDatabase {
 
    // Create SMS messages table
    async initializeSMSTables() {
-       const tables = [
-           {
-               sql: `CREATE TABLE IF NOT EXISTS sms_messages (
-                   id INTEGER PRIMARY KEY AUTOINCREMENT,
-                   message_sid TEXT UNIQUE NOT NULL,
-                   to_number TEXT,
-                   from_number TEXT,
-                   body TEXT NOT NULL,
-                   status TEXT DEFAULT 'queued',
-                   direction TEXT NOT NULL CHECK(direction IN ('inbound', 'outbound')),
-                   template_name TEXT,
-                   template_variables TEXT,
-                   error_code TEXT,
-                   error_message TEXT,
-                   ai_response TEXT,
-                   response_message_sid TEXT,
-                   user_chat_id TEXT,
-                   created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                   updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-               )`,
-               context: 'create sms_messages table'
-           },
-           {
-               sql: `CREATE TABLE IF NOT EXISTS bulk_sms_operations (
-                   id INTEGER PRIMARY KEY AUTOINCREMENT,
-                   total_recipients INTEGER NOT NULL,
-                   successful INTEGER DEFAULT 0,
-                   failed INTEGER DEFAULT 0,
-                   message TEXT NOT NULL,
-                   user_chat_id TEXT,
-                   created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-               )`,
-               context: 'create bulk_sms_operations table'
-           }
-       ];
+       return new Promise((resolve, reject) => {
+           const createSMSTable = `CREATE TABLE IF NOT EXISTS sms_messages (
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               message_sid TEXT UNIQUE NOT NULL,
+               to_number TEXT,
+               from_number TEXT,
+               body TEXT NOT NULL,
+               status TEXT DEFAULT 'queued',
+               direction TEXT NOT NULL CHECK(direction IN ('inbound', 'outbound')),
+               error_code TEXT,
+               error_message TEXT,
+               ai_response TEXT,
+               response_message_sid TEXT,
+               user_chat_id TEXT,
+               created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+               updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+           )`;
 
-       for (const statement of tables) {
-           await this.execute(statement.sql, `${statement.context}`);
-       }
+           const createBulkSMSTable = `CREATE TABLE IF NOT EXISTS bulk_sms_operations (
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               total_recipients INTEGER NOT NULL,
+               successful INTEGER DEFAULT 0,
+               failed INTEGER DEFAULT 0,
+               message TEXT NOT NULL,
+               user_chat_id TEXT,
+               created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+           )`;
 
-       const alterations = [
-           {
-               sql: 'ALTER TABLE sms_messages ADD COLUMN template_name TEXT',
-               context: 'add template_name column to sms_messages',
-               ignoreErrors: ['duplicate column name']
-           },
-           {
-               sql: 'ALTER TABLE sms_messages ADD COLUMN template_variables TEXT',
-               context: 'add template_variables column to sms_messages',
-               ignoreErrors: ['duplicate column name']
-           },
-           {
-               sql: 'ALTER TABLE sms_templates ADD COLUMN updated_by TEXT',
-               context: 'add updated_by column to sms_templates',
-               ignoreErrors: ['duplicate column name', 'no such table']
-           }
-       ];
-
-       for (const alteration of alterations) {
-           await this.execute(alteration.sql, alteration.context, { ignoreErrors: alteration.ignoreErrors });
-       }
-
-       console.log('✅ SMS tables verified successfully');
+           this.db.serialize(() => {
+               this.db.run(createSMSTable, (err) => {
+                   if (err) {
+                       console.error('Error creating SMS table:', err);
+                       reject(err);
+                       return;
+                   }
+               });
+               
+               this.db.run(createBulkSMSTable, (err) => {
+                   if (err) {
+                       console.error('Error creating bulk SMS table:', err);
+                       reject(err);
+                   } else {
+                       console.log('✅ SMS tables created successfully');
+                       resolve();
+                   }
+               });
+           });
+       });
    }
 
    // Save SMS message
    async saveSMSMessage(messageData) {
        return new Promise((resolve, reject) => {
            const sql = `INSERT INTO sms_messages (
-               message_sid, to_number, from_number, body, status,
-               direction, template_name, template_variables,
-               ai_response, response_message_sid, user_chat_id
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
+               message_sid, to_number, from_number, body, status, 
+               direction, ai_response, response_message_sid, user_chat_id
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`;
 
            this.db.run(sql, [
                messageData.message_sid,
@@ -2122,8 +1083,6 @@ class EnhancedDatabase {
                messageData.body,
                messageData.status || 'queued',
                messageData.direction,
-               messageData.template_name || null,
-               messageData.template_variables ? JSON.stringify(messageData.template_variables) : null,
                messageData.ai_response || null,
                messageData.response_message_sid || null,
                messageData.user_chat_id || null
@@ -2184,121 +1143,6 @@ class EnhancedDatabase {
            });
        });
    }
-
-    async getAllTemplates(options = {}) {
-        const { includeContent = false } = options;
-        const columns = includeContent ? '*' : 'id, name, description, is_builtin, metadata, created_by, created_at, updated_at';
-
-        return new Promise((resolve, reject) => {
-            this.db.all(`SELECT ${columns} FROM sms_templates ORDER BY name`, (err, rows) => {
-                if (err) {
-                    reject(err);
-                } else {
-                    const templates = (rows || []).map((row) => ({
-                        ...row,
-                        metadata: row.metadata ? JSON.parse(row.metadata) : {}
-                    }));
-                    resolve(templates);
-                }
-            });
-        });
-    }
-
-    async getTemplateByName(name) {
-        return new Promise((resolve, reject) => {
-            this.db.get(`SELECT * FROM sms_templates WHERE name = ?`, [name], (err, row) => {
-                if (err) {
-                    reject(err);
-                } else if (!row) {
-                    resolve(null);
-                } else {
-                    row.metadata = row.metadata ? JSON.parse(row.metadata) : {};
-                    resolve(row);
-                }
-            });
-        });
-    }
-
-    async createTemplate(templateData) {
-        return new Promise((resolve, reject) => {
-            const sql = `INSERT INTO sms_templates (name, description, content, metadata, is_builtin, created_by, updated_by)
-                         VALUES (?, ?, ?, ?, ?, ?, ?)`;
-
-            this.db.run(sql, [
-                templateData.name,
-                templateData.description || null,
-                templateData.content,
-                templateData.metadata ? JSON.stringify(templateData.metadata) : null,
-                templateData.is_builtin ? 1 : 0,
-                templateData.created_by || null,
-                templateData.updated_by || templateData.created_by || null
-            ], function (err) {
-                if (err) {
-                    reject(err);
-                } else {
-                    resolve(this.lastID);
-                }
-            });
-        });
-    }
-
-    async updateTemplate(name, updates) {
-        const fields = [];
-        const values = [];
-
-        if (updates.description !== undefined) {
-            fields.push('description = ?');
-            values.push(updates.description || null);
-        }
-
-        if (updates.content !== undefined) {
-            fields.push('content = ?');
-            values.push(updates.content);
-        }
-
-        if (updates.metadata !== undefined) {
-            fields.push('metadata = ?');
-            values.push(updates.metadata ? JSON.stringify(updates.metadata) : null);
-        }
-
-        if (updates.is_builtin !== undefined) {
-            fields.push('is_builtin = ?');
-            values.push(updates.is_builtin ? 1 : 0);
-        }
-
-        if (updates.updated_by !== undefined) {
-            fields.push('updated_by = ?');
-            values.push(updates.updated_by || null);
-        }
-
-        fields.push('updated_at = CURRENT_TIMESTAMP');
-
-        values.push(name);
-
-        const sql = `UPDATE sms_templates SET ${fields.join(', ')} WHERE name = ?`;
-
-        return new Promise((resolve, reject) => {
-            this.db.run(sql, values, function (err) {
-                if (err) {
-                    reject(err);
-                } else {
-                    resolve(this.changes);
-                }
-            });
-        });
-    }
-
-    async deleteTemplate(name) {
-        return new Promise((resolve, reject) => {
-            this.db.run(`DELETE FROM sms_templates WHERE name = ? AND is_builtin = 0`, [name], function (err) {
-                if (err) {
-                    reject(err);
-                } else {
-                    resolve(this.changes);
-                }
-            });
-        });
-    }
 
    // Get SMS messages
    async getSMSMessages(limit = 50, offset = 0) {
@@ -2485,8 +1329,6 @@ class EnhancedDatabase {
                UNION ALL
                SELECT 'webhook_notifications', COUNT(*) FROM webhook_notifications
                UNION ALL
-               SELECT 'dtmf_entries', COUNT(*) FROM dtmf_entries
-               UNION ALL
                SELECT 'notification_metrics', COUNT(*) FROM notification_metrics
                UNION ALL
                SELECT 'service_health_logs', COUNT(*) FROM service_health_logs
@@ -2536,7 +1378,6 @@ class EnhancedDatabase {
                        } else {
                            console.log('✅ Enhanced database connection closed');
                        }
-                       this.db = null;
                        resolve();
                    });
                }).catch(() => {
@@ -2547,7 +1388,6 @@ class EnhancedDatabase {
                        } else {
                            console.log('✅ Enhanced database connection closed');
                        }
-                       this.db = null;
                        resolve();
                    });
                });

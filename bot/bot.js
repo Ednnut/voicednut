@@ -75,6 +75,38 @@ bot.command('cancel', async (ctx) => {
     await ctx.reply('✅ Current action cancelled. Use /menu to start again.');
 });
 
+// Operator/alert inline actions
+bot.callbackQuery(/^alert:/, async (ctx) => {
+    const data = ctx.callbackQuery.data || '';
+    const parts = data.split(':');
+    if (parts.length < 3) return;
+    const action = parts[1];
+    const callSid = parts[2];
+
+    try {
+        switch (action) {
+            case 'mute':
+                await axios.post(`${API_BASE}/api/calls/${callSid}/operator`, { action: 'mute_alerts' }, { timeout: 8000 });
+                await ctx.answerCallbackQuery({ text: '🔕 Alerts muted for this call', show_alert: false });
+                break;
+            case 'retry':
+                await axios.post(`${API_BASE}/api/calls/${callSid}/operator`, { action: 'clarify', text: 'Let me retry that step.' }, { timeout: 8000 });
+                await ctx.answerCallbackQuery({ text: '🔄 Retry requested', show_alert: false });
+                break;
+            case 'transfer':
+                await axios.post(`${API_BASE}/api/calls/${callSid}/operator`, { action: 'transfer' }, { timeout: 8000 });
+                await ctx.answerCallbackQuery({ text: '📞 Transfer request noted', show_alert: false });
+                break;
+            default:
+                await ctx.answerCallbackQuery({ text: 'Action not supported yet', show_alert: false });
+                break;
+        }
+    } catch (error) {
+        console.error('Operator action error:', error?.message || error);
+        await ctx.answerCallbackQuery({ text: '⚠️ Failed to execute action', show_alert: false });
+    }
+});
+
 // Initialize conversations middleware AFTER session
 bot.use(conversations());
 
@@ -168,10 +200,10 @@ registerPersonaCommand(bot);
 require('./commands/help')(bot);
 require('./commands/menu')(bot);
 require('./commands/guide')(bot);
-require('./commands/transcript')(bot);
 require('./commands/api')(bot);
 registerProviderCommand(bot);
 require('./commands/webapp')(bot); // Register WebApp handler
+const API_BASE = config.apiUrl;
 
 function escapeMarkdown(text = '') {
     return text.replace(/([_*[\]()~`>#+=|{}.!\\-])/g, '\\$1');
@@ -308,7 +340,7 @@ async function handleCallFollowUp(ctx, callSid, followAction) {
                 transcriptMessage += `_… ${transcripts.length - maxMessages} more messages_\n\n`;
             }
 
-            transcriptMessage += `Use /transcript ${escapeMarkdown(callSid)} for the full conversation.`;
+            transcriptMessage += `Use /search ${escapeMarkdown(callSid)} for full details.`;
 
             await ctx.reply(transcriptMessage, { parse_mode: 'Markdown' });
             break;
@@ -705,8 +737,8 @@ async function executeHelpCommand(ctx) {
 • /sms - Send an SMS message
 • /miniapp - Open the Mini App
 • /smsconversation &lt;phone&gt; - View SMS conversation
-• /transcript &lt;call_sid&gt; - Get call transcript
-• /calls [limit] - List recent calls (max 50)
+• /search &lt;term&gt; - Find calls by ID/phone/intent
+• /recent [limit] - List recent calls (max 50)
 • /health or /ping - Check bot &amp; API health
 • /guide - Show detailed usage guide
 • /menu - Show quick action buttons
@@ -740,8 +772,8 @@ async function executeHelpCommand(ctx) {
 
 💡 <b>Examples</b>
 • Phone format: +1234567890 (not 123-456-7890)
-• Get transcript: /transcript CA1234567890abcdef
-• List calls: /calls 20
+• Search calls: /search refund
+• List calls: /recent 20
 • Check health: /health
         
 🆘 <b>Support &amp; Info</b>
@@ -1072,7 +1104,7 @@ async function executeCallsCommand(ctx) {
             message += `&nbsp;&nbsp;💬 ${transcriptCount} message${transcriptCount === 1 ? '' : 's'}\n\n`;
         });
 
-        message += 'Use /transcript &lt;call_id&gt; to view details';
+        message += 'Use /search &lt;call_id&gt; to view details';
 
         await ctx.reply(message, { parse_mode: 'HTML' });
 
@@ -1231,8 +1263,8 @@ const TELEGRAM_COMMANDS = [
     { command: 'miniapp', description: 'Open the Voice Call Mini App' },
     { command: 'call', description: 'Start outbound voice call' },
     { command: 'sms', description: 'Send SMS message' },
-    { command: 'transcript', description: 'Get call transcript by SID' },
-    { command: 'calls', description: 'List recent calls' },
+    { command: 'search', description: 'Search calls' },
+    { command: 'recent', description: 'List recent calls' },
     { command: 'smsconversation', description: 'View SMS conversation' },
     { command: 'guide', description: 'Show detailed usage guide' },
     { command: 'help', description: 'Show available commands' },
