@@ -281,7 +281,7 @@ class InputOrchestrator {
     return lines.filter(Boolean).join(' ').trim();
   }
 
-  buildClarification(stage, digits, issues = [], context = {}, stage = {}) {
+  buildClarification(stage, digits, issues = [], context = {}) {
     const lines = [];
 
     if (stage.hint) {
