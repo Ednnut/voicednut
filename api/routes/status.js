@@ -1,5 +1,5 @@
 const axios = require('axios');
-const { telegram: telegramConfig } = require('../config');
+const { telegram: telegramConfig, twilio: twilioConfig } = require('../config');
 const {
   formatSummary,
   decryptDigits,
@@ -431,8 +431,18 @@ function describeDualChannelIssue(issue = {}) {
   return `${issue.label || 'Secondary check'} alert`;
 }
 
-function getStatusLine(status = '') {
+function getStatusLine(status = '', options = {}) {
+  const toNumber = options.to || null;
+  const fromNumber = options.from || null;
   const normalized = (status || '').toLowerCase();
+  if (normalized === 'initiated' || normalized === 'queued') {
+    if (toNumber && fromNumber) {
+      return `📞 Calling ${toNumber} from ${fromNumber}`;
+    }
+    if (toNumber) {
+      return `📞 Calling ${toNumber}`;
+    }
+  }
   return STATUS_LINE_MAP[normalized] || `📱 ${titleCase(normalized || 'Update')}`;
 }
 
@@ -868,9 +878,10 @@ class EnhancedWebhookService {
         return true;
       }
 
-      const statusLine = getStatusLine(normalizedStatus);
-      const headerId = await this.ensureCallHeader(call_sid, chatId, callDetails);
-      await this.enqueueStatusMessage(call_sid, chatId, statusLine, { status: normalizedStatus });
+      const toNumber = callDetails?.phone_number || metadata?.dialed_number || 'Unknown';
+      const fromNumber = metadata?.from_number || twilioConfig?.fromNumber || 'Unknown';
+      const statusLine = getStatusLine(normalizedStatus, { to: toNumber, from: fromNumber });
+      await this.enqueueStatusMessage(call_sid, chatId, statusLine, { status: normalizedStatus, replyTo: null });
       const finalOutcome = additionalData.finalOutcome || (normalizedStatus === 'no-answer' ? '❌ Not completed: no-answer' : null);
       if (finalOutcome) {
         await this.enqueueStatusMessage(call_sid, chatId, finalOutcome, { status: `${normalizedStatus}-final` });
@@ -1360,8 +1371,7 @@ class EnhancedWebhookService {
       const amdLine = getAmdLine(label);
       const thread = this.getStatusThread(call_sid, chatId);
       if (amdLine && amdLine !== thread.lastStatus) {
-        await this.ensureCallHeader(call_sid, chatId, call);
-        await this.enqueueStatusMessage(call_sid, chatId, amdLine, { status: `amd-${label}` });
+        await this.enqueueStatusMessage(call_sid, chatId, amdLine, { status: `amd-${label}`, replyTo: null });
       }
       return true;
     } catch (error) {
@@ -1927,35 +1937,13 @@ class EnhancedWebhookService {
     return thread;
   }
 
-  async ensureCallHeader(callSid, chatId, callDetails = null) {
-    const thread = this.getStatusThread(callSid, chatId);
-    if (thread.headerMessageId) {
-      return thread.headerMessageId;
-    }
-    const metadata = parseCallMetadata(callDetails?.metadata_json) || {};
-    const callLabel = callSid ? `Call ${callSid.slice(-6)}` : 'Call';
-    const phoneDisplay = callDetails?.phone_number || metadata?.dialed_number || 'Unknown';
-    const personaLabel = callDetails ? getPersonaLabel(callDetails) : 'Adaptive Agent';
-    const intentLabel = resolveIntentLabel(callDetails || {}, metadata);
-
-    const headerLines = [
-      `📞 ${escapeMarkdownV2(callLabel)} • ${escapeMarkdownV2(phoneDisplay)}`,
-      `Persona: ${escapeMarkdownV2(personaLabel)}`,
-      `Intent: ${escapeMarkdownV2(intentLabel)}`,
-    ];
-
-    const sent = await this.sendTelegramMessage(chatId, headerLines.join('\n'), 'MarkdownV2');
-    const messageId = sent?.result?.message_id || sent?.message_id || null;
-    thread.headerMessageId = messageId;
-    return messageId;
-  }
-
   async enqueueStatusMessage(callSid, chatId, text, options = {}) {
     const thread = this.getStatusThread(callSid, chatId);
     if (options.status && thread.lastStatus === options.status) {
       return;
     }
-    thread.queue.push({ text, replyTo: thread.headerMessageId, status: options.status });
+    const replyTo = options.replyTo !== undefined ? options.replyTo : null;
+    thread.queue.push({ text, replyTo, status: options.status });
     thread.lastStatus = options.status || thread.lastStatus;
     if (!thread.sending) {
       this.processStatusQueue(callSid);
