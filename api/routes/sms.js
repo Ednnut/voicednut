@@ -1,6 +1,7 @@
 const EventEmitter = require('events');
 const axios = require('axios');
 const PersonaComposer = require('../services/PersonaComposer');
+const config = require('../config');
 
 class EnhancedSmsService extends EventEmitter {
     constructor(options = {}) {
@@ -9,8 +10,8 @@ class EnhancedSmsService extends EventEmitter {
         this.provider = provider;
         if (provider === 'twilio') {
             this.twilio = twilioClient || require('twilio')(
-                process.env.TWILIO_ACCOUNT_SID,
-                process.env.TWILIO_AUTH_TOKEN
+                config.twilio.accountSid,
+                config.twilio.authToken
             );
         } else {
             this.twilio = twilioClient || null;
@@ -18,20 +19,20 @@ class EnhancedSmsService extends EventEmitter {
         this.awsAdapter = awsAdapter || null;
         this.openai = new(require('openai'))({
             baseURL: "https://openrouter.ai/api/v1",
-            apiKey: process.env.OPENROUTER_API_KEY,
+            apiKey: config.openRouter.apiKey,
             defaultHeaders: {
-                "HTTP-Referer": process.env.YOUR_SITE_URL || "http://localhost:3000",
-                "X-Title": process.env.YOUR_SITE_NAME || "SMS AI Assistant",
+                "HTTP-Referer": config.openRouter.siteUrl || "http://localhost:3000",
+                "X-Title": config.openRouter.siteName || "SMS AI Assistant",
             }
         });
-        this.model = process.env.OPENROUTER_MODEL || "meta-llama/llama-3.1-8b-instruct:free";
+        this.model = config.openRouter.model || "meta-llama/llama-3.1-8b-instruct:free";
 
         // SMS conversation tracking
         this.activeConversations = new Map();
         this.messageQueue = new Map(); // Queue for outbound messages
         this.personaComposer = new PersonaComposer();
         this.defaultSmsPersona = {
-            businessId: process.env.DEFAULT_SMS_BUSINESS_ID || null,
+            businessId: config.smsDefaults.businessId,
             purpose: 'customer_service',
             channel: 'sms',
             emotion: 'neutral',
@@ -113,8 +114,8 @@ class EnhancedSmsService extends EventEmitter {
             }
             if (!this.twilio) {
                 this.twilio = require('twilio')(
-                    process.env.TWILIO_ACCOUNT_SID,
-                    process.env.TWILIO_AUTH_TOKEN
+                    config.twilio.accountSid,
+                    config.twilio.authToken
                 );
             }
             this.awsAdapter = null;
@@ -123,8 +124,8 @@ class EnhancedSmsService extends EventEmitter {
             this.vonageAdapter = null;
             if (!this.twilio) {
                 this.twilio = require('twilio')(
-                    process.env.TWILIO_ACCOUNT_SID,
-                    process.env.TWILIO_AUTH_TOKEN
+                    config.twilio.accountSid,
+                    config.twilio.authToken
                 );
             }
         }
@@ -204,7 +205,7 @@ class EnhancedSmsService extends EventEmitter {
     // Send individual SMS
     async sendSMS(to, message, from = null, personaOverrides = null) {
         try {
-            const fromNumber = from || process.env.FROM_NUMBER;
+            const fromNumber = from || config.twilio.fromNumber;
 
             if (this.provider !== 'aws' && !fromNumber) {
                 throw new Error('No FROM_NUMBER configured for SMS');
@@ -260,7 +261,7 @@ class EnhancedSmsService extends EventEmitter {
                     to,
                     body: message,
                     from,
-                    statusCallback: `https://${process.env.SERVER}/webhook/sms-status`
+                    statusCallback: config.server.hostname ? `https://${config.server.hostname}/webhook/sms-status` : undefined
                 });
 
                 const [vonageResult] = response.messages || [];
@@ -277,7 +278,7 @@ class EnhancedSmsService extends EventEmitter {
                     body: message,
                     from: fromNumber,
                     to: to,
-                    statusCallback: `https://${process.env.SERVER}/webhook/sms-status`
+                    statusCallback: config.server.hostname ? `https://${config.server.hostname}/webhook/sms-status` : undefined
                 });
 
                 providerResponse = smsMessage;

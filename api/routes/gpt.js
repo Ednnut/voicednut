@@ -2,6 +2,7 @@ require('colors');
 const EventEmitter = require('events');
 const OpenAI = require('openai');
 const PersonalityEngine = require('../functions/PersonalityEngine');
+const config = require('../config');
 
 const DEFAULT_SYSTEM_PROMPT =
   'You are an intelligent AI assistant capable of adapting to different business contexts and customer needs. Be professional, helpful, and responsive to customer communication styles. You must add a \'•\' symbol every 5 to 10 words at natural pauses where your response can be split for text to speech.';
@@ -15,14 +16,14 @@ class EnhancedGptService extends EventEmitter {
     // Initialize OpenRouter client
     this.openai = new OpenAI({
       baseURL: "https://openrouter.ai/api/v1",
-      apiKey: process.env.OPENROUTER_API_KEY,
+      apiKey: config.openRouter.apiKey,
       defaultHeaders: {
-        "HTTP-Referer": process.env.YOUR_SITE_URL || "http://localhost:3000",
-        "X-Title": process.env.YOUR_SITE_NAME || "Adaptive Voice AI",
+        "HTTP-Referer": config.openRouter.siteUrl || "http://localhost:3000",
+        "X-Title": config.openRouter.siteName || "Adaptive Voice AI",
       }
     });
     
-    this.model = process.env.OPENROUTER_MODEL || "meta-llama/llama-3.1-8b-instruct:free";
+    this.model = config.openRouter.model || "meta-llama/llama-3.1-8b-instruct:free";
     
     // Initialize Personality Engine
     this.personalityEngine = new PersonalityEngine();

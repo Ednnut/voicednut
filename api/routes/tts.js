@@ -1,21 +1,21 @@
-require('dotenv').config();
 const { Buffer } = require('node:buffer');
 const EventEmitter = require('events');
 const fetch = require('node-fetch');
+const { deepgram: deepgramConfig } = require('../config');
 
 class TextToSpeechService extends EventEmitter {
   constructor() {
     super();
     this.nextExpectedIndex = 0;
     this.speechBuffer = {};
-    this.defaultVoiceModel = process.env.VOICE_MODEL || 'aura-asteria-en';
+    this.defaultVoiceModel = deepgramConfig.voiceModel || 'aura-asteria-en';
     this.activeVoiceModel = this.defaultVoiceModel;
     
     // Validate required environment variables
-    if (!process.env.DEEPGRAM_API_KEY) {
+    if (!deepgramConfig.apiKey) {
       console.error('❌ DEEPGRAM_API_KEY is not set');
     }
-    if (!process.env.VOICE_MODEL) {
+    if (!deepgramConfig.voiceModel) {
       console.warn('⚠️ VOICE_MODEL not set, using default');
     }
     
@@ -52,7 +52,7 @@ class TextToSpeechService extends EventEmitter {
       const response = await fetch(url, {
         method: 'POST',
         headers: {
-          'Authorization': `Token ${process.env.DEEPGRAM_API_KEY}`,
+          'Authorization': `Token ${deepgramConfig.apiKey}`,
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({

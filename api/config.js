@@ -37,6 +37,11 @@ const corsOrigins = corsOriginsRaw
   .map((origin) => origin.trim())
   .filter(Boolean);
 
+const recordingEnabled = String(readEnv('RECORDING_ENABLED') || 'false').toLowerCase() === 'true';
+const transferNumber = readEnv('TRANSFER_NUMBER');
+const defaultSmsBusinessId = readEnv('DEFAULT_SMS_BUSINESS_ID') || null;
+const deepgramModel = readEnv('DEEPGRAM_MODEL') || 'nova-2';
+
 const callProvider = ensure('CALL_PROVIDER', 'twilio').toLowerCase();
 const awsRegion = ensure('AWS_REGION', 'us-east-1');
 const adminApiToken = readEnv('ADMIN_API_TOKEN');
@@ -79,6 +84,7 @@ module.exports = {
     accountSid: ensure('TWILIO_ACCOUNT_SID'),
     authToken: ensure('TWILIO_AUTH_TOKEN'),
     fromNumber: ensure('FROM_NUMBER'),
+    transferNumber,
   },
   aws: {
     region: awsRegion,
@@ -134,6 +140,7 @@ module.exports = {
   deepgram: {
     apiKey: ensure('DEEPGRAM_API_KEY'),
     voiceModel: ensure('VOICE_MODEL', 'aura-asteria-en'),
+    model: deepgramModel,
   },
   server: {
     port: Number(ensure('PORT', '3000')),
@@ -151,5 +158,11 @@ module.exports = {
     mode: complianceMode,
     encryptionKey: dtmfEncryptionKey,
     isSafe: complianceMode !== 'dev_insecure',
+  },
+  recording: {
+    enabled: recordingEnabled,
+  },
+  smsDefaults: {
+    businessId: defaultSmsBusinessId,
   },
 };

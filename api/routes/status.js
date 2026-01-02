@@ -1,4 +1,5 @@
 const axios = require('axios');
+const { telegram: telegramConfig } = require('../config');
 const {
   formatSummary,
   decryptDigits,
@@ -721,7 +722,7 @@ class EnhancedWebhookService {
     this.isRunning = false;
     this.interval = null;
     this.db = null;
-    this.telegramBotToken = process.env.TELEGRAM_BOT_TOKEN;
+    this.telegramBotToken = telegramConfig.botToken;
     this.processInterval = 3000; // Check every 3 seconds for faster updates
     this.activeCallStatus = new Map(); // Track call status to avoid duplicates
     this.callThreads = new Map(); // Track Telegram master message threads

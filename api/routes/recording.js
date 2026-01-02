@@ -1,17 +1,18 @@
 require('colors');
+const { twilio: twilioConfig, recording: recordingConfig } = require('../config');
 
 async function recordingService(ttsService, callSid) {
   try {
     console.log(`🎤 Recording service called for call: ${callSid}`.cyan);
     
-    if (process.env.RECORDING_ENABLED === 'true') {
+    if (recordingConfig.enabled) {
       console.log('📹 Recording is enabled, creating recording...'.green);
       
-      if (!process.env.TWILIO_ACCOUNT_SID || !process.env.TWILIO_AUTH_TOKEN) {
+      if (!twilioConfig.accountSid || !twilioConfig.authToken) {
         throw new Error('Twilio credentials not configured for recording');
       }
       
-      const client = require('twilio')(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
+      const client = require('twilio')(twilioConfig.accountSid, twilioConfig.authToken);
       
       // Generate the recording message first
       console.log('🎵 Generating recording announcement...'.cyan);
