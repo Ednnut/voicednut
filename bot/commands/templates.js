@@ -962,7 +962,8 @@ async function listCallTemplatesFlow(conversation, ctx, ensureActive) {
   try {
     const templates = await fetchCallTemplates();
     safeEnsureActive();
-    const validTemplates = (templates || []).filter((template) => template && typeof template.id !== 'undefined' && template.id !== null);
+    const list = Array.isArray(templates) ? templates : [];
+    const validTemplates = list.filter((template) => template && typeof template.id !== 'undefined' && template.id !== null);
 
     if (!validTemplates.length) {
       if (templates && templates.length && templates.some((t) => !t || typeof t.id === 'undefined')) {
@@ -1002,6 +1003,11 @@ async function listCallTemplatesFlow(conversation, ctx, ensureActive) {
       options,
       { prefix: 'call-template-select', columns: 1, formatLabel: (option) => option.label, ensureActive: safeEnsureActive }
     );
+
+    if (!selection || !selection.id) {
+      await ctx.reply('❌ No selection received. Please try again.');
+      return;
+    }
 
     if (selection.id === 'back') {
       return;

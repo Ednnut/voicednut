@@ -1648,6 +1648,11 @@ class EnhancedWebhookService {
       headers: {
         'Content-Type': 'application/json'
       }
+    }).catch((error) => {
+      const status = error.response?.status;
+      const desc = error.response?.data?.description || error.message;
+      console.error(`❌ Telegram send error (${status || 'unknown'}): ${desc}`);
+      throw error;
     });
 
     if (!response.data.ok) {
