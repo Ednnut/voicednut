@@ -2208,15 +2208,34 @@ class EnhancedWebhookService {
     }
   }
 
-  // Enhanced immediate status update with better error handling
+  // Enhanced immediate status update with direct sending (NO QUEUEING)
   async sendImmediateStatus(call_sid, status, telegram_chat_id) {
+    console.log(`[IMMEDIATE] Sending ${status} for ${call_sid} to chat ${telegram_chat_id}`);
+    
     try {
-      return await this.sendCallStatusUpdate(call_sid, status, telegram_chat_id);
+      // Skip the queue system - send directly
+      const callDetails = await this.db.getCall(call_sid);
+      const metadata = parseCallMetadata(callDetails?.metadata_json) || {};
+      
+      const normalizedStatus = status.toLowerCase();
+      const toNumber = callDetails?.phone_number || metadata?.dialed_number || 'Unknown';
+      
+      // Build status line
+      const statusLine = getStatusLine(normalizedStatus, { to: toNumber });
+      
+      // Send immediately without queueing
+      await this.sendTelegramMessage(telegram_chat_id, statusLine, null);
+      
+      console.log(`[IMMEDIATE] ✅ Status ${status} sent successfully`);
+      return true;
+      
     } catch (error) {
       console.error(`❌ Failed to send immediate status for ${call_sid}:`, error);
       // Try to send a generic notification
       try {
-        await this.sendTelegramMessage(telegram_chat_id, `📱 Call ${call_sid.slice(-6)} status: ${status}`, null);
+        const simpleMessage = `📱 Call status: ${status}`;
+        await this.sendTelegramMessage(telegram_chat_id, simpleMessage, null);
+        console.log(`[IMMEDIATE] ✅ Fallback message sent`);
         return true;
       } catch (fallbackError) {
         console.error(`❌ Fallback notification also failed:`, fallbackError);

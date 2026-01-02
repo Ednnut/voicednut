@@ -2564,6 +2564,25 @@ app.post('/outbound-call', async (req, res) => {
         metadata_json: metadataSerialized
       });
 
+      // Create call status thread mapping immediately so webhooks can find chat/message anchor
+      if (resolvedTelegramChatId && db?.upsertCallStatusThread) {
+        try {
+          await db.upsertCallStatusThread({
+            call_sid: callSid,
+            telegram_chat_id: resolvedTelegramChatId,
+            to_number: number,
+            from_number: twilioFromNumber || providerMetadata?.from_number,
+            call_type: callType,
+            created_at: new Date().toISOString()
+          });
+          console.log(`✅ Created status thread mapping: ${callSid} -> ${resolvedTelegramChatId}`.green);
+        } catch (mappingError) {
+          console.error('❌ Failed to create status thread mapping:', mappingError);
+        }
+      } else {
+        console.warn('⚠️ Cannot create status thread mapping: missing chatId or upsertCallStatusThread function'.yellow);
+      }
+
       if (user_chat_id) {
         await db.createEnhancedWebhookNotification(callSid, 'call_initiated', user_chat_id);
       }
@@ -2914,201 +2933,291 @@ app.post('/vonage/event', async (req, res) => {
 // Enhanced webhook endpoint for call status updates
 
   app.post('/webhook/call-status', validateTwilioRequest(), async (req, res) => {
-    if (currentProvider !== 'twilio') {
-      res.status(404).json({ error: 'Twilio call status webhook disabled for current provider' });
-      return;
-    }
+    // CRITICAL: Log every webhook hit immediately
+    const {
+      CallSid,
+      CallStatus,
+      Duration,
+      From,
+      To,
+      CallDuration,
+      AnsweredBy,
+      ErrorCode,
+      ErrorMessage,
+      DialCallDuration
+    } = req.body;
+
+    const timestamp = new Date().toISOString();
+    console.log(`[STATUS WEBHOOK HIT] ${CallSid || 'unknown'} :: ${CallStatus || 'unknown'} @ ${timestamp}`);
+    console.log(`[WEBHOOK DETAILS] Duration=${Duration} DialDuration=${DialCallDuration} AnsweredBy=${AnsweredBy}`);
+
     try {
-      const { 
-        CallSid, 
-        CallStatus, 
-        Duration, 
-        From, 
-        To, 
-        CallDuration,
-        AnsweredBy,
-        ErrorCode,
-        ErrorMessage,
-        DialCallDuration // This is key for detecting actual answer vs no-answer
-      } = req.body;
-
-      console.log(`[STATUS WEBHOOK HIT] ${CallSid || 'unknown'} :: ${CallStatus || 'unknown'} @ ${new Date().toISOString()}`);
-    
-    console.log(`📱 Fixed Webhook: Call ${CallSid} status: ${CallStatus}`.blue);
-    console.log(`📊 Debug Info:`.cyan);
-    console.log(`   Duration: ${Duration || 'N/A'}`);
-    console.log(`   CallDuration: ${CallDuration || 'N/A'}`);
-    console.log(`   DialCallDuration: ${DialCallDuration || 'N/A'}`);
-    console.log(`   AnsweredBy: ${AnsweredBy || 'N/A'}`);
-    
-    if (db && typeof db.logCallEvent === 'function') {
-      await db.logCallEvent(CallSid, 'twilio_status_webhook', req.body, {
-        provider: 'twilio',
-        raw_status: CallStatus
-      });
-    }
-
-    // Get call details from database
-    const call = await db.getCall(CallSid);
-    if (!call) {
-      console.warn(`⚠️ Webhook received for unknown call: ${CallSid}`.yellow);
-      res.status(200).send('OK');
-      return;
-    }
-
-    let normalizedStatus = (CallStatus || '').toLowerCase();
-    const durationValue = parseInt(Duration || CallDuration || DialCallDuration || 0);
-    const updateData = {
-      duration: durationValue,
-      twilio_status: CallStatus,
-      answered_by: AnsweredBy,
-      error_code: ErrorCode,
-      error_message: ErrorMessage,
-      ring_duration: DialCallDuration ? parseInt(DialCallDuration) : undefined,
-    };
-
-    const isTerminal = ['completed', 'no-answer', 'failed', 'busy', 'canceled'].includes(normalizedStatus);
-
-    if (['answered', 'in-progress'].includes(normalizedStatus) || (normalizedStatus === 'completed' && durationValue > 0)) {
-      updateData.was_answered = 1;
-      if (!call.started_at) {
-        updateData.started_at = new Date().toISOString();
+      // Log the webhook event to database for debugging
+      if (db && typeof db.logCallEvent === 'function') {
+        await db.logCallEvent(CallSid, 'twilio_status_webhook', req.body, {
+          provider: 'twilio',
+          raw_status: CallStatus
+        });
       }
-    }
 
-    if (isTerminal && !call.ended_at) {
-      updateData.ended_at = new Date().toISOString();
-    }
+      // Get call details from database
+      const call = await db.getCall(CallSid);
+      if (!call) {
+        console.warn(`⚠️ Webhook received for unknown call: ${CallSid}`.yellow);
+        res.status(200).send('OK'); // Still return 200 to prevent retries
+        return;
+      }
 
-    // Reconcile with Twilio REST for terminal states
-    if (isTerminal && twilioRestClient) {
+      let normalizedStatus = (CallStatus || '').toLowerCase();
+      const durationValue = parseInt(Duration || CallDuration || DialCallDuration || 0);
+
+      // Build update data
+      const updateData = {
+        duration: durationValue,
+        twilio_status: CallStatus,
+        answered_by: AnsweredBy,
+        error_code: ErrorCode,
+        error_message: ErrorMessage,
+        ring_duration: DialCallDuration ? parseInt(DialCallDuration) : undefined
+      };
+
+      const isTerminal = ['completed', 'no-answer', 'failed', 'busy', 'canceled'].includes(normalizedStatus);
+
+      // Mark as answered if in progress or completed
+      if (
+        ['answered', 'in-progress'].includes(normalizedStatus) ||
+        (normalizedStatus === 'completed' && durationValue > 0)
+      ) {
+        updateData.was_answered = 1;
+        if (!call.started_at) {
+          updateData.started_at = new Date().toISOString();
+        }
+      }
+
+      if (isTerminal && !call.ended_at) {
+        updateData.ended_at = new Date().toISOString();
+      }
+
+      // CRITICAL: Reconcile with Twilio REST for terminal states to catch no-answer
+      if (isTerminal && twilioRestClient) {
+        try {
+          console.log(`[RECONCILE] Fetching final status from Twilio REST for ${CallSid}`);
+          const restCall = await twilioRestClient.calls(CallSid).fetch();
+          if (restCall) {
+            const restStatus = (restCall.status || '').toLowerCase();
+            const restDuration = parseInt(restCall.duration || 0);
+            const restAnsweredBy = restCall.answeredBy || AnsweredBy;
+
+            console.log(`[RECONCILE] REST status=${restStatus} duration=${restDuration} answeredBy=${restAnsweredBy}`);
+
+            // Trust REST API for final status
+            if (restStatus === 'no-answer') {
+              normalizedStatus = 'no-answer';
+              console.log(`[RECONCILE] Corrected to no-answer`);
+            }
+            if (!normalizedStatus && restStatus) {
+              normalizedStatus = restStatus;
+            }
+            if (restDuration > 0) {
+              updateData.duration = restDuration;
+            }
+            if (restAnsweredBy) {
+              updateData.answered_by = restAnsweredBy;
+            }
+            if (restCall.startTime && !updateData.started_at) {
+              updateData.started_at = new Date(restCall.startTime).toISOString();
+            }
+            if (restCall.endTime) {
+              updateData.ended_at = new Date(restCall.endTime).toISOString();
+            }
+          }
+        } catch (restError) {
+          console.warn(`Unable to reconcile call ${CallSid} with Twilio REST:`, restError.message);
+        }
+      }
+
+      const finalStatus = normalizedStatus || 'completed';
+
+      // Calculate ring duration for no-answer if not provided
+      if (finalStatus === 'no-answer' && !updateData.ring_duration && call.created_at) {
+        const callStart = new Date(call.created_at);
+        const now = new Date();
+        updateData.ring_duration = Math.round((now - callStart) / 1000);
+        console.log(`[NO-ANSWER] Calculated ring duration: ${updateData.ring_duration}s`);
+      }
+
+      // Update database
+      await db.updateCallStatus(CallSid, finalStatus, updateData);
+      console.log(`[DB UPDATE] Status updated to: ${finalStatus}`);
+
+      // Update call hint state machine
+      await callHintStateMachine.handleTwilioStatus(CallSid, finalStatus, {
+        call,
+        answeredBy: updateData.answered_by,
+        provider: 'twilio'
+      });
+
+      // Handle collect_input calls
+      if (
+        call.call_type === 'collect_input' &&
+        ['completed', 'no-answer', 'failed', 'canceled', 'busy'].includes(finalStatus)
+      ) {
+        await finalizeCollectInputCall(CallSid, call);
+      }
+
+      // CRITICAL: Get or create Telegram chat mapping
+      let targetChat = call.telegram_chat_id || call.user_chat_id;
+
+      // Try to get from call status thread table
+      if (!targetChat && db?.getCallStatusThread) {
+        try {
+          const threadMapping = await db.getCallStatusThread(CallSid);
+          if (threadMapping?.telegram_chat_id) {
+            targetChat = threadMapping.telegram_chat_id;
+            console.log(`[MAPPING] Found chat from thread table: ${targetChat}`);
+          }
+        } catch (mappingError) {
+          console.warn(`Failed to get thread mapping: ${mappingError.message}`);
+        }
+      }
+
+      // If still no chat, try to find from recent calls by same user
+      if (!targetChat && call.user_chat_id) {
+        targetChat = call.user_chat_id;
+        console.log(`[MAPPING] Using user_chat_id: ${targetChat}`);
+      }
+
+      if (!targetChat) {
+        console.error(`❌ NO TELEGRAM CHAT FOUND for call ${CallSid}. Cannot send updates!`);
+        res.status(200).send('OK');
+        return;
+      }
+
+      // CRITICAL: Ensure thread mapping exists in database
+      if (db?.upsertCallStatusThread) {
+        try {
+          await db.upsertCallStatusThread({
+            call_sid: CallSid,
+            telegram_chat_id: targetChat,
+            to_number: call.phone_number || To,
+            from_number: call.from_number || From || twilioFromNumber,
+            call_type: call.call_type || 'voice'
+          });
+          console.log(`[MAPPING] Persisted thread mapping for ${CallSid} -> ${targetChat}`);
+        } catch (mapErr) {
+          console.warn('⚠️ Failed to persist call status thread mapping:', mapErr.message);
+        }
+      } else {
+        console.warn('⚠️ upsertCallStatusThread not available in database');
+      }
+
+      // CRITICAL: Send immediate Telegram notification
+      console.log(`[TELEGRAM] Sending ${finalStatus} update to chat ${targetChat}`);
+
+      // Map status to user-friendly message
+      const statusMessages = {
+        initiated: '📤 Call initiated',
+        queued: '📤 Call initiated',
+        ringing: '🔔 Ringing…',
+        answered: '✅ Answered',
+        'in-progress': '🟢 In progress',
+        completed: '🏁 Completed',
+        busy: '🚫 Busy',
+        'no-answer': '⏳ No answer',
+        canceled: '⚠️ Canceled',
+        failed: '❌ Failed'
+      };
+
+      const statusMessage = statusMessages[finalStatus] || `📱 ${finalStatus}`;
+
+      // Send immediate status update
       try {
-        const restCall = await twilioRestClient.calls(CallSid).fetch();
-        if (restCall) {
-          const restStatus = (restCall.status || '').toLowerCase();
-          const restDuration = parseInt(restCall.duration || 0);
-          const restAnsweredBy = restCall.answeredBy || AnsweredBy;
+        await webhookService.sendImmediateStatus(CallSid, finalStatus, targetChat);
+        console.log(`[TELEGRAM] ✅ Status sent successfully`);
+      } catch (telegramError) {
+        console.error(`[TELEGRAM] ❌ Failed to send status:`, telegramError.message);
 
-          if (restStatus === 'no-answer') {
-            normalizedStatus = 'no-answer';
-          }
-          if (!normalizedStatus && restStatus) {
-            normalizedStatus = restStatus;
-          }
-          if (restDuration > 0) {
-            updateData.duration = restDuration;
-          }
-          if (restAnsweredBy) {
-            updateData.answered_by = restAnsweredBy;
-          }
-          if (restCall.startTime && !updateData.started_at) {
-            updateData.started_at = new Date(restCall.startTime).toISOString();
-          }
-          if (restCall.endTime) {
-            updateData.ended_at = new Date(restCall.endTime).toISOString();
+        // Fallback: try direct send
+        try {
+          const fallbackMessage = `${statusMessage}\nCall: ${call.phone_number || To}`;
+          await webhookService.sendTelegramMessage(targetChat, fallbackMessage);
+          console.log(`[TELEGRAM] ✅ Fallback message sent`);
+        } catch (fallbackError) {
+          console.error(`[TELEGRAM] ❌ Fallback also failed:`, fallbackError.message);
+        }
+      }
+
+      // For terminal states, send final outcome
+      if (isTerminal) {
+        console.log(`[TERMINAL] Finalizing outcome for ${finalStatus}`);
+
+        // Send final outcome message
+        let outcomeMessage = '';
+        if (finalStatus === 'no-answer') {
+          const ringTime = updateData.ring_duration || 0;
+          outcomeMessage = `❌ Not completed: no-answer\n\nThe call rang for ${ringTime} seconds but was not answered.`;
+        } else if (finalStatus === 'busy') {
+          outcomeMessage = `🚫 Line was busy`;
+        } else if (finalStatus === 'failed') {
+          outcomeMessage = `❌ Call failed${ErrorMessage ? `: ${ErrorMessage}` : ''}`;
+        } else if (finalStatus === 'canceled') {
+          outcomeMessage = `⚠️ Call was canceled`;
+        } else if (finalStatus === 'completed' && durationValue > 0) {
+          const minutes = Math.floor(durationValue / 60);
+          const seconds = durationValue % 60;
+          outcomeMessage = `✅ Call completed (${minutes}:${String(seconds).padStart(2, '0')})`;
+        }
+
+        if (outcomeMessage) {
+          try {
+            await webhookService.sendTelegramMessage(targetChat, outcomeMessage);
+            console.log(`[TELEGRAM] ✅ Outcome message sent`);
+          } catch (outcomeError) {
+            console.error(`[TELEGRAM] ❌ Failed to send outcome:`, outcomeError.message);
           }
         }
-      } catch (restError) {
-        console.warn(`Unable to reconcile call ${CallSid} with Twilio REST:`, restError.message);
-      }
-    }
 
-    const finalStatus = normalizedStatus || 'completed';
-    if (finalStatus === 'no-answer' && !updateData.ring_duration && call.created_at) {
-      const callStart = new Date(call.created_at);
-      const now = new Date();
-      updateData.ring_duration = Math.round((now - callStart) / 1000);
-    }
-    updateData.final_outcome = finalStatus.toUpperCase();
-
-    await db.updateCallStatus(CallSid, finalStatus, updateData);
-
-    await callHintStateMachine.handleTwilioStatus(CallSid, finalStatus, {
-      call,
-      answeredBy: updateData.answered_by,
-      provider: 'twilio'
-    });
-
-    if (call.call_type === 'collect_input' && ['completed', 'no-answer', 'failed', 'canceled', 'busy'].includes(finalStatus)) {
-      await finalizeCollectInputCall(CallSid, call);
-    }
-
-    const targetChat = call.telegram_chat_id || call.user_chat_id;
-    if (targetChat && db?.upsertCallStatusThread) {
-      try {
-        await db.upsertCallStatusThread({
-          call_sid: CallSid,
-          telegram_chat_id: targetChat,
-          to_number: call.phone_number || metadata?.dialed_number || number,
-          from_number: twilioFromNumber,
-          call_type: call.call_type || callType || 'voice',
+        // Finalize call outcome in database
+        await finalizeCallOutcome(CallSid, {
+          finalStatus,
+          answeredBy: updateData.answered_by,
+          call
         });
-      } catch (mapErr) {
-        console.warn('⚠️ Failed to persist call status thread mapping:', mapErr.message);
       }
-    }
-    const enqueueStatus = async (type) => {
-      if (!targetChat) {
-        return;
-      }
-      await db.createEnhancedWebhookNotification(CallSid, type, targetChat);
-    };
 
-    const emitImmediateStatus = async (statusLabel) => {
-      if (!targetChat) {
-        console.warn(`⚠️ No Telegram chat on record for ${CallSid}; status ${statusLabel} not sent.`);
-        return;
-      }
-      await webhookService.sendImmediateStatus(CallSid, statusLabel, targetChat);
-    };
-
-    if (['queued', 'initiated'].includes(finalStatus)) {
-      await enqueueStatus('call_initiated');
-      await emitImmediateStatus('initiated');
-    } else if (finalStatus === 'ringing') {
-      await enqueueStatus('call_ringing');
-      await emitImmediateStatus('ringing');
-    } else if (['in-progress', 'answered'].includes(finalStatus)) {
-      await enqueueStatus('call_answered');
-      await emitImmediateStatus('answered');
-    } else if (['busy', 'failed', 'canceled', 'completed', 'no-answer'].includes(finalStatus)) {
-      await finalizeCallOutcome(CallSid, {
-        finalStatus,
-        answeredBy: updateData.answered_by,
+      // Log to service health
+      await db.logServiceHealth('webhook_system', 'status_received', {
+        call_sid: CallSid,
+        original_status: CallStatus,
+        final_status: finalStatus,
+        duration: updateData.duration,
+        answered_by: updateData.answered_by,
+        correction_applied: finalStatus !== (CallStatus || '').toLowerCase(),
+        telegram_chat_id: targetChat
       });
-      // Ensure final status notification is emitted for terminal state
-      await enqueueStatus(`call_${finalStatus.replace('-', '_')}`);
-      await emitImmediateStatus(finalStatus.replace('_', '-'));
-    }
 
-    await db.logServiceHealth('webhook_system', 'status_received', {
-      call_sid: CallSid,
-      original_status: CallStatus,
-      final_status: finalStatus,
-      duration: updateData.duration,
-      answered_by: updateData.answered_by,
-      correction_applied: finalStatus !== (CallStatus || '').toLowerCase()
-    });
-    
-    res.status(200).send('OK');
-    
-  } catch (error) {
-    console.error('❌ Error processing fixed call status webhook:', error);
-    
-    // Log error to service health
-    try {
-      await db.logServiceHealth('webhook_system', 'error', {
-        operation: 'process_webhook',
-        error: error.message,
-        call_sid: req.body.CallSid
-      });
-    } catch (logError) {
-      console.error('Failed to log webhook error:', logError);
+      res.status(200).send('OK');
+      console.log(`[WEBHOOK] ✅ Processing complete for ${CallSid}`);
+    } catch (error) {
+      console.error('❌ Error processing call status webhook:', error);
+      console.error('Stack:', error.stack);
+
+      // Log error to service health
+      try {
+        await db.logServiceHealth('webhook_system', 'error', {
+          operation: 'process_webhook',
+          error: error.message,
+          call_sid: CallSid,
+          stack: error.stack
+        });
+      } catch (logError) {
+        console.error('Failed to log webhook error:', logError);
+      }
+
+      // Always return 200 to prevent Twilio retries
+      res.status(200).send('OK');
     }
-    
-    res.status(200).send('OK');
-  }
-});
+  });
 
 
 // Enhanced API endpoints with adaptation analytics
