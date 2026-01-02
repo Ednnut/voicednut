@@ -1295,10 +1295,11 @@ app.post('/webhook/call-status', async (req, res) => {
       switch (actualStatus) {
         case 'queued':
         case 'initiated':
-          notificationType = 'call_initiated';
-          break;
         case 'ringing':
-          notificationType = 'call_ringing';
+          notificationType = 'call_in_progress';
+          break;
+        case 'answered':
+          notificationType = 'call_answered';
           break;
         case 'in-progress':
           notificationType = 'call_answered';
@@ -1342,7 +1343,7 @@ app.post('/webhook/call-status', async (req, res) => {
     }
 
     // Set timestamps based on actual status (not original CallStatus)
-    if (actualStatus === 'in-progress' && !call.started_at) {
+    if ((actualStatus === 'in-progress' || actualStatus === 'answered') && !call.started_at) {
       updateData.started_at = new Date().toISOString();
     } else if (['completed', 'no-answer', 'failed', 'busy', 'canceled'].includes(actualStatus) && !call.ended_at) {
       updateData.ended_at = new Date().toISOString();
@@ -1354,13 +1355,15 @@ app.post('/webhook/call-status', async (req, res) => {
     try {
       if (call.user_chat_id) {
         await webhookService.initLiveCallConsole(CallSid, call.user_chat_id, {
-          phoneNumber: call.phone_number || To
+          phoneNumber: call.phone_number || To,
+          customerName: call.customer_name || call.client_name || null,
+          templateName: call.template || call.template_name || null
         });
         const phaseMap = {
-          queued: 'started',
-          initiated: 'started',
-          ringing: 'started',
-          'in-progress': 'speaking',
+          queued: 'calling',
+          initiated: 'calling',
+          ringing: 'calling',
+          'in-progress': 'calling',
           completed: 'ended',
           'no-answer': 'ended',
           failed: 'ended',
