@@ -3,7 +3,10 @@ const twilio = require('twilio');
 
 module.exports = function validateTwilioRequestFactory() {
   return function validateTwilioRequest(req, res, next) {
-    if (!process.env.TWILIO_AUTH_TOKEN) return next();
+    const shouldValidate = String(process.env.TWILIO_VALIDATE_SIGNATURE || 'true').toLowerCase() !== 'false';
+    if (!shouldValidate || !process.env.TWILIO_AUTH_TOKEN) {
+      return next();
+    }
 
     const signature = req.headers['x-twilio-signature'];
     const url = process.env.SERVER ? `https://${process.env.SERVER}${req.originalUrl}` : `${req.protocol}://${req.get('host')}${req.originalUrl}`;
