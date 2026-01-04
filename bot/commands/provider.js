@@ -109,15 +109,20 @@ function registerProviderCommand(bot) {
         }
 
         try {
+            const status = await fetchProviderStatus();
+            const supported = Array.isArray(status?.supported_providers) && status.supported_providers.length > 0
+                ? status.supported_providers.map((item) => item.toLowerCase())
+                : SUPPORTED_PROVIDERS;
+
             if (!requestedAction || requestedAction === 'status') {
-                const status = await fetchProviderStatus();
                 await ctx.reply(formatProviderStatus(status), { parse_mode: 'Markdown' });
                 return;
             }
 
-            if (!SUPPORTED_PROVIDERS.includes(requestedAction)) {
+            if (!supported.includes(requestedAction)) {
+                const options = supported.map((item) => `• /provider ${item}`).join('\n');
                 await ctx.reply(
-                    `❌ Unsupported provider "${requestedAction}".\n\nUsage:\n• /provider status\n• /provider twilio\n• /provider aws\n• /provider vonage`
+                    `❌ Unsupported provider "${requestedAction}".\n\nUsage:\n• /provider status\n${options}`
                 );
                 return;
             }

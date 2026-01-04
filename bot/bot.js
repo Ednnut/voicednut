@@ -110,6 +110,7 @@ bot.callbackQuery(/^alert:/, async (ctx) => {
 // Live call console actions (proxy to API webhook handler)
 bot.callbackQuery(/^lc:/, async (ctx) => {
     try {
+        await ctx.answerCallbackQuery();
         await axios.post(`${config.apiUrl}/webhook/telegram`, ctx.update, { timeout: 8000 });
         return;
     } catch (error) {
@@ -549,10 +550,12 @@ bot.command('start', async (ctx) => {
 // Enhanced callback query handler
 bot.on('callback_query:data', async (ctx) => {
     try {
+        const action = ctx.callbackQuery.data;
+        if (action && action.startsWith('lc:')) {
+            return;
+        }
         // Answer callback query immediately to prevent timeout
         await ctx.answerCallbackQuery();
-
-        const action = ctx.callbackQuery.data;
         console.log(`Callback query received: ${action} from user ${ctx.from.id}`);
 
         // Verify user authorization

@@ -22,6 +22,10 @@ const {
 } = require('../utils/sessionState');
 
 const templatesApiBase = config.templatesApiUrl.replace(/\/+$/, '');
+const DEFAULT_PROMPT =
+  'You are a professional, friendly voice assistant. Keep responses concise, clear, and helpful.';
+const DEFAULT_FIRST_MESSAGE =
+  'Hello! This is an automated call. How can I help you today?';
 
 function isValidPhoneNumber(number) {
   const e164Regex = /^\+[1-9]\d{1,14}$/;
@@ -517,6 +521,13 @@ async function callFlow(conversation, ctx) {
       customer_name: customerName || null,
       ...configuration.payloadUpdates
     };
+
+    if (!payload.prompt) {
+      payload.prompt = DEFAULT_PROMPT;
+    }
+    if (!payload.first_message) {
+      payload.first_message = DEFAULT_FIRST_MESSAGE;
+    }
 
     payload.business_id = payload.business_id || config.defaultBusinessId;
     payload.purpose = payload.purpose || config.defaultPurpose;
