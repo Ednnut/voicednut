@@ -94,6 +94,19 @@ class EnhancedDatabase {
                 FOREIGN KEY(call_sid) REFERENCES calls(call_sid)
             )`,
 
+            // Call templates for outbound call presets
+            `CREATE TABLE IF NOT EXISTS call_templates (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                description TEXT,
+                prompt TEXT,
+                first_message TEXT,
+                business_id TEXT,
+                voice_model TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )`,
+
             // Enhanced webhook notifications table with delivery metrics
             `CREATE TABLE IF NOT EXISTS webhook_notifications (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -195,6 +208,7 @@ class EnhancedDatabase {
             'CREATE INDEX IF NOT EXISTS idx_states_call_sid ON call_states(call_sid)',
             'CREATE INDEX IF NOT EXISTS idx_states_timestamp ON call_states(timestamp)',
             'CREATE INDEX IF NOT EXISTS idx_states_state ON call_states(state)',
+            'CREATE INDEX IF NOT EXISTS idx_call_templates_name ON call_templates(name)',
             
             // Notification indexes
             'CREATE INDEX IF NOT EXISTS idx_notifications_status ON webhook_notifications(status)',
@@ -339,6 +353,141 @@ class EnhancedDatabase {
                 }
             });
             stmt.finalize();
+        });
+    }
+
+    async getLatestCallState(call_sid, state) {
+        return new Promise((resolve, reject) => {
+            const sql = `
+                SELECT data
+                FROM call_states
+                WHERE call_sid = ? AND state = ?
+                ORDER BY sequence_number DESC
+                LIMIT 1
+            `;
+            this.db.get(sql, [call_sid, state], (err, row) => {
+                if (err) {
+                    reject(err);
+                } else if (!row?.data) {
+                    resolve(null);
+                } else {
+                    try {
+                        resolve(JSON.parse(row.data));
+                    } catch (parseError) {
+                        resolve(null);
+                    }
+                }
+            });
+        });
+    }
+
+    async getCallTemplates() {
+        return new Promise((resolve, reject) => {
+            const sql = `
+                SELECT id, name, description, prompt, first_message, business_id, voice_model, created_at, updated_at
+                FROM call_templates
+                ORDER BY id DESC
+            `;
+            this.db.all(sql, [], (err, rows) => {
+                if (err) {
+                    reject(err);
+                } else {
+                    resolve(rows || []);
+                }
+            });
+        });
+    }
+
+    async getCallTemplateById(id) {
+        return new Promise((resolve, reject) => {
+            const sql = `
+                SELECT id, name, description, prompt, first_message, business_id, voice_model, created_at, updated_at
+                FROM call_templates
+                WHERE id = ?
+            `;
+            this.db.get(sql, [id], (err, row) => {
+                if (err) {
+                    reject(err);
+                } else {
+                    resolve(row || null);
+                }
+            });
+        });
+    }
+
+    async createCallTemplate(payload) {
+        const {
+            name,
+            description = null,
+            prompt = null,
+            first_message,
+            business_id = null,
+            voice_model = null
+        } = payload || {};
+        return new Promise((resolve, reject) => {
+            const sql = `
+                INSERT INTO call_templates (
+                    name, description, prompt, first_message, business_id, voice_model, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            `;
+            this.db.run(
+                sql,
+                [name, description, prompt, first_message, business_id, voice_model],
+                function(err) {
+                    if (err) {
+                        reject(err);
+                    } else {
+                        resolve(this.lastID);
+                    }
+                }
+            );
+        });
+    }
+
+    async updateCallTemplate(id, payload) {
+        const fields = [];
+        const values = [];
+        const mapping = {
+            name: 'name',
+            description: 'description',
+            prompt: 'prompt',
+            first_message: 'first_message',
+            business_id: 'business_id',
+            voice_model: 'voice_model'
+        };
+        Object.entries(mapping).forEach(([key, column]) => {
+            if (payload[key] !== undefined) {
+                fields.push(`${column} = ?`);
+                values.push(payload[key]);
+            }
+        });
+        if (!fields.length) {
+            return 0;
+        }
+        fields.push('updated_at = CURRENT_TIMESTAMP');
+        values.push(id);
+        return new Promise((resolve, reject) => {
+            const sql = `UPDATE call_templates SET ${fields.join(', ')} WHERE id = ?`;
+            this.db.run(sql, values, function(err) {
+                if (err) {
+                    reject(err);
+                } else {
+                    resolve(this.changes);
+                }
+            });
+        });
+    }
+
+    async deleteCallTemplate(id) {
+        return new Promise((resolve, reject) => {
+            this.db.run('DELETE FROM call_templates WHERE id = ?', [id], function(err) {
+                if (err) {
+                    reject(err);
+                } else {
+                    resolve(this.changes);
+                }
+            });
         });
     }
 

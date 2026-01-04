@@ -72,6 +72,11 @@ class EnhancedGptService extends EventEmitter {
     this.userContext.push({ 'role': 'system', 'content': `callSid: ${callSid}` });
   }
 
+  setCustomerName(customerName) {
+    if (!customerName) return;
+    this.userContext.push({ 'role': 'system', 'content': `customerName: ${customerName}` });
+  }
+
   // Get current personality and adaptation info
   getPersonalityInfo() {
     const personality = this.personalityEngine.getCurrentPersonality();

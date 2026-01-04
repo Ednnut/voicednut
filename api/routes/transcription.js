@@ -6,13 +6,16 @@ const config = require('../config');
 
 
 class TranscriptionService extends EventEmitter {
-  constructor() {
+  constructor(options = {}) {
     super();
     const deepgram = createClient(config.deepgram.apiKey);
+    const encoding = options.encoding || 'mulaw';
+    const sampleRate = options.sampleRate || 8000;
+    const model = options.model || config.deepgram.model;
     this.dgConnection = deepgram.listen.live({
-      encoding: 'mulaw',
-      sample_rate: '8000',
-      model: config.deepgram.model,
+      encoding: encoding,
+      sample_rate: String(sampleRate),
+      model: model,
       punctuate: true,
       interim_results: true,
       endpointing: 200,
@@ -83,11 +86,21 @@ class TranscriptionService extends EventEmitter {
 
   /**
    * Send the payload to Deepgram
-   * @param {String} payload A base64 MULAW/8000 audio stream
+   * @param {String|Buffer} payload Base64 audio or raw buffer
    */
   send(payload) {
     if (this.dgConnection.getReadyState() === 1) {
-      this.dgConnection.send(Buffer.from(payload, 'base64'));
+      if (Buffer.isBuffer(payload)) {
+        this.dgConnection.send(payload);
+      } else {
+        this.dgConnection.send(Buffer.from(payload, 'base64'));
+      }
+    }
+  }
+
+  sendBuffer(buffer) {
+    if (this.dgConnection.getReadyState() === 1 && Buffer.isBuffer(buffer)) {
+      this.dgConnection.send(buffer);
     }
   }
 }
