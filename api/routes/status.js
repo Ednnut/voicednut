@@ -10,6 +10,9 @@ class EnhancedWebhookService {
     this.processInterval = 3000; // Check every 3 seconds for faster updates
     this.activeCallStatus = new Map(); // Track call status to avoid duplicates
     this.callTimestamps = new Map(); // Track call timing for better status management
+    this.noRingTimers = new Map(); // Track no-ring detection timers
+    this.webhookStatusSeen = new Map(); // Track real webhook status arrival
+    this.noRingTimeoutMs = 25000;
     this.statusOrder = [
       'queued',
       'initiated',
@@ -63,6 +66,9 @@ class EnhancedWebhookService {
     this.isRunning = false;
     this.activeCallStatus.clear();
     this.callTimestamps.clear();
+    this.noRingTimers.forEach((timer) => clearTimeout(timer));
+    this.noRingTimers.clear();
+    this.webhookStatusSeen.clear();
     console.log('Enhanced webhook service stopped'.yellow);
   }
 
@@ -166,10 +172,11 @@ class EnhancedWebhookService {
         case 'queued':
         case 'initiated':
           emoji = '⏳';
-          message = 'Call queued';
+          message = 'Calling...';
           if (!callTiming.initiated) {
             callTiming.initiated = new Date();
           }
+          this.scheduleNoRingCheck(call_sid, telegram_chat_id);
           break;
           
         case 'in-progress':
@@ -178,6 +185,7 @@ class EnhancedWebhookService {
           if (!callTiming.inProgress) {
             callTiming.inProgress = new Date();
           }
+          this.scheduleNoRingCheck(call_sid, telegram_chat_id);
           break;
 
         case 'ringing':
@@ -186,6 +194,7 @@ class EnhancedWebhookService {
           if (!callTiming.ringing) {
             callTiming.ringing = new Date();
           }
+          this.clearNoRingTimer(call_sid);
           // Calculate time to ring
           if (callTiming.initiated) {
             const ringDelay = ((new Date() - callTiming.initiated) / 1000).toFixed(1);
@@ -201,6 +210,7 @@ class EnhancedWebhookService {
           if (!callTiming.answered) {
             callTiming.answered = new Date();
           }
+          this.clearNoRingTimer(call_sid);
           // Calculate ring duration
           if (callTiming.ringing) {
             const ringDuration = ((new Date() - callTiming.ringing) / 1000).toFixed(0);
@@ -213,6 +223,7 @@ class EnhancedWebhookService {
           if (!callTiming.completed) {
             callTiming.completed = new Date();
           }
+          this.clearNoRingTimer(call_sid);
           
           // Calculate call duration - be more careful about actual vs ring time
           let duration = '';
@@ -237,6 +248,7 @@ class EnhancedWebhookService {
         case 'busy':
           emoji = '⚠️';
           message = 'Line busy';
+          this.clearNoRingTimer(call_sid);
           // Calculate time before busy signal
           if (callTiming.ringing || callTiming.initiated) {
             const busyTime = callTiming.ringing || callTiming.initiated;
@@ -250,6 +262,7 @@ class EnhancedWebhookService {
         case 'no-answer':
           emoji = '❌';
           message = 'No-answered';
+          this.clearNoRingTimer(call_sid);
           
           // Enhanced no-answer timing calculation
           let ringTime = 0;
@@ -278,6 +291,7 @@ class EnhancedWebhookService {
         case 'failed':
           emoji = '❌';
           message = 'Call failed';
+          this.clearNoRingTimer(call_sid);
           if (additionalData.error || additionalData.error_message) {
             const errorMsg = additionalData.error || additionalData.error_message;
             message += ` (${errorMsg})`;
@@ -287,11 +301,13 @@ class EnhancedWebhookService {
         case 'canceled':
           emoji = '🚫';
           message = 'Call canceled';
+          this.clearNoRingTimer(call_sid);
           break;
 
         case 'ended':
           emoji = '🔴';
           message = 'Call ended';
+          this.clearNoRingTimer(call_sid);
           break;
           
         default:
@@ -326,6 +342,56 @@ class EnhancedWebhookService {
       }
       
       return false;
+    }
+  }
+
+  scheduleNoRingCheck(call_sid, telegram_chat_id) {
+    if (this.noRingTimers.has(call_sid)) return;
+    const startedAt = Date.now();
+    const timer = setTimeout(async () => {
+      this.noRingTimers.delete(call_sid);
+      if (this.webhookStatusSeen.get(call_sid)) {
+        return;
+      }
+      const statusInfo = this.activeCallStatus.get(call_sid);
+      const lastStatus = statusInfo?.lastStatus;
+      if (!['queued', 'initiated', 'in-progress'].includes(lastStatus)) {
+        return;
+      }
+      const callTiming = this.callTimestamps.get(call_sid);
+      if (callTiming?.ringing || callTiming?.answered) {
+        return;
+      }
+
+      if (this.db?.getCall) {
+        try {
+          const call = await this.db.getCall(call_sid);
+          const persisted = this.normalizeStatus(call?.twilio_status || call?.status);
+          if (['ringing', 'answered', 'completed', 'busy', 'no-answer', 'failed', 'canceled'].includes(persisted)) {
+            return;
+          }
+        } catch {
+          // best-effort; continue with timeout handling
+        }
+      }
+
+      if (Date.now() - startedAt < this.noRingTimeoutMs) {
+        return;
+      }
+
+      await this.sendCallStatusUpdate(call_sid, 'failed', telegram_chat_id, {
+        error_message: 'Number not reachable'
+      });
+      await this.sendCallStatusUpdate(call_sid, 'ended', telegram_chat_id);
+    }, this.noRingTimeoutMs);
+    this.noRingTimers.set(call_sid, timer);
+  }
+
+  clearNoRingTimer(call_sid) {
+    const timer = this.noRingTimers.get(call_sid);
+    if (timer) {
+      clearTimeout(timer);
+      this.noRingTimers.delete(call_sid);
     }
   }
 
@@ -446,6 +512,7 @@ class EnhancedWebhookService {
 
     try {
       let success = false;
+      this.webhookStatusSeen.set(call_sid, true);
 
       switch (notification_type) {
         case 'call_initiated':
