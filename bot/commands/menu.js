@@ -1,7 +1,6 @@
 const { InlineKeyboard } = require('grammy');
 const { getUser, isAdmin } = require('../db/db');
 const { cancelActiveFlow, resetSession } = require('../utils/sessionState');
-const config = require('../config');
 
 module.exports = (bot) => {
     // Menu command
@@ -18,13 +17,8 @@ module.exports = (bot) => {
 
             const isOwner = await new Promise(r => isAdmin(ctx.from.id, r));
             
-            const kb = new InlineKeyboard();
-
-            if (config.miniAppUrl) {
-                kb.webApp('📱 Open Mini App', config.miniAppUrl).row();
-            }
-
-            kb.text('📞 New Call', 'CALL')
+            const kb = new InlineKeyboard()
+            .text('📞 New Call', 'CALL')
             .text('📱 Send SMS', 'SMS')
             .row()
             .text('📋 Recent Calls', 'CALLS')

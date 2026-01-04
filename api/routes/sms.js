@@ -1,27 +1,19 @@
 const EventEmitter = require('events');
 const axios = require('axios');
-const PersonaComposer = require('../services/PersonaComposer');
 const config = require('../config');
 
 class EnhancedSmsService extends EventEmitter {
-    constructor(options = {}) {
+    constructor() {
         super();
-        const { provider = 'twilio', awsAdapter = null, twilioClient = null } = options;
-        this.provider = provider;
-        if (provider === 'twilio') {
-            this.twilio = twilioClient || require('twilio')(
-                config.twilio.accountSid,
-                config.twilio.authToken
-            );
-        } else {
-            this.twilio = twilioClient || null;
-        }
-        this.awsAdapter = awsAdapter || null;
+        this.twilio = require('twilio')(
+            config.twilio.accountSid,
+            config.twilio.authToken
+        );
         this.openai = new(require('openai'))({
             baseURL: "https://openrouter.ai/api/v1",
             apiKey: config.openRouter.apiKey,
             defaultHeaders: {
-                "HTTP-Referer": config.openRouter.siteUrl || "http://localhost:3000",
+                "HTTP-Referer": config.openRouter.siteUrl,
                 "X-Title": config.openRouter.siteName || "SMS AI Assistant",
             }
         });
@@ -30,284 +22,39 @@ class EnhancedSmsService extends EventEmitter {
         // SMS conversation tracking
         this.activeConversations = new Map();
         this.messageQueue = new Map(); // Queue for outbound messages
-        this.personaComposer = new PersonaComposer();
-        this.defaultSmsPersona = {
-            businessId: config.smsDefaults.businessId,
-            purpose: 'customer_service',
-            channel: 'sms',
-            emotion: 'neutral',
-            urgency: 'normal',
-            technicalLevel: 'general'
-        };
-        this.db = null;
-        this.vonageAdapter = null;
-        this.builtinTemplates = {
-            welcome: {
-                name: 'welcome',
-                description: 'Friendly greeting for new contacts',
-                content: "Welcome to our service! We're excited to have you aboard. Reply HELP for assistance or STOP to unsubscribe.",
-                is_builtin: true
-            },
-            appointment_reminder: {
-                name: 'appointment_reminder',
-                description: 'Notify about upcoming appointments',
-                content: 'Reminder: You have an appointment on {date} at {time}. Reply CONFIRM to confirm or RESCHEDULE to change.',
-                is_builtin: true
-            },
-            verification: {
-                name: 'verification',
-                description: 'Send one-time verification codes',
-                content: 'Your verification code is: {code}. This code will expire in 10 minutes. Do not share this code with anyone.',
-                is_builtin: true
-            },
-            order_update: {
-                name: 'order_update',
-                description: 'Inform customers about order status',
-                content: 'Order #{order_id} update: {status}. Track your order at {tracking_url}',
-                is_builtin: true
-            },
-            payment_reminder: {
-                name: 'payment_reminder',
-                description: 'Prompt users about pending payments',
-                content: 'Payment reminder: Your payment of {amount} is due on {due_date}. Pay now: {payment_url}',
-                is_builtin: true
-            },
-            promotional: {
-                name: 'promotional',
-                description: 'Broadcast limited-time promotions',
-                content: '🎉 Special offer just for you! {offer_text} Use code {promo_code}. Valid until {expiry_date}. Reply STOP to opt out.',
-                is_builtin: true
-            },
-            customer_service: {
-                name: 'customer_service',
-                description: 'Acknowledge support inquiries',
-                content: "Thanks for contacting us! We've received your message and will respond within 24 hours. For urgent matters, call {phone}.",
-                is_builtin: true
-            },
-            survey: {
-                name: 'survey',
-                description: 'Request post-interaction feedback',
-                content: 'How was your experience with us? Rate us 1-5 stars by replying with a number. Your feedback helps us improve!',
-                is_builtin: true
-            }
-        };
-    }
-
-    setDatabase(database) {
-        this.db = database;
-    }
-
-    setSmsAdapter(adapter) {
-        this.awsAdapter = adapter;
-    }
-
-    setProvider(provider, adapter = null) {
-        this.provider = provider;
-        if (provider === 'aws') {
-            if (adapter) {
-                this.awsAdapter = adapter;
-            }
-            this.vonageAdapter = null;
-        } else if (provider === 'vonage') {
-            if (adapter) {
-                this.vonageAdapter = adapter;
-            }
-            if (!this.twilio) {
-                this.twilio = require('twilio')(
-                    config.twilio.accountSid,
-                    config.twilio.authToken
-                );
-            }
-            this.awsAdapter = null;
-        } else {
-            this.awsAdapter = null;
-            this.vonageAdapter = null;
-            if (!this.twilio) {
-                this.twilio = require('twilio')(
-                    config.twilio.accountSid,
-                    config.twilio.authToken
-                );
-            }
-        }
-    }
-
-    updateDefaultPersona(options = {}) {
-        this.defaultSmsPersona = {
-            ...this.defaultSmsPersona,
-            ...options
-        };
-    }
-
-    analyzeTone(message) {
-        const text = (message || '').toLowerCase();
-        let emotion = 'neutral';
-        let urgency = 'normal';
-        let technicalLevel = 'general';
-
-        if (/(urgent|asap|immediately|right now|emergency|critical)/.test(text)) {
-            emotion = 'urgent';
-            urgency = 'high';
-        } else if (/(frustrated|angry|annoyed|upset|mad|furious|disappointed)/.test(text)) {
-            emotion = 'frustrated';
-        } else if (/(confused|don't understand|lost|unclear|explain)/.test(text)) {
-            emotion = 'confused';
-        } else if (/(thanks|thank you|appreciate|great)/.test(text)) {
-            emotion = 'positive';
-        }
-
-        if (/(security|fraud|breach|locked|hack)/.test(text)) {
-            urgency = 'critical';
-        } else if (/(deadline|due today|late fee)/.test(text)) {
-            urgency = 'high';
-        }
-
-        if (/(stack trace|exception|deployment|api|server|database|config)/.test(text)) {
-            technicalLevel = 'advanced';
-        } else if (/(setup|install|how do i|step by step)/.test(text)) {
-            technicalLevel = 'novice';
-        }
-
-        return { emotion, urgency, technicalLevel };
-    }
-
-    composeConversationContext(conversation, overrides = {}) {
-        const normalized = { ...overrides };
-
-        if (normalized.business_id && !normalized.businessId) {
-            normalized.businessId = normalized.business_id;
-        }
-        if (normalized.purpose_id && !normalized.purpose) {
-            normalized.purpose = normalized.purpose_id;
-        }
-        if (normalized.technical_level && !normalized.technicalLevel) {
-            normalized.technicalLevel = normalized.technical_level;
-        }
-
-        normalized.channel = 'sms';
-
-        const personaOptions = {
-            ...(conversation.personaProfile || this.defaultSmsPersona),
-            ...normalized
-        };
-
-        const composition = this.personaComposer.compose(personaOptions);
-        conversation.context = composition.systemPrompt;
-        conversation.persona = composition.metadata;
-        conversation.personaProfile = {
-            businessId: composition.metadata.businessId,
-            purpose: composition.metadata.purpose,
-            emotion: composition.metadata.emotion,
-            urgency: composition.metadata.urgency,
-            technicalLevel: composition.metadata.technicalLevel
-        };
     }
 
     // Send individual SMS
-    async sendSMS(to, message, from = null, personaOverrides = null) {
+    async sendSMS(to, message, from = null) {
         try {
             const fromNumber = from || config.twilio.fromNumber;
 
-            if (this.provider !== 'aws' && !fromNumber) {
+            if (!fromNumber) {
                 throw new Error('No FROM_NUMBER configured for SMS');
             }
 
-            let conversation = this.activeConversations.get(to);
-            if (!conversation) {
-                conversation = {
-                    phone: to,
-                    messages: [],
-                    created_at: new Date(),
-                    last_activity: new Date(),
-                    personaProfile: { ...this.defaultSmsPersona }
-                };
-                this.activeConversations.set(to, conversation);
-            }
+            console.log(`ð± Sending SMS to ${to}: ${message.substring(0, 50)}...`);
 
-            if (personaOverrides || !conversation.context) {
-                this.composeConversationContext(conversation, personaOverrides || {});
-            }
-
-            console.log(`📱 Sending SMS to ${to}: ${message.substring(0, 50)}...`);
-
-            let providerResponse = null;
-            let messageSid = null;
-            let status = null;
-            let fromNumberUsed = fromNumber;
-
-            if (this.provider === 'aws') {
-                if (!this.awsAdapter) {
-                    throw new Error('AWS Pinpoint adapter not configured');
-                }
-                const response = await this.awsAdapter.sendSms({
-                    to,
-                    body: message,
-                    from: from || undefined,
-                    context: {
-                        persona: conversation.persona?.name || 'default'
-                    }
-                });
-
-                const result = response?.MessageResponse?.Result?.[to] || {};
-                providerResponse = response;
-                messageSid = result.MessageId || null;
-                status = result.DeliveryStatus || 'SUBMITTED';
-                fromNumberUsed = result.OriginationNumber || from || this.awsAdapter?.config?.pinpoint?.originationNumber || null;
-            } else if (this.provider === 'vonage') {
-                if (!this.vonageAdapter) {
-                    throw new Error('Vonage SMS adapter not configured');
-                }
-
-                const response = await this.vonageAdapter.sendSms({
-                    to,
-                    body: message,
-                    from,
-                    statusCallback: config.server.hostname ? `https://${config.server.hostname}/webhook/sms-status` : undefined
-                });
-
-                const [vonageResult] = response.messages || [];
-                providerResponse = response;
-                messageSid = vonageResult?.['message-id'] || null;
-                status = vonageResult?.status === '0' ? 'sent' : vonageResult?.status || 'unknown';
-                fromNumberUsed = from || this.vonageAdapter.fromNumber || null;
-            } else {
-                if (!fromNumber) {
-                    throw new Error('No FROM_NUMBER configured for SMS');
-                }
-
-                const smsMessage = await this.twilio.messages.create({
-                    body: message,
-                    from: fromNumber,
-                    to: to,
-                    statusCallback: config.server.hostname ? `https://${config.server.hostname}/webhook/sms-status` : undefined
-                });
-
-                providerResponse = smsMessage;
-                messageSid = smsMessage.sid;
-                status = smsMessage.status;
-                fromNumberUsed = fromNumber;
-            }
-
-            conversation.messages.push({
-                role: 'assistant',
-                content: message,
-                timestamp: new Date(),
-                message_sid: messageSid,
-                provider: this.provider
+            const smsMessage = await this.twilio.messages.create({
+                body: message,
+                from: fromNumber,
+                to: to,
+                statusCallback: config.server.hostname
+                    ? `https://${config.server.hostname}/webhook/sms-status`
+                    : undefined
             });
-            conversation.last_activity = new Date();
 
+            console.log(`â SMS sent successfully: ${smsMessage.sid}`);
             return {
                 success: true,
-                message_sid: messageSid,
+                message_sid: smsMessage.sid,
                 to: to,
-                from: fromNumberUsed,
+                from: fromNumber,
                 body: message,
-                status,
-                persona: conversation.persona,
-                providerResponse
+                status: smsMessage.status
             };
         } catch (error) {
-            console.error('❌ SMS sending error:', error);
+            console.error('â SMS sending error:', error);
             throw error;
         }
     }
@@ -319,7 +66,7 @@ class EnhancedSmsService extends EventEmitter {
             delay = 1000, batchSize = 10
         } = options;
 
-        console.log(`📱 Sending bulk SMS to ${recipients.length} recipients`);
+        console.log(`ð± Sending bulk SMS to ${recipients.length} recipients`);
 
         // Process in batches to avoid rate limiting
         for (let i = 0; i < recipients.length; i += batchSize) {
@@ -352,7 +99,7 @@ class EnhancedSmsService extends EventEmitter {
         const successful = results.filter(r => r.success).length;
         const failed = results.length - successful;
 
-        console.log(`📊 Bulk SMS completed: ${successful} sent, ${failed} failed`);
+        console.log(`ð Bulk SMS completed: ${successful} sent, ${failed} failed`);
 
         return {
             total: recipients.length,
@@ -365,7 +112,7 @@ class EnhancedSmsService extends EventEmitter {
     // AI-powered SMS conversation
     async handleIncomingSMS(from, body, messageSid) {
         try {
-            console.log(`📨 Incoming SMS from ${from}: ${body}`);
+            console.log(`ð¨ Incoming SMS from ${from}: ${body}`);
 
             // Get or create conversation context
             let conversation = this.activeConversations.get(from);
@@ -375,11 +122,9 @@ class EnhancedSmsService extends EventEmitter {
                     messages: [],
                     context: `You are a helpful SMS assistant. Keep responses concise (under 160 chars when possible). Be friendly and professional.`,
                     created_at: new Date(),
-                    last_activity: new Date(),
-                    personaProfile: { ...this.defaultSmsPersona }
+                    last_activity: new Date()
                 };
                 this.activeConversations.set(from, conversation);
-                this.composeConversationContext(conversation);
             }
 
             // Add incoming message to conversation
@@ -390,9 +135,6 @@ class EnhancedSmsService extends EventEmitter {
                 message_sid: messageSid
             });
             conversation.last_activity = new Date();
-
-            const tone = this.analyzeTone(body);
-            this.composeConversationContext(conversation, tone);
 
             // Generate AI response
             const aiResponse = await this.generateAIResponse(conversation);
@@ -422,13 +164,13 @@ class EnhancedSmsService extends EventEmitter {
             };
 
         } catch (error) {
-            console.error('❌ Error handling incoming SMS:', error);
+            console.error('â Error handling incoming SMS:', error);
 
             // Send fallback message
             try {
                 await this.sendSMS(from, "Sorry, I'm experiencing technical difficulties. Please try again later.");
             } catch (fallbackError) {
-                console.error('❌ Failed to send fallback message:', fallbackError);
+                console.error('â Failed to send fallback message:', fallbackError);
             }
 
             throw error;
@@ -461,7 +203,7 @@ class EnhancedSmsService extends EventEmitter {
             return response;
 
         } catch (error) {
-            console.error('❌ AI response generation error:', error);
+            console.error('â AI response generation error:', error);
             return "I apologize, but I'm having trouble processing your request right now. Please try again later.";
         }
     }
@@ -498,7 +240,7 @@ class EnhancedSmsService extends EventEmitter {
         }
 
         if (cleanedCount > 0) {
-            console.log(`🧹 Cleaned up ${cleanedCount} old SMS conversations`);
+            console.log(`ð§¹ Cleaned up ${cleanedCount} old SMS conversations`);
         }
 
         return cleanedCount;
@@ -520,7 +262,7 @@ class EnhancedSmsService extends EventEmitter {
         const scheduleId = `sched_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
         this.messageQueue.set(scheduleId, scheduleData);
 
-        console.log(`📅 SMS scheduled for ${scheduledTime}: ${scheduleId}`);
+        console.log(`ð SMS scheduled for ${scheduledTime}: ${scheduleId}`);
 
         return {
             schedule_id: scheduleId,
@@ -553,9 +295,9 @@ class EnhancedSmsService extends EventEmitter {
                 scheduleData.sent_at = new Date();
                 scheduleData.message_sid = result.message_sid;
 
-                console.log(`📱 Scheduled SMS sent: ${scheduleId}`);
+                console.log(`ð± Scheduled SMS sent: ${scheduleId}`);
             } catch (error) {
-                console.error(`❌ Failed to send scheduled SMS ${scheduleId}:`, error);
+                console.error(`â Failed to send scheduled SMS ${scheduleId}:`, error);
                 scheduleData.status = 'failed';
                 scheduleData.error = error.message;
             }
@@ -564,98 +306,30 @@ class EnhancedSmsService extends EventEmitter {
         return toSend.length;
     }
 
-    getBuiltinTemplates(includeContent = true) {
-        return Object.values(this.builtinTemplates).map((template) => ({
-            name: template.name,
-            description: template.description,
-            is_builtin: true,
-            content: includeContent ? template.content : undefined
-        }));
-    }
-
-    async listTemplates(options = {}) {
-        const { includeContent = false, includeBuiltin = true } = options;
-        const custom = this.db
-            ? await this.db.getAllTemplates({ includeContent })
-            : [];
-
-        const customTemplates = custom.map((template) => ({
-            id: template.id,
-            name: template.name,
-            description: template.description,
-            content: includeContent ? template.content : undefined,
-            metadata: template.metadata,
-            is_builtin: !!template.is_builtin,
-            created_by: template.created_by,
-            updated_by: template.updated_by,
-            created_at: template.created_at,
-            updated_at: template.updated_at
-        }));
-
-        const builtinTemplates = includeBuiltin
-            ? this.getBuiltinTemplates(includeContent)
-            : [];
-
-        return {
-            custom: customTemplates,
-            builtin: builtinTemplates
+    // SMS templates system
+    getTemplate(templateName, variables = {}) {
+        const templates = {
+            welcome: "Welcome to our service! We're excited to have you aboard. Reply HELP for assistance or STOP to unsubscribe.",
+            appointment_reminder: "Reminder: You have an appointment on {date} at {time}. Reply CONFIRM to confirm or RESCHEDULE to change.",
+            verification: "Your verification code is: {code}. This code will expire in 10 minutes. Do not share this code with anyone.",
+            order_update: "Order #{order_id} update: {status}. Track your order at {tracking_url}",
+            payment_reminder: "Payment reminder: Your payment of {amount} is due on {due_date}. Pay now: {payment_url}",
+            promotional: "ð Special offer just for you! {offer_text} Use code {promo_code}. Valid until {expiry_date}. Reply STOP to opt out.",
+            customer_service: "Thanks for contacting us! We've received your message and will respond within 24 hours. For urgent matters, call {phone}.",
+            survey: "How was your experience with us? Rate us 1-5 stars by replying with a number. Your feedback helps us improve!"
         };
-    }
 
-    async fetchTemplateDefinition(templateName) {
-        if (this.db) {
-            const customTemplate = await this.db.getTemplateByName(templateName);
-            if (customTemplate) {
-                return {
-                    name: customTemplate.name,
-                    description: customTemplate.description,
-                    content: customTemplate.content,
-                    metadata: customTemplate.metadata,
-                    is_builtin: !!customTemplate.is_builtin
-                };
-            }
-        }
-
-        const builtin = this.builtinTemplates[templateName];
-        if (builtin) {
-            return {
-                name: builtin.name,
-                description: builtin.description,
-                content: builtin.content,
-                metadata: {},
-                is_builtin: true
-            };
-        }
-
-        return null;
-    }
-
-    applyTemplateVariables(templateContent, variables = {}) {
-        let rendered = templateContent;
-        if (variables && typeof variables === 'object') {
-            for (const [key, value] of Object.entries(variables)) {
-                rendered = rendered.replace(new RegExp(`{${key}}`, 'g'), value);
-            }
-        }
-        return rendered;
-    }
-
-    async renderTemplate(templateName, variables = {}) {
-        const definition = await this.fetchTemplateDefinition(templateName);
-        if (!definition) {
+        let template = templates[templateName];
+        if (!template) {
             throw new Error(`Template '${templateName}' not found`);
         }
-        const content = this.applyTemplateVariables(definition.content, variables);
-        return {
-            ...definition,
-            rendered: content,
-            variables
-        };
-    }
 
-    async getTemplate(templateName, variables = {}) {
-        const rendered = await this.renderTemplate(templateName, variables);
-        return rendered.rendered;
+        // Replace variables
+        for (const [key, value] of Object.entries(variables)) {
+            template = template.replace(new RegExp(`{${key}}`, 'g'), value);
+        }
+
+        return template;
     }
 
     // Get service statistics

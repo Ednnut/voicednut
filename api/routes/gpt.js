@@ -4,11 +4,6 @@ const OpenAI = require('openai');
 const PersonalityEngine = require('../functions/PersonalityEngine');
 const config = require('../config');
 
-const DEFAULT_SYSTEM_PROMPT =
-  'You are an intelligent AI assistant capable of adapting to different business contexts and customer needs. Be professional, helpful, and responsive to customer communication styles. You must add a \'•\' symbol every 5 to 10 words at natural pauses where your response can be split for text to speech.';
-
-const DEFAULT_FIRST_MESSAGE = 'Hello! How can I assist you today?';
-
 class EnhancedGptService extends EventEmitter {
   constructor(customPrompt = null, customFirstMessage = null) {
     super();
@@ -18,7 +13,7 @@ class EnhancedGptService extends EventEmitter {
       baseURL: "https://openrouter.ai/api/v1",
       apiKey: config.openRouter.apiKey,
       defaultHeaders: {
-        "HTTP-Referer": config.openRouter.siteUrl || "http://localhost:3000",
+        "HTTP-Referer": config.openRouter.siteUrl,
         "X-Title": config.openRouter.siteName || "Adaptive Voice AI",
       }
     });
@@ -32,9 +27,12 @@ class EnhancedGptService extends EventEmitter {
     this.dynamicTools = [];
     this.availableFunctions = {};
     
+    const defaultPrompt = 'You are an intelligent AI assistant capable of adapting to different business contexts and customer needs. Be professional, helpful, and responsive to customer communication styles. You must add a \'â¢\' symbol every 5 to 10 words at natural pauses where your response can be split for text to speech.';
+    const defaultFirstMessage = 'Hello! How can I assist you today?';
+
     // Use custom prompt if provided, otherwise use default
-    this.baseSystemPrompt = customPrompt || DEFAULT_SYSTEM_PROMPT;
-    const firstMessage = customFirstMessage || DEFAULT_FIRST_MESSAGE;
+    this.baseSystemPrompt = customPrompt || defaultPrompt;
+    const firstMessage = customFirstMessage || defaultFirstMessage;
 
     // Initialize conversation with adaptive prompt
     this.userContext = [
@@ -44,7 +42,6 @@ class EnhancedGptService extends EventEmitter {
     
     this.partialResponseIndex = 0;
     this.conversationHistory = []; // Track full conversation for personality analysis
-    this.structuredInputs = [];
 
     // Store prompts for debugging/logging
     this.systemPrompt = this.baseSystemPrompt;
@@ -55,7 +52,7 @@ class EnhancedGptService extends EventEmitter {
     this.personalityChanges = [];
     this.lastPersonalityUpdate = null;
 
-    console.log('🎭 Enhanced GPT Service initialized with adaptive capabilities'.green);
+    console.log('ð­ Enhanced GPT Service initialized with adaptive capabilities'.green);
     if (this.isCustomConfiguration) {
       console.log(`Custom prompt preview: ${this.baseSystemPrompt.substring(0, 100)}...`.cyan);
     }
@@ -66,70 +63,13 @@ class EnhancedGptService extends EventEmitter {
     this.dynamicTools = tools;
     this.availableFunctions = implementations;
     
-    console.log(`🔧 Loaded ${tools.length} dynamic functions: ${Object.keys(implementations).join(', ')}`.blue);
+    console.log(`ð§ Loaded ${tools.length} dynamic functions: ${Object.keys(implementations).join(', ')}`.blue);
   }
 
   // Add the callSid to the chat context
   setCallSid(callSid) {
     this.callSid = callSid;
     this.userContext.push({ 'role': 'system', 'content': `callSid: ${callSid}` });
-  }
-
-  // Provide persona metadata for context-aware responses
-  setPersonaMetadata(metadata) {
-    if (!metadata) return;
-    this.personaMetadata = metadata;
-    this.userContext.push({
-      role: 'system',
-      content: `persona_profile: ${JSON.stringify(metadata)}`
-    });
-  }
-
-  setStructuredInputSequence(sequence = []) {
-    if (!Array.isArray(sequence) || sequence.length === 0) {
-      return;
-    }
-    this.structuredInputs = sequence.map((entry, index) => {
-      const label = entry.label || entry.stage || entry.stage_key || `Step ${index + 1}`;
-      return {
-        step: index + 1,
-        label,
-        stage: entry.stage || entry.stage_key || label,
-        prompt: entry.prompt || '',
-        instructions: entry.instructions || '',
-        hint: entry.hint || '',
-        expectedDigits: entry.numDigits || entry.expectedLength || null,
-      };
-    });
-
-    const planLines = this.structuredInputs.map((step) => {
-      const parts = [`Step ${step.step}: ${step.label}`];
-      if (step.expectedDigits) {
-        parts.push(`expect ${step.expectedDigits} digits`);
-      }
-      if (step.prompt) {
-        parts.push(`Prompt: ${step.prompt}`);
-      }
-      if (step.instructions) {
-        parts.push(`Agent instructions: ${step.instructions}`);
-      }
-      if (step.hint) {
-        parts.push(`Hint: ${step.hint}`);
-      }
-      return parts.join(' | ');
-    });
-
-    const guidance = [
-      'Structured input workflow in effect. Follow each step carefully, confirm digits back to the caller, and listen for mistakes.',
-      planLines.join('\n'),
-      'If digits are missing or incorrect, politely explain the issue, remind them how many digits are required, and offer to let them speak the digits aloud.',
-      'Never skip steps; acknowledge successful entries before moving forward.'
-    ].join('\n');
-
-    this.userContext.push({
-      role: 'system',
-      content: guidance,
-    });
   }
 
   // Get current personality and adaptation info
@@ -175,12 +115,12 @@ class EnhancedGptService extends EventEmitter {
 
     // Analyze customer message and adapt personality if needed
     if (role === 'user') {
-      console.log(`🔍 Analyzing message for adaptation...`.blue);
+      console.log(`ð Analyzing message for adaptation...`.blue);
       
       const adaptation = this.personalityEngine.adaptPersonality(text, this.conversationHistory);
       
       if (adaptation.personalityChanged) {
-        console.log(`🎭 Personality: ${adaptation.previousPersonality} → ${adaptation.currentPersonality}`.magenta);
+        console.log(`ð­ Personality: ${adaptation.previousPersonality} â ${adaptation.currentPersonality}`.magenta);
         
         // Update system prompt with new personality
         this.updateSystemPromptWithPersonality(adaptation.adaptedPrompt);
@@ -205,7 +145,7 @@ class EnhancedGptService extends EventEmitter {
         });
       }
 
-      console.log(`🎯 Current: ${adaptation.currentPersonality} | Mood: ${adaptation.context.customerMood}`.cyan);
+      console.log(`ð¯ Current: ${adaptation.currentPersonality} | Mood: ${adaptation.context.customerMood}`.cyan);
     }
 
     this.updateUserContext(name, role, text);
@@ -252,7 +192,7 @@ class EnhancedGptService extends EventEmitter {
         const functionToCall = this.availableFunctions[functionName];
         
         if (!functionToCall) {
-          console.error(`❌ Function ${functionName} not found in dynamic implementations`.red);
+          console.error(`â Function ${functionName} not found in dynamic implementations`.red);
           // Continue without function call
           completeResponse += `I apologize, but I cannot execute the ${functionName} function at this time.`;
           continue;
@@ -274,9 +214,9 @@ class EnhancedGptService extends EventEmitter {
         let functionResponse;
         try {
           functionResponse = await functionToCall(validatedArgs);
-          console.log(`🔧 Executed dynamic function: ${functionName}`.green);
+          console.log(`ð§ Executed dynamic function: ${functionName}`.green);
         } catch (functionError) {
-          console.error(`❌ Error executing function ${functionName}:`, functionError);
+          console.error(`â Error executing function ${functionName}:`, functionError);
           functionResponse = JSON.stringify({ error: 'Function execution failed', details: functionError.message });
         }
 
@@ -288,7 +228,7 @@ class EnhancedGptService extends EventEmitter {
         completeResponse += content;
         partialResponse += content;
         
-        if (content.trim().slice(-1) === '•' || finishReason === 'stop') {
+        if (content.trim().slice(-1) === 'â¢' || finishReason === 'stop') {
           const gptReply = { 
             partialResponseIndex: this.partialResponseIndex,
             partialResponse,
@@ -316,7 +256,7 @@ class EnhancedGptService extends EventEmitter {
 
     this.userContext.push({'role': 'assistant', 'content': completeResponse});
     
-    console.log(`🧠 Context: ${this.userContext.length} | Personality: ${this.personalityEngine.currentPersonality} | Functions: ${Object.keys(this.availableFunctions).length}`.green);
+    console.log(`ð§  Context: ${this.userContext.length} | Personality: ${this.personalityEngine.currentPersonality} | Functions: ${Object.keys(this.availableFunctions).length}`.green);
   }
 
   // Update system prompt with new personality
@@ -326,7 +266,7 @@ class EnhancedGptService extends EventEmitter {
     
     if (systemMessageIndex !== -1) {
       this.userContext[systemMessageIndex].content = adaptedPrompt;
-      console.log(`📝 System prompt updated for new personality`.green);
+      console.log(`ð System prompt updated for new personality`.green);
     } else {
       // If no system message found, add one at the beginning
       this.userContext.unshift({ 'role': 'system', 'content': adaptedPrompt });
@@ -367,7 +307,7 @@ class EnhancedGptService extends EventEmitter {
         manual: true
       });
 
-      console.log(`🎭 Manually switched personality: ${oldPersonality} → ${personalityName}`.yellow);
+      console.log(`ð­ Manually switched personality: ${oldPersonality} â ${personalityName}`.yellow);
       
       return {
         success: true,
@@ -376,7 +316,7 @@ class EnhancedGptService extends EventEmitter {
         adaptedPrompt: adaptedPrompt
       };
     } else {
-      console.log(`❌ Unknown personality: ${personalityName}`.red);
+      console.log(`â Unknown personality: ${personalityName}`.red);
       return { success: false, error: 'Unknown personality' };
     }
   }
@@ -386,7 +326,7 @@ class EnhancedGptService extends EventEmitter {
     this.dynamicTools.push(toolDefinition);
     this.availableFunctions[toolDefinition.function.name] = implementation;
     
-    console.log(`🔧 Added dynamic function: ${toolDefinition.function.name}`.green);
+    console.log(`ð§ Added dynamic function: ${toolDefinition.function.name}`.green);
   }
 
   // Remove dynamic function
@@ -394,7 +334,7 @@ class EnhancedGptService extends EventEmitter {
     this.dynamicTools = this.dynamicTools.filter(tool => tool.function.name !== functionName);
     delete this.availableFunctions[functionName];
     
-    console.log(`🔧 Removed dynamic function: ${functionName}`.yellow);
+    console.log(`ð§ Removed dynamic function: ${functionName}`.yellow);
   }
 
   // Get function usage statistics
@@ -437,7 +377,7 @@ class EnhancedGptService extends EventEmitter {
       this.userContext.push({ 'role': 'system', 'content': `callSid: ${this.callSid}` });
     }
 
-    console.log('🔄 Enhanced GPT Service reset for new conversation'.blue);
+    console.log('ð Enhanced GPT Service reset for new conversation'.blue);
   }
 
   // Get current configuration with comprehensive info
@@ -467,10 +407,10 @@ class EnhancedGptService extends EventEmitter {
 
     try {
       const result = await this.availableFunctions[functionName](args);
-      console.log(`🧪 Test result for ${functionName}:`, result);
+      console.log(`ð§ª Test result for ${functionName}:`, result);
       return { success: true, result: result };
     } catch (error) {
-      console.error(`❌ Test failed for ${functionName}:`, error);
+      console.error(`â Test failed for ${functionName}:`, error);
       return { success: false, error: error.message };
     }
   }
@@ -527,8 +467,4 @@ class EnhancedGptService extends EventEmitter {
   }
 }
 
-module.exports = {
-  EnhancedGptService,
-  DEFAULT_SYSTEM_PROMPT,
-  DEFAULT_FIRST_MESSAGE
-};
+module.exports = { EnhancedGptService };

@@ -1,36 +1,24 @@
+require('dotenv').config();
 const { Buffer } = require('node:buffer');
 const EventEmitter = require('events');
 const fetch = require('node-fetch');
-const { deepgram: deepgramConfig } = require('../config');
+const config = require('../config');
 
 class TextToSpeechService extends EventEmitter {
   constructor() {
     super();
     this.nextExpectedIndex = 0;
     this.speechBuffer = {};
-    this.defaultVoiceModel = deepgramConfig.voiceModel || 'aura-asteria-en';
-    this.activeVoiceModel = this.defaultVoiceModel;
     
     // Validate required environment variables
-    if (!deepgramConfig.apiKey) {
+    if (!config.deepgram.apiKey) {
       console.error('❌ DEEPGRAM_API_KEY is not set');
     }
-    if (!deepgramConfig.voiceModel) {
+    if (!config.deepgram.voiceModel) {
       console.warn('⚠️ VOICE_MODEL not set, using default');
     }
     
-    console.log(`🎵 TTS Service initialized with voice model: ${this.defaultVoiceModel}`);
-  }
-
-  setVoiceModel(voiceModel) {
-    if (voiceModel && typeof voiceModel === 'string' && voiceModel.trim().length > 0) {
-      this.activeVoiceModel = voiceModel.trim();
-      console.log(`🎙️ TTS voice model set to: ${this.activeVoiceModel}`.cyan);
-    }
-  }
-
-  resetVoiceModel() {
-    this.activeVoiceModel = this.defaultVoiceModel;
+    console.log(`🎵 TTS Service initialized with voice model: ${config.deepgram.voiceModel || 'default'}`);
   }
 
   async generate(gptReply, interactionCount) {
@@ -44,7 +32,7 @@ class TextToSpeechService extends EventEmitter {
     console.log(`🎵 TTS generating for: "${partialResponse.substring(0, 50)}..."`.cyan);
 
     try {
-      const voiceModel = this.activeVoiceModel || this.defaultVoiceModel;
+      const voiceModel = config.deepgram.voiceModel || 'aura-asteria-en';
       const url = `https://api.deepgram.com/v1/speak?model=${voiceModel}&encoding=mulaw&sample_rate=8000&container=none`;
       
       console.log(`🌐 Making TTS request to: ${url}`.gray);
@@ -52,7 +40,7 @@ class TextToSpeechService extends EventEmitter {
       const response = await fetch(url, {
         method: 'POST',
         headers: {
-          'Authorization': `Token ${deepgramConfig.apiKey}`,
+          'Authorization': `Token ${config.deepgram.apiKey}`,
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({

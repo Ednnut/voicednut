@@ -107,6 +107,17 @@ bot.callbackQuery(/^alert:/, async (ctx) => {
     }
 });
 
+// Live call console actions (proxy to API webhook handler)
+bot.callbackQuery(/^lc:/, async (ctx) => {
+    try {
+        await axios.post(`${config.apiUrl}/webhook/telegram`, ctx.update, { timeout: 8000 });
+        return;
+    } catch (error) {
+        console.error('Live call action proxy error:', error?.message || error);
+        await ctx.answerCallbackQuery({ text: '⚠️ Failed to process action', show_alert: false });
+    }
+});
+
 // Initialize conversations middleware AFTER session
 bot.use(conversations());
 
@@ -202,7 +213,6 @@ require('./commands/menu')(bot);
 require('./commands/guide')(bot);
 require('./commands/api')(bot);
 registerProviderCommand(bot);
-require('./commands/webapp')(bot); // Register WebApp handler
 const API_BASE = config.apiUrl;
 
 function escapeMarkdown(text = '') {
@@ -502,20 +512,8 @@ bot.command('start', async (ctx) => {
             '🛡️ *Welcome, Administrator!*\n\nYou have full access to all bot features.' :
             '👋 *Welcome to Voicednut Bot!*\n\nYou can make voice calls using AI agents.';
 
-        // Get the Mini App URL from config
-        const webAppUrl = config.webAppUrl;
-        
-        // Prepare keyboard with Mini App button if URL is configured
-        const kb = new InlineKeyboard();
-        
-        // Add Mini App button if URL is configured
-        if (webAppUrl) {
-            kb.webApp('🚀 Open Mini App', webAppUrl)
-              .row();
-        }
-        
-        // Add other buttons
-        kb.text('📞 New Call', 'CALL')
+        const kb = new InlineKeyboard()
+          .text('📞 New Call', 'CALL')
           .text('📚 Guide', 'GUIDE')
             .row()
             .text('💬 New Sms', 'SMS')
@@ -536,16 +534,7 @@ bot.command('start', async (ctx) => {
                 .text('🔍 Status', 'STATUS');
         }
 
-        // Prepare the message with conditional Mini App notice
-        let message = `${welcomeText}\n\n${userStats}\n\n`;
-        
-        // Add Mini App notice only if it's configured
-        if (config.webAppUrl) {
-            message += '🚀 *Try our Mini App for a better experience!*\n' +
-                      'Click the Mini App button below to access enhanced features.\n\n';
-        }
-        
-        message += 'Use the buttons below or type /help for available commands.';
+        const message = `${welcomeText}\n\n${userStats}\n\nUse the buttons below or type /help for available commands.`;
         
         await ctx.reply(message, {
             parse_mode: 'Markdown',
@@ -735,7 +724,6 @@ async function executeHelpCommand(ctx) {
 • /start - Restart bot &amp; show main menu
 • /call - Start a new voice call
 • /sms - Send an SMS message
-• /miniapp - Open the Mini App
 • /smsconversation &lt;phone&gt; - View SMS conversation
 • /search &lt;term&gt; - Find calls by ID/phone/intent
 • /recent [limit] - List recent calls (max 50)
@@ -1222,45 +1210,8 @@ async function executeProviderSwitchCommand(ctx, provider) {
     }
 }
 
-// Mini App command handler
-bot.command('miniapp', async (ctx) => {
-    try {
-        // Verify user authorization
-        const user = await new Promise(r => getUser(ctx.from.id, r));
-        if (!user) {
-            return ctx.reply('❌ You are not authorized to use this bot.');
-        }
-
-        // Check if Mini App URL is configured
-        if (!config.webAppUrl) {
-            return ctx.reply('❌ Mini App is not configured. Please contact the administrator.');
-        }
-
-        const kb = new InlineKeyboard()
-            .webApp('🚀 Launch Mini App', config.webAppUrl);
-
-        await ctx.reply(
-            '🎯 *Voice Call Bot Mini App*\n\n' +
-            'Access enhanced features through our Mini App:\n' +
-            '• 📱 Modern interface\n' +
-            '• 🚀 Quick access to all features\n' +
-            '• 📊 Real-time call monitoring\n' +
-            '• 💬 Instant messaging\n\n' +
-            'Click the button below to open the Mini App.',
-            {
-                parse_mode: 'Markdown',
-                reply_markup: kb
-            }
-        );
-    } catch (error) {
-        console.error('Mini App command error:', error);
-        await ctx.reply('❌ Error launching Mini App. Please try again or contact support.');
-    }
-});
-
 const TELEGRAM_COMMANDS = [
     { command: 'start', description: 'Start or restart the bot' },
-    { command: 'miniapp', description: 'Open the Voice Call Mini App' },
     { command: 'call', description: 'Start outbound voice call' },
     { command: 'sms', description: 'Send SMS message' },
     { command: 'search', description: 'Search calls' },

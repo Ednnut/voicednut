@@ -15,13 +15,6 @@ if (missing.length > 0) {
   process.exit(1);
 }
 
-const miniAppUrl = process.env.MINI_APP_URL || process.env.WEB_APP_URL;
-
-if (!miniAppUrl) {
-  console.error('❌ Missing environment variable: MINI_APP_URL (or WEB_APP_URL fallback)');
-  process.exit(1);
-}
-
 const templatesApiUrl = process.env.TEMPLATES_API_URL || process.env.API_URL;
 
 try {
@@ -46,18 +39,4 @@ module.exports = {
   defaultVoiceModel: process.env.DEFAULT_VOICE_MODEL || 'aura-asteria-en',
   defaultBusinessId: process.env.DEFAULT_BUSINESS_ID || 'general',
   defaultPurpose: process.env.DEFAULT_CALL_PURPOSE || 'general',
-
-  // New Mini App configuration
-  webAppUrl: miniAppUrl,
-  miniAppUrl,
-  webAppSecret: process.env.WEB_APP_SECRET || 'your-web-app-secret',
-  webAppPort: process.env.WEB_APP_PORT || 8080,
-
-  // CORS settings for Mini App
-  cors: {
-    origins: [
-      'https://web.telegram.org',
-      miniAppUrl
-    ].filter(Boolean)
-  }
 };

@@ -125,19 +125,6 @@ class EnhancedDatabase {
                 UNIQUE(date, notification_type)
             )`,
 
-            // Call templates (bot-managed prompt templates)
-            `CREATE TABLE IF NOT EXISTS call_templates (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT UNIQUE NOT NULL,
-                description TEXT,
-                business_id TEXT,
-                prompt TEXT,
-                first_message TEXT,
-                voice_model TEXT,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-            )`,
-
             // Service health monitoring logs
             `CREATE TABLE IF NOT EXISTS service_health_logs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -216,10 +203,6 @@ class EnhancedDatabase {
             'CREATE INDEX IF NOT EXISTS idx_notifications_created_at ON webhook_notifications(created_at)',
             'CREATE INDEX IF NOT EXISTS idx_notifications_chat_id ON webhook_notifications(telegram_chat_id)',
             'CREATE INDEX IF NOT EXISTS idx_notifications_priority ON webhook_notifications(priority)',
-
-            // Call templates
-            'CREATE INDEX IF NOT EXISTS idx_call_templates_name ON call_templates(name)',
-            'CREATE INDEX IF NOT EXISTS idx_call_templates_business ON call_templates(business_id)',
             
             // Metrics indexes
             'CREATE INDEX IF NOT EXISTS idx_metrics_date ON notification_metrics(date)',
@@ -418,8 +401,7 @@ class EnhancedDatabase {
             const query = `
                 SELECT 
                     c.*,
-                    COUNT(t.id) as transcript_count,
-                    MAX(t.timestamp) as last_message_at
+                    COUNT(t.id) as transcript_count
                 FROM calls c
                 LEFT JOIN transcripts t ON c.call_sid = t.call_sid
                 GROUP BY c.call_sid
@@ -560,12 +542,10 @@ class EnhancedDatabase {
                         ELSE 5
                     END,
                     CASE wn.notification_type
-                        WHEN 'call_alert' THEN 0
                         WHEN 'call_failed' THEN 1
                         WHEN 'call_completed' THEN 2
-                        WHEN 'call_summary' THEN 3
-                        WHEN 'call_transcript' THEN 4
-                        ELSE 5
+                        WHEN 'call_transcript' THEN 3
+                        ELSE 4
                     END,
                     wn.created_at ASC
                 LIMIT ?
@@ -663,79 +643,6 @@ class EnhancedDatabase {
                 } else {
                     resolve(this.lastID);
                 }
-            });
-            stmt.finalize();
-        });
-    }
-
-    // Call templates CRUD
-    async listCallTemplates() {
-        return new Promise((resolve, reject) => {
-            this.db.all(
-                `SELECT * FROM call_templates ORDER BY updated_at DESC, created_at DESC`,
-                (err, rows) => {
-                    if (err) reject(err);
-                    else resolve(rows || []);
-                }
-            );
-        });
-    }
-
-    async getCallTemplateById(id) {
-        return new Promise((resolve, reject) => {
-            this.db.get(`SELECT * FROM call_templates WHERE id = ?`, [id], (err, row) => {
-                if (err) reject(err);
-                else resolve(row || null);
-            });
-        });
-    }
-
-    async createCallTemplate(payload) {
-        const { name, description, business_id, prompt, first_message, voice_model } = payload;
-        return new Promise((resolve, reject) => {
-            const stmt = this.db.prepare(`
-                INSERT INTO call_templates (name, description, business_id, prompt, first_message, voice_model)
-                VALUES (?, ?, ?, ?, ?, ?)
-            `);
-            stmt.run([name, description, business_id, prompt, first_message, voice_model], function(err) {
-                if (err) reject(err);
-                else resolve(this.lastID);
-            });
-            stmt.finalize();
-        });
-    }
-
-    async updateCallTemplate(id, payload) {
-        const fields = [];
-        const values = [];
-        const allowed = ['name', 'description', 'business_id', 'prompt', 'first_message', 'voice_model'];
-        allowed.forEach((key) => {
-            if (payload[key] !== undefined) {
-                fields.push(`${key} = ?`);
-                values.push(payload[key]);
-            }
-        });
-        fields.push('updated_at = CURRENT_TIMESTAMP');
-        values.push(id);
-
-        return new Promise((resolve, reject) => {
-            const stmt = this.db.prepare(
-                `UPDATE call_templates SET ${fields.join(', ')} WHERE id = ?`
-            );
-            stmt.run(values, function(err) {
-                if (err) reject(err);
-                else resolve(this.changes);
-            });
-            stmt.finalize();
-        });
-    }
-
-    async deleteCallTemplate(id) {
-        return new Promise((resolve, reject) => {
-            const stmt = this.db.prepare(`DELETE FROM call_templates WHERE id = ?`);
-            stmt.run([id], function(err) {
-                if (err) reject(err);
-                else resolve(this.changes);
             });
             stmt.finalize();
         });
