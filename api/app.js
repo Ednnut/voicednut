@@ -18,7 +18,25 @@ const config = require('./config');
 const { AwsConnectAdapter, AwsTtsAdapter, VonageVoiceAdapter } = require('./adapters');
 const { v4: uuidv4 } = require('uuid');
 
-const VoiceResponse = require('twilio').twiml.VoiceResponse;
+const twilio = require('twilio');
+const VoiceResponse = twilio.twiml.VoiceResponse;
+
+function getTwilioWebhookUrl(req) {
+  if (!config.server?.hostname) {
+    return null;
+  }
+  return `https://${config.server.hostname}${req.originalUrl}`;
+}
+
+function validateTwilioRequest(req) {
+  const signature = req.headers['x-twilio-signature'];
+  const authToken = config.twilio.authToken;
+  const url = getTwilioWebhookUrl(req);
+  if (!signature || !authToken || !url) {
+    return false;
+  }
+  return twilio.validateRequest(authToken, signature, url, req.body);
+}
 
 const app = express();
 ExpressWs(app);
@@ -131,7 +149,7 @@ async function endCallForProvider(callSid) {
     if (!accountSid || !authToken) {
       throw new Error('Twilio credentials not configured');
     }
-    const client = require('twilio')(accountSid, authToken);
+    const client = twilio(accountSid, authToken);
     await client.calls(callSid).update({ status: 'completed' });
     return;
   }
@@ -661,16 +679,6 @@ app.ws('/vonage/stream', (ws, req) => {
       webhookService.addLiveEvent(callSid, `⚠️ GPT error: ${message}`, { force: true });
     });
 
-    gptService.on('gpterror', (err) => {
-      const message = err?.message || 'GPT error';
-      webhookService.addLiveEvent(callSid, `⚠️ GPT error: ${message}`, { force: true });
-    });
-
-    gptService.on('gpterror', (err) => {
-      const message = err?.message || 'GPT error';
-      webhookService.addLiveEvent(callSid, `⚠️ GPT error: ${message}`, { force: true });
-    });
-
     ttsService.on('speech', (responseIndex, audio) => {
       webhookService.setLiveCallPhase(callSid, 'agent_speaking').catch(() => {});
       try {
@@ -1086,7 +1094,7 @@ app.post('/webhook/telegram', async (req, res) => {
       }
       webhookService.lockConsoleButtons(callSid, 'Transferring…');
       try {
-        const transferCall = require('./transferCall');
+        const transferCall = require('./functions/transferCall');
         await transferCall({ callSid });
         webhookService.markToolInvocation(callSid, 'transferCall').catch(() => {});
         webhookService.answerCallbackQuery(cb.id, 'Transferring...').catch(() => {});
@@ -1419,7 +1427,7 @@ app.post('/outbound-call', async (req, res) => {
         });
       }
 
-      const client = require('twilio')(accountSid, authToken);
+      const client = twilio(accountSid, authToken);
       const call = await client.calls.create({
         url: `https://${config.server.hostname}/incoming`,
         to: number,
@@ -1560,7 +1568,11 @@ app.post('/webhook/call-status', async (req, res) => {
       ErrorMessage,
       DialCallDuration // This is key for detecting actual answer vs no-answer
     } = req.body;
-    
+    if (!validateTwilioRequest(req)) {
+      console.warn(`⚠️ Rejected call status webhook for ${CallSid || 'unknown'} due to invalid Twilio signature`);
+      return res.status(401).send('Unauthorized');
+    }
+
     console.log(`ð± Fixed Webhook: Call ${CallSid} status: ${CallStatus}`.blue);
     console.log(`ð Debug Info:`.cyan);
     console.log(`   Duration: ${Duration || 'N/A'}`);
@@ -1578,7 +1590,8 @@ app.post('/webhook/call-status', async (req, res) => {
 
     // Enhanced logic for determining actual call outcome
     let notificationType = null;
-    let actualStatus = CallStatus.toLowerCase();
+    const rawStatus = String(CallStatus || '').toLowerCase();
+    let actualStatus = rawStatus || 'unknown';
     
     // Special handling for "completed" status - check if it was actually answered
     if (actualStatus === 'completed') {
