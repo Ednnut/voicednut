@@ -205,6 +205,7 @@ class EnhancedWebhookService {
       }
       const callTiming = this.callTimestamps.get(call_sid);
       const callDetails = await this.db.getCall(call_sid).catch(() => null);
+      const callMeta = await this.getCallMeta(call_sid, callDetails);
       const statusInfo = this.activeCallStatus.get(call_sid);
 
       const correctedStatus = this.correctStatusForEvidence(normalizedStatus, {
@@ -214,14 +215,14 @@ class EnhancedWebhookService {
         additionalData
       });
 
-      await this.ensureLiveConsole(call_sid, telegram_chat_id, callDetails);
+      await this.ensureLiveConsole(call_sid, telegram_chat_id, callMeta);
 
       // Check if we should send this status
       if (!this.shouldSendStatus(call_sid, correctedStatus)) {
         return true; // Return success to mark notification as processed
       }
 
-      const customerName = callDetails?.customer_name || 'the customer';
+      const customerName = callMeta.customerName || 'the customer';
       let message = '';
       let emoji = '';
 
@@ -472,6 +473,7 @@ class EnhancedWebhookService {
     try {
       const callDetails = await this.db.getCall(call_sid);
       const transcripts = await this.db.getCallTranscripts(call_sid);
+      const meta = await this.getCallMeta(call_sid, callDetails);
 
       if (!callDetails) {
         await this.sendTelegramMessage(telegram_chat_id, '📋 No call details available for recap');
@@ -490,8 +492,8 @@ class EnhancedWebhookService {
       const recapMessage = [
         '📋 *Call Recap*',
         '',
-        `👤 *Customer:* ${callDetails.customer_name || 'Unknown'}`,
-        `📞 *Number:* ${callDetails.phone_number || 'Unknown'}`,
+        `👤 *Customer:* ${meta.customerName || 'Unknown'}`,
+        `📞 *Number:* ${meta.phoneNumber || 'Unknown'}`,
         `📊 *Status:* ${status}`,
         duration ? `⏱️ *Duration:* ${this.formatDuration(duration)}` : null,
         `📝 *Summary:* ${this.cleanMessageForTelegram(summary)}`,
@@ -824,8 +826,10 @@ class EnhancedWebhookService {
       case 'busy':
         return `🚫 Busy - ${name}'s line is occupied.`;
       case 'no-answer':
-      case 'no_answer':
-        return `⏳ No Answer - ${name} didn't pick up.`;
+      case 'no_answer': {
+        const ringText = ringDelay ? ` (rang ${ringDelay}s)` : '';
+        return `⏳ No Answer - ${name} didn't pick up${ringText}.`;
+      }
       case 'canceled':
         return `⚠️ Canceled - Call was canceled.`;
       case 'failed':
@@ -858,12 +862,31 @@ class EnhancedWebhookService {
       .trim();
   }
 
-  async ensureLiveConsole(callSid, chatId, callDetails = null) {
+  async getCallMeta(callSid, callDetails = null) {
+    let details = callDetails;
+    if (!details) {
+      details = await this.db.getCall(callSid).catch(() => null);
+    }
+    let state = null;
+    try {
+      state = await this.db.getLatestCallState(callSid, 'call_created');
+    } catch {
+      state = null;
+    }
+
+    return {
+      customerName: state?.customer_name || details?.customer_name || 'Unknown',
+      phoneNumber: details?.phone_number || state?.phone_number || 'Unknown',
+      template: state?.template || details?.template || '—'
+    };
+  }
+
+  async ensureLiveConsole(callSid, chatId, callMeta = null) {
     const existing = this.liveConsoleByCallSid.get(callSid);
     if (existing) return existing;
     if (!chatId) return null;
 
-    const details = callDetails || await this.db.getCall(callSid).catch(() => null);
+    const meta = callMeta || await this.getCallMeta(callSid);
     const entry = {
       chatId,
       messageId: null,
@@ -875,9 +898,9 @@ class EnhancedWebhookService {
       phase: this.getConsolePhaseLabel('waiting'),
       lastEvents: [],
       previewTurns: { user: '—', agent: '—' },
-      customerName: details?.customer_name || 'Unknown',
-      phoneNumber: details?.phone_number || 'Unknown',
-      template: details?.template || '—',
+      customerName: meta.customerName || 'Unknown',
+      phoneNumber: meta.phoneNumber || 'Unknown',
+      template: meta.template || '—',
       waveformIndex: 0,
       sentimentFlag: ''
     };
@@ -1030,6 +1053,11 @@ class EnhancedWebhookService {
     } catch (error) {
       const telegramError = error?.response?.data?.description || error.message;
       console.error(`❌ Live console edit failed (callSid=${callSid}, messageId=${entry.messageId}): ${telegramError}`);
+      try {
+        await this.sendTelegramMessage(entry.chatId, '⚠️ Console update delayed, retrying…');
+      } catch {
+        // best effort
+      }
     }
   }
 
