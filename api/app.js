@@ -656,6 +656,21 @@ app.ws('/vonage/stream', (ws, req) => {
       await ttsService.generate(gptReply, icount);
     });
 
+    gptService.on('gpterror', (err) => {
+      const message = err?.message || 'GPT error';
+      webhookService.addLiveEvent(callSid, `⚠️ GPT error: ${message}`, { force: true });
+    });
+
+    gptService.on('gpterror', (err) => {
+      const message = err?.message || 'GPT error';
+      webhookService.addLiveEvent(callSid, `⚠️ GPT error: ${message}`, { force: true });
+    });
+
+    gptService.on('gpterror', (err) => {
+      const message = err?.message || 'GPT error';
+      webhookService.addLiveEvent(callSid, `⚠️ GPT error: ${message}`, { force: true });
+    });
+
     ttsService.on('speech', (responseIndex, audio) => {
       webhookService.setLiveCallPhase(callSid, 'agent_speaking').catch(() => {});
       try {

@@ -9,6 +9,10 @@ class EnhancedGptService extends EventEmitter {
     super();
     
     // Initialize OpenRouter client
+    if (!config.openRouter.apiKey) {
+      throw new Error('OPENROUTER_API_KEY is not set. Please configure it to enable GPT responses.');
+    }
+
     this.openai = new OpenAI({
       baseURL: "https://openrouter.ai/api/v1",
       apiKey: config.openRouter.apiKey,
@@ -110,6 +114,10 @@ class EnhancedGptService extends EventEmitter {
 
   // Enhanced completion method with dynamic functions and personality adaptation
   async completion(text, interactionCount, role = 'user', name = 'user') {
+    if (!this.openai?.chat?.completions) {
+      throw new Error('OpenRouter client not initialized');
+    }
+
     // Store conversation for personality analysis
     this.conversationHistory.push({
       role: role,
@@ -159,12 +167,18 @@ class EnhancedGptService extends EventEmitter {
     const toolsToUse = this.dynamicTools.length > 0 ? this.dynamicTools : [];
 
     // Send completion request with current personality-adapted context and dynamic tools
-    const stream = await this.openai.chat.completions.create({
-      model: this.model,
-      messages: this.userContext,
-      tools: toolsToUse,
-      stream: true,
-    });
+    let stream;
+    try {
+      stream = await this.openai.chat.completions.create({
+        model: this.model,
+        messages: this.userContext,
+        tools: toolsToUse,
+        stream: true,
+      });
+    } catch (err) {
+      this.emit('gpterror', err);
+      throw err;
+    }
 
     let completeResponse = '';
     let partialResponse = '';
