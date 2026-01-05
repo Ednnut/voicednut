@@ -552,16 +552,11 @@ async function callFlow(conversation, ctx) {
     const techValue = payload.technical_level || 'auto';
     const hasAutoFields = [toneValue, urgencyValue, techValue].some((value) => value === 'auto');
 
-    const shortDescription = templateDescription
-      ? `${templateDescription}`.slice(0, 80) + (templateDescription.length > 80 ? '…' : '')
-      : null;
-
     const callDetailsCard = [
       '📋 Call Details',
       `• To: ${number}`,
       customerName ? `• Customer: ${customerName}` : null,
       `• Template: ${templateName}`,
-      shortDescription ? `• Desc: ${shortDescription}` : null,
       payload.purpose ? `• Purpose: ${payload.purpose}` : null
     ].filter(Boolean);
 
@@ -633,8 +628,6 @@ async function callFlow(conversation, ctx) {
 
     const data = response?.data;
     if (data?.success && data.call_sid) {
-      await ctx.reply('✅ Call placed', { parse_mode: 'Markdown' });
-      await ctx.reply(`📞 To: ${data.to}`);
       flow.touch('completed');
     } else {
       await ctx.reply('⚠️ Call was sent but response format unexpected. Check logs.');

@@ -1023,6 +1023,7 @@ app.post('/webhook/telegram', async (req, res) => {
         webhookService.answerCallbackQuery(cb.id, 'Call stream not active').catch(() => {});
         return;
       }
+      webhookService.lockConsoleButtons(callSid, 'Interrupting…');
       try {
         session.ws.send(JSON.stringify({ streamSid: session.streamSid, event: 'clear' }));
       } catch {
@@ -1030,17 +1031,21 @@ app.post('/webhook/telegram', async (req, res) => {
       }
       webhookService.setLiveCallPhase(callSid, 'interrupted').catch(() => {});
       webhookService.answerCallbackQuery(cb.id, 'Interrupted').catch(() => {});
+      setTimeout(() => webhookService.unlockConsoleButtons(callSid), 1200);
       return;
     }
 
     if (action === 'end') {
+      webhookService.lockConsoleButtons(callSid, 'Ending…');
       try {
         await endCallForProvider(callSid);
         webhookService.setLiveCallPhase(callSid, 'ended').catch(() => {});
         webhookService.answerCallbackQuery(cb.id, 'Ending call...').catch(() => {});
       } catch (e) {
         webhookService.answerCallbackQuery(cb.id, `Failed: ${e.message}`.slice(0, 180)).catch(() => {});
+        webhookService.unlockConsoleButtons(callSid);
       }
+      setTimeout(() => webhookService.unlockConsoleButtons(callSid), 1500);
       return;
     }
 
@@ -1049,6 +1054,7 @@ app.post('/webhook/telegram', async (req, res) => {
         webhookService.answerCallbackQuery(cb.id, 'Transfer not configured').catch(() => {});
         return;
       }
+      webhookService.lockConsoleButtons(callSid, 'Transferring…');
       try {
         const transferCall = require('./transferCall');
         await transferCall({ callSid });
@@ -1056,7 +1062,9 @@ app.post('/webhook/telegram', async (req, res) => {
         webhookService.answerCallbackQuery(cb.id, 'Transferring...').catch(() => {});
       } catch (e) {
         webhookService.answerCallbackQuery(cb.id, `Transfer failed: ${e.message}`.slice(0, 180)).catch(() => {});
+        webhookService.unlockConsoleButtons(callSid);
       }
+      setTimeout(() => webhookService.unlockConsoleButtons(callSid), 2000);
       return;
     }
   } catch (error) {

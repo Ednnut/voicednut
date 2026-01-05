@@ -18,6 +18,8 @@ class EnhancedWebhookService {
     this.liveConsoleMaxEvents = 5;
     this.liveConsoleMaxPreviewChars = 200;
     this.waveformFrames = ['▁ ▂ ▃ ▄ ▅ ▆ ▇', '▂ ▃ ▄ ▅ ▆ ▇ ▁', '▃ ▄ ▅ ▆ ▇ ▁ ▂', '▄ ▅ ▆ ▇ ▁ ▂ ▃', '▅ ▆ ▇ ▁ ▂ ▃ ▄', '▆ ▇ ▁ ▂ ▃ ▄ ▅', '▇ ▁ ▂ ▃ ▄ ▅ ▆'];
+    this.lastSentimentAt = new Map();
+    this.sentimentCooldownMs = 10000;
   }
 
   start(database) {
@@ -63,6 +65,7 @@ class EnhancedWebhookService {
     this.liveConsoleEditTimers.forEach((timer) => clearTimeout(timer));
     this.liveConsoleEditTimers.clear();
     this.liveConsoleByCallSid.clear();
+    this.lastSentimentAt.clear();
     console.log('Enhanced webhook service stopped'.yellow);
   }
 
@@ -471,45 +474,20 @@ class EnhancedWebhookService {
 
   async sendCallRecap(call_sid, telegram_chat_id) {
     try {
-      const callDetails = await this.db.getCall(call_sid);
-      const transcripts = await this.db.getCallTranscripts(call_sid);
-      const meta = await this.getCallMeta(call_sid, callDetails);
-
-      if (!callDetails) {
-        await this.sendTelegramMessage(telegram_chat_id, '📋 No call details available for recap');
-        return true;
-      }
-
-      const status = (callDetails.status || callDetails.twilio_status || 'unknown').toLowerCase();
-      const duration = typeof callDetails.duration === 'number' ? callDetails.duration : null;
-      const summary = callDetails.call_summary || 'No summary available yet.';
-
-      const previewLines = this.buildTranscriptPreview(transcripts || [], 2);
-      const previewBlock = previewLines.length
-        ? previewLines.map((line) => `• ${line}`).join('\n')
-        : '• (no transcript lines yet)';
-
-      const recapMessage = [
-        '📋 *Call Recap*',
-        '',
-        `👤 *Customer:* ${meta.customerName || 'Unknown'}`,
-        `📞 *Number:* ${meta.phoneNumber || 'Unknown'}`,
-        `📊 *Status:* ${status}`,
-        duration ? `⏱️ *Duration:* ${this.formatDuration(duration)}` : null,
-        `📝 *Summary:* ${this.cleanMessageForTelegram(summary)}`,
-        '',
-        '*Transcript preview*',
-        previewBlock
-      ].filter(Boolean).join('\n');
-
+      // We only send buttons now to keep things quiet; no recap body.
       const replyMarkup = {
         inline_keyboard: [[
           { text: '📩 Send recap via SMS', callback_data: `recap:sms:${call_sid}` },
           { text: '✋ Skip', callback_data: `recap:skip:${call_sid}` }
         ]]
       };
-
-      await this.sendTelegramMessage(telegram_chat_id, recapMessage, true, { replyMarkup });
+      const response = await this.sendTelegramMessage(telegram_chat_id, ' ', false, { replyMarkup });
+      // Clean up placeholder text by editing to an empty caption-like space
+      try {
+        await this.editTelegramMessage(telegram_chat_id, response?.result?.message_id, ' ');
+      } catch {
+        // ignore if edit fails; buttons remain
+      }
       return true;
     } catch (error) {
       console.error('❌ Failed to send call recap:', error);
@@ -906,7 +884,7 @@ class EnhancedWebhookService {
     };
 
     const text = this.buildLiveConsoleMessage(entry);
-    const response = await this.sendTelegramMessage(chatId, text, false, { replyMarkup: this.consoleButtons(callSid) });
+    const response = await this.sendTelegramMessage(chatId, text, false, { replyMarkup: this.consoleButtons(callSid, entry) });
     entry.messageId = response?.result?.message_id;
     entry.lastEditAt = new Date();
     this.liveConsoleByCallSid.set(callSid, entry);
@@ -942,7 +920,12 @@ class EnhancedWebhookService {
     return map[phaseKey] || phaseKey || '—';
   }
 
-  consoleButtons(callSid) {
+  consoleButtons(callSid, entry) {
+    if (entry?.actionLock) {
+      return {
+        inline_keyboard: [[{ text: `⏳ ${entry.actionLock}`, callback_data: 'noop' }]]
+      };
+    }
     return {
       inline_keyboard: [
         [
@@ -1049,7 +1032,7 @@ class EnhancedWebhookService {
     entry.lastEditAt = new Date();
     const text = this.buildLiveConsoleMessage(entry);
     try {
-      await this.editTelegramMessage(entry.chatId, entry.messageId, text, false, this.consoleButtons(callSid));
+      await this.editTelegramMessage(entry.chatId, entry.messageId, text, false, this.consoleButtons(callSid, entry));
     } catch (error) {
       const telegramError = error?.response?.data?.description || error.message;
       console.error(`❌ Live console edit failed (callSid=${callSid}, messageId=${entry.messageId}): ${telegramError}`);
@@ -1068,18 +1051,17 @@ class EnhancedWebhookService {
     const waveform = this.waveformFrames[entry.waveformIndex] || '';
     const phaseLine = entry.phase.includes('Agent speaking') ? `${entry.phase} ${waveform}` : entry.phase;
     const sentimentLine = entry.sentimentFlag ? `Mood: ${entry.sentimentFlag}` : null;
+    const recentBlock = events.length ? events.map((e) => `• ${e}`).join('\n') : '• (no events yet)';
 
     return [
-      '📞 Live Call Console',
-      `👤 ${entry.customerName} | 📱 ${entry.phoneNumber}`,
-      entry.template ? `🧩 Template: ${entry.template}` : null,
-      `Status: ${entry.status}`,
-      `Phase: ${phaseLine}`,
+      `🎧 Live Call • ${entry.status}`,
+      `👤 ${entry.customerName} | 📞 ${entry.phoneNumber}`,
+      entry.template && entry.template !== '—' ? `🧩 ${entry.template}` : null,
+      `⏱ ${elapsed} | Phase: ${phaseLine}`,
       sentimentLine,
-      `Elapsed: ${elapsed}`,
       '',
       'Recent',
-      ...events.map((e) => `- ${e}`),
+      recentBlock,
       '',
       'Preview',
       `🧑 ${entry.previewTurns.user || '—'}`,
@@ -1126,6 +1108,35 @@ class EnhancedWebhookService {
 
   normalizePreviewText(text) {
     return String(text || '').replace(/\s+/g, ' ').trim();
+  }
+
+  markSentimentScore(callSid, score) {
+    const now = Date.now();
+    const last = this.lastSentimentAt.get(callSid) || 0;
+    if (now - last < this.sentimentCooldownMs) {
+      return;
+    }
+    if (typeof score === 'number' && score < -0.3) {
+      this.markSentimentDrop(callSid, { force: true });
+      this.lastSentimentAt.set(callSid, now);
+    }
+  }
+
+  lockConsoleButtons(callSid, label = 'Working…', durationMs = 1500) {
+    const entry = this.liveConsoleByCallSid.get(callSid);
+    if (!entry) return;
+    entry.actionLock = label;
+    this.queueLiveConsoleUpdate(callSid, { force: true });
+    setTimeout(() => {
+      this.unlockConsoleButtons(callSid);
+    }, durationMs);
+  }
+
+  unlockConsoleButtons(callSid) {
+    const entry = this.liveConsoleByCallSid.get(callSid);
+    if (!entry || !entry.actionLock) return;
+    entry.actionLock = null;
+    this.queueLiveConsoleUpdate(callSid, { force: true });
   }
   correctStatusForEvidence(normalizedStatus, context) {
     const { callTiming, callDetails, statusInfo, additionalData } = context || {};
@@ -1242,6 +1253,7 @@ class EnhancedWebhookService {
       clearTimeout(timer);
       this.liveConsoleEditTimers.delete(callSid);
     }
+    this.lastSentimentAt.delete(callSid);
   }
 
   // Enhanced immediate status update with better error handling
