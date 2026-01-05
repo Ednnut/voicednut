@@ -23,8 +23,7 @@ class EnhancedWebhookService {
       'busy',
       'no-answer',
       'failed',
-      'canceled',
-      'ended'
+      'canceled'
     ];
   }
 
@@ -101,6 +100,14 @@ class EnhancedWebhookService {
     // Allow backwards progression for failure states
     const failureStates = ['busy', 'no-answer', 'failed', 'canceled'];
     const isFailureTransition = failureStates.includes(newStatus);
+
+    if (newStatus === 'in-progress' && lastStatus === 'answered') {
+      currentStatusInfo.lastStatus = newStatus;
+      currentStatusInfo.timestamp = new Date();
+      currentStatusInfo.statusHistory.push(newStatus);
+      this.activeCallStatus.set(call_sid, currentStatusInfo);
+      return true;
+    }
     
     // Allow progression if moving forward or transitioning to failure state
     if (newIndex > currentIndex || isFailureTransition) {
@@ -150,6 +157,22 @@ class EnhancedWebhookService {
     return normalized;
   }
 
+  formatDuration(seconds, decimals = 0) {
+    if (!Number.isFinite(seconds)) return '';
+    const rounded = decimals > 0 ? Number(seconds.toFixed(decimals)) : Math.round(seconds);
+    if (rounded < 60) {
+      return `${rounded}${decimals > 0 && rounded % 1 !== 0 ? '' : ''}s`;
+    }
+    const minutes = Math.floor(rounded / 60);
+    const remaining = Math.round(rounded % 60);
+    return `${minutes}m ${remaining}s`;
+  }
+
+  escapeMarkdown(text) {
+    if (!text) return '';
+    return String(text).replace(/([_*`\[])/g, '\\$1');
+  }
+
   // Enhanced call status update with proper no-answer detection
   async sendCallStatusUpdate(call_sid, status, telegram_chat_id, additionalData = {}) {
     try {
@@ -161,6 +184,7 @@ class EnhancedWebhookService {
       const normalizedStatus = this.normalizeStatus(status);
       let message = '';
       let emoji = '';
+      let title = '';
       
       // Track call timing for duration calculations
       if (!this.callTimestamps.has(call_sid)) {
@@ -168,11 +192,30 @@ class EnhancedWebhookService {
       }
       const callTiming = this.callTimestamps.get(call_sid);
 
+      const statusMessages = {
+        queued: { emoji: '📡', title: 'Initiating Call' },
+        initiated: { emoji: '📡', title: 'Initiating Call' },
+        'in-progress': { emoji: '📞', title: 'Dialing' },
+        ringing: { emoji: '🔔', title: 'Ringing' },
+        answered: { emoji: '✅', title: 'Call Connected' },
+        completed: { emoji: '✅', title: 'Call Completed' },
+        busy: { emoji: '🚫', title: 'Line Busy' },
+        'no-answer': { emoji: '⏳', title: 'No Answer' },
+        canceled: { emoji: '⚠️', title: 'Call Canceled' },
+        failed: { emoji: '❌', title: 'Call Failed' }
+      };
+
       switch (normalizedStatus) {
         case 'queued':
+          if (!callTiming.initiated) {
+            callTiming.initiated = new Date();
+          }
+          this.scheduleNoRingCheck(call_sid, telegram_chat_id);
+          return true;
+
         case 'initiated':
-          emoji = '⏳';
-          message = 'Calling...';
+          ({ emoji, title } = statusMessages.initiated);
+          message = 'Connecting to network...';
           if (!callTiming.initiated) {
             callTiming.initiated = new Date();
           }
@@ -180,46 +223,61 @@ class EnhancedWebhookService {
           break;
           
         case 'in-progress':
-          emoji = '📞';
-          message = 'Calling...';
+          if (callTiming.answered) {
+            emoji = '☎️';
+            title = 'In Progress';
+            message = 'Call is active';
+          } else {
+            ({ emoji, title } = statusMessages['in-progress']);
+            message = 'Attempting to connect...';
+          }
           if (!callTiming.inProgress) {
             callTiming.inProgress = new Date();
           }
-          this.scheduleNoRingCheck(call_sid, telegram_chat_id);
+          if (!callTiming.answered) {
+            this.scheduleNoRingCheck(call_sid, telegram_chat_id);
+          }
           break;
 
         case 'ringing':
-          emoji = '🔔';
-          message = 'Ringing...';
+          ({ emoji, title } = statusMessages.ringing);
           if (!callTiming.ringing) {
             callTiming.ringing = new Date();
           }
           this.clearNoRingTimer(call_sid);
           // Calculate time to ring
+          message = 'Phone ringing';
           if (callTiming.initiated) {
-            const ringDelay = ((new Date() - callTiming.initiated) / 1000).toFixed(1);
-            if (ringDelay > 2) {
-              message += ` (${ringDelay}s)`;
+            const ringDelay = (new Date() - callTiming.initiated) / 1000;
+            if (ringDelay >= 2) {
+              message += ` (${this.formatDuration(ringDelay, 1)})`;
             }
           }
           break;
           
         case 'answered':
-          emoji = '✅';
-          message = 'Call answered';
+          ({ emoji, title } = statusMessages.answered);
           if (!callTiming.answered) {
             callTiming.answered = new Date();
           }
           this.clearNoRingTimer(call_sid);
           // Calculate ring duration
+          message = 'Call answered';
           if (callTiming.ringing) {
-            const ringDuration = ((new Date() - callTiming.ringing) / 1000).toFixed(0);
-            message += ` (rang ${ringDuration}s)`;
+            const ringDuration = (new Date() - callTiming.ringing) / 1000;
+            if (ringDuration >= 2) {
+              message = `Answered after ${this.formatDuration(ringDuration)}`;
+            }
+          } else if (callTiming.initiated) {
+            const ringDuration = (new Date() - callTiming.initiated) / 1000;
+            if (ringDuration >= 2) {
+              message = `Answered after ${this.formatDuration(ringDuration)}`;
+            }
           }
           break;
           
         case 'completed':
-          emoji = '🔴';
+          ({ emoji, title } = statusMessages.completed);
           if (!callTiming.completed) {
             callTiming.completed = new Date();
           }
@@ -229,39 +287,35 @@ class EnhancedWebhookService {
           let duration = '';
           const actualDuration = additionalData.duration;
           
-          if (actualDuration && actualDuration > 3) {
-            const minutes = Math.floor(actualDuration / 60);
-            const seconds = actualDuration % 60;
-            duration = ` (${minutes}:${String(seconds).padStart(2, '0')})`;
+          if (actualDuration && actualDuration > 2) {
+            duration = this.formatDuration(actualDuration);
           } else if (callTiming.answered) {
-            const totalTime = ((new Date() - callTiming.answered) / 1000).toFixed(0);
-            if (totalTime > 3) {
-              const minutes = Math.floor(totalTime / 60);
-              const seconds = totalTime % 60;
-              duration = ` (~${minutes}:${String(seconds).padStart(2, '0')})`;
+            const totalTime = (new Date() - callTiming.answered) / 1000;
+            if (totalTime >= 2) {
+              duration = this.formatDuration(totalTime);
             }
           }
           
-          message = `Call completed${duration}`;
+          message = duration ? `Duration: ${duration}` : 'Call completed';
           break;
           
         case 'busy':
-          emoji = '⚠️';
-          message = 'Line busy';
+          ({ emoji, title } = statusMessages.busy);
           this.clearNoRingTimer(call_sid);
           // Calculate time before busy signal
+          message = 'The line is currently occupied';
           if (callTiming.ringing || callTiming.initiated) {
             const busyTime = callTiming.ringing || callTiming.initiated;
-            const timeBeforeBusy = ((new Date() - busyTime) / 1000).toFixed(0);
-            if (timeBeforeBusy > 1) {
-              message += ` (${timeBeforeBusy}s)`;
+            const timeBeforeBusy = (new Date() - busyTime) / 1000;
+            if (timeBeforeBusy >= 2) {
+              message += ` (${this.formatDuration(timeBeforeBusy)})`;
             }
           }
           break;
           
         case 'no-answer':
-          emoji = '❌';
-          message = 'No-answered';
+          ({ emoji, title } = statusMessages['no-answer']);
+          message = 'No answer';
           this.clearNoRingTimer(call_sid);
           
           // Enhanced no-answer timing calculation
@@ -282,42 +336,39 @@ class EnhancedWebhookService {
           }
           
           if (ringTime > 0) {
-            message += ` (rang ${ringTime}s)`;
+            if (ringTime >= 2) {
+              message = `No answer after ${this.formatDuration(ringTime)}`;
+            }
           }
           
           console.log(`📞 No-answer notification: ${message}`.yellow);
           break;
           
         case 'failed':
-          emoji = '❌';
-          message = 'Call failed';
+          ({ emoji, title } = statusMessages.failed);
+          message = 'Unable to complete the call';
           this.clearNoRingTimer(call_sid);
           if (additionalData.error || additionalData.error_message) {
             const errorMsg = additionalData.error || additionalData.error_message;
-            message += ` (${errorMsg})`;
+            message += `\nReason: ${this.escapeMarkdown(errorMsg)}`;
           }
           break;
           
         case 'canceled':
-          emoji = '🚫';
-          message = 'Call canceled';
-          this.clearNoRingTimer(call_sid);
-          break;
-
-        case 'ended':
-          emoji = '🔴';
-          message = 'Call ended';
+          ({ emoji, title } = statusMessages.canceled);
+          message = 'Call was canceled before completion';
           this.clearNoRingTimer(call_sid);
           break;
           
         default:
           emoji = '📱';
+          title = 'Call Status';
           message = `Call ${status}`;
       }
 
-      const fullMessage = `${emoji} ${message}`;
+      const fullMessage = `${emoji} *${title}*\n${message}`;
 
-      await this.sendTelegramMessage(telegram_chat_id, fullMessage);
+      await this.sendTelegramMessage(telegram_chat_id, fullMessage, true);
       console.log(`✅ Sent enhanced status update: ${normalizedStatus} for call ${call_sid}`.green);
       
       // Log notification metric
@@ -326,7 +377,7 @@ class EnhancedWebhookService {
       }
 
       // Schedule cleanup for terminal states
-      if (['completed', 'failed', 'no-answer', 'busy', 'canceled', 'ended'].includes(normalizedStatus)) {
+      if (['completed', 'failed', 'no-answer', 'busy', 'canceled'].includes(normalizedStatus)) {
         setTimeout(() => {
           this.cleanupCallData(call_sid);
         }, 5 * 60 * 1000); // Cleanup after 5 minutes
@@ -382,7 +433,6 @@ class EnhancedWebhookService {
       await this.sendCallStatusUpdate(call_sid, 'failed', telegram_chat_id, {
         error_message: 'Number not reachable'
       });
-      await this.sendCallStatusUpdate(call_sid, 'ended', telegram_chat_id);
     }, this.noRingTimeoutMs);
     this.noRingTimers.set(call_sid, timer);
   }
@@ -515,9 +565,11 @@ class EnhancedWebhookService {
       this.webhookStatusSeen.set(call_sid, true);
 
       switch (notification_type) {
-        case 'call_initiated':
         case 'call_queued':
-          success = await this.sendCallStatusUpdate(call_sid, 'in-progress', telegram_chat_id);
+          success = await this.sendCallStatusUpdate(call_sid, 'queued', telegram_chat_id);
+          break;
+        case 'call_initiated':
+          success = await this.sendCallStatusUpdate(call_sid, 'initiated', telegram_chat_id);
           break;
         case 'call_ringing':
           success = await this.sendCallStatusUpdate(call_sid, 'ringing', telegram_chat_id);
@@ -533,9 +585,6 @@ class EnhancedWebhookService {
           success = await this.sendCallStatusUpdate(call_sid, 'completed', telegram_chat_id, { 
             duration: callDetails?.duration 
           });
-          if (success) {
-            await this.sendCallStatusUpdate(call_sid, 'ended', telegram_chat_id);
-          }
           break;
         case 'call_transcript':
           success = await this.sendCallTranscript(call_sid, telegram_chat_id);
@@ -545,15 +594,9 @@ class EnhancedWebhookService {
           success = await this.sendCallStatusUpdate(call_sid, 'failed', telegram_chat_id, { 
             error_message: failedCall?.error_message 
           });
-          if (success) {
-            await this.sendCallStatusUpdate(call_sid, 'ended', telegram_chat_id);
-          }
           break;
         case 'call_busy':
           success = await this.sendCallStatusUpdate(call_sid, 'busy', telegram_chat_id);
-          if (success) {
-            await this.sendCallStatusUpdate(call_sid, 'ended', telegram_chat_id);
-          }
           break;
         case 'call_no_answer':
         case 'call_no-answer':
@@ -561,15 +604,9 @@ class EnhancedWebhookService {
           success = await this.sendCallStatusUpdate(call_sid, 'no-answer', telegram_chat_id, {
             ring_duration: noAnswerCall?.ring_duration
           });
-          if (success) {
-            await this.sendCallStatusUpdate(call_sid, 'ended', telegram_chat_id);
-          }
           break;
         case 'call_canceled':
           success = await this.sendCallStatusUpdate(call_sid, 'canceled', telegram_chat_id);
-          if (success) {
-            await this.sendCallStatusUpdate(call_sid, 'ended', telegram_chat_id);
-          }
           break;
         default:
           console.warn(`⚠️ Unknown notification type: ${notification_type}`.yellow);

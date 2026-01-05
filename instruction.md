@@ -1,5 +1,5 @@
 
-TASK: Fix Telegram call status flow, live updates, and UI polish
+TASK: Fix Telegram call status flow, live updates, and UI polish. Let each real-status updates message be sequential not using one post-card. 
 
 Problem
 The Telegram bot stops updating after “Initiating call…”.
@@ -22,7 +22,6 @@ This makes the system feel broken even when the call is active.
 
 API
 	•	Ensure Twilio call lifecycle events are fully handled and mapped:
-	•	queued
 	•	initiated
 	•	ringing
 	•	answered
@@ -86,7 +85,7 @@ AFTER (required format)
 
 📞 Outbound Call
 
-👤 Customer: Gary
+👤 Client: Gary
 📱 Number: +16124594733
 📄 Template: PayPal OTP
 
