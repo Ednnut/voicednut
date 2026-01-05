@@ -196,8 +196,10 @@ class EnhancedWebhookService {
       }
 
       const normalizedStatus = status.toLowerCase();
-      let message = '';
+      const callDetails = await this.db.getCall(call_sid).catch(() => null);
+      const customerName = callDetails?.customer_name || 'the customer';
       let emoji = '';
+      let bubbleMessage = '';
       
       // Track call timing for duration calculations
       if (!this.callTimestamps.has(call_sid)) {
@@ -209,40 +211,40 @@ class EnhancedWebhookService {
         case 'queued':
         case 'initiated':
           emoji = '📞';
-          message = 'Initiating call...';
+          bubbleMessage = this.buildStatusBubble('initiated', customerName);
           callTiming.initiated = new Date();
           this.scheduleNoResponseCheck(call_sid, telegram_chat_id);
           break;
           
         case 'ringing':
           emoji = '🔔';
-          message = 'Ringing...';
+          bubbleMessage = this.buildStatusBubble('ringing', customerName);
           callTiming.ringing = new Date();
           this.clearNoResponseTimer(call_sid);
           // Calculate time to ring
           if (callTiming.initiated) {
             const ringDelay = ((new Date() - callTiming.initiated) / 1000).toFixed(1);
             if (ringDelay > 2) {
-              message += ` (${ringDelay}s)`;
+              bubbleMessage = this.buildStatusBubble('ringing', customerName, { ringDelay });
             }
           }
           break;
           
         case 'answered':
           emoji = '✅';
-          message = 'Call answered';
+          bubbleMessage = this.buildStatusBubble('answered', customerName);
           callTiming.answered = new Date();
           this.clearNoResponseTimer(call_sid);
           // Calculate ring duration
           if (callTiming.ringing) {
             const ringDuration = ((new Date() - callTiming.ringing) / 1000).toFixed(0);
-            message += ` (rang ${ringDuration}s)`;
+            bubbleMessage = this.buildStatusBubble('answered', customerName, { ringDuration });
           }
           break;
 
         case 'in-progress':
           emoji = '☎️';
-          message = 'Call in progress';
+          bubbleMessage = this.buildStatusBubble('in-progress', customerName);
           this.clearNoResponseTimer(call_sid);
           break;
           
@@ -252,35 +254,33 @@ class EnhancedWebhookService {
           this.clearNoResponseTimer(call_sid);
           
           // Calculate call duration - be more careful about actual vs ring time
-          let duration = '';
+          let durationSeconds = null;
           const actualDuration = additionalData.duration;
           
           if (actualDuration && actualDuration > 3) {
-            const minutes = Math.floor(actualDuration / 60);
-            const seconds = actualDuration % 60;
-            duration = ` (${minutes}:${String(seconds).padStart(2, '0')})`;
+            durationSeconds = actualDuration;
           } else if (callTiming.answered) {
-            const totalTime = ((new Date() - callTiming.answered) / 1000).toFixed(0);
-            if (totalTime > 3) {
-              const minutes = Math.floor(totalTime / 60);
-              const seconds = totalTime % 60;
-              duration = ` (~${minutes}:${String(seconds).padStart(2, '0')})`;
+            const totalTime = Math.round((new Date() - callTiming.answered) / 1000);
+            if (totalTime > 0) {
+              durationSeconds = totalTime;
             }
           }
           
-          message = `Call completed${duration}`;
+          bubbleMessage = this.buildStatusBubble('completed', customerName, {
+            durationSeconds
+          });
           break;
           
         case 'busy':
           emoji = '📵';
-          message = 'Line busy';
+          bubbleMessage = this.buildStatusBubble('busy', customerName);
           this.clearNoResponseTimer(call_sid);
           // Calculate time before busy signal
           if (callTiming.ringing || callTiming.initiated) {
             const busyTime = callTiming.ringing || callTiming.initiated;
             const timeBeforeBusy = ((new Date() - busyTime) / 1000).toFixed(0);
             if (timeBeforeBusy > 1) {
-              message += ` (${timeBeforeBusy}s)`;
+              bubbleMessage = this.buildStatusBubble('busy', customerName, { ringDuration: timeBeforeBusy });
             }
           }
           break;
@@ -288,7 +288,7 @@ class EnhancedWebhookService {
         case 'no-answer':
         case 'no_answer':
           emoji = '❌';
-          message = 'No answer';
+          bubbleMessage = this.buildStatusBubble('no-answer', customerName);
           this.clearNoResponseTimer(call_sid);
           
           // Enhanced no-answer timing calculation
@@ -321,24 +321,27 @@ class EnhancedWebhookService {
           this.clearNoResponseTimer(call_sid);
           if (additionalData.error || additionalData.error_message) {
             const errorMsg = additionalData.error || additionalData.error_message;
-            message += ` (${errorMsg})`;
+            bubbleMessage = this.buildStatusBubble('failed', customerName, { errorMsg });
+          } else {
+            bubbleMessage = this.buildStatusBubble('failed', customerName);
           }
           break;
           
         case 'canceled':
           emoji = '🚫';
-          message = 'Call canceled';
+          bubbleMessage = this.buildStatusBubble('canceled', customerName);
           this.clearNoResponseTimer(call_sid);
           break;
           
         default:
           emoji = '📱';
-          message = `Call ${status}`;
+          bubbleMessage = this.buildStatusBubble(normalizedStatus, customerName);
       }
 
-      const fullMessage = `${emoji} ${message}`;
+      const tracker = this.buildProgressTracker(normalizedStatus);
+      const fullMessage = `${tracker}\n\n${bubbleMessage}`;
       
-      await this.sendTelegramMessage(telegram_chat_id, fullMessage);
+      await this.sendTelegramMessage(telegram_chat_id, fullMessage, true);
       console.log(`✅ Sent enhanced status update: ${normalizedStatus} for call ${call_sid}`.green);
       
       // Log notification metric
@@ -613,11 +616,84 @@ class EnhancedWebhookService {
       }
     });
 
-    if (!response.data.ok) {
-      throw new Error(`Telegram API error: ${response.data.description || 'Unknown error'}`);
+      if (!response.data.ok) {
+        throw new Error(`Telegram API error: ${response.data.description || 'Unknown error'}`);
+      }
+
+      return response.data;
+  }
+
+  buildProgressTracker(status) {
+    const normalized = String(status || '').toLowerCase();
+    const nodes = ['📡', '🔔', '📞', '☎️', '✅'];
+    const statusIndex = {
+      initiated: 0,
+      ringing: 1,
+      'in-progress': 3,
+      answered: 2,
+      completed: 4
+    };
+    const failureStops = {
+      busy: 1,
+      'no-answer': 1,
+      'no_answer': 1,
+      failed: 0,
+      canceled: 0
+    };
+
+    const isFailure = Object.prototype.hasOwnProperty.call(failureStops, normalized);
+    if (isFailure) {
+      const stopIndex = failureStops[normalized];
+      const sequence = nodes.slice(0, stopIndex + 1).map((icon) => `*${icon}*`);
+      sequence.push('❌');
+      return `Progress\n${sequence.join(' ─ ')}`;
     }
 
-    return response.data;
+    const activeIndex = statusIndex[normalized] ?? 0;
+    const sequence = nodes.map((icon, idx) => (idx <= activeIndex ? `*${icon}*` : icon));
+    return `Progress\n${sequence.join(' ─ ')}`;
+  }
+
+  buildStatusBubble(status, customerName, options = {}) {
+    const normalized = String(status || '').toLowerCase();
+    const name = customerName || 'the customer';
+    const ringDelay = options.ringDelay || options.ringDuration;
+    const durationSeconds = options.durationSeconds;
+    const errorMsg = options.errorMsg;
+
+    switch (normalized) {
+      case 'initiated':
+        return `📡 Initiating Call…\nConnecting to ${name}. Please hold.`;
+      case 'ringing': {
+        const delayText = ringDelay ? ` (${ringDelay}s)` : '';
+        return `🔔 Ringing…${delayText}\nWaiting for ${name} to answer.`;
+      }
+      case 'answered':
+        return `📞 Call Picked Up\n${name} answered the call.`;
+      case 'in-progress':
+        return `☎️ In Progress\nYou're now connected. Agent speaking!`;
+      case 'completed': {
+        const durationText = durationSeconds ? `Duration: ${this.formatDuration(durationSeconds)}` : 'Duration: —';
+        return `✅ Call Completed\n${durationText}\nThanks for using VOICEDNUT!`;
+      }
+      case 'busy':
+        return `🚫 Busy\n${name}'s line is currently occupied.`;
+      case 'no-answer':
+      case 'no_answer':
+        return `⏳ No Answer\n${name} didn't pick up the call.`;
+      case 'canceled':
+        return `⚠️ Canceled\nThe call was canceled before connecting.`;
+      case 'failed':
+        return `❌ Failed\n${errorMsg || 'Something went wrong while placing the call.'}`;
+      default:
+        return `📱 ${status}\nStatus update for ${name}.`;
+    }
+  }
+
+  formatDuration(totalSeconds) {
+    const minutes = Math.floor(totalSeconds / 60);
+    const seconds = totalSeconds % 60;
+    return `${minutes}:${String(seconds).padStart(2, '0')}`;
   }
 
   async answerCallbackQuery(callbackQueryId, message, showAlert = false) {
