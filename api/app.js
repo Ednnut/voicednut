@@ -1475,6 +1475,9 @@ app.post('/webhook/call-status', async (req, res) => {
           notificationType = 'call_ringing';
           break;
         case 'in-progress':
+          notificationType = 'call_in_progress';
+          break;
+        case 'answered':
           notificationType = 'call_answered';
           break;
         case 'busy':

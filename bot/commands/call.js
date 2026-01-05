@@ -22,10 +22,6 @@ const {
 } = require('../utils/sessionState');
 
 const templatesApiBase = config.templatesApiUrl.replace(/\/+$/, '');
-const DEFAULT_PROMPT =
-  'You are a professional, friendly voice assistant. Keep responses concise, clear, and helpful.';
-const DEFAULT_FIRST_MESSAGE =
-  'Hello! This is an automated call. How can I help you today?';
 
 function isValidPhoneNumber(number) {
   const e164Regex = /^\+[1-9]\d{1,14}$/;
@@ -62,13 +58,6 @@ function buildPersonalizedFirstMessage(baseMessage, customerName, personaLabel) 
   const withoutExistingGreeting = trimmedBase.replace(/^hello[^.!?]*[.!?]?\\s*/i, '').trim();
   const remainder = withoutExistingGreeting.length ? withoutExistingGreeting : trimmedBase;
   return `${greeting} ${remainder}`;
-}
-
-function escapeMarkdown(text) {
-  if (!text) {
-    return '';
-  }
-  return String(text).replace(/([_*[\]()`])/g, '\\$1');
 }
 
 async function safeTemplatesRequest(method, url, options = {}) {
@@ -529,13 +518,6 @@ async function callFlow(conversation, ctx) {
       ...configuration.payloadUpdates
     };
 
-    if (!payload.prompt) {
-      payload.prompt = DEFAULT_PROMPT;
-    }
-    if (!payload.first_message) {
-      payload.first_message = DEFAULT_FIRST_MESSAGE;
-    }
-
     payload.business_id = payload.business_id || config.defaultBusinessId;
     payload.purpose = payload.purpose || config.defaultPurpose;
     payload.voice_model = payload.voice_model || config.defaultVoiceModel;
@@ -555,35 +537,20 @@ async function callFlow(conversation, ctx) {
       configuration.payloadUpdates?.persona_label ||
       'Custom';
 
-    const escapedTemplateName = escapeMarkdown(templateName);
-    const escapedDescription = escapeMarkdown(templateDescription);
-    const escapedPurpose = escapeMarkdown(payload.purpose || 'general');
-    const escapedTone = escapeMarkdown(payload.emotion || 'auto');
-    const escapedUrgency = escapeMarkdown(payload.urgency || 'auto');
-    const escapedTechLevel = escapeMarkdown(payload.technical_level || 'auto');
-    const escapedCustomer = escapeMarkdown(customerName || 'Not provided');
-
-    const callDetailsMessage = [
-      '╔═══════════════════════════╗',
-      '║    📞 CALL DETAILS         ║',
-      '╚═══════════════════════════╝',
-      '',
-      `📱 *Number:* \`${number}\``,
-      `👤 *Customer:* ${escapedCustomer}`,
-      '',
-      '🎯 *Configuration:*',
-      `├─ Template: ${escapedTemplateName}`,
-      `├─ Purpose: ${escapedPurpose}`,
-      `├─ Tone: ${escapedTone}`,
-      `├─ Urgency: ${escapedUrgency}`,
-      `└─ Tech Level: ${escapedTechLevel}`,
-      '',
-      '📝 *Description:*',
-      escapedDescription
+    const callDetailsCard = [
+      '📋 Call Details:',
+      `• Number: ${number}`,
+      `• Customer: ${customerName || 'Not provided'}`,
+      `• Template: ${templateName}`,
+      `• Description: ${templateDescription}`,
+      `• Purpose: ${payload.purpose || 'general'}`,
+      `• Tone: ${payload.emotion || 'auto'}`,
+      `• Urgency: ${payload.urgency || 'auto'}`,
+      `• Technical level: ${payload.technical_level || 'auto'}`
     ];
 
-    await ctx.reply(callDetailsMessage.join('\n'), { parse_mode: 'Markdown' });
-    await ctx.reply(['╔═══════════════════════════╗', '║  📡 INITIATING CALL       ║', '╚═══════════════════════════╝'].join('\n'));
+    await ctx.reply(callDetailsCard.join('\n'));
+    await ctx.reply('⏳ Making the call…');
 
     const payloadForLog = { ...payload };
     if (payloadForLog.prompt) {
@@ -610,23 +577,8 @@ async function callFlow(conversation, ctx) {
 
     const data = response?.data;
     if (data?.success && data.call_sid) {
-      const callPlacedMessage = [
-        '╔═══════════════════════════╗',
-        '║   ✅ CALL PLACED          ║',
-        '╚═══════════════════════════╝',
-        '',
-        `📞 *To:* \`${data.to}\``,
-        `🆔 *Call ID:* \`${data.call_sid}\``,
-        '',
-        '⏳ *Real-time updates will appear below:*',
-        '├─ 📡 Initiating...',
-        '├─ 🔔 Ringing...',
-        '├─ ✅ Connected',
-        '└─ ✅ Completed',
-        '',
-        "_You'll receive live notifications as the call progresses_"
-      ];
-      await ctx.reply(callPlacedMessage.join('\n'), { parse_mode: 'Markdown' });
+      await ctx.reply('✅ *Call Placed Successfully!*', { parse_mode: 'Markdown' });
+      await ctx.reply(`📞 To: ${data.to}`);
       flow.touch('completed');
     } else {
       await ctx.reply('⚠️ Call was sent but response format unexpected. Check logs.');
