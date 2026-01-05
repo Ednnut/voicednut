@@ -1,6 +1,7 @@
 const config = require('../config');
 const axios = require('axios');
 const { getUser, isAdmin } = require('../db/db');
+const { escapeMarkdown, buildLine } = require('../utils/messageStyle');
 
 module.exports = (bot) => {
     // API test command (enhanced)
@@ -33,45 +34,50 @@ module.exports = (bot) => {
             const health = response.data;
             console.log('API Health Response:', health);
             
-            let message = `✅ *API Status: ${health.status || 'healthy'}*\n\n`;
-            message += `🔗 URL: ${config.apiUrl}\n`;
-            message += `⚡ Response Time: ${responseTime}ms\n`;
-            message += `📊 Active Calls: ${health.active_calls || 0}\n`;
+            const apiStatusLabel = escapeMarkdown(health.status || 'healthy');
+            let message = `✅ *API Status: ${apiStatusLabel}*\n\n`;
+            message += `${buildLine('🔗', 'URL', escapeMarkdown(config.apiUrl))}\n`;
+            message += `${buildLine('⚡', 'Response Time', `${responseTime}ms`)}\n`;
+            message += `${buildLine('📊', 'Active Calls', health.active_calls || 0)}\n`;
             
             // Handle different response structures
             if (health.services) {
                 const db = health.services.database;
                 const webhook = health.services.webhook_service;
-                
-                message += `🗄️ Database: ${db?.connected ? '✅ Connected' : '❌ Disconnected'}\n`;
-                message += `📋 Recent Calls: ${db?.recent_calls || 0}\n`;
-                message += `📡 Webhook Service: ${webhook?.status || 'Unknown'}\n`;
-                
+
+                message += `${buildLine('🗄️', 'Database', db?.connected ? '✅ Connected' : '❌ Disconnected')}\n`;
+                if (db?.recent_calls !== undefined) {
+                    message += `${buildLine('📋', 'Recent Calls', db.recent_calls)}\n`;
+                } else {
+                    message += `${buildLine('📋', 'Recent Calls', db?.recent_calls || 0)}\n`;
+                }
+                message += `${buildLine('📡', 'Webhook Service', escapeMarkdown(webhook?.status || 'Unknown'))}\n`;
+
                 if (health.adaptation_engine) {
-                    message += `🤖 Adaptation Engine: ✅ Active\n`;
-                    message += `🧩 Function Templates: ${health.adaptation_engine.available_templates || 0}\n`;
+                    message += `\n${buildLine('🤖', 'Adaptation Engine', '✅ Active')}\n`;
+                    message += `${buildLine('🧩', 'Function Templates', health.adaptation_engine.available_templates || 0)}\n`;
                 }
             } else {
                 // Fallback for simpler health responses
-                message += `🗄️ Database: ${health.database_connected ? '✅ Connected' : '❌ Unknown'}\n`;
+                message += `${buildLine('🗄️', 'Database', health.database_connected ? '✅ Connected' : '❌ Unknown')}\n`;
             }
             
-            message += `⏰ Timestamp: ${new Date(health.timestamp).toLocaleString()}\n`;
+            message += `${buildLine('⏰', 'Timestamp', escapeMarkdown(new Date(health.timestamp).toLocaleString()))}\n`;
             
             // Add enhanced features info if available
             if (health.enhanced_features) {
-                message += `\n🚀 Enhanced Features: ✅ Active`;
+            message += `\n🚀 Enhanced Features: ✅ Active`;
             }
             
             await ctx.reply(message, { parse_mode: 'Markdown' });
         } catch (error) {
             console.error('API test failed:', error);
             
-            let errorMessage = `❌ *API Test Failed*\n\nURL: ${config.apiUrl}\n`;
+            let errorMessage = `❌ *API Test Failed*\n\nURL: ${escapeMarkdown(config.apiUrl)}\n`;
             
             if (error.response) {
-                errorMessage += `Status: ${error.response.status} - ${error.response.statusText}\n`;
-                errorMessage += `Error: ${error.response.data?.error || error.message}`;
+                errorMessage += `Status: ${escapeMarkdown(String(error.response.status))} - ${escapeMarkdown(error.response.statusText)}\n`;
+                errorMessage += `Error: ${escapeMarkdown(error.response.data?.error || error.message)}`;
             } else if (error.code === 'ECONNREFUSED') {
                 errorMessage += `Error: Connection refused - API server may be down`;
             } else if (error.code === 'ENOTFOUND') {
@@ -79,7 +85,7 @@ module.exports = (bot) => {
             } else if (error.code === 'ETIMEDOUT') {
                 errorMessage += `Error: Request timeout - API server is not responding`;
             } else {
-                errorMessage += `Error: ${error.message}`;
+                errorMessage += `Error: ${escapeMarkdown(error.message)}`;
             }
             
             await ctx.reply(errorMessage, { parse_mode: 'Markdown' });
@@ -111,51 +117,53 @@ module.exports = (bot) => {
             
             const health = response.data;
             
+            const apiHealthStatus = health.status || 'healthy';
             let message = `🔍 *System Status Report*\n\n`;
             message += `🤖 Bot: ✅ Online & Responsive\n`;
-            message += `🌐 API: ${health.status === 'healthy' ? '✅' : '❌'} ${health.status || 'healthy'}\n`;
-            message += `⚡ API Response Time: ${responseTime}ms\n\n`;
+            message += `🌐 API: ${health.status === 'healthy' ? '✅' : '❌'} ${escapeMarkdown(apiHealthStatus)}\n`;
+            message += `${buildLine('⚡', 'API Response Time', `${responseTime}ms`)}\n\n`;
             
             // Enhanced service status
             if (health.services) {
                 message += `*🔧 Services Status:*\n`;
                 
                 const db = health.services.database;
-                message += `🗄️ Database: ${db?.connected ? '✅ Connected' : '❌ Disconnected'}\n`;
+                message += `${buildLine('🗄️', 'Database', db?.connected ? '✅ Connected' : '❌ Disconnected')}\n`;
                 if (db?.recent_calls !== undefined) {
-                    message += `📋 Recent DB Calls: ${db.recent_calls}\n`;
+                    message += `${buildLine('📋', 'Recent DB Calls', db.recent_calls)}\n`;
                 }
-                
+
                 const webhook = health.services.webhook_service;
                 if (webhook) {
-                    message += `📡 Webhook Service: ${webhook.status === 'running' ? '✅' : '⚠️'} ${webhook.status}\n`;
+                    message += `${buildLine('📡', 'Webhook Service', `${webhook.status === 'running' ? '✅' : '⚠️'} ${escapeMarkdown(webhook.status)}`)}\n`;
                     if (webhook.processed_today !== undefined) {
-                        message += `📨 Webhooks Today: ${webhook.processed_today}\n`;
+                        message += `${buildLine('📨', 'Webhooks Today', webhook.processed_today)}\n`;
                     }
                 }
-                
+
                 const notifications = health.services.notification_system;
                 if (notifications) {
-                    message += `🔔 Notifications: ${notifications.success_rate || 'N/A'} success rate\n`;
+                    message += `${buildLine('🔔', 'Notifications', `${escapeMarkdown(String(notifications.success_rate || 'N/A'))} success rate`)}\n`;
                 }
-                
+
                 message += `\n`;
             }
             
             // Call statistics
             message += `*📊 Call Statistics:*\n`;
-            message += `📞 Active Calls: ${health.active_calls || 0}\n`;
+            message += `${buildLine('📞', 'Active Calls', health.active_calls || 0)}\n`;
+            message += `✨ Keeping the console lively with ${health.active_calls || 0} active connections.\n`;
             
             // Enhanced features
             if (health.adaptation_engine) {
                 message += `\n*🤖 AI Features:*\n`;
-                message += `🧠 Adaptation Engine: ✅ Active\n`;
-                message += `🧩 Function Templates: ${health.adaptation_engine.available_templates || 0}\n`;
-                message += `⚙️ Active Systems: ${health.adaptation_engine.active_function_systems || 0}\n`;
+                message += `${buildLine('🧠', 'Adaptation Engine', '✅ Active')}\n`;
+                message += `${buildLine('🧩', 'Function Templates', health.adaptation_engine.available_templates || 0)}\n`;
+                message += `${buildLine('⚙️', 'Active Systems', health.adaptation_engine.active_function_systems || 0)}\n`;
             }
             
             if (health.enhanced_features) {
-                message += `🚀 Enhanced Features: ✅ Enabled\n`;
+                message += `${buildLine('🚀', 'Enhanced Mode', '✅ Enabled')}\n`;
             }
             
             // System health logs (if available)
@@ -163,12 +171,12 @@ module.exports = (bot) => {
                 message += `\n*🔍 Recent Activity:*\n`;
                 health.system_health.slice(0, 3).forEach(log => {
                     const status = log.status === 'error' ? '❌' : '✅';
-                    message += `${status} ${log.service_name}: ${log.count} ${log.status}\n`;
+                    message += `${status} ${escapeMarkdown(log.service_name)}: ${log.count} ${escapeMarkdown(log.status)}\n`;
                 });
             }
             
-            message += `\n⏰ Last Updated: ${new Date(health.timestamp).toLocaleString()}`;
-            message += `\n📡 API Endpoint: ${config.apiUrl}`;
+            message += `\n${buildLine('⏰','Last Updated', escapeMarkdown(new Date(health.timestamp).toLocaleString()))}`;
+            message += `\n${buildLine('📡','API Endpoint', escapeMarkdown(config.apiUrl))}`;
             
             await ctx.reply(message, { parse_mode: 'Markdown' });
         } catch (error) {
@@ -179,8 +187,8 @@ module.exports = (bot) => {
             errorMessage += `🌐 API: ❌ Connection failed\n\n`;
             
             if (error.response) {
-                errorMessage += `📊 API Status: ${error.response.status} - ${error.response.statusText}\n`;
-                errorMessage += `📝 Error Details: ${error.response.data?.error || 'Unknown API error'}\n`;
+                errorMessage += `📊 API Status: ${escapeMarkdown(String(error.response.status))} - ${escapeMarkdown(error.response.statusText)}\n`;
+                errorMessage += `📝 Error Details: ${escapeMarkdown(error.response.data?.error || 'Unknown API error')}\n`;
             } else if (error.code === 'ECONNREFUSED') {
                 errorMessage += `📝 Error: API server connection refused\n`;
                 errorMessage += `💡 Suggestion: Check if the API server is running\n`;
@@ -188,10 +196,10 @@ module.exports = (bot) => {
                 errorMessage += `📝 Error: API server not found\n`;
                 errorMessage += `💡 Suggestion: Verify API URL configuration\n`;
             } else {
-                errorMessage += `📝 Error: ${error.message}\n`;
+                errorMessage += `📝 Error: ${escapeMarkdown(error.message)}\n`;
             }
             
-            errorMessage += `\n📡 API Endpoint: ${config.apiUrl}`;
+            errorMessage += `\n📡 API Endpoint: ${escapeMarkdown(config.apiUrl)}`;
             
             await ctx.reply(errorMessage, { parse_mode: 'Markdown' });
         }

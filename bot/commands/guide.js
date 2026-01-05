@@ -1,43 +1,58 @@
 const { InlineKeyboard } = require('grammy');
 const config = require('../config');
+const { section, emphasize, buildLine, escapeMarkdown } = require('../utils/messageStyle');
 
 module.exports = (bot) => {
     bot.command('guide', async (ctx) => {
-        const mainGuide = `📚 *Voice Call Bot Guide*
+        const callSteps = [
+            '1️⃣ Start a call via /call or the 📞 button',
+            '2️⃣ Provide the number in E.164 format (+1234567890)',
+            '3️⃣ Describe the personality and first prompt',
+            '4️⃣ Confirm the initial message to speak',
+            '5️⃣ Watch the live console and use controls as needed'
+        ];
 
-*Making Calls:*
-1️⃣ Start a call using /call or the Call button
-2️⃣ Enter phone number in E.164 format (+1234567890)
-3️⃣ Define the AI agent's behavior/personality
-4️⃣ Set the first message to be spoken
-5️⃣ Monitor the call progress
+        const formatRules = [
+            '• Must include the + symbol',
+            '• Keep the country code first',
+            '• No spaces or punctuation besides digits',
+            '• Example: +18005551234'
+        ];
 
-*Phone Number Format:*
-• Must start with + symbol
-• Include country code
-• No spaces or special characters
-• Example: +1234567890
+        const bestPractices = [
+            '🧹 Keep prompts precise so the AI stays on track',
+            '🧪 Test with a short call before scaling',
+            '👂 Monitor the console for user tone shifts',
+            '✋ End or interrupt if you need to steer the call'
+        ];
 
-*Best Practices:*
-• Keep agent prompts clear and specific
-• Test with short calls first
-• Monitor initial responses
-• End calls if needed with /end
+        const adminControls = [
+            '📍 /provider status — see the active provider',
+            '🔁 /provider twilio|aws|vonage — switch on the fly',
+            '👥 /users, /adduser, /removeuser — manage seats'
+        ];
 
-*Admin Controls:*
-• Use /provider status to view the active call provider
-• Switch providers with /provider twilio | aws | vonage
-• Manage authorized users with /users, /adduser, /removeuser
+        const troubleshooting = [
+            'Check number format if a call fails',
+            'Ensure your profile is authorized',
+            'Ask the admin for persistent issues',
+            'Use /status to validate system health'
+        ];
 
-*Troubleshooting:*
-• If call fails, check number format
-• Ensure proper authorization
-• Contact admin for persistent issues
-• Use /status to check bot health
+        const guideSections = [
+            emphasize('Voice Call Bot Guide — stylized steps for smooth operations.'),
+            section('Making Calls', callSteps),
+            section('Phone Number Rules', formatRules),
+            section('Best Practices', bestPractices),
+            section('Admin Controls', adminControls),
+            section('Troubleshooting', troubleshooting),
+            section('Need Help?', [
+                tipLine('🆘', `Contact: @${escapeMarkdown(config.admin.username)}`),
+                buildLine('🧭', 'Version', '1.0.0')
+            ])
+        ];
 
-*Need Help?*
-Contact: @${config.admin.username} for support.
-Version: 1.0.0`;
+        const guideText = guideSections.join('\n\n');
 
         const kb = new InlineKeyboard()
             .text('📞 New Call', 'CALL')
@@ -46,7 +61,7 @@ Version: 1.0.0`;
             .text('💬 New Sms', 'SMS')
             .text('🔄 Main Menu', 'MENU');
 
-        await ctx.reply(mainGuide, {
+        await ctx.reply(guideText, {
             parse_mode: 'Markdown',
             reply_markup: kb
         });

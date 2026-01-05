@@ -136,6 +136,7 @@ module.exports = {
     model: ensure('OPENROUTER_MODEL', 'meta-llama/llama-3.1-8b-instruct:free'),
     siteUrl: ensure('YOUR_SITE_URL', 'http://localhost:3000'),
     siteName: ensure('YOUR_SITE_NAME', 'Voice Call Bot'),
+    maxTokens: Number(ensure('OPENROUTER_MAX_TOKENS', '160'))
   },
   deepgram: {
     apiKey: ensure('DEEPGRAM_API_KEY'),

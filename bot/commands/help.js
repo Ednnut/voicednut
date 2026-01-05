@@ -1,6 +1,7 @@
 const { InlineKeyboard } = require('grammy');
 const { isAdmin, getUser } = require('../db/db');
 const config = require('../config');
+const { section, emphasize, tipLine, escapeMarkdown } = require('../utils/messageStyle');
 
 module.exports = (bot) => {
     bot.command('help', async (ctx) => {
@@ -12,57 +13,69 @@ module.exports = (bot) => {
             }
 
             const isOwner = await new Promise(r => isAdmin(ctx.from.id, r));
-            
-            // Build help text using HTML formatting (more reliable)
-            let helpText = `📱 <b>Basic Commands</b>
-• /start - Restart bot &amp; show main menu
-• /call - Start a new voice call
-• /sms - Send an SMS message
-• /smsconversation &lt;phone&gt; - View SMS conversation
-• /search &lt;term&gt; - Find calls by ID/phone/intent
-• /recent [limit] - List recent calls (max 50)
-• /health or /ping - Check bot &amp; API health
-• /guide - Show detailed usage guide
-• /menu - Show quick action buttons
-• /help - Show this help message`;
+
+            const basicList = [
+                '📱 /start — warm restart plus menu reset',
+                '📞 /call — launch a fresh voice session',
+                '💬 /sms — send a quick AI-powered SMS',
+                '🧾 /smsconversation <phone> — view recent SMS threads',
+                '🔍 /search <term> — locate calls by number, intent, or ID',
+                '🕒 /recent [limit] — list recent calls (max 50)',
+                '🩺 /health or /ping — check bot & API health in one tap',
+                '📚 /guide — view the master user guide',
+                '📋 /menu — reopen quick actions',
+                '❓ /help — show this message again'
+            ];
+
+            const quickUsage = [
+                'Use /call or the 📞 button to get started',
+                'Enter phone numbers in E.164 format (+1234567890)',
+                'Describe the AI agent personality and first message',
+                'Monitor live updates and ask for transcripts',
+                'End the call with the ✋ Interrupt or ⏹️ End button if needed'
+            ];
+
+            const exampleUsage = [
+                '+1234567890 (not 123-456-7890)',
+                '/search refund',
+                '/recent 20',
+                '/health'
+            ];
+
+            const supportBlock = [
+                tipLine('🆘', 'Contact admin: @' + escapeMarkdown(config.admin.username)),
+                tipLine('🧭', 'Bot edition: v2.0.0 — secrets aged to perfection')
+            ];
+
+            const helpSections = [
+                emphasize('Ready to guide your AI calls with sparkling clarity.'),
+                section('Command Essentials', basicList),
+                section('Quick Usage Flow', quickUsage.map(line => `• ${line}`))
+            ];
 
             if (isOwner) {
-                helpText += `
-
-👑 <b>Admin Commands</b>
-• /adduser - Add new authorized user
-• /promote - Promote user to admin
-• /removeuser - Remove user access
-• /users - List all authorized users
-• /bulksms - Send bulk SMS messages
-• /schedulesms - Schedule SMS for later
-• /templates - Manage call &amp; SMS templates
-• /persona - Manage adaptive personas
-• /provider - View or switch call provider
-• /smsstats - View SMS statistics
-• /status - Full system status check
-• /testapi - Test API connection`;
+                const adminList = [
+                    '🛡️ /adduser — add a trusted operator',
+                    '⭐ /promote — elevate a teammate to admin',
+                    '❌ /removeuser — cut access cleanly',
+                    '👥 /users — list all authorized personnel',
+                    '📣 /bulksms — broadcast smart SMS',
+                    '⏰ /schedulesms — plan future outreach',
+                    '🧪 /status — deep system status',
+                    '🧰 /templates — manage reusable prompts',
+                    '🍃 /persona — sculpt adaptive agents',
+                    '🔀 /provider — view or switch voice providers',
+                    '📊 /smsstats — view SMS health & delivery'
+                ];
+                helpSections.push(section('Admin Toolkit', adminList));
             }
 
-            helpText += `
+            helpSections.push(
+                section('Examples', exampleUsage.map(line => `• ${line}`)),
+                section('Support & Info', supportBlock)
+            );
 
-📖 <b>Quick Usage</b>
-1. Use /call or click 📞 Call button
-2. Enter phone number (E.164 format: +1234567890)
-3. Define agent behavior/prompt
-4. Set initial message to be spoken
-5. Monitor call progress and receive notifications
-
-💡 <b>Examples</b>
-• Phone format: +1234567890 (not 123-456-7890)
-• Search: /search refund
-• List calls: /recent 20
-• Check health: /health
-
-🆘 <b>Support &amp; Info</b>
-• Contact admin: @${config.admin.username}
-• Bot version: 2.0.0
-• For issues or questions, contact support`;
+            const helpText = helpSections.join('\n\n');
 
             const kb = new InlineKeyboard()
                 .text('📞 New Call', 'CALL')
@@ -80,7 +93,7 @@ module.exports = (bot) => {
             }
 
             await ctx.reply(helpText, {
-                parse_mode: 'HTML',
+                parse_mode: 'Markdown',
                 reply_markup: kb
             });
 

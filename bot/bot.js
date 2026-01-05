@@ -69,12 +69,6 @@ bot.use(async (ctx, next) => {
     return next();
 });
 
-bot.command('cancel', async (ctx) => {
-    await cancelActiveFlow(ctx, 'user:/cancel');
-    resetSession(ctx);
-    await ctx.reply('✅ Current action cancelled. Use /menu to start again.');
-});
-
 // Operator/alert inline actions
 bot.callbackQuery(/^alert:/, async (ctx) => {
     const data = ctx.callbackQuery.data || '';

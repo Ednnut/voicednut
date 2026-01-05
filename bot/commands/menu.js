@@ -1,6 +1,7 @@
 const { InlineKeyboard } = require('grammy');
 const { getUser, isAdmin } = require('../db/db');
 const { cancelActiveFlow, resetSession } = require('../utils/sessionState');
+const { section, emphasize } = require('../utils/messageStyle');
 
 module.exports = (bot) => {
     // Menu command
@@ -48,8 +49,8 @@ module.exports = (bot) => {
             }
 
             const menuText = isOwner ? 
-                '🛡️ *Administrator Menu*\n\nSelect an action below:' :
-                '📋 *Quick Actions Menu*\n\nSelect an action below:';
+                `${emphasize('Administrator Menu')} \n${section('Choose an action', ['• Access advanced tools below'])}` :
+                `${emphasize('Quick Actions Menu')} \n${section('Tap a shortcut', ['• Get calling, texting and status tools fast'])}`;
 
             await ctx.reply(menuText, {
                 parse_mode: 'Markdown',

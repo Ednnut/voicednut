@@ -221,7 +221,7 @@ class EnhancedWebhookService {
         additionalData
       });
 
-      await this.ensureLiveConsole(call_sid, telegram_chat_id, callMeta);
+      const consolePromise = this.ensureLiveConsole(call_sid, telegram_chat_id, callMeta);
 
       // Check if we should send this status
       if (!this.shouldSendStatus(call_sid, correctedStatus)) {
@@ -364,6 +364,7 @@ class EnhancedWebhookService {
       } else {
         console.log(`⏭️ Console-only status ${correctedStatus} for call ${call_sid}`.gray);
       }
+      await consolePromise;
       await this.updateLiveConsoleStatus(call_sid, correctedStatus, telegram_chat_id);
 
       // Log notification metric
@@ -438,8 +439,10 @@ class EnhancedWebhookService {
       }
 
       // Add call summary if available
-      if (callDetails.call_summary) {
-        message += `\n📝 *Summary:* ${callDetails.call_summary}`;
+      const rawSummary = callDetails.call_summary || this.generateAutoSummaryFromTranscripts(transcripts);
+      const polishedSummary = this.polishSummaryText(rawSummary);
+      if (polishedSummary) {
+        message += `\n📝 *Summary:* ${polishedSummary}`;
       }
 
       const replyMarkup = {
@@ -1043,11 +1046,7 @@ class EnhancedWebhookService {
     } catch (error) {
       const telegramError = error?.response?.data?.description || error.message;
       console.error(`❌ Live console edit failed (callSid=${callSid}, messageId=${entry.messageId}): ${telegramError}`);
-      try {
-        await this.sendTelegramMessage(entry.chatId, '⚠️ Console update delayed, retrying…');
-      } catch {
-        // best effort
-      }
+      this.addLiveEvent(callSid, '⚠️ Console update delayed, retrying…', { force: true });
     }
   }
 
@@ -1207,6 +1206,38 @@ class EnhancedWebhookService {
       const snippet = this.truncateText(cleanMessage, 180);
       return `${speaker}: ${snippet}`;
     });
+  }
+
+  generateAutoSummaryFromTranscripts(transcripts) {
+    if (!Array.isArray(transcripts) || transcripts.length === 0) {
+      return '';
+    }
+    const firstUser = transcripts.find((entry) => entry.speaker === 'user');
+    const lastAi = [...transcripts].reverse().find((entry) => entry.speaker === 'ai');
+    const parts = [];
+    if (firstUser?.message) {
+      const text = firstUser.message.replace(/\s+/g, ' ');
+      parts.push(`Customer mentioned ${this.truncateText(text, 120)}`);
+    }
+    if (lastAi?.message) {
+      const text = lastAi.message.replace(/\s+/g, ' ');
+      parts.push(`AI responded ${this.truncateText(text, 120)}`);
+    }
+    return parts.join('. ');
+  }
+
+  polishSummaryText(text) {
+    if (!text) return '';
+    let sanitized = String(text)
+      .replace(/[•-–—]/g, ' ')
+      .replace(/[*_`\[\]()~>#+=|{}]/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+    if (!sanitized) return '';
+    if (!/[.!?]$/.test(sanitized)) {
+      sanitized += '.';
+    }
+    return sanitized;
   }
 
   truncateText(text, maxLength) {

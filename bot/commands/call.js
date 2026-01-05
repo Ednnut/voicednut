@@ -20,6 +20,13 @@ const {
   safeReset,
   guardAgainstCommandInterrupt
 } = require('../utils/sessionState');
+const { section, escapeMarkdown, tipLine, buildLine } = require('../utils/messageStyle');
+
+async function notifyCallError(ctx, lines = []) {
+  const body = Array.isArray(lines) ? lines : [lines];
+  await ctx.reply(section('❌ Call Alert', body));
+}
+const { section, escapeMarkdown, tipLine, buildLine } = require('../utils/messageStyle');
 
 const templatesApiBase = config.templatesApiUrl.replace(/\/+$/, '');
 const DEFAULT_FIRST_MESSAGE = 'Hello! This is an automated call. How can I help you today?';
@@ -552,25 +559,24 @@ async function callFlow(conversation, ctx) {
     const techValue = payload.technical_level || 'auto';
     const hasAutoFields = [toneValue, urgencyValue, techValue].some((value) => value === 'auto');
 
-    const callDetailsCard = [
-      '📋 Call Details',
-      `• To: ${number}`,
-      customerName ? `• Customer: ${customerName}` : null,
-      `• Template: ${templateName}`,
-      payload.purpose ? `• Purpose: ${payload.purpose}` : null
+    const detailLines = [
+      buildLine('📋', 'To', number),
+      customerName ? buildLine('👤', 'Customer', escapeMarkdown(customerName)) : null,
+      buildLine('🧩', 'Template', escapeMarkdown(templateName)),
+      payload.purpose ? buildLine('🎯', 'Purpose', escapeMarkdown(payload.purpose)) : null
     ].filter(Boolean);
 
     if (toneValue !== 'auto') {
-      callDetailsCard.push(`• Tone: ${toneValue}`);
+      detailLines.push(buildLine('🎙️', 'Tone', toneValue));
     }
     if (urgencyValue !== 'auto') {
-      callDetailsCard.push(`• Urgency: ${urgencyValue}`);
+      detailLines.push(buildLine('⏱️', 'Urgency', urgencyValue));
     }
     if (techValue !== 'auto') {
-      callDetailsCard.push(`• Technical level: ${techValue}`);
+      detailLines.push(buildLine('🧠', 'Technical level', techValue));
     }
     if (hasAutoFields) {
-      callDetailsCard.push('• ⚙️ Mode: Auto');
+      detailLines.push(tipLine('⚙️', 'Mode: Auto'));
     }
 
     const replyOptions = {};
@@ -600,7 +606,7 @@ async function callFlow(conversation, ctx) {
       };
     }
 
-    await ctx.reply(callDetailsCard.join('\n'), replyOptions);
+    await ctx.reply(section('🔍 Call Brief', detailLines), replyOptions);
     await ctx.reply('⏳ Making the call…');
 
     const payloadForLog = { ...payload };
@@ -657,29 +663,29 @@ async function callFlow(conversation, ctx) {
       const unknownBusinessMatch = apiError.match(/Unknown business_id "([^"]+)"/i);
       if (unknownBusinessMatch) {
         const invalidId = unknownBusinessMatch[1];
-        await ctx.reply(`❌ Unrecognized service “${invalidId}”. Choose a valid business profile.`);
+        await notifyCallError(ctx, `${tipLine('🧩', `Unrecognized service “${escapeMarkdown(invalidId)}”. Choose a valid profile.`)}`);
         handled = true;
       } else if (status === 400) {
-        await ctx.reply('❌ Invalid request. Check the provided details and try again.');
+        await notifyCallError(ctx, 'Invalid request. Check the provided details and try again.');
         handled = true;
       } else if (status === 401) {
-        await ctx.reply('❌ Authentication failed. Please verify your API credentials.');
+        await notifyCallError(ctx, 'Authentication failed. Please verify your API credentials.');
         handled = true;
       } else if (status === 503) {
-        await ctx.reply('⚠️ Service unavailable. Please try again shortly.');
+        await notifyCallError(ctx, 'Service unavailable. Please try again shortly.');
         handled = true;
       }
 
       if (!handled) {
         const errorData = error.response.data;
-        await ctx.reply(`❌ Call failed with status ${status}: ${errorData?.error || error.response.statusText}`);
+        await notifyCallError(ctx, `${tipLine('🔍', `Call failed with status ${status}: ${escapeMarkdown(errorData?.error || error.response.statusText)}`)}`);
         handled = true;
       }
     } else if (error.request) {
-      await ctx.reply('🔄 Temporary network issue. Retrying shortly.');
+      await notifyCallError(ctx, 'Temporary network issue. Retrying shortly.');
       handled = true;
     } else {
-      await ctx.reply(`❌ Unexpected error: ${error.message}`);
+      await notifyCallError(ctx, `Unexpected error: ${escapeMarkdown(error.message)}`);
       handled = true;
     }
 

@@ -23,6 +23,12 @@ const {
     extractTemplateVariables,
     TEMPLATE_METADATA
 } = require('../utils/templates');
+const { section, buildLine, tipLine } = require('../utils/messageStyle');
+
+async function smsAlert(ctx, text) {
+    await ctx.reply(section('⚠️ SMS Alert', [text]));
+}
+const { section, buildLine, tipLine } = require('../utils/messageStyle');
 
 // Simple phone number validation
 function isValidPhoneNumber(number) {
@@ -76,7 +82,7 @@ async function smsFlow(conversation, ctx) {
         const user = await new Promise((resolve) => getUser(ctx.from.id, resolve));
         ensureActive();
         if (!user) {
-            await ctx.reply('❌ You are not authorized to use this bot.');
+            await ctx.reply(section('❌ Authorization', ['You are not authorized to use this bot.']));
             return;
         }
 
@@ -84,18 +90,20 @@ async function smsFlow(conversation, ctx) {
         let number = prefill.phoneNumber || null;
 
         if (number) {
-            await ctx.reply(`📞 Using follow-up number: ${number}`);
+            await ctx.reply(section('📞 Follow-up number', [
+                buildLine('➡️', 'Using', number)
+            ]));
             if (ctx.session.meta) {
                 delete ctx.session.meta.prefill;
             }
         } else {
-            await ctx.reply('📱 Enter phone number (E.164 format, e.g., +1234567890):');
+            await ctx.reply(section('📱 Enter phone number', ['Use E.164 format, e.g., +1234567890']));
             const numMsg = await waitForMessage();
             number = numMsg?.message?.text?.trim();
 
-            if (!number) return ctx.reply('❌ Please provide a phone number.');
+            if (!number) return smsAlert(ctx, 'Please provide a phone number.');
             if (!isValidPhoneNumber(number)) {
-                return ctx.reply('❌ Invalid phone number format. Use E.164 format: +1234567890');
+                return smsAlert(ctx, 'Invalid phone number format. Use E.164 format: +1234567890');
             }
         }
 
@@ -272,7 +280,7 @@ Tap an option below to continue.`;
             const msgContent = await waitForMessage();
             message = msgContent?.message?.text?.trim();
 
-            if (!message) return ctx.reply('❌ Please provide a message.');
+            if (!message) return smsAlert(ctx, 'Please provide a message.');
             if (message.length > 1600) {
                 return ctx.reply('❌ Message too long. SMS messages must be under 1600 characters.');
             }
@@ -320,7 +328,7 @@ Tap an option below to continue.`;
                 const msgContent = await waitForMessage();
                 message = msgContent?.message?.text?.trim();
 
-                if (!message) return ctx.reply('❌ Please provide a message.');
+                if (!message) return smsAlert(ctx, 'Please provide a message.');
                 if (message.length > 1600) {
                     return ctx.reply('❌ Message too long. SMS messages must be under 1600 characters.');
                 }
@@ -448,7 +456,7 @@ async function bulkSmsFlow(conversation, ctx) {
         const numbersMsg = await waitForMessage();
         const numbersText = numbersMsg?.message?.text?.trim();
 
-        if (!numbersText) return ctx.reply('❌ Please provide phone numbers.');
+        if (!numbersText) return smsAlert(ctx, 'Please provide phone numbers.');
 
         const numbers = numbersText
             .split(/[,\n]/)
@@ -469,7 +477,7 @@ async function bulkSmsFlow(conversation, ctx) {
         const msgContent = await waitForMessage();
         const message = msgContent?.message?.text?.trim();
 
-        if (!message) return ctx.reply('❌ Please provide a message.');
+        if (!message) return smsAlert(ctx, 'Please provide a message.');
         if (message.length > 1600) {
             return ctx.reply('❌ Message too long. SMS messages must be under 1600 characters.');
         }
@@ -589,12 +597,12 @@ async function scheduleSmsFlow(conversation, ctx) {
         await ctx.reply('💬 Enter the message:');
         const msgContent = await waitForMessage();
         const message = msgContent?.message?.text?.trim();
-        if (!message) return ctx.reply('❌ Please provide a message.');
+        if (!message) return smsAlert(ctx, 'Please provide a message.');
 
         await ctx.reply('⏰ Enter schedule time (e.g., "2024-12-25 14:30" or "in 2 hours"):');
         const timeMsg = await waitForMessage();
         const timeText = timeMsg?.message?.text?.trim();
-        if (!timeText) return ctx.reply('❌ Please provide a schedule time.');
+        if (!timeText) return smsAlert(ctx, 'Please provide a schedule time.');
 
         let scheduledTime;
         try {

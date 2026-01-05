@@ -1,13 +1,14 @@
 const axios = require('axios');
 const config = require('../config');
 const { getUser, isAdmin } = require('../db/db');
+const { buildLine, section, escapeMarkdown } = require('../utils/messageStyle');
 
 const ADMIN_HEADER_NAME = 'x-admin-token';
 const SUPPORTED_PROVIDERS = ['twilio', 'aws', 'vonage'];
 
 function formatProviderStatus(status) {
     if (!status) {
-        return 'No status data available.';
+        return section('⚙️ Call Provider Settings', ['No status data available.']);
     }
 
     const current = typeof status.provider === 'string' ? status.provider : 'unknown';
@@ -17,20 +18,18 @@ function formatProviderStatus(status) {
     const supportedValues = Array.isArray(status.supported_providers) && status.supported_providers.length > 0
         ? status.supported_providers
         : SUPPORTED_PROVIDERS;
-    const vonageReady = status.vonage_ready ? '✅' : '⚠️';
+    const vonageReady = status.vonage_ready ? '✅ Ready' : '⚠️ Missing keys';
 
-    const lines = [
-        '⚙️ *Call Provider Settings*',
-        '',
-        `• Current Provider: *${current.toUpperCase()}*`,
-        `• Stored Default: ${stored.toUpperCase()}`,
-        `• AWS Ready: ${status.aws_ready ? '✅' : '⚠️'}`,
-        `• Twilio Ready: ${status.twilio_ready ? '✅' : '⚠️'}`,
-        `• Vonage Ready: ${vonageReady}`,
-        `• Supported: ${supportedValues.join(', ').toUpperCase()}`,
+    const details = [
+        buildLine('•', `Current Provider`, `*${current.toUpperCase()}*`),
+        buildLine('•', `Stored Default`, stored.toUpperCase()),
+        buildLine('•', `AWS Ready`, status.aws_ready ? '✅' : '⚠️'),
+        buildLine('•', `Twilio Ready`, status.twilio_ready ? '✅' : '⚠️'),
+        buildLine('•', `Vonage Ready`, vonageReady),
+        buildLine('•', `Supported Backbones`, supportedValues.join(', ').toUpperCase())
     ];
 
-    return lines.join('\n');
+    return section('⚙️ Call Provider Settings', details);
 }
 
 async function fetchProviderStatus() {
@@ -87,14 +86,13 @@ async function handleProviderSwitch(ctx, requestedProvider) {
     const result = await updateProvider(requestedProvider);
     const status = await fetchProviderStatus();
 
-    let message = `✅ Call provider set to *${status.provider?.toUpperCase() || requestedProvider.toUpperCase()}*.\n`;
-    if (result.changed === false) {
-        message = `ℹ️ Provider already set to *${status.provider?.toUpperCase() || requestedProvider.toUpperCase()}*.\n`;
-    }
-    message += '\n';
-    message += formatProviderStatus(status);
+    const baseLine = result.changed === false
+        ? `ℹ️ Provider already set to *${status.provider?.toUpperCase() || requestedProvider.toUpperCase()}*.`
+        : `✅ Call provider set to *${status.provider?.toUpperCase() || requestedProvider.toUpperCase()}*.`;
 
-    await ctx.reply(message, { parse_mode: 'Markdown' });
+    const payload = `${baseLine}\n\n${formatProviderStatus(status)}`;
+
+    await ctx.reply(payload, { parse_mode: 'Markdown' });
 }
 
 function registerProviderCommand(bot) {
@@ -132,7 +130,7 @@ function registerProviderCommand(bot) {
             console.error('Failed to manage provider via Telegram command:', error);
             if (error.response) {
                 const details = error.response.data?.details || error.response.data?.error || error.response.statusText;
-                await ctx.reply(`❌ Failed to update provider: ${details || 'Unknown error'}`);
+                await ctx.reply(`❌ Failed to update provider: ${escapeMarkdown(details || 'Unknown error')}`);
             } else if (error.request) {
                 await ctx.reply('❌ No response from API. Please check the server status.');
             } else {

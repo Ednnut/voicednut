@@ -19,6 +19,7 @@ const {
   getCurrentOpId,
   guardAgainstCommandInterrupt
 } = require('../utils/sessionState');
+const { section, buildLine, tipLine } = require('../utils/messageStyle');
 
 const templatesApi = axios.create({
   baseURL: config.templatesApiUrl.replace(/\/+$/, ''),
@@ -28,6 +29,11 @@ const templatesApi = axios.create({
     'x-admin-token': config.admin.apiToken
   }
 });
+
+function styledNotice(ctx, title, lines) {
+  const content = Array.isArray(lines) ? lines : [lines];
+  return ctx.reply(section(title, content));
+}
 
 function nonJsonResponseError(endpoint, response) {
   const contentType = response?.headers?.['content-type'] || 'unknown';

@@ -23,6 +23,7 @@ class EnhancedGptService extends EventEmitter {
     });
     
     this.model = config.openRouter.model;
+    this.maxTokens = config.openRouter.maxTokens || 160;
     
     // Initialize Personality Engine
     this.personalityEngine = new PersonalityEngine();
@@ -38,9 +39,10 @@ class EnhancedGptService extends EventEmitter {
     this.baseSystemPrompt = customPrompt || defaultPrompt;
     const firstMessage = customFirstMessage || defaultFirstMessage;
 
-    // Initialize conversation with adaptive prompt
+    // Initialize conversation with adaptive prompt and concise guidance
+    const brevityHint = 'Keep spoken replies concise: max 2 sentences, ~200 characters, and avoid rambling.';
     this.userContext = [
-      { 'role': 'system', 'content': this.baseSystemPrompt },
+      { 'role': 'system', 'content': `${this.baseSystemPrompt}\n${brevityHint}` },
       { 'role': 'assistant', 'content': firstMessage },
     ];
     
@@ -173,6 +175,7 @@ class EnhancedGptService extends EventEmitter {
         model: this.model,
         messages: this.userContext,
         tools: toolsToUse,
+        max_tokens: this.maxTokens,
         stream: true,
       });
     } catch (err) {
