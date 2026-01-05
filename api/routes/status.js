@@ -348,11 +348,15 @@ class EnhancedWebhookService {
           message = this.buildStatusBubble(correctedStatus, customerName);
       }
 
-      const tracker = this.buildProgressTracker(correctedStatus);
-      const fullMessage = `${tracker}\n\n${message}`;
+      const fullMessage = message;
+      const shouldSendBubble = ['initiated', 'completed', 'failed', 'busy', 'no-answer', 'no_answer', 'canceled'];
 
-      await this.sendTelegramMessage(telegram_chat_id, fullMessage, true);
-      console.log(`✅ Sent enhanced status update: ${correctedStatus} for call ${call_sid}`.green);
+      if (shouldSendBubble.includes(correctedStatus)) {
+        await this.sendTelegramMessage(telegram_chat_id, fullMessage);
+        console.log(`✅ Sent enhanced status update: ${correctedStatus} for call ${call_sid}`.green);
+      } else {
+        console.log(`⏭️ Console-only status ${correctedStatus} for call ${call_sid}`.gray);
+      }
       await this.updateLiveConsoleStatus(call_sid, correctedStatus, telegram_chat_id);
 
       // Log notification metric
@@ -801,35 +805,33 @@ class EnhancedWebhookService {
     const ringDelay = options.ringDelay || options.ringDuration;
     const durationSeconds = options.durationSeconds;
     const errorMsg = options.errorMsg;
-    const waveform = options.waveform || '';
-    const sentiment = options.sentiment ? `\n${options.sentiment}` : '';
 
     switch (normalized) {
       case 'initiated':
-        return `📡 Initiating Call…\nConnecting to ${name}. Please hold.`;
+        return `📡 Connecting to ${name}…`;
       case 'ringing': {
         const delayText = ringDelay ? ` (${ringDelay}s)` : '';
-        return `🔔 Ringing…${delayText}\nWaiting for ${name} to answer.`;
+        return `🔔 Ringing${delayText}`;
       }
       case 'answered':
-        return `📞 Call Picked Up\n${name} answered the call.`;
+        return `📞 ${name} picked up!`;
       case 'in-progress':
-        return `☎️ In Progress\nYou're now connected. Agent speaking! ${waveform}${sentiment}`;
+        return `☎️ You're now connected.`;
       case 'completed': {
-        const durationText = durationSeconds ? `Duration: ${this.formatDuration(durationSeconds)}` : 'Duration: —';
-        return `✅ Call Completed\n${durationText}\nThanks for using VOICEDNUT!`;
+        const durationText = durationSeconds ? ` - Duration: ${this.formatDuration(durationSeconds)}` : '';
+        return `✅ Call ended${durationText}`;
       }
       case 'busy':
-        return `🚫 Busy\n${name}'s line is currently occupied.`;
+        return `🚫 Busy - ${name}'s line is occupied.`;
       case 'no-answer':
       case 'no_answer':
-        return `⏳ No Answer\n${name} didn't pick up the call.`;
+        return `⏳ No Answer - ${name} didn't pick up.`;
       case 'canceled':
-        return `⚠️ Canceled\nThe call was canceled before connecting.`;
+        return `⚠️ Canceled - Call was canceled.`;
       case 'failed':
-        return `❌ Failed\n${errorMsg || 'Something went wrong while placing the call.'}`;
+        return `❌ Failed - ${errorMsg || 'Something went wrong placing the call.'}`;
       default:
-        return `📱 ${status}\nStatus update for ${name}.`;
+        return `📱 ${status} - Update for ${name}.`;
     }
   }
 
@@ -1037,19 +1039,16 @@ class EnhancedWebhookService {
     while (events.length < this.liveConsoleMaxEvents) events.unshift('—');
     const waveform = this.waveformFrames[entry.waveformIndex] || '';
     const phaseLine = entry.phase.includes('Agent speaking') ? `${entry.phase} ${waveform}` : entry.phase;
+    const sentimentLine = entry.sentimentFlag ? `Mood: ${entry.sentimentFlag}` : null;
 
     return [
-      '📞 Outbound Call',
-      `👤 Customer: ${entry.customerName}`,
-      `📱 Number: ${entry.phoneNumber}`,
-      `🧩 Template: ${entry.template}`,
-      '',
+      '📞 Live Call Console',
+      `👤 ${entry.customerName} | 📱 ${entry.phoneNumber}`,
+      entry.template ? `🧩 Template: ${entry.template}` : null,
       `Status: ${entry.status}`,
       `Phase: ${phaseLine}`,
+      sentimentLine,
       `Elapsed: ${elapsed}`,
-      '',
-      'Progress',
-      this.buildProgressTrackerInline(entry.status),
       '',
       'Recent',
       ...events.map((e) => `- ${e}`),
@@ -1057,7 +1056,7 @@ class EnhancedWebhookService {
       'Preview',
       `🧑 ${entry.previewTurns.user || '—'}`,
       `🤖 ${entry.previewTurns.agent || '—'}`
-    ].join('\n');
+    ].filter(Boolean).join('\n');
   }
 
   buildProgressTrackerInline(statusLabel) {
