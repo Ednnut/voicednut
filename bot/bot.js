@@ -577,6 +577,17 @@ bot.on('callback_query:data', async (ctx) => {
             return;
         }
 
+        if (action.startsWith('CALL_DETAILS:')) {
+            const detailsKey = action.split(':')[1];
+            const detailsMessage = ctx.session?.callDetailsCache?.[detailsKey];
+            if (!detailsMessage) {
+                await ctx.reply('ℹ️ Details are no longer available for this call.');
+                return;
+            }
+            await ctx.reply(detailsMessage);
+            return;
+        }
+
         if (action.startsWith('FOLLOWUP_CALL:')) {
             await cancelActiveFlow(ctx, `callback:${action}`);
             resetSession(ctx);

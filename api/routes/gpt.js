@@ -166,8 +166,6 @@ class EnhancedGptService extends EventEmitter {
       stream: true,
     });
 
-    this.emit('gptstart', { callSid: this.callSid });
-
     let completeResponse = '';
     let partialResponse = '';
     let functionName = '';
@@ -195,15 +193,11 @@ class EnhancedGptService extends EventEmitter {
       }
 
       if (finishReason === 'tool_calls') {
-        if (functionName) {
-          this.emit('toolstart', { name: functionName });
-        }
         // Use dynamic function if available
         const functionToCall = this.availableFunctions[functionName];
         
         if (!functionToCall) {
           console.error(`â Function ${functionName} not found in dynamic implementations`.red);
-          this.emit('toolerror', { name: functionName, error: 'not_found' });
           // Continue without function call
           completeResponse += `I apologize, but I cannot execute the ${functionName} function at this time.`;
           continue;
@@ -228,7 +222,6 @@ class EnhancedGptService extends EventEmitter {
           console.log(`ð§ Executed dynamic function: ${functionName}`.green);
         } catch (functionError) {
           console.error(`â Error executing function ${functionName}:`, functionError);
-          this.emit('toolerror', { name: functionName, error: functionError });
           functionResponse = JSON.stringify({ error: 'Function execution failed', details: functionError.message });
         }
 

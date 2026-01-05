@@ -547,19 +547,61 @@ async function callFlow(conversation, ctx) {
       personaLabel
     );
 
+    const toneValue = payload.emotion || 'auto';
+    const urgencyValue = payload.urgency || 'auto';
+    const techValue = payload.technical_level || 'auto';
+    const hasAutoFields = [toneValue, urgencyValue, techValue].some((value) => value === 'auto');
+
     const callDetailsCard = [
       '📋 Call Details:',
       `• Number: ${number}`,
       `• Customer: ${customerName || 'Not provided'}`,
       `• Template: ${templateName}`,
       `• Description: ${templateDescription}`,
-      `• Purpose: ${payload.purpose || 'general'}`,
-      `• Tone: ${payload.emotion || 'auto'}`,
-      `• Urgency: ${payload.urgency || 'auto'}`,
-      `• Technical level: ${payload.technical_level || 'auto'}`
+      `• Purpose: ${payload.purpose || 'general'}`
     ];
 
-    await ctx.reply(callDetailsCard.join('\n'));
+    if (toneValue !== 'auto') {
+      callDetailsCard.push(`• Tone: ${toneValue}`);
+    }
+    if (urgencyValue !== 'auto') {
+      callDetailsCard.push(`• Urgency: ${urgencyValue}`);
+    }
+    if (techValue !== 'auto') {
+      callDetailsCard.push(`• Technical level: ${techValue}`);
+    }
+    if (hasAutoFields) {
+      callDetailsCard.push('• ⚙️ Mode: Auto');
+    }
+
+    const replyOptions = {};
+    if (hasAutoFields) {
+      const detailsKey = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+      if (!ctx.session.callDetailsCache) {
+        ctx.session.callDetailsCache = {};
+      }
+      if (!ctx.session.callDetailsKeys) {
+        ctx.session.callDetailsKeys = [];
+      }
+      ctx.session.callDetailsCache[detailsKey] = [
+        'ℹ️ Call Details:',
+        `• Tone: ${toneValue}`,
+        `• Urgency: ${urgencyValue}`,
+        `• Technical level: ${techValue}`
+      ].join('\n');
+      ctx.session.callDetailsKeys.push(detailsKey);
+      if (ctx.session.callDetailsKeys.length > 10) {
+        const oldestKey = ctx.session.callDetailsKeys.shift();
+        if (oldestKey) {
+          delete ctx.session.callDetailsCache[oldestKey];
+        }
+      }
+      replyOptions.reply_markup = {
+        inline_keyboard: [[{ text: 'ℹ️ Details', callback_data: `CALL_DETAILS:${detailsKey}` }]]
+      };
+    }
+
+    await ctx.reply(callDetailsCard.join('\n'), replyOptions);
     await ctx.reply('⏳ Making the call…');
 
     const payloadForLog = { ...payload };
