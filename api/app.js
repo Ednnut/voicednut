@@ -37,6 +37,25 @@ let db;
 const functionEngine = new DynamicFunctionEngine();
 const smsService = new EnhancedSmsService();
 
+function formatDurationForSms(seconds) {
+  if (!seconds || Number.isNaN(seconds)) return '';
+  const mins = Math.floor(seconds / 60);
+  const secs = seconds % 60;
+  if (mins === 0) {
+    return `${secs}s`;
+  }
+  return `${mins}m ${secs}s`;
+}
+
+function buildRecapSmsBody(call) {
+  const name = call.customer_name ? ` with ${call.customer_name}` : '';
+  const status = (call.status || call.twilio_status || 'completed').replace(/_/g, ' ');
+  const duration = call.duration ? ` Duration: ${formatDurationForSms(call.duration)}.` : '';
+  const rawSummary = (call.call_summary || '').replace(/\s+/g, ' ').trim();
+  const summary = rawSummary ? rawSummary.slice(0, 180) : 'Call finished.';
+  return `VoicedNut call recap${name}: ${summary} Status: ${status}.${duration}`;
+}
+
 const ADMIN_HEADER_NAME = 'x-admin-token';
 const SUPPORTED_PROVIDERS = ['twilio', 'aws', 'vonage'];
 let currentProvider = config.platform?.provider || 'twilio';
@@ -181,6 +200,9 @@ async function ensureAwsSession(callSid) {
   gptService.on('gptreply', async (gptReply, icount) => {
     const personalityInfo = gptReply.personalityInfo || {};
 
+    webhookService.recordTranscriptTurn(callSid, 'agent', gptReply.partialResponse);
+    webhookService.setLiveCallPhase(callSid, 'agent_responding').catch(() => {});
+
     try {
       await db.addTranscript({
         call_sid: callSid,
@@ -210,6 +232,7 @@ async function ensureAwsSession(callSid) {
           contactId,
           audioKey: key
         });
+        webhookService.setLiveCallPhase(callSid, 'agent_speaking').catch(() => {});
       }
     } catch (ttsError) {
       console.error('AWS TTS playback error:', ttsError);
@@ -229,6 +252,8 @@ async function ensureAwsSession(callSid) {
         contactId,
         audioKey: key
       });
+      webhookService.recordTranscriptTurn(callSid, 'agent', firstMessage);
+      webhookService.setLiveCallPhase(callSid, 'agent_speaking').catch(() => {});
     }
   } catch (error) {
     console.error('AWS first message playback error:', error);
@@ -351,6 +376,8 @@ app.ws('/connection', (ws) => {
           gptService.on('gptreply', async (gptReply, icount) => {
             const personalityInfo = gptReply.personalityInfo || {};
             console.log(`ð­ ${personalityInfo.name || 'Default'} Personality: ${gptReply.partialResponse.substring(0, 50)}...`.green);
+            webhookService.recordTranscriptTurn(callSid, 'agent', gptReply.partialResponse);
+            webhookService.setLiveCallPhase(callSid, 'agent_responding').catch(() => {});
             
             // Save AI response to database with personality context
             try {
@@ -494,6 +521,9 @@ app.ws('/connection', (ws) => {
     });
   
     transcriptionService.on('utterance', async (text) => {
+      if (text && text.trim().length > 0) {
+        webhookService.setLiveCallPhase(callSid, 'user_speaking').catch(() => {});
+      }
       if(marks.length > 0 && text?.length > 5) {
         console.log('ð Interruption detected, clearing stream'.red);
         ws.send(
@@ -529,12 +559,15 @@ app.ws('/connection', (ws) => {
         console.error('Database error adding user transcript:', dbError);
       }
       
+      webhookService.recordTranscriptTurn(callSid, 'user', text);
+      
       // Process with adaptive personality and functions
       gptService.completion(text, interactionCount);
       interactionCount += 1;
     });
     
     ttsService.on('speech', (responseIndex, audio, label, icount) => {
+      webhookService.setLiveCallPhase(callSid, 'agent_speaking').catch(() => {});
       streamService.buffer(responseIndex, audio);
     });
   
@@ -596,6 +629,8 @@ app.ws('/vonage/stream', (ws, req) => {
     });
 
     gptService.on('gptreply', async (gptReply, icount) => {
+      webhookService.recordTranscriptTurn(callSid, 'agent', gptReply.partialResponse);
+      webhookService.setLiveCallPhase(callSid, 'agent_responding').catch(() => {});
       try {
         await db.addTranscript({
           call_sid: callSid,
@@ -617,11 +652,18 @@ app.ws('/vonage/stream', (ws, req) => {
     });
 
     ttsService.on('speech', (responseIndex, audio) => {
+      webhookService.setLiveCallPhase(callSid, 'agent_speaking').catch(() => {});
       try {
         const buffer = Buffer.from(audio, 'base64');
         ws.send(buffer);
       } catch (error) {
         console.error('Vonage websocket send error:', error);
+      }
+    });
+
+    transcriptionService.on('utterance', (text) => {
+      if (text && text.trim().length > 0) {
+        webhookService.setLiveCallPhase(callSid, 'user_speaking').catch(() => {});
       }
     });
 
@@ -641,6 +683,7 @@ app.ws('/vonage/stream', (ws, req) => {
       } catch (dbError) {
         console.error('Database error adding user transcript:', dbError);
       }
+      webhookService.recordTranscriptTurn(callSid, 'user', text);
       gptService.completion(text, interactionCount);
       interactionCount += 1;
     });
@@ -673,6 +716,7 @@ app.ws('/vonage/stream', (ws, req) => {
     // Send first message once stream is ready
     if (callConfig?.first_message) {
       ttsService.generate({ partialResponseIndex: null, partialResponse: callConfig.first_message }, 0);
+      webhookService.recordTranscriptTurn(callSid, 'agent', callConfig.first_message);
     }
   } catch (error) {
     console.error('Vonage websocket error:', error);
@@ -715,6 +759,12 @@ app.ws('/aws/stream', (ws, req) => {
     const sessionPromise = ensureAwsSession(callSid);
     let interactionCount = 0;
 
+    transcriptionService.on('utterance', (text) => {
+      if (text && text.trim().length > 0) {
+        webhookService.setLiveCallPhase(callSid, 'user_speaking').catch(() => {});
+      }
+    });
+
     transcriptionService.on('transcription', async (text) => {
       if (!text) return;
       const session = await sessionPromise;
@@ -732,6 +782,8 @@ app.ws('/aws/stream', (ws, req) => {
       } catch (dbError) {
         console.error('Database error adding user transcript:', dbError);
       }
+
+      webhookService.recordTranscriptTurn(callSid, 'user', text);
 
       session.gptService.completion(text, interactionCount);
       interactionCount += 1;
@@ -911,6 +963,44 @@ app.post('/webhook/telegram', async (req, res) => {
     const callSid = prefix === 'lc' ? parts[2] : parts[1];
     if (!prefix || !callSid || (prefix === 'lc' && !action)) {
       webhookService.answerCallbackQuery(cb.id, 'Unsupported action').catch(() => {});
+      return;
+    }
+
+    if (prefix === 'recap') {
+      try {
+        const callRecord = await db.getCall(callSid).catch(() => null);
+        const chatId = cb.message?.chat?.id;
+        if (callRecord?.user_chat_id && chatId && String(callRecord.user_chat_id) !== String(chatId)) {
+          webhookService.answerCallbackQuery(cb.id, 'Not authorized for this call').catch(() => {});
+          return;
+        }
+
+        const recapAction = parts[1];
+        if (recapAction === 'skip') {
+          webhookService.answerCallbackQuery(cb.id, 'Skipped').catch(() => {});
+          return;
+        }
+
+        if (recapAction === 'sms') {
+          if (!callRecord?.phone_number) {
+            webhookService.answerCallbackQuery(cb.id, 'No phone number on record').catch(() => {});
+            return;
+          }
+
+          const smsBody = buildRecapSmsBody(callRecord);
+          try {
+            await smsService.sendSMS(callRecord.phone_number, smsBody);
+            webhookService.answerCallbackQuery(cb.id, 'Recap sent via SMS').catch(() => {});
+            await webhookService.sendTelegramMessage(chatId, '📩 Recap sent via SMS to the customer.');
+          } catch (smsError) {
+            webhookService.answerCallbackQuery(cb.id, 'Failed to send SMS').catch(() => {});
+            await webhookService.sendTelegramMessage(chatId, `❌ Failed to send recap SMS: ${smsError.message || smsError}`);
+          }
+          return;
+        }
+      } catch (error) {
+        webhookService.answerCallbackQuery(cb.id, 'Error handling recap').catch(() => {});
+      }
       return;
     }
 
@@ -1564,7 +1654,11 @@ app.post('/webhook/call-status', async (req, res) => {
     if (call.user_chat_id && notificationType) {
       try {
         await db.createEnhancedWebhookNotification(CallSid, notificationType, call.user_chat_id);
-        console.log(`ð¨ Created corrected ${notificationType} notification for call ${CallSid}`.green);
+        console.log(`📨 Created corrected ${notificationType} notification for call ${CallSid}`.green);
+
+        if (['completed', 'no-answer', 'failed', 'busy', 'canceled'].includes(actualStatus)) {
+          await db.createEnhancedWebhookNotification(CallSid, 'call_recap', call.user_chat_id);
+        }
         
         // Log the correction if we changed the status
         if (actualStatus !== CallStatus.toLowerCase()) {

@@ -552,14 +552,18 @@ async function callFlow(conversation, ctx) {
     const techValue = payload.technical_level || 'auto';
     const hasAutoFields = [toneValue, urgencyValue, techValue].some((value) => value === 'auto');
 
+    const shortDescription = templateDescription
+      ? `${templateDescription}`.slice(0, 80) + (templateDescription.length > 80 ? '…' : '')
+      : null;
+
     const callDetailsCard = [
-      '📋 Call Details:',
-      `• Number: ${number}`,
-      `• Customer: ${customerName || 'Not provided'}`,
+      '📋 Call Details',
+      `• To: ${number}`,
+      customerName ? `• Customer: ${customerName}` : null,
       `• Template: ${templateName}`,
-      `• Description: ${templateDescription}`,
-      `• Purpose: ${payload.purpose || 'general'}`
-    ];
+      shortDescription ? `• Desc: ${shortDescription}` : null,
+      payload.purpose ? `• Purpose: ${payload.purpose}` : null
+    ].filter(Boolean);
 
     if (toneValue !== 'auto') {
       callDetailsCard.push(`• Tone: ${toneValue}`);
@@ -629,7 +633,7 @@ async function callFlow(conversation, ctx) {
 
     const data = response?.data;
     if (data?.success && data.call_sid) {
-      await ctx.reply('✅ *Call Placed Successfully!*', { parse_mode: 'Markdown' });
+      await ctx.reply('✅ Call placed', { parse_mode: 'Markdown' });
       await ctx.reply(`📞 To: ${data.to}`);
       flow.touch('completed');
     } else {

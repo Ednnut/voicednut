@@ -12,6 +12,12 @@ class EnhancedWebhookService {
     this.noResponseTimers = new Map(); // Track fallback timers when no status arrives
     this.noResponseTimeoutMs = 30000;
     this.statusOrder = ['queued', 'initiated', 'ringing', 'answered', 'in-progress', 'completed', 'busy', 'no-answer', 'failed', 'canceled'];
+    this.liveConsoleByCallSid = new Map();
+    this.liveConsoleEditTimers = new Map();
+    this.liveConsoleDebounceMs = 900;
+    this.liveConsoleMaxEvents = 5;
+    this.liveConsoleMaxPreviewChars = 200;
+    this.waveformFrames = ['▁ ▂ ▃ ▄ ▅ ▆ ▇', '▂ ▃ ▄ ▅ ▆ ▇ ▁', '▃ ▄ ▅ ▆ ▇ ▁ ▂', '▄ ▅ ▆ ▇ ▁ ▂ ▃', '▅ ▆ ▇ ▁ ▂ ▃ ▄', '▆ ▇ ▁ ▂ ▃ ▄ ▅', '▇ ▁ ▂ ▃ ▄ ▅ ▆'];
   }
 
   start(database) {
@@ -54,6 +60,9 @@ class EnhancedWebhookService {
     this.callTimestamps.clear();
     this.noResponseTimers.forEach((timer) => clearTimeout(timer));
     this.noResponseTimers.clear();
+    this.liveConsoleEditTimers.forEach((timer) => clearTimeout(timer));
+    this.liveConsoleEditTimers.clear();
+    this.liveConsoleByCallSid.clear();
     console.log('Enhanced webhook service stopped'.yellow);
   }
 
@@ -190,107 +199,114 @@ class EnhancedWebhookService {
   // Enhanced call status update with proper no-answer detection
   async sendCallStatusUpdate(call_sid, status, telegram_chat_id, additionalData = {}) {
     try {
-      // Check if we should send this status
-      if (!this.shouldSendStatus(call_sid, status)) {
-        return true; // Return success to mark notification as processed
-      }
-
-      const normalizedStatus = status.toLowerCase();
-      let message = '';
-      let emoji = '';
-      
-      // Track call timing for duration calculations
+      const normalizedStatus = String(status || '').toLowerCase().replace(/_/g, '-');
       if (!this.callTimestamps.has(call_sid)) {
         this.callTimestamps.set(call_sid, { started: new Date() });
       }
       const callTiming = this.callTimestamps.get(call_sid);
+      const callDetails = await this.db.getCall(call_sid).catch(() => null);
+      const statusInfo = this.activeCallStatus.get(call_sid);
 
-      switch (normalizedStatus) {
+      const correctedStatus = this.correctStatusForEvidence(normalizedStatus, {
+        callTiming,
+        callDetails,
+        statusInfo,
+        additionalData
+      });
+
+      await this.ensureLiveConsole(call_sid, telegram_chat_id, callDetails);
+
+      // Check if we should send this status
+      if (!this.shouldSendStatus(call_sid, correctedStatus)) {
+        return true; // Return success to mark notification as processed
+      }
+
+      const customerName = callDetails?.customer_name || 'the customer';
+      let message = '';
+      let emoji = '';
+
+      switch (correctedStatus) {
         case 'queued':
         case 'initiated':
           emoji = '📞';
-          message = 'Initiating call...';
+          message = this.buildStatusBubble('initiated', customerName);
           callTiming.initiated = new Date();
           this.scheduleNoResponseCheck(call_sid, telegram_chat_id);
           break;
-          
+
         case 'ringing':
           emoji = '🔔';
-          message = 'Ringing...';
+          message = this.buildStatusBubble('ringing', customerName);
           callTiming.ringing = new Date();
           this.clearNoResponseTimer(call_sid);
           // Calculate time to ring
           if (callTiming.initiated) {
             const ringDelay = ((new Date() - callTiming.initiated) / 1000).toFixed(1);
             if (ringDelay > 2) {
-              message += ` (${ringDelay}s)`;
+              message = this.buildStatusBubble('ringing', customerName, { ringDelay });
             }
           }
           break;
-          
+
         case 'answered':
           emoji = '✅';
-          message = 'Call answered';
+          message = this.buildStatusBubble('answered', customerName);
           callTiming.answered = new Date();
           this.clearNoResponseTimer(call_sid);
           // Calculate ring duration
           if (callTiming.ringing) {
             const ringDuration = ((new Date() - callTiming.ringing) / 1000).toFixed(0);
-            message += ` (rang ${ringDuration}s)`;
+            message = this.buildStatusBubble('answered', customerName, { ringDuration });
           }
           break;
 
         case 'in-progress':
           emoji = '☎️';
-          message = 'Call in progress';
+          message = this.buildStatusBubble('in-progress', customerName);
           this.clearNoResponseTimer(call_sid);
           break;
-          
+
         case 'completed':
           emoji = '🏁';
           callTiming.completed = new Date();
           this.clearNoResponseTimer(call_sid);
-          
+
           // Calculate call duration - be more careful about actual vs ring time
-          let duration = '';
+          let durationSeconds = null;
           const actualDuration = additionalData.duration;
-          
+
           if (actualDuration && actualDuration > 3) {
-            const minutes = Math.floor(actualDuration / 60);
-            const seconds = actualDuration % 60;
-            duration = ` (${minutes}:${String(seconds).padStart(2, '0')})`;
+            durationSeconds = actualDuration;
           } else if (callTiming.answered) {
-            const totalTime = ((new Date() - callTiming.answered) / 1000).toFixed(0);
-            if (totalTime > 3) {
-              const minutes = Math.floor(totalTime / 60);
-              const seconds = totalTime % 60;
-              duration = ` (~${minutes}:${String(seconds).padStart(2, '0')})`;
+            const totalTime = Math.round((new Date() - callTiming.answered) / 1000);
+            if (totalTime > 0) {
+              durationSeconds = totalTime;
             }
           }
-          
-          message = `Call completed${duration}`;
+
+          message = this.buildStatusBubble('completed', customerName, { durationSeconds });
           break;
-          
+
         case 'busy':
           emoji = '📵';
-          message = 'Line busy';
+          message = this.buildStatusBubble('busy', customerName);
           this.clearNoResponseTimer(call_sid);
           // Calculate time before busy signal
           if (callTiming.ringing || callTiming.initiated) {
             const busyTime = callTiming.ringing || callTiming.initiated;
             const timeBeforeBusy = ((new Date() - busyTime) / 1000).toFixed(0);
             if (timeBeforeBusy > 1) {
-              message += ` (${timeBeforeBusy}s)`;
+              message = this.buildStatusBubble('busy', customerName, { ringDuration: timeBeforeBusy });
             }
           }
           break;
-          
+
         case 'no-answer':
         case 'no_answer':
           emoji = '❌';
-          message = 'No answer';
+          message = this.buildStatusBubble('no-answer', customerName);
           this.clearNoResponseTimer(call_sid);
-          
+
           // Enhanced no-answer timing calculation
           let ringTime = 0;
           
@@ -309,45 +325,43 @@ class EnhancedWebhookService {
           }
           
           if (ringTime > 0) {
-            message += ` (rang ${ringTime}s)`;
+            message = this.buildStatusBubble('no-answer', customerName, { ringDuration: ringTime });
           }
-          
+
           console.log(`📞 No-answer notification: ${message}`.yellow);
           break;
-          
+
         case 'failed':
           emoji = '❌';
-          message = 'Call failed';
+          message = this.buildStatusBubble('failed', customerName, { errorMsg: additionalData.error || additionalData.error_message });
           this.clearNoResponseTimer(call_sid);
-          if (additionalData.error || additionalData.error_message) {
-            const errorMsg = additionalData.error || additionalData.error_message;
-            message += ` (${errorMsg})`;
-          }
           break;
-          
+
         case 'canceled':
           emoji = '🚫';
-          message = 'Call canceled';
+          message = this.buildStatusBubble('canceled', customerName);
           this.clearNoResponseTimer(call_sid);
           break;
-          
+
         default:
           emoji = '📱';
-          message = `Call ${status}`;
+          message = this.buildStatusBubble(correctedStatus, customerName);
       }
 
-      const fullMessage = `${emoji} ${message}`;
-      
-      await this.sendTelegramMessage(telegram_chat_id, fullMessage);
-      console.log(`✅ Sent enhanced status update: ${normalizedStatus} for call ${call_sid}`.green);
-      
+      const tracker = this.buildProgressTracker(correctedStatus);
+      const fullMessage = `${tracker}\n\n${message}`;
+
+      await this.sendTelegramMessage(telegram_chat_id, fullMessage, true);
+      console.log(`✅ Sent enhanced status update: ${correctedStatus} for call ${call_sid}`.green);
+      await this.updateLiveConsoleStatus(call_sid, correctedStatus, telegram_chat_id);
+
       // Log notification metric
       if (this.db && this.db.logNotificationMetric) {
-        await this.db.logNotificationMetric(`call_${normalizedStatus}`, true);
+        await this.db.logNotificationMetric(`call_${correctedStatus}`, true);
       }
 
       // Schedule cleanup for terminal states
-      if (['completed', 'failed', 'no-answer', 'busy', 'canceled'].includes(normalizedStatus)) {
+      if (['completed', 'failed', 'no-answer', 'busy', 'canceled'].includes(correctedStatus)) {
         setTimeout(() => {
           this.cleanupCallData(call_sid);
         }, 5 * 60 * 1000); // Cleanup after 5 minutes
@@ -450,6 +464,58 @@ class EnhancedWebhookService {
     }
   }
 
+  async sendCallRecap(call_sid, telegram_chat_id) {
+    try {
+      const callDetails = await this.db.getCall(call_sid);
+      const transcripts = await this.db.getCallTranscripts(call_sid);
+
+      if (!callDetails) {
+        await this.sendTelegramMessage(telegram_chat_id, '📋 No call details available for recap');
+        return true;
+      }
+
+      const status = (callDetails.status || callDetails.twilio_status || 'unknown').toLowerCase();
+      const duration = typeof callDetails.duration === 'number' ? callDetails.duration : null;
+      const summary = callDetails.call_summary || 'No summary available yet.';
+
+      const previewLines = this.buildTranscriptPreview(transcripts || [], 2);
+      const previewBlock = previewLines.length
+        ? previewLines.map((line) => `• ${line}`).join('\n')
+        : '• (no transcript lines yet)';
+
+      const recapMessage = [
+        '📋 *Call Recap*',
+        '',
+        `👤 *Customer:* ${callDetails.customer_name || 'Unknown'}`,
+        `📞 *Number:* ${callDetails.phone_number || 'Unknown'}`,
+        `📊 *Status:* ${status}`,
+        duration ? `⏱️ *Duration:* ${this.formatDuration(duration)}` : null,
+        `📝 *Summary:* ${this.cleanMessageForTelegram(summary)}`,
+        '',
+        '*Transcript preview*',
+        previewBlock
+      ].filter(Boolean).join('\n');
+
+      const replyMarkup = {
+        inline_keyboard: [[
+          { text: '📩 Send recap via SMS', callback_data: `recap:sms:${call_sid}` },
+          { text: '✋ Skip', callback_data: `recap:skip:${call_sid}` }
+        ]]
+      };
+
+      await this.sendTelegramMessage(telegram_chat_id, recapMessage, true, { replyMarkup });
+      return true;
+    } catch (error) {
+      console.error('❌ Failed to send call recap:', error);
+      try {
+        await this.sendTelegramMessage(telegram_chat_id, '❌ Error sending call recap');
+      } catch (fallbackError) {
+        console.error('Failed to send recap error message:', fallbackError);
+      }
+      return false;
+    }
+  }
+
   async sendFullTranscript(call_sid, telegram_chat_id, replyToMessageId = null) {
     try {
       const callDetails = await this.db.getCall(call_sid);
@@ -534,6 +600,9 @@ class EnhancedWebhookService {
           success = await this.sendCallStatusUpdate(call_sid, 'completed', telegram_chat_id, { 
             duration: callDetails?.duration 
           });
+          break;
+        case 'call_recap':
+          success = await this.sendCallRecap(call_sid, telegram_chat_id);
           break;
         case 'call_transcript':
           success = await this.sendCallTranscript(call_sid, telegram_chat_id);
@@ -620,6 +689,36 @@ class EnhancedWebhookService {
     return response.data;
   }
 
+  async editTelegramMessage(chatId, messageId, message, enableMarkdown = false, replyMarkup = null) {
+    const url = `https://api.telegram.org/bot${this.telegramBotToken}/editMessageText`;
+    const payload = {
+      chat_id: chatId,
+      message_id: messageId,
+      text: message,
+      disable_web_page_preview: true
+    };
+
+    if (enableMarkdown) {
+      payload.parse_mode = 'Markdown';
+    }
+    if (replyMarkup) {
+      payload.reply_markup = replyMarkup;
+    }
+
+    const response = await axios.post(url, payload, {
+      timeout: 15000,
+      headers: {
+        'Content-Type': 'application/json'
+      }
+    });
+
+    if (!response.data.ok) {
+      throw new Error(`Telegram API error: ${response.data.description || 'Unknown error'}`);
+    }
+
+    return response.data;
+  }
+
   async answerCallbackQuery(callbackQueryId, message, showAlert = false) {
     if (!this.telegramBotToken || !callbackQueryId) {
       return false;
@@ -666,6 +765,74 @@ class EnhancedWebhookService {
     }
   }
 
+  buildProgressTracker(status) {
+    const normalized = String(status || '').toLowerCase();
+    const nodes = ['📡', '🔔', '📞', '☎️', '✅'];
+    const statusIndex = {
+      initiated: 0,
+      ringing: 1,
+      answered: 2,
+      'in-progress': 3,
+      completed: 4
+    };
+    const failureStops = {
+      busy: 1,
+      'no-answer': 1,
+      failed: 0,
+      canceled: 0
+    };
+
+    const isFailure = Object.prototype.hasOwnProperty.call(failureStops, normalized);
+    if (isFailure) {
+      const stopIndex = failureStops[normalized];
+      const sequence = nodes.slice(0, stopIndex + 1).map((icon) => `*${icon}*`);
+      sequence.push('❌');
+      return `Progress\n${sequence.join(' ─ ')}`;
+    }
+
+    const activeIndex = statusIndex[normalized] ?? 0;
+    const sequence = nodes.map((icon, idx) => (idx <= activeIndex ? `*${icon}*` : icon));
+    return `Progress\n${sequence.join(' ─ ')}`;
+  }
+
+  buildStatusBubble(status, customerName, options = {}) {
+    const normalized = String(status || '').toLowerCase();
+    const name = customerName || 'the customer';
+    const ringDelay = options.ringDelay || options.ringDuration;
+    const durationSeconds = options.durationSeconds;
+    const errorMsg = options.errorMsg;
+    const waveform = options.waveform || '';
+    const sentiment = options.sentiment ? `\n${options.sentiment}` : '';
+
+    switch (normalized) {
+      case 'initiated':
+        return `📡 Initiating Call…\nConnecting to ${name}. Please hold.`;
+      case 'ringing': {
+        const delayText = ringDelay ? ` (${ringDelay}s)` : '';
+        return `🔔 Ringing…${delayText}\nWaiting for ${name} to answer.`;
+      }
+      case 'answered':
+        return `📞 Call Picked Up\n${name} answered the call.`;
+      case 'in-progress':
+        return `☎️ In Progress\nYou're now connected. Agent speaking! ${waveform}${sentiment}`;
+      case 'completed': {
+        const durationText = durationSeconds ? `Duration: ${this.formatDuration(durationSeconds)}` : 'Duration: —';
+        return `✅ Call Completed\n${durationText}\nThanks for using VOICEDNUT!`;
+      }
+      case 'busy':
+        return `🚫 Busy\n${name}'s line is currently occupied.`;
+      case 'no-answer':
+      case 'no_answer':
+        return `⏳ No Answer\n${name} didn't pick up the call.`;
+      case 'canceled':
+        return `⚠️ Canceled\nThe call was canceled before connecting.`;
+      case 'failed':
+        return `❌ Failed\n${errorMsg || 'Something went wrong while placing the call.'}`;
+      default:
+        return `📱 ${status}\nStatus update for ${name}.`;
+    }
+  }
+
   // Utility methods
   getStatusEmoji(status) {
     const statusEmojis = {
@@ -687,6 +854,276 @@ class EnhancedWebhookService {
       .replace(/[*_`\[\]()~>#+=|{}.!-]/g, '\\$&') // Escape markdown chars
       .replace(/•/g, '') // Remove TTS markers
       .trim();
+  }
+
+  async ensureLiveConsole(callSid, chatId, callDetails = null) {
+    const existing = this.liveConsoleByCallSid.get(callSid);
+    if (existing) return existing;
+    if (!chatId) return null;
+
+    const details = callDetails || await this.db.getCall(callSid).catch(() => null);
+    const entry = {
+      chatId,
+      messageId: null,
+      createdAt: new Date(),
+      lastEditAt: null,
+      pickedUpAt: null,
+      endedAt: null,
+      status: this.getConsoleStatusLabel('initiated'),
+      phase: this.getConsolePhaseLabel('waiting'),
+      lastEvents: [],
+      previewTurns: { user: '—', agent: '—' },
+      customerName: details?.customer_name || 'Unknown',
+      phoneNumber: details?.phone_number || 'Unknown',
+      template: details?.template || '—',
+      waveformIndex: 0,
+      sentimentFlag: ''
+    };
+
+    const text = this.buildLiveConsoleMessage(entry);
+    const response = await this.sendTelegramMessage(chatId, text, false, { replyMarkup: this.consoleButtons(callSid) });
+    entry.messageId = response?.result?.message_id;
+    entry.lastEditAt = new Date();
+    this.liveConsoleByCallSid.set(callSid, entry);
+    return entry;
+  }
+
+  getConsoleStatusLabel(status) {
+    const map = {
+      initiated: '📡 Initiated',
+      ringing: '🔔 Ringing…',
+      answered: '📞 Picked up',
+      'in-progress': '☎️ In progress',
+      completed: '✅ Completed',
+      'no-answer': '⏳ No answer',
+      busy: '🚫 Busy',
+      failed: '❌ Failed',
+      canceled: '⚠️ Canceled'
+    };
+    return map[status] || `📱 ${status}`;
+  }
+
+  getConsolePhaseLabel(phaseKey) {
+    const map = {
+      waiting: '⏳ Waiting…',
+      listening: '🎙 Listening…',
+      user_speaking: '🎙 User speaking…',
+      thinking: '🧠 Thinking…',
+      agent_responding: '🤖 Agent responding…',
+      agent_speaking: '🔊 Agent speaking…',
+      interrupted: '✋ Interrupted',
+      ended: '—'
+    };
+    return map[phaseKey] || phaseKey || '—';
+  }
+
+  consoleButtons(callSid) {
+    return {
+      inline_keyboard: [
+        [
+          { text: '✋ Interrupt', callback_data: `lc:int:${callSid}` },
+          { text: '⏹ End', callback_data: `lc:end:${callSid}` },
+          { text: '🔀 Transfer', callback_data: `lc:xfer:${callSid}` }
+        ]
+      ]
+    };
+  }
+
+  updateLiveConsoleStatus(callSid, status, chatId) {
+    const entry = this.liveConsoleByCallSid.get(callSid);
+    if (!entry) return;
+
+    entry.status = this.getConsoleStatusLabel(status);
+    if (['answered', 'in-progress'].includes(status) && !entry.pickedUpAt) {
+      entry.pickedUpAt = new Date();
+      entry.phase = this.getConsolePhaseLabel('listening');
+    }
+    if (['completed', 'failed', 'no-answer', 'busy', 'canceled'].includes(status)) {
+      entry.phase = this.getConsolePhaseLabel('ended');
+      entry.endedAt = new Date();
+    }
+
+    this.queueLiveConsoleUpdate(callSid, { force: ['completed', 'failed', 'no-answer', 'busy', 'canceled'].includes(status) });
+  }
+
+  async setLiveCallPhase(callSid, phaseKey, options = {}) {
+    const entry = this.liveConsoleByCallSid.get(callSid);
+    if (!entry) return;
+    const phase = this.getConsolePhaseLabel(phaseKey);
+    entry.phase = phase;
+    if (phaseKey === 'agent_speaking') {
+      entry.waveformIndex = (entry.waveformIndex + 1) % this.waveformFrames.length;
+    }
+    this.queueLiveConsoleUpdate(callSid, { force: !!options.force });
+    return true;
+  }
+
+  markToolInvocation(callSid, toolName, options = {}) {
+    this.addLiveEvent(callSid, `🔄 Tool: ${toolName || 'unknown'}`, options);
+  }
+
+  markSentimentDrop(callSid, options = {}) {
+    this.addLiveEvent(callSid, '⚠️ Sentiment drop detected', { force: !!options.force });
+    const entry = this.liveConsoleByCallSid.get(callSid);
+    if (entry) {
+      entry.sentimentFlag = '⚠️';
+    }
+  }
+
+  addLiveEvent(callSid, eventLine, options = {}) {
+    const entry = this.liveConsoleByCallSid.get(callSid);
+    if (!entry) return;
+    const line = String(eventLine || '').trim();
+    if (!line) return;
+    entry.lastEvents.push(line);
+    if (entry.lastEvents.length > this.liveConsoleMaxEvents) {
+      entry.lastEvents.splice(0, entry.lastEvents.length - this.liveConsoleMaxEvents);
+    }
+    this.queueLiveConsoleUpdate(callSid, { force: !!options.force });
+  }
+
+  recordTranscriptTurn(callSid, speaker, text) {
+    const entry = this.liveConsoleByCallSid.get(callSid);
+    if (!entry) return;
+    const cleaned = this.truncatePreview(this.normalizePreviewText(text));
+    if (!cleaned) return;
+    if (speaker === 'user') {
+      entry.previewTurns.user = cleaned;
+      entry.phase = this.getConsolePhaseLabel('thinking');
+    } else if (speaker === 'agent') {
+      entry.previewTurns.agent = cleaned;
+    }
+    this.queueLiveConsoleUpdate(callSid);
+  }
+
+  queueLiveConsoleUpdate(callSid, options = {}) {
+    const entry = this.liveConsoleByCallSid.get(callSid);
+    if (!entry || !entry.messageId) return;
+    const force = !!options.force;
+    const now = Date.now();
+    const lastEdit = entry.lastEditAt ? entry.lastEditAt.getTime() : 0;
+    const elapsed = now - lastEdit;
+
+    if (force || elapsed >= this.liveConsoleDebounceMs) {
+      this.editLiveConsoleMessage(callSid).catch(() => {});
+      return;
+    }
+
+    if (this.liveConsoleEditTimers.has(callSid)) return;
+    const delay = Math.max(this.liveConsoleDebounceMs - elapsed, 0);
+    const timer = setTimeout(() => {
+      this.liveConsoleEditTimers.delete(callSid);
+      this.editLiveConsoleMessage(callSid).catch(() => {});
+    }, delay);
+    this.liveConsoleEditTimers.set(callSid, timer);
+  }
+
+  async editLiveConsoleMessage(callSid) {
+    const entry = this.liveConsoleByCallSid.get(callSid);
+    if (!entry || !entry.messageId) return;
+    entry.lastEditAt = new Date();
+    const text = this.buildLiveConsoleMessage(entry);
+    try {
+      await this.editTelegramMessage(entry.chatId, entry.messageId, text, false, this.consoleButtons(callSid));
+    } catch (error) {
+      const telegramError = error?.response?.data?.description || error.message;
+      console.error(`❌ Live console edit failed (callSid=${callSid}, messageId=${entry.messageId}): ${telegramError}`);
+    }
+  }
+
+  buildLiveConsoleMessage(entry) {
+    const elapsed = this.formatElapsed(entry.createdAt, entry.endedAt);
+    const events = entry.lastEvents.slice(-this.liveConsoleMaxEvents);
+    while (events.length < this.liveConsoleMaxEvents) events.unshift('—');
+    const waveform = this.waveformFrames[entry.waveformIndex] || '';
+    const phaseLine = entry.phase.includes('Agent speaking') ? `${entry.phase} ${waveform}` : entry.phase;
+
+    return [
+      '📞 Outbound Call',
+      `👤 Customer: ${entry.customerName}`,
+      `📱 Number: ${entry.phoneNumber}`,
+      `🧩 Template: ${entry.template}`,
+      '',
+      `Status: ${entry.status}`,
+      `Phase: ${phaseLine}`,
+      `Elapsed: ${elapsed}`,
+      '',
+      'Progress',
+      this.buildProgressTrackerInline(entry.status),
+      '',
+      'Recent',
+      ...events.map((e) => `- ${e}`),
+      '',
+      'Preview',
+      `🧑 ${entry.previewTurns.user || '—'}`,
+      `🤖 ${entry.previewTurns.agent || '—'}`
+    ].join('\n');
+  }
+
+  buildProgressTrackerInline(statusLabel) {
+    const normalized = String(statusLabel || '').toLowerCase();
+    const stages = ['📡', '🔔', '📞', '☎️', '✅'];
+    const indexMap = {
+      '📡 initiated': 0,
+      '🔔 ringing…': 1,
+      '📞 picked up': 2,
+      '☎️ in progress': 3,
+      '✅ completed': 4
+    };
+    const activeIndex = indexMap[normalized] ?? 0;
+    return stages.map((s, i) => (i <= activeIndex ? `*${s}*` : s)).join(' ─ ');
+  }
+
+  formatDuration(totalSeconds) {
+    if (!totalSeconds && totalSeconds !== 0) return '';
+    const minutes = Math.floor(totalSeconds / 60);
+    const seconds = totalSeconds % 60;
+    return `${minutes}:${String(seconds).padStart(2, '0')}`;
+  }
+
+  formatElapsed(startTime, endTime = null) {
+    if (!startTime) return '00:00';
+    const end = endTime || new Date();
+    const diffMs = Math.max(0, end - startTime);
+    const totalSeconds = Math.floor(diffMs / 1000);
+    const minutes = Math.floor(totalSeconds / 60);
+    const seconds = totalSeconds % 60;
+    return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+  }
+
+  truncatePreview(text) {
+    if (!text) return '';
+    if (text.length <= this.liveConsoleMaxPreviewChars) return text;
+    return text.slice(0, this.liveConsoleMaxPreviewChars - 1).trim() + '…';
+  }
+
+  normalizePreviewText(text) {
+    return String(text || '').replace(/\s+/g, ' ').trim();
+  }
+  correctStatusForEvidence(normalizedStatus, context) {
+    const { callTiming, callDetails, statusInfo, additionalData } = context || {};
+    const history = statusInfo?.statusHistory || [];
+    const answeredEvidence = !!(
+      callTiming?.answered ||
+      callDetails?.started_at ||
+      history.includes('answered') ||
+      history.includes('in-progress')
+    );
+
+    if (normalizedStatus === 'in-progress' && !answeredEvidence) {
+      return 'ringing';
+    }
+
+    if (normalizedStatus === 'completed') {
+      const duration = typeof additionalData.duration === 'number' ? additionalData.duration : null;
+      const shortCall = duration !== null ? duration < 3 : false;
+      const noAnsweredHistory = !answeredEvidence && !history.includes('completed');
+      if (!answeredEvidence || shortCall) {
+        return 'no-answer';
+      }
+    }
+
+    return normalizedStatus;
   }
 
   buildTranscriptPreview(transcripts, maxLines) {
@@ -772,6 +1209,12 @@ class EnhancedWebhookService {
   cleanupCallData(callSid) {
     this.activeCallStatus.delete(callSid);
     this.callTimestamps.delete(callSid);
+    this.liveConsoleByCallSid.delete(callSid);
+    const timer = this.liveConsoleEditTimers.get(callSid);
+    if (timer) {
+      clearTimeout(timer);
+      this.liveConsoleEditTimers.delete(callSid);
+    }
   }
 
   // Enhanced immediate status update with better error handling
