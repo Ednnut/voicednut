@@ -1,6 +1,6 @@
 require('colors');
 const EventEmitter = require('events');
-const OpenAI = require('openai');
+const OpenRouter = require('openrouter');
 const PersonalityEngine = require('../functions/PersonalityEngine');
 const config = require('../config');
 
@@ -13,7 +13,7 @@ class EnhancedGptService extends EventEmitter {
       throw new Error('OPENROUTER_API_KEY is not set. Please configure it to enable GPT responses.');
     }
 
-    this.openai = new OpenAI({
+    this.openai = new OpenRouter({
       baseURL: "https://openrouter.ai/api/v1",
       apiKey: config.openRouter.apiKey,
       defaultHeaders: {
@@ -22,7 +22,7 @@ class EnhancedGptService extends EventEmitter {
       }
     });
     
-    this.model = config.openRouter.model || "meta-llama/llama-3.1-8b-instruct:free";
+    this.model = config.openRouter.model;
     
     // Initialize Personality Engine
     this.personalityEngine = new PersonalityEngine();
@@ -97,7 +97,7 @@ class EnhancedGptService extends EventEmitter {
     try {
       return JSON.parse(args);
     } catch (error) {
-      console.log('Warning: Double function arguments returned by OpenAI:', args);
+      console.log('Warning: Double function arguments returned by OpenRouter:', args);
       if (args.indexOf('{') != args.lastIndexOf('{')) {
         return JSON.parse(args.substring(args.indexOf(''), args.indexOf('}') + 1));
       }
