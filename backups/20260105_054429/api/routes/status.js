@@ -11,12 +11,7 @@ class EnhancedWebhookService {
     this.callTimestamps = new Map(); // Track call timing for better status management
     this.noResponseTimers = new Map(); // Track fallback timers when no status arrives
     this.noResponseTimeoutMs = 30000;
-    this.statusOrder = ['initiated', 'ringing', 'answered', 'in-progress', 'completed', 'busy', 'no-answer', 'failed', 'canceled'];
-    this.liveConsoleByCallSid = new Map();
-    this.liveConsoleEditTimers = new Map();
-    this.liveConsoleDebounceMs = 900;
-    this.liveConsoleMaxEvents = 5;
-    this.liveConsoleMaxPreviewChars = 200;
+    this.statusOrder = ['queued', 'initiated', 'ringing', 'answered', 'in-progress', 'completed', 'busy', 'no-answer', 'failed', 'canceled'];
   }
 
   start(database) {
@@ -59,9 +54,6 @@ class EnhancedWebhookService {
     this.callTimestamps.clear();
     this.noResponseTimers.forEach((timer) => clearTimeout(timer));
     this.noResponseTimers.clear();
-    this.liveConsoleEditTimers.forEach((timer) => clearTimeout(timer));
-    this.liveConsoleEditTimers.clear();
-    this.liveConsoleByCallSid.clear();
     console.log('Enhanced webhook service stopped'.yellow);
   }
 
@@ -104,14 +96,6 @@ class EnhancedWebhookService {
     // Allow backwards progression for failure states
     const failureStates = ['busy', 'no-answer', 'failed', 'canceled'];
     const isFailureTransition = failureStates.includes(newStatus);
-
-    if (currentIndex === -1 || newIndex === -1) {
-      currentStatusInfo.lastStatus = newStatus;
-      currentStatusInfo.timestamp = new Date();
-      currentStatusInfo.statusHistory.push(newStatus);
-      this.activeCallStatus.set(call_sid, currentStatusInfo);
-      return true;
-    }
     
     // Allow progression if moving forward or transitioning to failure state
     if (newIndex > currentIndex || isFailureTransition) {
@@ -206,17 +190,12 @@ class EnhancedWebhookService {
   // Enhanced call status update with proper no-answer detection
   async sendCallStatusUpdate(call_sid, status, telegram_chat_id, additionalData = {}) {
     try {
-      const normalizedStatus = String(status || '').toLowerCase().replace(/_/g, '-');
-      if (normalizedStatus === 'queued') {
-        console.log(`⏭️ Skipping queued status for call ${call_sid}`.gray);
-        return true;
-      }
-
       // Check if we should send this status
-      if (!this.shouldSendStatus(call_sid, normalizedStatus)) {
+      if (!this.shouldSendStatus(call_sid, status)) {
         return true; // Return success to mark notification as processed
       }
 
+      const normalizedStatus = status.toLowerCase();
       let message = '';
       let emoji = '';
       
@@ -227,6 +206,7 @@ class EnhancedWebhookService {
       const callTiming = this.callTimestamps.get(call_sid);
 
       switch (normalizedStatus) {
+        case 'queued':
         case 'initiated':
           emoji = '📞';
           message = 'Initiating call...';
@@ -306,6 +286,7 @@ class EnhancedWebhookService {
           break;
           
         case 'no-answer':
+        case 'no_answer':
           emoji = '❌';
           message = 'No answer';
           this.clearNoResponseTimer(call_sid);
@@ -358,11 +339,6 @@ class EnhancedWebhookService {
       const fullMessage = `${emoji} ${message}`;
       
       await this.sendTelegramMessage(telegram_chat_id, fullMessage);
-      try {
-        await this.updateLiveConsoleStatus(call_sid, normalizedStatus, telegram_chat_id);
-      } catch (consoleError) {
-        console.error(`❌ Live console status update failed for ${call_sid}:`, consoleError.message);
-      }
       console.log(`✅ Sent enhanced status update: ${normalizedStatus} for call ${call_sid}`.green);
       
       // Log notification metric
@@ -509,11 +485,8 @@ class EnhancedWebhookService {
       let success = false;
 
       switch (notification_type) {
-        case 'call_queued':
-          console.log(`⏭️ Skipping queued notification for call ${call_sid}`.gray);
-          success = true;
-          break;
         case 'call_initiated':
+        case 'call_queued':
           success = await this.sendCallStatusUpdate(call_sid, 'initiated', telegram_chat_id);
           break;
         case 'call_ringing':
@@ -581,7 +554,7 @@ class EnhancedWebhookService {
   }
 
   // Enhanced Telegram message sending with markdown support
-  async sendTelegramMessage(chatId, message, enableMarkdown = false, options = {}) {
+  async sendTelegramMessage(chatId, message, enableMarkdown = false) {
     const url = `https://api.telegram.org/bot${this.telegramBotToken}/sendMessage`;
     
     const payload = {
@@ -592,10 +565,6 @@ class EnhancedWebhookService {
 
     if (enableMarkdown) {
       payload.parse_mode = 'Markdown';
-    }
-
-    if (options.replyMarkup) {
-      payload.reply_markup = options.replyMarkup;
     }
 
     const response = await axios.post(url, payload, {
@@ -610,412 +579,6 @@ class EnhancedWebhookService {
     }
 
     return response.data;
-  }
-
-  async editTelegramMessage(chatId, messageId, message, enableMarkdown = false, replyMarkup = null) {
-    const url = `https://api.telegram.org/bot${this.telegramBotToken}/editMessageText`;
-
-    const payload = {
-      chat_id: chatId,
-      message_id: messageId,
-      text: message,
-      disable_web_page_preview: true
-    };
-
-    if (enableMarkdown) {
-      payload.parse_mode = 'Markdown';
-    }
-
-    if (replyMarkup) {
-      payload.reply_markup = replyMarkup;
-    }
-
-    const response = await axios.post(url, payload, {
-      timeout: 15000,
-      headers: {
-        'Content-Type': 'application/json'
-      }
-    });
-
-    if (!response.data.ok) {
-      throw new Error(`Telegram API error: ${response.data.description || 'Unknown error'}`);
-    }
-
-    return response.data;
-  }
-
-  async answerCallbackQuery(callbackQueryId, message, showAlert = false) {
-    if (!this.telegramBotToken) return false;
-
-    const url = `https://api.telegram.org/bot${this.telegramBotToken}/answerCallbackQuery`;
-    const payload = {
-      callback_query_id: callbackQueryId
-    };
-
-    if (message) {
-      payload.text = String(message).slice(0, 190);
-      payload.show_alert = !!showAlert;
-    }
-
-    try {
-      const response = await axios.post(url, payload, { timeout: 8000 });
-      return !!response.data.ok;
-    } catch (error) {
-      console.error('Failed to answer Telegram callback query:', error.message);
-      return false;
-    }
-  }
-
-  normalizeConsoleStatus(status) {
-    return String(status || '').toLowerCase().replace(/_/g, '-');
-  }
-
-  isTerminalStatus(status) {
-    return ['completed', 'no-answer', 'busy', 'failed', 'canceled'].includes(status);
-  }
-
-  getConsoleStatusLabel(status) {
-    const map = {
-      initiated: '📡 Initiated',
-      ringing: '🔔 Ringing…',
-      answered: '🟢 In call',
-      'in-progress': '🟢 In call',
-      completed: '🔴 Ended: Completed',
-      'no-answer': '🔴 Ended: No answer',
-      busy: '🔴 Ended: Busy',
-      failed: '🔴 Ended: Failed',
-      canceled: '🔴 Ended: Canceled'
-    };
-    return map[status] || `📱 ${status}`;
-  }
-
-  getConsolePhaseLabel(phaseKey) {
-    const map = {
-      waiting: '⏳ Waiting…',
-      listening: '🎙 Listening…',
-      user_speaking: '🎙 User speaking…',
-      thinking: '🧠 Thinking…',
-      agent_responding: '🤖 Agent responding…',
-      agent_speaking: '🔊 Agent speaking…',
-      interrupted: '✋ Interrupted',
-      ended: '—'
-    };
-    return map[phaseKey] || phaseKey;
-  }
-
-  getConsolePhaseEvent(phaseKey) {
-    const map = {
-      user_speaking: '🎙 User speaking…',
-      agent_responding: '🤖 Agent responding…',
-      agent_speaking: '🔊 Agent speaking…',
-      interrupted: '✋ Interrupted'
-    };
-    return map[phaseKey] || null;
-  }
-
-  getDefaultPhaseForStatus(status) {
-    if (['answered', 'in-progress'].includes(status)) {
-      return this.getConsolePhaseLabel('listening');
-    }
-    if (this.isTerminalStatus(status)) {
-      return this.getConsolePhaseLabel('ended');
-    }
-    return this.getConsolePhaseLabel('waiting');
-  }
-
-  async getConsoleCallDetails(callSid) {
-    let call = null;
-    let callState = null;
-
-    try {
-      call = await this.db?.getCall(callSid);
-    } catch {
-      call = null;
-    }
-
-    try {
-      callState = await this.db?.getLatestCallState(callSid, 'call_created');
-    } catch {
-      callState = null;
-    }
-
-    const customerName = callState?.customer_name || call?.customer_name || 'Unknown';
-    const phoneNumber = call?.phone_number || 'Unknown';
-    let template = callState?.template || null;
-    if (!template && callState?.template_id) {
-      template = `Template #${callState.template_id}`;
-    }
-    if (!template) {
-      template = '—';
-    }
-
-    return { customerName, phoneNumber, template };
-  }
-
-  async ensureLiveConsole(callSid, chatId, options = {}) {
-    const existing = this.liveConsoleByCallSid.get(callSid);
-    if (existing) {
-      return existing;
-    }
-
-    if (!chatId || !this.telegramBotToken) {
-      return null;
-    }
-
-    const details = await this.getConsoleCallDetails(callSid);
-    const entry = {
-      chatId,
-      messageId: null,
-      createdAt: new Date(),
-      lastEditAt: null,
-      pickedUpAt: null,
-      endedAt: null,
-      status: options.status || this.getConsoleStatusLabel('initiated'),
-      phase: options.phase || this.getConsolePhaseLabel('waiting'),
-      lastEvents: [],
-      previewTurns: { user: null, agent: null },
-      customerName: details.customerName,
-      phoneNumber: details.phoneNumber,
-      template: details.template
-    };
-
-    const text = this.buildLiveConsoleMessage(entry);
-    const response = await this.sendTelegramMessage(chatId, text);
-    const messageId = response?.result?.message_id;
-    if (!messageId) {
-      throw new Error('Telegram did not return a message_id for live console');
-    }
-
-    entry.messageId = messageId;
-    entry.lastEditAt = new Date();
-    this.liveConsoleByCallSid.set(callSid, entry);
-    return entry;
-  }
-
-  async updateLiveConsoleStatus(callSid, status, chatId) {
-    const normalized = this.normalizeConsoleStatus(status);
-    if (!normalized || normalized === 'queued') {
-      return;
-    }
-
-    const statusLabel = this.getConsoleStatusLabel(normalized);
-    const defaultPhase = this.getDefaultPhaseForStatus(normalized);
-    const entry = await this.ensureLiveConsole(callSid, chatId, {
-      status: statusLabel,
-      phase: defaultPhase
-    });
-    if (!entry) {
-      return;
-    }
-
-    entry.status = statusLabel;
-
-    if (['answered', 'in-progress'].includes(normalized)) {
-      if (!entry.pickedUpAt) {
-        entry.pickedUpAt = new Date();
-      }
-      if (!entry.phase || entry.phase === this.getConsolePhaseLabel('waiting') || entry.phase === this.getConsolePhaseLabel('ended')) {
-        entry.phase = this.getConsolePhaseLabel('listening');
-      }
-    } else if (this.isTerminalStatus(normalized)) {
-      entry.phase = this.getConsolePhaseLabel('ended');
-      entry.endedAt = new Date();
-    } else if (!entry.phase) {
-      entry.phase = defaultPhase;
-    }
-
-    this.queueLiveConsoleUpdate(callSid, { force: this.isTerminalStatus(normalized) });
-  }
-
-  queueLiveConsoleUpdate(callSid, options = {}) {
-    const entry = this.liveConsoleByCallSid.get(callSid);
-    if (!entry || !entry.messageId) {
-      return;
-    }
-
-    const force = !!options.force;
-    const now = Date.now();
-    const lastEdit = entry.lastEditAt ? entry.lastEditAt.getTime() : 0;
-    const elapsed = now - lastEdit;
-
-    if (force) {
-      const pending = this.liveConsoleEditTimers.get(callSid);
-      if (pending) {
-        clearTimeout(pending);
-        this.liveConsoleEditTimers.delete(callSid);
-      }
-      this.editLiveConsoleMessage(callSid).catch(() => {});
-      return;
-    }
-
-    if (elapsed >= this.liveConsoleDebounceMs) {
-      this.editLiveConsoleMessage(callSid).catch(() => {});
-      return;
-    }
-
-    if (this.liveConsoleEditTimers.has(callSid)) {
-      return;
-    }
-
-    const delay = Math.max(this.liveConsoleDebounceMs - elapsed, 0);
-    const timer = setTimeout(() => {
-      this.liveConsoleEditTimers.delete(callSid);
-      this.editLiveConsoleMessage(callSid).catch(() => {});
-    }, delay);
-    this.liveConsoleEditTimers.set(callSid, timer);
-  }
-
-  async editLiveConsoleMessage(callSid) {
-    const entry = this.liveConsoleByCallSid.get(callSid);
-    if (!entry || !entry.messageId) {
-      return;
-    }
-
-    const message = this.buildLiveConsoleMessage(entry);
-    entry.lastEditAt = new Date();
-    try {
-      await this.editTelegramMessage(entry.chatId, entry.messageId, message);
-    } catch (error) {
-      const telegramError = error?.response?.data?.description || error.message;
-      console.error(`❌ Live console edit failed (callSid=${callSid}, messageId=${entry.messageId}): ${telegramError}`);
-    }
-  }
-
-  addLiveEvent(callSid, eventLine, options = {}) {
-    const entry = this.liveConsoleByCallSid.get(callSid);
-    if (!entry || !entry.pickedUpAt) {
-      return;
-    }
-
-    const trimmed = String(eventLine || '').trim();
-    if (!trimmed) {
-      return;
-    }
-
-    const lastEvent = entry.lastEvents[entry.lastEvents.length - 1];
-    if (lastEvent === trimmed) {
-      return;
-    }
-
-    entry.lastEvents.push(trimmed);
-    if (entry.lastEvents.length > this.liveConsoleMaxEvents) {
-      entry.lastEvents.splice(0, entry.lastEvents.length - this.liveConsoleMaxEvents);
-    }
-
-    this.queueLiveConsoleUpdate(callSid, { force: !!options.force });
-  }
-
-  setLiveCallPhase(callSid, phaseKey, options = {}) {
-    const entry = this.liveConsoleByCallSid.get(callSid);
-    if (!entry) {
-      return;
-    }
-
-    const normalizedKey = String(phaseKey || '').toLowerCase();
-    const allowWithoutPickup = normalizedKey === 'ended';
-    if (!allowWithoutPickup && !entry.pickedUpAt) {
-      return;
-    }
-
-    const phaseLabel = this.getConsolePhaseLabel(normalizedKey);
-    if (!phaseLabel) {
-      return;
-    }
-
-    entry.phase = phaseLabel;
-    const eventLine = this.getConsolePhaseEvent(normalizedKey);
-    const force = !!options.force || normalizedKey === 'interrupted';
-
-    if (eventLine) {
-      this.addLiveEvent(callSid, eventLine, { force });
-    } else {
-      this.queueLiveConsoleUpdate(callSid, { force });
-    }
-  }
-
-  recordTranscriptTurn(callSid, speaker, text) {
-    const entry = this.liveConsoleByCallSid.get(callSid);
-    if (!entry || !entry.pickedUpAt) {
-      return;
-    }
-
-    const cleaned = this.truncatePreview(this.normalizePreviewText(text));
-    if (!cleaned) {
-      return;
-    }
-
-    if (speaker === 'user') {
-      entry.previewTurns.user = cleaned;
-      entry.phase = this.getConsolePhaseLabel('thinking');
-    } else if (speaker === 'agent') {
-      entry.previewTurns.agent = cleaned;
-    }
-
-    this.queueLiveConsoleUpdate(callSid);
-  }
-
-  markToolInvocation(callSid, toolName, options = {}) {
-    const label = String(toolName || '').trim();
-    if (!label) {
-      return;
-    }
-    this.addLiveEvent(callSid, `🔄 Tool: ${label}`, { force: !!options.force });
-  }
-
-  markSentimentDrop(callSid, options = {}) {
-    this.addLiveEvent(callSid, '⚠️ Sentiment drop detected', { force: !!options.force });
-  }
-
-  normalizePreviewText(text) {
-    return String(text || '').replace(/\s+/g, ' ').trim();
-  }
-
-  truncatePreview(text) {
-    if (!text) return '';
-    if (text.length <= this.liveConsoleMaxPreviewChars) {
-      return text;
-    }
-    return text.slice(0, this.liveConsoleMaxPreviewChars - 1).trim() + '…';
-  }
-
-  formatElapsed(startTime, endTime = null) {
-    if (!startTime) return '00:00';
-    const end = endTime || new Date();
-    const diffMs = Math.max(0, end - startTime);
-    const totalSeconds = Math.floor(diffMs / 1000);
-    const minutes = Math.floor(totalSeconds / 60);
-    const seconds = totalSeconds % 60;
-    return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
-  }
-
-  buildLiveConsoleMessage(entry) {
-    const events = entry.lastEvents.slice(-this.liveConsoleMaxEvents);
-    const eventLines = [];
-    for (let i = 0; i < this.liveConsoleMaxEvents; i += 1) {
-      eventLines.push(`- ${events[i] || '—'}`);
-    }
-
-    const elapsed = this.formatElapsed(entry.createdAt, entry.endedAt);
-    const userLine = entry.previewTurns.user || '—';
-    const agentLine = entry.previewTurns.agent || '—';
-
-    return [
-      '📞 Outbound Call',
-      `👤 Customer: ${entry.customerName || 'Unknown'}`,
-      `📱 Number: ${entry.phoneNumber || 'Unknown'}`,
-      `🧩 Template: ${entry.template || '—'}`,
-      '',
-      `Status: ${entry.status || this.getConsoleStatusLabel('initiated')}`,
-      `Phase: ${entry.phase || this.getConsolePhaseLabel('waiting')}`,
-      `Elapsed: ${elapsed}`,
-      '',
-      'Recent',
-      ...eventLines,
-      '',
-      'Preview',
-      `🧑 ${userLine}`,
-      `🤖 ${agentLine}`
-    ].join('\n');
   }
 
   // Debug method for troubleshooting
@@ -1130,12 +693,6 @@ class EnhancedWebhookService {
   cleanupCallData(callSid) {
     this.activeCallStatus.delete(callSid);
     this.callTimestamps.delete(callSid);
-    this.liveConsoleByCallSid.delete(callSid);
-    const timer = this.liveConsoleEditTimers.get(callSid);
-    if (timer) {
-      clearTimeout(timer);
-      this.liveConsoleEditTimers.delete(callSid);
-    }
   }
 
   // Enhanced immediate status update with better error handling

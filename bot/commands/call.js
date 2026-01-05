@@ -22,6 +22,7 @@ const {
 } = require('../utils/sessionState');
 
 const templatesApiBase = config.templatesApiUrl.replace(/\/+$/, '');
+const DEFAULT_FIRST_MESSAGE = 'Hello! This is an automated call. How can I help you today?';
 
 function isValidPhoneNumber(number) {
   const e164Regex = /^\+[1-9]\d{1,14}$/;
@@ -536,6 +537,15 @@ async function callFlow(conversation, ctx) {
       configuration.meta?.personaLabel ||
       configuration.payloadUpdates?.persona_label ||
       'Custom';
+
+    if (!payload.first_message) {
+      payload.first_message = DEFAULT_FIRST_MESSAGE;
+    }
+    payload.first_message = buildPersonalizedFirstMessage(
+      payload.first_message,
+      customerName,
+      personaLabel
+    );
 
     const callDetailsCard = [
       '📋 Call Details:',
