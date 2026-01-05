@@ -20,6 +20,7 @@ class EnhancedWebhookService {
     this.waveformFrames = ['▁ ▂ ▃ ▄ ▅ ▆ ▇', '▂ ▃ ▄ ▅ ▆ ▇ ▁', '▃ ▄ ▅ ▆ ▇ ▁ ▂', '▄ ▅ ▆ ▇ ▁ ▂ ▃', '▅ ▆ ▇ ▁ ▂ ▃ ▄', '▆ ▇ ▁ ▂ ▃ ▄ ▅', '▇ ▁ ▂ ▃ ▄ ▅ ▆'];
     this.lastSentimentAt = new Map();
     this.sentimentCooldownMs = 10000;
+    this.mediaSeen = new Map();
   }
 
   start(database) {
@@ -66,6 +67,7 @@ class EnhancedWebhookService {
     this.liveConsoleEditTimers.clear();
     this.liveConsoleByCallSid.clear();
     this.lastSentimentAt.clear();
+    this.mediaSeen.clear();
     console.log('Enhanced webhook service stopped'.yellow);
   }
 
@@ -212,6 +214,7 @@ class EnhancedWebhookService {
       const statusInfo = this.activeCallStatus.get(call_sid);
 
       const correctedStatus = this.correctStatusForEvidence(normalizedStatus, {
+        callSid: call_sid,
         callTiming,
         callDetails,
         statusInfo,
@@ -481,13 +484,7 @@ class EnhancedWebhookService {
           { text: '✋ Skip', callback_data: `recap:skip:${call_sid}` }
         ]]
       };
-      const response = await this.sendTelegramMessage(telegram_chat_id, ' ', false, { replyMarkup });
-      // Clean up placeholder text by editing to an empty caption-like space
-      try {
-        await this.editTelegramMessage(telegram_chat_id, response?.result?.message_id, ' ');
-      } catch {
-        // ignore if edit fails; buttons remain
-      }
+      await this.sendTelegramMessage(telegram_chat_id, '📋 Call recap options', false, { replyMarkup });
       return true;
     } catch (error) {
       console.error('❌ Failed to send call recap:', error);
@@ -942,6 +939,7 @@ class EnhancedWebhookService {
     if (!entry) return;
 
     entry.status = this.getConsoleStatusLabel(status);
+    const statusEvent = this.statusEventText(status, entry.customerName);
     if (['answered', 'in-progress'].includes(status) && !entry.pickedUpAt) {
       entry.pickedUpAt = new Date();
       entry.phase = this.getConsolePhaseLabel('listening');
@@ -949,6 +947,10 @@ class EnhancedWebhookService {
     if (['completed', 'failed', 'no-answer', 'busy', 'canceled'].includes(status)) {
       entry.phase = this.getConsolePhaseLabel('ended');
       entry.endedAt = new Date();
+    }
+
+    if (statusEvent) {
+      this.addLiveEvent(callSid, statusEvent, { force: true });
     }
 
     this.queueLiveConsoleUpdate(callSid, { force: ['completed', 'failed', 'no-answer', 'busy', 'canceled'].includes(status) });
@@ -961,6 +963,10 @@ class EnhancedWebhookService {
     entry.phase = phase;
     if (phaseKey === 'agent_speaking') {
       entry.waveformIndex = (entry.waveformIndex + 1) % this.waveformFrames.length;
+    }
+    const phaseEvent = this.phaseEventText(phaseKey);
+    if (phaseEvent) {
+      this.addLiveEvent(callSid, phaseEvent, { force: !!options.force });
     }
     this.queueLiveConsoleUpdate(callSid, { force: !!options.force });
     return true;
@@ -995,6 +1001,7 @@ class EnhancedWebhookService {
     if (!entry) return;
     const cleaned = this.truncatePreview(this.normalizePreviewText(text));
     if (!cleaned) return;
+    this.mediaSeen.set(callSid, true);
     if (speaker === 'user') {
       entry.previewTurns.user = cleaned;
       entry.phase = this.getConsolePhaseLabel('thinking');
@@ -1110,6 +1117,32 @@ class EnhancedWebhookService {
     return String(text || '').replace(/\s+/g, ' ').trim();
   }
 
+  statusEventText(status, customerName) {
+    const name = customerName || 'customer';
+    const map = {
+      initiated: `📡 Connecting to ${name}…`,
+      ringing: `🔔 Ringing ${name}…`,
+      answered: `📞 ${name} picked up`,
+      'in-progress': `☎️ Connected`,
+      completed: `✅ Call ended`,
+      'no-answer': `⏳ ${name} didn't pick up`,
+      busy: `🚫 ${name}'s line is busy`,
+      failed: `❌ Call failed`,
+      canceled: `⚠️ Call canceled`
+    };
+    return map[status] || null;
+  }
+
+  phaseEventText(phaseKey) {
+    const map = {
+      user_speaking: '🎙 User speaking…',
+      agent_responding: '🤖 Agent responding…',
+      agent_speaking: '🔊 Agent speaking…',
+      interrupted: '✋ Interrupted'
+    };
+    return map[phaseKey] || null;
+  }
+
   markSentimentScore(callSid, score) {
     const now = Date.now();
     const last = this.lastSentimentAt.get(callSid) || 0;
@@ -1141,11 +1174,13 @@ class EnhancedWebhookService {
   correctStatusForEvidence(normalizedStatus, context) {
     const { callTiming, callDetails, statusInfo, additionalData } = context || {};
     const history = statusInfo?.statusHistory || [];
+    const mediaEvidence = this.mediaSeen.get(context?.callSid) || false;
     const answeredEvidence = !!(
       callTiming?.answered ||
       callDetails?.started_at ||
       history.includes('answered') ||
-      history.includes('in-progress')
+      history.includes('in-progress') ||
+      mediaEvidence
     );
 
     if (normalizedStatus === 'in-progress' && !answeredEvidence) {
@@ -1156,7 +1191,7 @@ class EnhancedWebhookService {
       const duration = typeof additionalData.duration === 'number' ? additionalData.duration : null;
       const shortCall = duration !== null ? duration < 3 : false;
       const noAnsweredHistory = !answeredEvidence && !history.includes('completed');
-      if (!answeredEvidence || shortCall) {
+      if (!answeredEvidence || (shortCall && !mediaEvidence)) {
         return 'no-answer';
       }
     }
@@ -1254,6 +1289,7 @@ class EnhancedWebhookService {
       this.liveConsoleEditTimers.delete(callSid);
     }
     this.lastSentimentAt.delete(callSid);
+    this.mediaSeen.delete(callSid);
   }
 
   // Enhanced immediate status update with better error handling

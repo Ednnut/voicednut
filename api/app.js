@@ -562,7 +562,12 @@ app.ws('/connection', (ws) => {
       webhookService.recordTranscriptTurn(callSid, 'user', text);
       
       // Process with adaptive personality and functions
-      gptService.completion(text, interactionCount);
+      try {
+        await gptService.completion(text, interactionCount);
+      } catch (gptError) {
+        console.error('GPT completion error:', gptError);
+        webhookService.addLiveEvent(callSid, '⚠️ GPT error, retrying', { force: true });
+      }
       interactionCount += 1;
     });
     
@@ -684,7 +689,12 @@ app.ws('/vonage/stream', (ws, req) => {
         console.error('Database error adding user transcript:', dbError);
       }
       webhookService.recordTranscriptTurn(callSid, 'user', text);
-      gptService.completion(text, interactionCount);
+      try {
+        await gptService.completion(text, interactionCount);
+      } catch (gptError) {
+        console.error('GPT completion error:', gptError);
+        webhookService.addLiveEvent(callSid, '⚠️ GPT error, retrying', { force: true });
+      }
       interactionCount += 1;
     });
 
@@ -785,7 +795,12 @@ app.ws('/aws/stream', (ws, req) => {
 
       webhookService.recordTranscriptTurn(callSid, 'user', text);
 
-      session.gptService.completion(text, interactionCount);
+      try {
+        await session.gptService.completion(text, interactionCount);
+      } catch (gptError) {
+        console.error('GPT completion error:', gptError);
+        webhookService.addLiveEvent(callSid, '⚠️ GPT error, retrying', { force: true });
+      }
       interactionCount += 1;
     });
 
