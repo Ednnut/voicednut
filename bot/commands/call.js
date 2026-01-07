@@ -20,8 +20,6 @@ const {
   safeReset,
   guardAgainstCommandInterrupt
 } = require('../utils/sessionState');
-const { section, escapeMarkdown, tipLine, buildLine } = require('../utils/messageStyle');
-
 async function notifyCallError(ctx, lines = []) {
   const body = Array.isArray(lines) ? lines : [lines];
   await ctx.reply(section('❌ Call Alert', body));

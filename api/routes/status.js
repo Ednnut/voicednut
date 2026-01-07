@@ -1208,7 +1208,7 @@ class EnhancedWebhookService {
   polishSummaryText(text) {
     if (!text) return '';
     let sanitized = String(text)
-      .replace(/[•-–—]/g, ' ')
+      .replace(/[•–—-]/g, ' ')
       .replace(/[*_`\[\]()~>#+=|{}]/g, '')
       .replace(/\s+/g, ' ')
       .trim();
