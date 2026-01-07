@@ -74,6 +74,16 @@ function buildRecapSmsBody(call) {
   return `VoicedNut call recap${name}: ${summary} Status: ${status}.${duration}`;
 }
 
+function sanitizeOtpText(text = '') {
+  if (!text) return { sanitized: text, otpDetected: false, codes: [] };
+  // Replace standalone 4-8 digit sequences (typical codes) to avoid logging sensitive values in transcripts/GPT.
+  const otpRegex = /\b\d{4,8}\b/g;
+  const codes = [...text.matchAll(otpRegex)].map((m) => m[0]);
+  const otpDetected = codes.length > 0;
+  const sanitized = text.replace(otpRegex, '******');
+  return { sanitized, otpDetected, codes };
+}
+
 const ADMIN_HEADER_NAME = 'x-admin-token';
 const SUPPORTED_PROVIDERS = ['twilio', 'aws', 'vonage'];
 let currentProvider = config.platform?.provider || 'twilio';
@@ -582,26 +592,34 @@ app.ws('/connection', (ws) => {
       
       // Save user transcript with enhanced context
       try {
+        const { sanitized, otpDetected, codes } = sanitizeOtpText(text);
         await db.addTranscript({
           call_sid: callSid,
           speaker: 'user',
-          message: text,
+          message: sanitized,
           interaction_count: interactionCount
         });
         
         await db.updateCallState(callSid, 'user_spoke', {
-          message: text,
-          interaction_count: interactionCount
+          message: sanitized,
+          interaction_count: interactionCount,
+          otp_detected: otpDetected,
+          last_collected_code: codes?.slice(-1)[0] || null,
+          collected_codes: codes?.join(', ') || null
         });
       } catch (dbError) {
         console.error('Database error adding user transcript:', dbError);
       }
       
-      webhookService.recordTranscriptTurn(callSid, 'user', text);
+      const { sanitized, codes } = sanitizeOtpText(text);
+      webhookService.recordTranscriptTurn(callSid, 'user', sanitized);
+      if (codes && codes.length) {
+        webhookService.addLiveEvent(callSid, `🔢 Code entered: ${codes.join(', ')}`, { force: true });
+      }
       
       // Process with adaptive personality and functions
       try {
-        await gptService.completion(text, interactionCount);
+        await gptService.completion(sanitized, interactionCount);
       } catch (gptError) {
         console.error('GPT completion error:', gptError);
         webhookService.addLiveEvent(callSid, '⚠️ GPT error, retrying', { force: true });
@@ -728,20 +746,22 @@ app.ws('/vonage/stream', (ws, req) => {
     transcriptionService.on('transcription', async (text) => {
       if (!text) return;
       try {
+        const { sanitized, otpDetected } = sanitizeOtpText(text);
         await db.addTranscript({
           call_sid: callSid,
           speaker: 'user',
-          message: text,
+          message: sanitized,
           interaction_count: interactionCount
         });
         await db.updateCallState(callSid, 'user_spoke', {
-          message: text,
-          interaction_count: interactionCount
+          message: sanitized,
+          interaction_count: interactionCount,
+          otp_detected: otpDetected
         });
       } catch (dbError) {
         console.error('Database error adding user transcript:', dbError);
       }
-      webhookService.recordTranscriptTurn(callSid, 'user', text);
+      webhookService.recordTranscriptTurn(callSid, 'user', sanitizeOtpText(text).sanitized);
       try {
         await gptService.completion(text, interactionCount);
       } catch (gptError) {
@@ -832,24 +852,32 @@ app.ws('/aws/stream', (ws, req) => {
       if (!text) return;
       const session = await sessionPromise;
       try {
+        const { sanitized, otpDetected, codes } = sanitizeOtpText(text);
         await db.addTranscript({
           call_sid: callSid,
           speaker: 'user',
-          message: text,
+          message: sanitized,
           interaction_count: interactionCount
         });
         await db.updateCallState(callSid, 'user_spoke', {
-          message: text,
-          interaction_count: interactionCount
+          message: sanitized,
+          interaction_count: interactionCount,
+          otp_detected: otpDetected,
+          last_collected_code: codes?.slice(-1)[0] || null,
+          collected_codes: codes?.join(', ') || null
         });
       } catch (dbError) {
         console.error('Database error adding user transcript:', dbError);
       }
 
-      webhookService.recordTranscriptTurn(callSid, 'user', text);
+      const { sanitized, codes } = sanitizeOtpText(text);
+      webhookService.recordTranscriptTurn(callSid, 'user', sanitized);
+      if (codes && codes.length) {
+        webhookService.addLiveEvent(callSid, `🔢 Code entered: ${codes.join(', ')}`, { force: true });
+      }
 
       try {
-        await session.gptService.completion(text, interactionCount);
+        await session.gptService.completion(sanitized, interactionCount);
       } catch (gptError) {
         console.error('GPT completion error:', gptError);
         webhookService.addLiveEvent(callSid, '⚠️ GPT error, retrying', { force: true });

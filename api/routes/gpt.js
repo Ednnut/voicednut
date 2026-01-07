@@ -64,7 +64,7 @@ class EnhancedGptService extends EventEmitter {
       },
       verification: {
         name: 'verification',
-        prompt: 'Call profile: verification. Purpose is identity/OTP/security checks. Never read or share codes or passwords. Prompt for the expected code only, refuse unrelated data, and keep responses brief.'
+        prompt: 'Call profile: verification. Purpose is identity/OTP/security checks. Never read or share codes or passwords. Prefer keypad entry; if spoken, accept only digits, acknowledge without repeating, and keep responses brief.'
       }
     };
     this.systemPrompt = this.composeSystemPrompt();
