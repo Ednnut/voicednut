@@ -21,6 +21,17 @@ const { v4: uuidv4 } = require('uuid');
 const twilio = require('twilio');
 const VoiceResponse = twilio.twiml.VoiceResponse;
 
+// Global console helpers to ensure emoji + color consistency (idempotent)
+if (!console.__emojiWrapped) {
+  const baseLog = console.log.bind(console);
+  const baseWarn = console.warn.bind(console);
+  const baseError = console.error.bind(console);
+  console.log = (...args) => baseLog('📘'.blue, ...args);
+  console.warn = (...args) => baseWarn('⚠️'.yellow, ...args);
+  console.error = (...args) => baseError('❌'.red, ...args);
+  console.__emojiWrapped = true;
+}
+
 function getTwilioWebhookUrl(req) {
   if (!config.server?.hostname) {
     return null;
@@ -55,6 +66,275 @@ let db;
 const functionEngine = new DynamicFunctionEngine();
 const smsService = new EnhancedSmsService();
 
+// Lightweight digit collection manager for keypad/spoken entries
+const digitCollectionManager = {
+  expectations: new Map(), // callSid -> expectation
+  setExpectation(callSid, params = {}) {
+    this.expectations.set(callSid, {
+      profile: params.profile || 'generic',
+      min_digits: params.min_digits || 1,
+      max_digits: params.max_digits || params.min_digits || 6,
+      timeout_s: params.timeout_s || 20,
+      max_retries: params.max_retries || 2,
+      menu_options: params.menu_options || [],
+      confirmation_style: params.confirmation_style || 'none',
+      allow_spoken_fallback: params.allow_spoken_fallback !== false,
+      mask_for_gpt: params.mask_for_gpt !== false,
+      speak_confirmation: params.speak_confirmation || false,
+      retries: 0,
+      collected: [],
+      last_masked: null
+    });
+  },
+  recordDigits(callSid, digits = '') {
+    if (!digits) return { accepted: false, reason: 'empty' };
+    const exp = this.expectations.get(callSid);
+    if (!exp) return { accepted: false, reason: 'no_expectation' };
+    const len = digits.length;
+    const inRange = len >= exp.min_digits && len <= exp.max_digits;
+    const masked = len <= 4 ? digits : `${'*'.repeat(Math.max(0, len - 4))}${digits.slice(-4)}`;
+    const result = { accepted: inRange, masked, profile: exp.profile, len, digits };
+    result.mask_for_gpt = exp.mask_for_gpt;
+
+    if (exp.profile === 'menu' && exp.menu_options.length) {
+      const hit = exp.menu_options.find((o) => String(o.digit) === digits);
+      if (hit) {
+        result.route = hit.route || hit.label || `menu_${digits}`;
+        result.accepted = true;
+      } else {
+        result.accepted = false;
+        result.reason = 'invalid_menu_option';
+      }
+    }
+
+    exp.collected.push(digits);
+    exp.last_masked = masked;
+    if (!result.accepted) {
+      exp.retries += 1;
+      result.retries = exp.retries;
+      if (exp.retries > exp.max_retries) {
+        result.fallback = true;
+      }
+    }
+    this.expectations.set(callSid, exp);
+    return result;
+  }
+};
+
+async function handleCollectionResult(callSid, collection) {
+  if (!collection) return;
+  const payload = {
+    profile: collection.profile,
+    raw_digits: collection.digits,
+    masked: collection.masked,
+    len: collection.len,
+    route: collection.route || null
+  };
+
+  try {
+    await db.updateCallState(callSid, 'digits_collected', {
+      ...payload,
+      masked_last4: collection.masked
+    });
+  } catch (err) {
+    console.error('Error logging digits_collected:', err);
+  }
+
+  if (collection.accepted) {
+    switch (collection.profile) {
+      case 'menu':
+      case 'extension':
+        if (collection.route) {
+          webhookService.addLiveEvent(callSid, `➡️ Routing via menu: ${collection.route}`, { force: true });
+          await db.updateCallState(callSid, 'route_requested', { reason: collection.route, via: 'menu' }).catch(() => {});
+        }
+        break;
+      case 'account':
+      case 'zip':
+      case 'verification':
+        webhookService.addLiveEvent(callSid, `✅ Digits captured (${collection.profile})`, { force: true });
+        await db.updateCallState(callSid, 'identity_confirmed', {
+          method: 'digits',
+          note: `${collection.profile} digits confirmed (masked)`,
+          masked: collection.masked
+        }).catch(() => {});
+        break;
+      case 'amount': {
+        const amountCents = Number(collection.digits);
+        const dollars = (amountCents / 100).toFixed(2);
+        webhookService.addLiveEvent(callSid, `💵 Amount entered: $${dollars}`, { force: true });
+        await db.updateCallState(callSid, 'amount_captured', {
+          amount_cents: amountCents,
+          amount_display: `$${dollars}`
+        }).catch(() => {});
+        break;
+      }
+      case 'survey':
+        webhookService.addLiveEvent(callSid, `📝 Survey response: ${collection.digits}`, { force: true });
+        await db.updateCallState(callSid, 'survey_response', { rating: collection.digits }).catch(() => {});
+        break;
+      case 'callback_confirm':
+        webhookService.addLiveEvent(callSid, `📞 Callback number confirmed (ending ${collection.masked.slice(-4)})`, { force: true });
+        await db.updateCallState(callSid, 'callback_confirmed', {
+          masked_last4: collection.masked,
+          raw_digits: collection.digits
+        }).catch(() => {});
+        break;
+      default:
+        webhookService.addLiveEvent(callSid, `🔢 Digits captured (${collection.len})`, { force: true });
+    }
+  } else {
+    webhookService.addLiveEvent(callSid, `⚠️ Invalid digits (${collection.len}); retry ${collection.retries}/${digitCollectionManager.expectations.get(callSid)?.max_retries || 0}`, { force: true });
+    if (collection.fallback) {
+      webhookService.addLiveEvent(callSid, `⏳ No valid digits; consider fallback/transfer`, { force: true });
+    }
+  }
+}
+
+// Built-in telephony function templates to give GPT deterministic controls
+const telephonyTools = [
+  {
+    type: 'function',
+    function: {
+      name: 'confirm_identity',
+      description: 'Log that the caller has been identity-verified (do not include the code) and proceed to the next step.',
+      parameters: {
+        type: 'object',
+        properties: {
+          method: { type: 'string', enum: ['otp', 'pin', 'knowledge', 'other'], description: 'Verification method used.' },
+          note: { type: 'string', description: 'Brief note about what was confirmed (no sensitive values).' }
+        },
+        required: ['method']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'route_to_agent',
+      description: 'Escalate or transfer the call to a human/agent queue.',
+      parameters: {
+        type: 'object',
+        properties: {
+          reason: { type: 'string', description: 'Short reason for the transfer.' },
+          priority: { type: 'string', enum: ['low', 'normal', 'high'], description: 'Transfer priority if applicable.' }
+        },
+        required: ['reason']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'collect_digits',
+      description: 'Ask caller to enter digits on the keypad (e.g., OTP). Do not speak or repeat the digits.',
+      parameters: {
+        type: 'object',
+        properties: {
+          prompt: { type: 'string', description: 'Short instruction to the caller.' },
+          min_digits: { type: 'integer', description: 'Minimum digits expected.', minimum: 1 },
+          max_digits: { type: 'integer', description: 'Maximum digits expected.', minimum: 1 },
+          profile: { type: 'string', enum: ['generic', 'verification', 'menu', 'account', 'extension', 'zip', 'amount', 'survey', 'callback_confirm'], description: 'Collection profile for downstream handling.' },
+          menu_options: { type: 'array', description: 'For menu profile, array of {digit,label,route}.', items: { type: 'object', properties: { digit: { type: 'string' }, label: { type: 'string' }, route: { type: 'string' } } } },
+          confirmation_style: { type: 'string', enum: ['none', 'last4', 'spoken_amount'], description: 'How to confirm receipt (masked, spoken summary only).' },
+          timeout_s: { type: 'integer', description: 'Timeout in seconds before reprompt.', minimum: 3 },
+          max_retries: { type: 'integer', description: 'Number of retries before fallback.', minimum: 0 },
+          allow_spoken_fallback: { type: 'boolean', description: 'If true, allow spoken fallback after keypad timeout.' },
+          mask_for_gpt: { type: 'boolean', description: 'If true (default), mask digits before sending to GPT/transcripts.' },
+          speak_confirmation: { type: 'boolean', description: 'If true, GPT can verbally confirm receipt (without echoing digits).' }
+        },
+        required: ['prompt', 'min_digits', 'max_digits']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'play_disclosure',
+      description: 'Play or read a required disclosure to the caller. Keep it concise.',
+      parameters: {
+        type: 'object',
+        properties: {
+          message: { type: 'string', description: 'Disclosure text to convey.' }
+        },
+        required: ['message']
+      }
+    }
+  }
+];
+
+function buildTelephonyImplementations(callSid) {
+  return {
+    confirm_identity: async (args = {}) => {
+      const payload = {
+        status: 'acknowledged',
+        method: args.method || 'unspecified',
+        note: args.note || ''
+      };
+      try {
+        await db.updateCallState(callSid, 'identity_confirmed', payload);
+        webhookService.addLiveEvent(callSid, `✅ Identity confirmed (${payload.method})`, { force: true });
+      } catch (err) {
+        console.error('confirm_identity handler error:', err);
+      }
+      return payload;
+    },
+    route_to_agent: async (args = {}) => {
+      const payload = {
+        status: 'queued',
+        reason: args.reason || 'unspecified',
+        priority: args.priority || 'normal'
+      };
+      try {
+        await db.updateCallState(callSid, 'route_requested', payload);
+        webhookService.addLiveEvent(callSid, `📞 Routing to agent: ${payload.reason}`, { force: true });
+      } catch (err) {
+        console.error('route_to_agent handler error:', err);
+      }
+      return payload;
+    },
+    collect_digits: async (args = {}) => {
+      const payload = {
+        prompt: args.prompt || 'Please enter the digits now.',
+        min_digits: args.min_digits || 1,
+        max_digits: args.max_digits || args.min_digits || 6,
+        profile: args.profile || 'generic',
+        menu_options: args.menu_options || [],
+        confirmation_style: args.confirmation_style || 'none',
+        timeout_s: args.timeout_s || 20,
+        max_retries: typeof args.max_retries === 'number' ? args.max_retries : 2,
+        allow_spoken_fallback: args.allow_spoken_fallback !== false,
+        mask_for_gpt: args.mask_for_gpt !== false,
+        speak_confirmation: !!args.speak_confirmation
+      };
+      try {
+        await db.updateCallState(callSid, 'digit_collection_requested', payload);
+        webhookService.addLiveEvent(callSid, `🔢 Collect digits (${payload.profile}): ${payload.min_digits}-${payload.max_digits}`, { force: true });
+        digitCollectionManager.setExpectation(callSid, payload);
+      } catch (err) {
+        console.error('collect_digits handler error:', err);
+      }
+      return payload;
+    },
+    play_disclosure: async (args = {}) => {
+      const payload = { message: args.message || '' };
+      try {
+        await db.updateCallState(callSid, 'disclosure_played', payload);
+        webhookService.addLiveEvent(callSid, '📢 Disclosure played', { force: true });
+      } catch (err) {
+        console.error('play_disclosure handler error:', err);
+      }
+      return payload;
+    }
+  };
+}
+
+function applyTelephonyTools(gptService, callSid, baseTools = [], baseImpl = {}) {
+  const combinedTools = [...baseTools, ...telephonyTools];
+  const combinedImpl = { ...baseImpl, ...buildTelephonyImplementations(callSid) };
+  gptService.setDynamicFunctions(combinedTools, combinedImpl);
+}
+
 function formatDurationForSms(seconds) {
   if (!seconds || Number.isNaN(seconds)) return '';
   const mins = Math.floor(seconds / 60);
@@ -74,13 +354,14 @@ function buildRecapSmsBody(call) {
   return `VoicedNut call recap${name}: ${summary} Status: ${status}.${duration}`;
 }
 
-function sanitizeOtpText(text = '') {
+function sanitizeOtpText(text = '', callSid = null) {
   if (!text) return { sanitized: text, otpDetected: false, codes: [] };
-  // Replace standalone 4-8 digit sequences (typical codes) to avoid logging sensitive values in transcripts/GPT.
+  const expectation = callSid ? digitCollectionManager.expectations.get(callSid) : null;
+  const maskForGpt = expectation ? expectation.mask_for_gpt !== false : true;
   const otpRegex = /\b\d{4,8}\b/g;
   const codes = [...text.matchAll(otpRegex)].map((m) => m[0]);
   const otpDetected = codes.length > 0;
-  const sanitized = text.replace(otpRegex, '******');
+  const sanitized = maskForGpt ? text.replace(otpRegex, '******') : text;
   return { sanitized, otpDetected, codes };
 }
 
@@ -207,9 +488,10 @@ async function ensureAwsSession(callSid) {
   let gptService;
   if (functionSystem) {
     gptService = new EnhancedGptService(callConfig.prompt, callConfig.first_message);
-    gptService.setDynamicFunctions(functionSystem.functions, functionSystem.implementations);
+    applyTelephonyTools(gptService, callSid, functionSystem.functions, functionSystem.implementations);
   } else {
     gptService = new EnhancedGptService(callConfig.prompt, callConfig.first_message);
+    applyTelephonyTools(gptService, callSid);
   }
 
   gptService.setCallSid(callSid);
@@ -386,16 +668,13 @@ app.ws('/connection', (ws) => {
             console.log(`ð­ Using adaptive configuration for ${functionSystem.context.industry} industry`.green);
             console.log(`ð§ Available functions: ${Object.keys(functionSystem.implementations).join(', ')}`.cyan);
             
-            // Initialize Enhanced GPT service with dynamic functions
             gptService = new EnhancedGptService(callConfig.prompt, callConfig.first_message);
-            
-            // Inject the dynamic function system
-            gptService.setDynamicFunctions(functionSystem.functions, functionSystem.implementations);
+            applyTelephonyTools(gptService, callSid, functionSystem.functions, functionSystem.implementations);
             
           } else {
             console.log(`ð¯ Standard call detected: ${callSid}`.yellow);
-            // Use default configuration for regular calls
             gptService = new EnhancedGptService();
+            applyTelephonyTools(gptService, callSid);
           }
           
           gptService.setCallSid(callSid);
@@ -592,7 +871,7 @@ app.ws('/connection', (ws) => {
       
       // Save user transcript with enhanced context
       try {
-        const { sanitized, otpDetected, codes } = sanitizeOtpText(text);
+        const { sanitized, otpDetected, codes } = sanitizeOtpText(text, callSid);
         await db.addTranscript({
           call_sid: callSid,
           speaker: 'user',
@@ -611,10 +890,12 @@ app.ws('/connection', (ws) => {
         console.error('Database error adding user transcript:', dbError);
       }
       
-      const { sanitized, codes } = sanitizeOtpText(text);
+      const { sanitized, codes } = sanitizeOtpText(text, callSid);
       webhookService.recordTranscriptTurn(callSid, 'user', sanitized);
       if (codes && codes.length) {
         webhookService.addLiveEvent(callSid, `🔢 Code entered: ${codes.join(', ')}`, { force: true });
+        const collection = digitCollectionManager.recordDigits(callSid, codes[codes.length - 1]);
+        await handleCollectionResult(callSid, collection);
       }
       
       // Process with adaptive personality and functions
@@ -671,9 +952,10 @@ app.ws('/vonage/stream', (ws, req) => {
     let gptService;
     if (functionSystem) {
       gptService = new EnhancedGptService(callConfig?.prompt, callConfig?.first_message);
-      gptService.setDynamicFunctions(functionSystem.functions, functionSystem.implementations);
+      applyTelephonyTools(gptService, callSid, functionSystem.functions, functionSystem.implementations);
     } else {
       gptService = new EnhancedGptService(callConfig?.prompt, callConfig?.first_message);
+      applyTelephonyTools(gptService, callSid);
     }
 
     gptService.setCallSid(callSid);
@@ -746,7 +1028,7 @@ app.ws('/vonage/stream', (ws, req) => {
     transcriptionService.on('transcription', async (text) => {
       if (!text) return;
       try {
-        const { sanitized, otpDetected } = sanitizeOtpText(text);
+        const { sanitized, otpDetected, codes } = sanitizeOtpText(text, callSid);
         await db.addTranscript({
           call_sid: callSid,
           speaker: 'user',
@@ -756,14 +1038,22 @@ app.ws('/vonage/stream', (ws, req) => {
         await db.updateCallState(callSid, 'user_spoke', {
           message: sanitized,
           interaction_count: interactionCount,
-          otp_detected: otpDetected
+          otp_detected: otpDetected,
+          last_collected_code: codes?.slice(-1)[0] || null,
+          collected_codes: codes?.join(', ') || null
         });
       } catch (dbError) {
         console.error('Database error adding user transcript:', dbError);
       }
-      webhookService.recordTranscriptTurn(callSid, 'user', sanitizeOtpText(text).sanitized);
+      const { sanitized, codes } = sanitizeOtpText(text, callSid);
+      webhookService.recordTranscriptTurn(callSid, 'user', sanitized);
+      if (codes && codes.length) {
+        webhookService.addLiveEvent(callSid, `🔢 Code entered: ${codes.join(', ')}`, { force: true });
+        const collection = digitCollectionManager.recordDigits(callSid, codes[codes.length - 1]);
+        await handleCollectionResult(callSid, collection);
+      }
       try {
-        await gptService.completion(text, interactionCount);
+        await gptService.completion(sanitized, interactionCount);
       } catch (gptError) {
         console.error('GPT completion error:', gptError);
         webhookService.addLiveEvent(callSid, '⚠️ GPT error, retrying', { force: true });
@@ -852,7 +1142,7 @@ app.ws('/aws/stream', (ws, req) => {
       if (!text) return;
       const session = await sessionPromise;
       try {
-        const { sanitized, otpDetected, codes } = sanitizeOtpText(text);
+        const { sanitized, otpDetected, codes } = sanitizeOtpText(text, callSid);
         await db.addTranscript({
           call_sid: callSid,
           speaker: 'user',
@@ -870,10 +1160,15 @@ app.ws('/aws/stream', (ws, req) => {
         console.error('Database error adding user transcript:', dbError);
       }
 
-      const { sanitized, codes } = sanitizeOtpText(text);
+      const { sanitized, codes } = sanitizeOtpText(text, callSid);
       webhookService.recordTranscriptTurn(callSid, 'user', sanitized);
       if (codes && codes.length) {
         webhookService.addLiveEvent(callSid, `🔢 Code entered: ${codes.join(', ')}`, { force: true });
+        const collection = digitCollectionManager.recordDigits(callSid, codes[codes.length - 1]);
+        if (collection.accepted && collection.route) {
+          webhookService.addLiveEvent(callSid, `➡️ Routing via menu: ${collection.route}`, { force: true });
+          await db.updateCallState(callSid, 'route_requested', { reason: collection.route, via: 'menu' }).catch(() => {});
+        }
       }
 
       try {
@@ -1560,7 +1855,14 @@ app.post('/outbound-call', async (req, res) => {
       emotion: emotion || null,
       urgency: urgency || null,
       technical_level: technical_level || null,
-      voice_model: voice_model || null
+      voice_model: voice_model || null,
+      collection_profile: req.body?.collection_profile || null,
+      collection_expected_length: req.body?.collection_expected_length || null,
+      collection_menu_options: req.body?.collection_menu_options || [],
+      collection_timeout_s: req.body?.collection_timeout_s || null,
+      collection_max_retries: req.body?.collection_max_retries || null,
+      collection_mask_for_gpt: req.body?.collection_mask_for_gpt,
+      collection_speak_confirmation: req.body?.collection_speak_confirmation
     };
     
     callConfigurations.set(callId, callConfig);
@@ -1590,7 +1892,14 @@ app.post('/outbound-call', async (req, res) => {
         technical_level: technical_level || null,
         voice_model: voice_model || null,
         provider: currentProvider,
-        provider_metadata: providerMetadata
+        provider_metadata: providerMetadata,
+        collection_profile: req.body?.collection_profile || null,
+        collection_expected_length: req.body?.collection_expected_length || null,
+        collection_menu_options: req.body?.collection_menu_options || [],
+        collection_timeout_s: req.body?.collection_timeout_s || null,
+        collection_max_retries: req.body?.collection_max_retries || null,
+        collection_mask_for_gpt: req.body?.collection_mask_for_gpt,
+        collection_speak_confirmation: req.body?.collection_speak_confirmation
       });
 
       // Create initial webhook notification
