@@ -1055,20 +1055,28 @@ app.post('/webhook/telegram', async (req, res) => {
       return;
     }
 
-    if (action === 'int') {
-      const session = activeCalls.get(callSid);
-      if (!session?.ws || session.ws.readyState !== 1) {
-        webhookService.answerCallbackQuery(cb.id, 'Call stream not active').catch(() => {});
-        return;
-      }
-      webhookService.lockConsoleButtons(callSid, 'Interrupting…');
+    if (prefix === 'rca') {
+      webhookService.answerCallbackQuery(cb.id, 'Fetching recording…').catch(() => {});
       try {
-        session.ws.send(JSON.stringify({ streamSid: session.streamSid, event: 'clear' }));
-      } catch {
-        // ignore
+        await db.updateCallState(callSid, 'recording_access_requested', {
+          at: new Date().toISOString()
+        });
+      } catch (stateError) {
+        console.error('Failed to log recording access request:', stateError);
       }
-      webhookService.setLiveCallPhase(callSid, 'interrupted').catch(() => {});
-      webhookService.answerCallbackQuery(cb.id, 'Interrupted').catch(() => {});
+      await webhookService.sendTelegramMessage(chatId, '🎧 Recording is being prepared. You will receive it here if available.');
+      return;
+    }
+
+    if (action === 'rec') {
+      webhookService.lockConsoleButtons(callSid, 'Recording…');
+      try {
+        await db.updateCallState(callSid, 'recording_requested', { at: new Date().toISOString() });
+        webhookService.addLiveEvent(callSid, '⏺ Recording requested', { force: true });
+        webhookService.answerCallbackQuery(cb.id, 'Recording toggled').catch(() => {});
+      } catch (e) {
+        webhookService.answerCallbackQuery(cb.id, `Failed: ${e.message}`.slice(0, 180)).catch(() => {});
+      }
       setTimeout(() => webhookService.unlockConsoleButtons(callSid), 1200);
       return;
     }

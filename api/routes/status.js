@@ -403,53 +403,20 @@ class EnhancedWebhookService {
         return true;
       }
 
-      // Enhanced transcript header with call details
-      let message = `📋 *Call Transcript*\n\n`;
-      
-      // Call information
-      message += `📞 *Phone:* ${callDetails.phone_number}\n`;
-      
-      // Enhanced duration display
-      if (callDetails.duration && callDetails.duration > 0) {
-        const minutes = Math.floor(callDetails.duration / 60);
-        const seconds = callDetails.duration % 60;
-        message += `⏱️ *Duration:* ${minutes}:${String(seconds).padStart(2, '0')}\n`;
-      }
-      
-      // Call timing if available
-      if (callDetails.started_at && callDetails.ended_at) {
-        const startTime = new Date(callDetails.started_at).toLocaleTimeString();
-        message += `🕐 *Time:* ${startTime}\n`;
-      }
-      
-      message += `💬 *Messages:* ${transcripts.length}\n`;
-      
-      // Add status info with proper emoji
-      if (callDetails.status) {
-        const statusEmoji = this.getStatusEmoji(callDetails.status);
-        message += `📊 *Status:* ${statusEmoji} ${callDetails.status}\n`;
-      }
-      
-      message += `\n*Transcript Preview (last 4 lines):*\n`;
-      const previewLines = this.buildTranscriptPreview(transcripts, 4);
-      if (previewLines.length === 0) {
-        message += `_No transcript lines available_\n`;
-      } else {
-        message += `${previewLines.join('\n')}\n`;
-      }
-
-      // Add call summary if available
-      const rawSummary = callDetails.call_summary || this.generateAutoSummaryFromTranscripts(transcripts);
-      const polishedSummary = this.polishSummaryText(rawSummary);
-      if (polishedSummary) {
-        message += `\n📝 *Summary:* ${polishedSummary}`;
-      }
+      const label =
+        callDetails.customer_name ||
+        callDetails.phone_number ||
+        'this call';
+      const message = `📋 Transcript ready for ${label}.\nChoose an option below.`;
 
       const replyMarkup = {
-        inline_keyboard: [[{ text: '📄 Full transcript', callback_data: `tr:${call_sid}` }]]
+        inline_keyboard: [
+          [{ text: '📄 View transcript', callback_data: `tr:${call_sid}` }],
+          [{ text: '🎧 Transcript audio', callback_data: `rca:${call_sid}` }]
+        ]
       };
 
-      await this.sendTelegramMessage(telegram_chat_id, message, true, { replyMarkup });
+      await this.sendTelegramMessage(telegram_chat_id, message, false, { replyMarkup });
 
       console.log(`✅ Sent enhanced transcript for call ${call_sid}`.green);
       
@@ -799,7 +766,7 @@ class EnhancedWebhookService {
         return `☎️ You're now connected.`;
       case 'completed': {
         const durationText = durationSeconds ? ` - Duration: ${this.formatDuration(durationSeconds)}` : '';
-        return `✅ Call ended${durationText}`;
+        return `🟢 Call ended${durationText}`;
       }
       case 'busy':
         return `🚫 Busy - ${name}'s line is occupied.`;
@@ -820,7 +787,7 @@ class EnhancedWebhookService {
   // Utility methods
   getStatusEmoji(status) {
     const statusEmojis = {
-      'completed': '✅',
+      'completed': '🟢',
       'failed': '❌',
       'busy': '📵',
       'no-answer': '❌',
@@ -872,7 +839,7 @@ class EnhancedWebhookService {
       lastEditAt: null,
       pickedUpAt: null,
       endedAt: null,
-      status: this.getConsoleStatusLabel('initiated'),
+      status: `📡 Connecting to ${meta.customerName || 'customer'}…`,
       phase: this.getConsolePhaseLabel('waiting'),
       lastEvents: [],
       previewTurns: { user: '—', agent: '—' },
@@ -897,7 +864,7 @@ class EnhancedWebhookService {
       ringing: '🔔 Ringing…',
       answered: '📞 Picked up',
       'in-progress': '☎️ In progress',
-      completed: '✅ Completed',
+      completed: '🟢 Completed',
       'no-answer': '⏳ No answer',
       busy: '🚫 Busy',
       failed: '❌ Failed',
@@ -929,7 +896,7 @@ class EnhancedWebhookService {
     return {
       inline_keyboard: [
         [
-          { text: '✋ Interrupt', callback_data: `lc:int:${callSid}` },
+          { text: '⏺️ Record', callback_data: `lc:rec:${callSid}` },
           { text: '⏹ End', callback_data: `lc:end:${callSid}` },
           { text: '🔀 Transfer', callback_data: `lc:xfer:${callSid}` }
         ]
@@ -1046,7 +1013,7 @@ class EnhancedWebhookService {
     } catch (error) {
       const telegramError = error?.response?.data?.description || error.message;
       console.error(`❌ Live console edit failed (callSid=${callSid}, messageId=${entry.messageId}): ${telegramError}`);
-      this.addLiveEvent(callSid, '⚠️ Console update delayed, retrying…', { force: true });
+      // No noisy notifications; rely on next successful update
     }
   }
 
@@ -1123,7 +1090,7 @@ class EnhancedWebhookService {
       ringing: `🔔 Ringing ${name}…`,
       answered: `📞 ${name} picked up`,
       'in-progress': `☎️ Connected`,
-      completed: `✅ Call ended`,
+      completed: `🟢 Call ended`,
       'no-answer': `⏳ ${name} didn't pick up`,
       busy: `🚫 ${name}'s line is busy`,
       failed: `❌ Call failed`,
