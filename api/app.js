@@ -21,14 +21,14 @@ const { v4: uuidv4 } = require('uuid');
 const twilio = require('twilio');
 const VoiceResponse = twilio.twiml.VoiceResponse;
 
-// Global console helpers to ensure emoji + color consistency (idempotent)
+// Console helpers with clean emoji prefixes (idempotent, minimal noise)
 if (!console.__emojiWrapped) {
   const baseLog = console.log.bind(console);
   const baseWarn = console.warn.bind(console);
   const baseError = console.error.bind(console);
-  console.log = (...args) => baseLog('📘'.blue, ...args);
-  console.warn = (...args) => baseWarn('⚠️'.yellow, ...args);
-  console.error = (...args) => baseError('❌'.red, ...args);
+  console.log = (...args) => baseLog('📘', ...args);
+  console.warn = (...args) => baseWarn('⚠️', ...args);
+  console.error = (...args) => baseError('❌', ...args);
   console.__emojiWrapped = true;
 }
 

@@ -28,7 +28,6 @@ const { section, buildLine, tipLine } = require('../utils/messageStyle');
 async function smsAlert(ctx, text) {
     await ctx.reply(section('⚠️ SMS Alert', [text]));
 }
-const { section, buildLine, tipLine } = require('../utils/messageStyle');
 
 // Simple phone number validation
 function isValidPhoneNumber(number) {

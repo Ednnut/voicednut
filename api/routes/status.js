@@ -1,14 +1,12 @@
-require('colors');
 const axios = require('axios');
-
-// Ensure console has emoji + color prefixes (idempotent)
+// Keep status logs readable with emoji prefixes; avoid duplication
 if (!console.__emojiWrapped) {
   const baseLog = console.log.bind(console);
   const baseWarn = console.warn.bind(console);
   const baseError = console.error.bind(console);
-  console.log = (...args) => baseLog('📘'.blue, ...args);
-  console.warn = (...args) => baseWarn('⚠️'.yellow, ...args);
-  console.error = (...args) => baseError('❌'.red, ...args);
+  console.log = (...args) => baseLog('📘', ...args);
+  console.warn = (...args) => baseWarn('⚠️', ...args);
+  console.error = (...args) => baseError('❌', ...args);
   console.__emojiWrapped = true;
 }
 
