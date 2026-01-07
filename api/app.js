@@ -575,31 +575,31 @@ async function ensureAwsSession(callSid) {
 
 async function startServer() {
   try {
-    console.log('ð Initializing Adaptive AI Call System...'.blue);
+    console.log('🚀 Initializing Adaptive AI Call System...');
 
     // Initialize database first
-    console.log('Initializing enhanced database...'.yellow);
+    console.log('Initializing enhanced database...');
     db = new Database();
     await db.initialize();
-    console.log('â Enhanced database initialized successfully'.green);
+    console.log('✅ Enhanced database initialized successfully');
 
     // Start webhook service after database is ready
-    console.log('Starting enhanced webhook service...'.yellow);
+    console.log('Starting enhanced webhook service...');
     webhookService.start(db);
-    console.log('â Enhanced webhook service started'.green);
+    console.log('✅ Enhanced webhook service started');
 
     // Initialize function engine
-    console.log('â Dynamic Function Engine ready'.green);
+    console.log('✅ Dynamic Function Engine ready');
 
     // Start HTTP server
     app.listen(PORT, () => {
-      console.log(`â Enhanced Adaptive API server running on port ${PORT}`.green);
-      console.log(`ð­ System ready - Personality Engine & Dynamic Functions active`.green);
-      console.log(`ð± Enhanced webhook notifications enabled`.green);
+      console.log(`✅ Enhanced Adaptive API server running on port ${PORT}`);
+      console.log(`🎭 System ready - Personality Engine & Dynamic Functions active`);
+      console.log(`📡 Enhanced webhook notifications enabled`);
     });
 
   } catch (error) {
-    console.error('â Failed to start server:', error);
+    console.error('❌ Failed to start server:', error);
     process.exit(1);
   }
 }
