@@ -1,6 +1,6 @@
 require('colors');
 const EventEmitter = require('events');
-const OpenRouter = require('openrouter');
+const OpenAI = require('openai');
 const PersonalityEngine = require('../functions/PersonalityEngine');
 const config = require('../config');
 
@@ -8,12 +8,12 @@ class EnhancedGptService extends EventEmitter {
   constructor(customPrompt = null, customFirstMessage = null) {
     super();
     
-    // Initialize OpenRouter client
+    // Initialize OpenRouter-compatible OpenAI client
     if (!config.openRouter.apiKey) {
       throw new Error('OPENROUTER_API_KEY is not set. Please configure it to enable GPT responses.');
     }
 
-    this.openai = new OpenRouter({
+    this.openai = new OpenAI({
       baseURL: "https://openrouter.ai/api/v1",
       apiKey: config.openRouter.apiKey,
       defaultHeaders: {
