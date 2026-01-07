@@ -606,7 +606,7 @@ async function startServer() {
 
 // Enhanced WebSocket connection handler with dynamic functions
 app.ws('/connection', (ws) => {
-  console.log('ð New WebSocket connection established'.cyan);
+  console.log('ð New WebSocket connection established');
   
   try {
     ws.on('error', (error) => {
@@ -637,7 +637,7 @@ app.ws('/connection', (ws) => {
           callSid = msg.start.callSid;
           callStartTime = new Date();
           
-          console.log(`ð¯ Adaptive call started - SID: ${callSid}`.green);
+          console.log(`ð¯ Adaptive call started - SID: ${callSid}`);
           
           streamService.setStreamSid(streamSid);
 
@@ -665,14 +665,14 @@ app.ws('/connection', (ws) => {
           functionSystem = callFunctionSystems.get(callSid);
           
           if (callConfig && functionSystem) {
-            console.log(`ð­ Using adaptive configuration for ${functionSystem.context.industry} industry`.green);
-            console.log(`ð§ Available functions: ${Object.keys(functionSystem.implementations).join(', ')}`.cyan);
+            console.log(`ð­ Using adaptive configuration for ${functionSystem.context.industry} industry`);
+            console.log(`ð§ Available functions: ${Object.keys(functionSystem.implementations).join(', ')}`);
             
             gptService = new EnhancedGptService(callConfig.prompt, callConfig.first_message);
             applyTelephonyTools(gptService, callSid, functionSystem.functions, functionSystem.implementations);
             
           } else {
-            console.log(`ð¯ Standard call detected: ${callSid}`.yellow);
+            console.log(`ð¯ Standard call detected: ${callSid}`);
             gptService = new EnhancedGptService();
             applyTelephonyTools(gptService, callSid);
           }
@@ -684,7 +684,7 @@ app.ws('/connection', (ws) => {
           // Set up GPT reply handler with personality tracking
           gptService.on('gptreply', async (gptReply, icount) => {
             const personalityInfo = gptReply.personalityInfo || {};
-            console.log(`ð­ ${personalityInfo.name || 'Default'} Personality: ${gptReply.partialResponse.substring(0, 50)}...`.green);
+            console.log(`ð­ ${personalityInfo.name || 'Default'} Personality: ${gptReply.partialResponse.substring(0, 50)}...`);
             webhookService.recordTranscriptTurn(callSid, 'agent', gptReply.partialResponse);
             webhookService.setLiveCallPhase(callSid, 'agent_responding').catch(() => {});
             
@@ -731,7 +731,7 @@ app.ws('/connection', (ws) => {
 
           // Listen for personality changes
           gptService.on('personalityChanged', async (changeData) => {
-            console.log(`ð­ Personality adapted: ${changeData.from} â ${changeData.to}`.magenta);
+            console.log(`ð­ Personality adapted: ${changeData.from} â ${changeData.to}`);
             console.log(`ð Reason: ${JSON.stringify(changeData.reason)}`.blue);
             
             // Log personality change to database
@@ -764,7 +764,7 @@ app.ws('/connection', (ws) => {
               callConfig.first_message : 
               'Hello! what\'s your name and how can i help you today?';
             
-            console.log(`ð£ï¸ First message (${functionSystem?.context.industry || 'default'}): ${firstMessage.substring(0, 50)}...`.magenta);
+            console.log(`ð£ï¸ First message (${functionSystem?.context.industry || 'default'}): ${firstMessage.substring(0, 50)}...`);
             
             try {
               await db.addTranscript({
@@ -784,7 +784,7 @@ app.ws('/connection', (ws) => {
             }, 0);
             
             isInitialized = true;
-            console.log('â Adaptive call initialization complete'.green);
+            console.log('â Adaptive call initialization complete');
             
           } catch (recordingError) {
             console.error('â Recording service error:', recordingError);
@@ -839,7 +839,7 @@ app.ws('/connection', (ws) => {
           if (callSid && callConfigurations.has(callSid)) {
             callConfigurations.delete(callSid);
             callFunctionSystems.delete(callSid);
-            console.log(`ð§¹ Cleaned up adaptive configuration for call: ${callSid}`.yellow);
+            console.log(`ð§¹ Cleaned up adaptive configuration for call: ${callSid}`);
           }
         }
       } catch (messageError) {
@@ -867,7 +867,7 @@ app.ws('/connection', (ws) => {
         return; 
       }
       
-      console.log(`ð¤ Customer: ${text}`.yellow);
+      console.log(`ð¤ Customer: ${text}`);
       
       // Save user transcript with enhanced context
       try {
@@ -918,7 +918,7 @@ app.ws('/connection', (ws) => {
     });
 
     ws.on('close', () => {
-      console.log(`ð WebSocket connection closed for adaptive call: ${callSid || 'unknown'}`.yellow);
+      console.log(`ð WebSocket connection closed for adaptive call: ${callSid || 'unknown'}`);
     });
 
   } catch (err) {
@@ -1265,10 +1265,10 @@ async function handleCallEnd(callSid, callStartTime) {
       }, 2000);
     }
 
-    console.log(`â Enhanced adaptive call ${callSid} completed`.green);
-    console.log(`ð Duration: ${duration}s | Messages: ${transcripts.length} | Adaptations: ${adaptationAnalysis.personalityChanges || 0}`.cyan);
+    console.log(`â Enhanced adaptive call ${callSid} completed`);
+    console.log(`ð Duration: ${duration}s | Messages: ${transcripts.length} | Adaptations: ${adaptationAnalysis.personalityChanges || 0}`);
     if (adaptationAnalysis.finalPersonality) {
-      console.log(`ð­ Final personality: ${adaptationAnalysis.finalPersonality}`.magenta);
+      console.log(`ð­ Final personality: ${adaptationAnalysis.finalPersonality}`);
     }
 
     // Log service health
@@ -1771,7 +1771,7 @@ app.post('/outbound-call', async (req, res) => {
     // Generate dynamic functions based on the prompt
     const functionSystem = functionEngine.generateAdaptiveFunctionSystem(prompt, first_message);
     
-    console.log(`â Generated ${functionSystem.functions.length} functions for ${functionSystem.context.industry} industry`.green);
+    console.log(`â Generated ${functionSystem.functions.length} functions for ${functionSystem.context.industry} industry`);
 
     let callId;
     let callStatus = 'queued';
@@ -1907,8 +1907,8 @@ app.post('/outbound-call', async (req, res) => {
         await db.createEnhancedWebhookNotification(callId, 'call_initiated', user_chat_id);
       }
 
-      console.log(`ð Enhanced adaptive call created: ${callId} to ${number}`.green);
-      console.log(`ð¯ Business context: ${functionSystem.context.industry} - ${functionSystem.context.businessType}`.cyan);
+      console.log(`ð Enhanced adaptive call created: ${callId} to ${number}`);
+      console.log(`ð¯ Business context: ${functionSystem.context.industry} - ${functionSystem.context.businessType}`);
       
     } catch (dbError) {
       console.error('Database error:', dbError);
@@ -1957,7 +1957,7 @@ app.post('/webhook/call-status', async (req, res) => {
     }
 
     console.log(`ð± Fixed Webhook: Call ${CallSid} status: ${CallStatus}`.blue);
-    console.log(`ð Debug Info:`.cyan);
+    console.log(`ð Debug Info:`);
     console.log(`   Duration: ${Duration || 'N/A'}`);
     console.log(`   CallDuration: ${CallDuration || 'N/A'}`);
     console.log(`   DialCallDuration: ${DialCallDuration || 'N/A'}`);
@@ -1966,7 +1966,7 @@ app.post('/webhook/call-status', async (req, res) => {
     // Get call details from database
     const call = await db.getCall(CallSid);
     if (!call) {
-      console.warn(`â ï¸ Webhook received for unknown call: ${CallSid}`.yellow);
+      console.warn(`â ï¸ Webhook received for unknown call: ${CallSid}`);
       res.status(200).send('OK');
       return;
     }
@@ -1984,7 +1984,7 @@ app.post('/webhook/call-status', async (req, res) => {
         !!call.started_at ||
         ['answered', 'in-progress', 'completed'].includes(priorStatus);
       
-      console.log(`ð Analyzing completed call: Duration = ${duration}s`.yellow);
+      console.log(`ð Analyzing completed call: Duration = ${duration}s`);
       
       // If call completed but duration is very short (< 3 seconds), it's likely no-answer
       // unless we already recorded an answer signal
@@ -1997,7 +1997,7 @@ app.post('/webhook/call-status', async (req, res) => {
         actualStatus = 'no-answer';
         notificationType = 'call_no_answer';
       } else {
-        console.log(`â Valid call duration (${duration}s) - confirmed answered`.green);
+        console.log(`â Valid call duration (${duration}s) - confirmed answered`);
         actualStatus = 'completed';
         notificationType = 'call_completed';
       }
@@ -2030,12 +2030,12 @@ app.post('/webhook/call-status', async (req, res) => {
           notificationType = 'call_canceled';
           break;
         default:
-          console.warn(`â ï¸ Unknown call status: ${CallStatus}`.yellow);
+          console.warn(`â ï¸ Unknown call status: ${CallStatus}`);
           notificationType = `call_${actualStatus}`;
       }
     }
 
-    console.log(`ð¯ Final determination: ${CallStatus} â ${actualStatus} â ${notificationType}`.green);
+    console.log(`ð¯ Final determination: ${CallStatus} â ${actualStatus} â ${notificationType}`);
 
     // Update call status in database with enhanced data
     const updateData = {
@@ -2072,7 +2072,7 @@ app.post('/webhook/call-status', async (req, res) => {
       if (!updateData.duration || updateData.duration < ringDuration) {
         updateData.duration = ringDuration;
       }
-      console.log(`ð Calculated ring duration: ${ringDuration}s`.cyan);
+      console.log(`ð Calculated ring duration: ${ringDuration}s`);
     }
 
     // Set timestamps based on actual status (not original CallStatus)
@@ -2088,7 +2088,7 @@ app.post('/webhook/call-status', async (req, res) => {
     if (call.user_chat_id && notificationType) {
       try {
         await db.createEnhancedWebhookNotification(CallSid, notificationType, call.user_chat_id);
-        console.log(`📨 Created corrected ${notificationType} notification for call ${CallSid}`.green);
+        console.log(`📨 Created corrected ${notificationType} notification for call ${CallSid}`);
 
         if (['completed', 'no-answer', 'failed', 'busy', 'canceled'].includes(actualStatus)) {
           await db.createEnhancedWebhookNotification(CallSid, 'call_recap', call.user_chat_id);
@@ -2110,11 +2110,11 @@ app.post('/webhook/call-status', async (req, res) => {
     }
     
     // Log comprehensive status update
-    console.log(`â Fixed webhook processed: ${CallSid} -> ${CallStatus} (corrected to: ${actualStatus})`.green);
+    console.log(`â Fixed webhook processed: ${CallSid} -> ${CallStatus} (corrected to: ${actualStatus})`);
     if (updateData.duration) {
       const minutes = Math.floor(updateData.duration / 60);
       const seconds = updateData.duration % 60;
-      console.log(`ð Call metrics: ${minutes}:${String(seconds).padStart(2, '0')} duration`.cyan);
+      console.log(`ð Call metrics: ${minutes}:${String(seconds).padStart(2, '0')} duration`);
     }
 
     // Log to service health with correction info
@@ -2567,7 +2567,7 @@ app.post('/api/system/cleanup', async (req, res) => {
   try {
     const { days_to_keep = 30 } = req.body;
     
-    console.log(`ð§¹ Starting enhanced system cleanup (keeping ${days_to_keep} days)...`.yellow);
+    console.log(`ð§¹ Starting enhanced system cleanup (keeping ${days_to_keep} days)...`);
     
     const cleanedRecords = await db.cleanupOldRecords(days_to_keep);
     
@@ -4097,7 +4097,7 @@ startServer();
 
 // Enhanced graceful shutdown with comprehensive cleanup
 process.on('SIGINT', async () => {
-  console.log('\nð Shutting down enhanced adaptive system gracefully...'.yellow);
+  console.log('\nð Shutting down enhanced adaptive system gracefully...');
   
   try {
     // Log shutdown start
@@ -4117,7 +4117,7 @@ process.on('SIGINT', async () => {
     });
     
     await db.close();
-    console.log('â Enhanced adaptive system shutdown complete'.green);
+    console.log('â Enhanced adaptive system shutdown complete');
   } catch (shutdownError) {
     console.error('â Error during shutdown:', shutdownError);
   }
@@ -4126,7 +4126,7 @@ process.on('SIGINT', async () => {
 });
 
 process.on('SIGTERM', async () => {
-  console.log('\nð Shutting down enhanced adaptive system gracefully...'.yellow);
+  console.log('\nð Shutting down enhanced adaptive system gracefully...');
   
   try {
     // Log shutdown start
@@ -4147,7 +4147,7 @@ process.on('SIGTERM', async () => {
     });
     
     await db.close();
-    console.log('â Enhanced adaptive system shutdown complete'.green);
+    console.log('â Enhanced adaptive system shutdown complete');
   } catch (shutdownError) {
     console.error('â Error during shutdown:', shutdownError);
   }

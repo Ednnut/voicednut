@@ -37,7 +37,7 @@ class EnhancedWebhookService {
     this.db = database;
     
     if (!this.telegramBotToken) {
-      console.warn('TELEGRAM_BOT_TOKEN not configured. Enhanced webhook service disabled.'.yellow);
+      console.warn('TELEGRAM_BOT_TOKEN not configured. Enhanced webhook service disabled.');
       return;
     }
 
@@ -47,7 +47,7 @@ class EnhancedWebhookService {
     }
 
     this.isRunning = true;
-    console.log('🚀 Starting enhanced webhook service with no-answer detection...'.green);
+    console.log('🚀 Starting enhanced webhook service with no-answer detection...');
     
     // Start processing notifications
     this.interval = setInterval(() => {
@@ -78,7 +78,7 @@ class EnhancedWebhookService {
     this.liveConsoleByCallSid.clear();
     this.lastSentimentAt.clear();
     this.mediaSeen.clear();
-    console.log('Enhanced webhook service stopped'.yellow);
+    console.log('Enhanced webhook service stopped');
   }
 
   // Track call progression and prevent out-of-order status updates
@@ -99,17 +99,17 @@ class EnhancedWebhookService {
     
     // Don't send duplicate status
     if (lastStatus === newStatus) {
-      console.log(`⏭️ Skipping duplicate status ${newStatus} for call ${call_sid}`.gray);
+      console.log(`⏭️ Skipping duplicate status ${newStatus} for call ${call_sid}`);
       return false;
     }
 
     if (lastStatus === 'completed') {
-      console.log(`⏭️ Skipping ${newStatus} because call ${call_sid} already completed`.gray);
+      console.log(`⏭️ Skipping ${newStatus} because call ${call_sid} already completed`);
       return false;
     }
 
     if (['busy', 'no-answer', 'failed', 'canceled'].includes(lastStatus) && newStatus === 'completed') {
-      console.log(`⏭️ Skipping completed because call ${call_sid} already ended as ${lastStatus}`.gray);
+      console.log(`⏭️ Skipping completed because call ${call_sid} already ended as ${lastStatus}`);
       return false;
     }
 
@@ -131,7 +131,7 @@ class EnhancedWebhookService {
       return true;
     }
 
-    console.log(`⏭️ Skipping out-of-order status ${newStatus} (current: ${lastStatus}) for call ${call_sid}`.gray);
+    console.log(`⏭️ Skipping out-of-order status ${newStatus} (current: ${lastStatus}) for call ${call_sid}`);
     return false;
   }
 
@@ -330,22 +330,22 @@ class EnhancedWebhookService {
           if (additionalData.ring_duration) {
             // Use ring duration from database if available
             ringTime = additionalData.ring_duration;
-            console.log(`📞 Using database ring duration: ${ringTime}s`.cyan);
+            console.log(`📞 Using database ring duration: ${ringTime}s`);
           } else if (callTiming.ringing) {
             // Calculate from our timing data
             ringTime = Math.round((new Date() - callTiming.ringing) / 1000);
-            console.log(`📞 Calculated ring duration: ${ringTime}s`.cyan);
+            console.log(`📞 Calculated ring duration: ${ringTime}s`);
           } else if (callTiming.initiated) {
             // Fall back to total time since call started
             ringTime = Math.round((new Date() - callTiming.initiated) / 1000);
-            console.log(`📞 Using total call time: ${ringTime}s`.cyan);
+            console.log(`📞 Using total call time: ${ringTime}s`);
           }
           
           if (ringTime > 0) {
             message = this.buildStatusBubble('no-answer', customerName, { ringDuration: ringTime });
           }
 
-          console.log(`📞 No-answer notification: ${message}`.yellow);
+          console.log(`📞 No-answer notification: ${message}`);
           break;
 
         case 'failed':
@@ -370,9 +370,9 @@ class EnhancedWebhookService {
 
       if (shouldSendBubble.includes(correctedStatus)) {
         await this.sendTelegramMessage(telegram_chat_id, fullMessage);
-        console.log(`✅ Sent enhanced status update: ${correctedStatus} for call ${call_sid}`.green);
+        console.log(`✅ Sent enhanced status update: ${correctedStatus} for call ${call_sid}`);
       } else {
-        console.log(`⏭️ Console-only status ${correctedStatus} for call ${call_sid}`.gray);
+        console.log(`⏭️ Console-only status ${correctedStatus} for call ${call_sid}`);
       }
       await consolePromise;
       await this.updateLiveConsoleStatus(call_sid, correctedStatus, telegram_chat_id);
@@ -428,7 +428,7 @@ class EnhancedWebhookService {
 
       await this.sendTelegramMessage(telegram_chat_id, message, false, { replyMarkup });
 
-      console.log(`✅ Sent enhanced transcript for call ${call_sid}`.green);
+      console.log(`✅ Sent enhanced transcript for call ${call_sid}`);
       
       // Log transcript metric
       if (this.db && this.db.logNotificationMetric) {
@@ -587,14 +587,18 @@ class EnhancedWebhookService {
         case 'call_canceled':
           success = await this.sendCallStatusUpdate(call_sid, 'canceled', telegram_chat_id);
           break;
+        case 'call_stream_started':
+          // Informational only; mark as processed without noisy logs
+          success = true;
+          break;
         default:
-          console.warn(`⚠️ Unknown notification type: ${notification_type}`.yellow);
+        console.warn(`⚠️ Unknown notification type: ${notification_type}`);
           success = await this.sendCallStatusUpdate(call_sid, notification_type.replace('call_', ''), telegram_chat_id);
       }
 
       if (success) {
         await this.db.updateEnhancedWebhookNotification(id, 'sent', null, null);
-        console.log(`✅ Processed enhanced notification ${id} (${notification_type})`.green);
+        console.log(`✅ Processed enhanced notification ${id} (${notification_type})`);
       } else {
         throw new Error('Failed to send notification');
       }
@@ -1283,7 +1287,7 @@ class EnhancedWebhookService {
     }
 
     if (callsToCleanup.length > 0) {
-      console.log(`🧹 Cleaned up ${callsToCleanup.length} old call records`.gray);
+      console.log(`🧹 Cleaned up ${callsToCleanup.length} old call records`);
     }
   }
 
@@ -1384,7 +1388,7 @@ class EnhancedWebhookService {
     
     try {
       const success = await this.sendCallStatusUpdate(call_sid, status, telegram_chat_id);
-      console.log(`🧪 Test result: ${success ? 'SUCCESS' : 'FAILED'}`.cyan);
+      console.log(`🧪 Test result: ${success ? 'SUCCESS' : 'FAILED'}`);
       return success;
     } catch (error) {
       console.error(`🧪 Test failed:`, error);
