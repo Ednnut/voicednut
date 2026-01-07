@@ -698,6 +698,10 @@ function registerCallCommand(bot) {
   bot.command('call', async (ctx) => {
     try {
       console.log(`Call command started by user ${ctx.from?.id || 'unknown'}`);
+      const user = await new Promise((resolve) => getUser(ctx.from.id, resolve));
+      if (!user) {
+        return ctx.reply('❌ You are not authorized to use this bot.');
+      }
       await ctx.conversation.enter('call-conversation');
     } catch (error) {
       console.error('Error starting call conversation:', error);

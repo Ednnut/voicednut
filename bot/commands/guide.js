@@ -1,9 +1,14 @@
 const { InlineKeyboard } = require('grammy');
 const config = require('../config');
+const { getUser } = require('../db/db');
 const { section, emphasize, buildLine, escapeMarkdown } = require('../utils/messageStyle');
 
 module.exports = (bot) => {
     bot.command('guide', async (ctx) => {
+        const user = await new Promise(r => getUser(ctx.from.id, r));
+        if (!user) {
+            return ctx.reply('❌ You are not authorized to use this bot.');
+        }
         const callSteps = [
             '1️⃣ Start a call via /call or the 📞 button',
             '2️⃣ Provide the number in E.164 format (+1234567890)',

@@ -23,10 +23,10 @@ const {
     extractTemplateVariables,
     TEMPLATE_METADATA
 } = require('../utils/templates');
-const { section, buildLine, tipLine } = require('../utils/messageStyle');
+const { section: formatSection, buildLine, tipLine } = require('../utils/messageStyle');
 
 async function smsAlert(ctx, text) {
-    await ctx.reply(section('⚠️ SMS Alert', [text]));
+    await ctx.reply(formatSection('⚠️ SMS Alert', [text]));
 }
 
 // Simple phone number validation
@@ -81,7 +81,7 @@ async function smsFlow(conversation, ctx) {
         const user = await new Promise((resolve) => getUser(ctx.from.id, resolve));
         ensureActive();
         if (!user) {
-            await ctx.reply(section('❌ Authorization', ['You are not authorized to use this bot.']));
+            await ctx.reply(formatSection('❌ Authorization', ['You are not authorized to use this bot.']));
             return;
         }
 
@@ -89,14 +89,14 @@ async function smsFlow(conversation, ctx) {
         let number = prefill.phoneNumber || null;
 
         if (number) {
-            await ctx.reply(section('📞 Follow-up number', [
+            await ctx.reply(formatSection('📞 Follow-up number', [
                 buildLine('➡️', 'Using', number)
             ]));
             if (ctx.session.meta) {
                 delete ctx.session.meta.prefill;
             }
         } else {
-            await ctx.reply(section('📱 Enter phone number', ['Use E.164 format, e.g., +1234567890']));
+            await ctx.reply(formatSection('📱 Enter phone number', ['Use E.164 format, e.g., +1234567890']));
             const numMsg = await waitForMessage();
             number = numMsg?.message?.text?.trim();
 

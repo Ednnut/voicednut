@@ -674,6 +674,16 @@ async function personaFlow(conversation, ctx) {
 function registerPersonaCommand(bot) {
   bot.command('persona', async (ctx) => {
     try {
+      const user = await new Promise((resolve) => getUser(ctx.from.id, resolve));
+      if (!user) {
+        return ctx.reply('❌ You are not authorized to use this bot.');
+      }
+
+      const adminStatus = await new Promise((resolve) => isAdmin(ctx.from.id, resolve));
+      if (!adminStatus) {
+        return ctx.reply('❌ This command is for administrators only.');
+      }
+
       await ctx.conversation.enter('persona-conversation');
     } catch (error) {
       console.error('Failed to start persona conversation:', error);
