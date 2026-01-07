@@ -24,6 +24,11 @@ class EnhancedGptService extends EventEmitter {
     
     this.model = config.openRouter.model;
     this.maxTokens = config.openRouter.maxTokens || 160;
+    this.fillerText = 'One moment while I pull that up.';
+    this.stallTimeoutMs = 2000;
+    this.latencyHistory = [];
+    this.maxLatencySamples = 8;
+    this.brevityHint = 'Keep spoken replies concise: max 2 sentences, ~200 characters, and avoid rambling.';
     
     // Initialize Personality Engine
     this.personalityEngine = new PersonalityEngine();
@@ -37,20 +42,56 @@ class EnhancedGptService extends EventEmitter {
 
     // Use custom prompt if provided, otherwise use default
     this.baseSystemPrompt = customPrompt || defaultPrompt;
+    this.personalityPrompt = this.baseSystemPrompt;
+    this.currentProfileName = 'general';
+    this.currentProfilePrompt = '';
+    this.callProfiles = {
+      general: {
+        name: 'general',
+        prompt: 'Call profile: general assistance. Be courteous, concise, and stick to verifiable information.'
+      },
+      sales: {
+        name: 'sales',
+        prompt: 'Call profile: sales. Build quick rapport, discover the need, offer a clear next step/CTA, avoid guarantees or aggressive claims, keep answers short.'
+      },
+      support: {
+        name: 'support',
+        prompt: 'Call profile: support. Clarify the issue, confirm device/account if relevant, give step-by-step actions, avoid speculation, summarize next steps briefly.'
+      },
+      collections: {
+        name: 'collections',
+        prompt: 'Call profile: collections. Be firm yet respectful. Verify identity, state balance and due date calmly, offer payment options or to schedule, avoid threats or legal advice.'
+      },
+      verification: {
+        name: 'verification',
+        prompt: 'Call profile: verification. Purpose is identity/OTP/security checks. Never read or share codes or passwords. Prompt for the expected code only, refuse unrelated data, and keep responses brief.'
+      }
+    };
+    this.systemPrompt = this.composeSystemPrompt();
     const firstMessage = customFirstMessage || defaultFirstMessage;
 
-    // Initialize conversation with adaptive prompt and concise guidance
-    const brevityHint = 'Keep spoken replies concise: max 2 sentences, ~200 characters, and avoid rambling.';
+    this.currentPhase = 'greeting';
+    this.phaseWindows = {
+      greeting: [],
+      verification: [],
+      resolution: [],
+      closing: [],
+      general: []
+    };
+    this.maxPerPhase = 8;
+    this.metadataMessages = [];
+
     this.userContext = [
-      { 'role': 'system', 'content': `${this.baseSystemPrompt}\n${brevityHint}` },
+      { 'role': 'system', 'content': this.systemPrompt },
       { 'role': 'assistant', 'content': firstMessage },
     ];
+    this.addToPhaseWindow({ role: 'assistant', content: firstMessage });
     
     this.partialResponseIndex = 0;
     this.conversationHistory = []; // Track full conversation for personality analysis
 
     // Store prompts for debugging/logging
-    this.systemPrompt = this.baseSystemPrompt;
+    this.systemPrompt = this.composeSystemPrompt();
     this.firstMessage = firstMessage;
     this.isCustomConfiguration = !!(customPrompt || customFirstMessage);
 
@@ -64,6 +105,48 @@ class EnhancedGptService extends EventEmitter {
     }
   }
 
+  composeSystemPrompt(basePrompt = null) {
+    const personalityBlock = basePrompt || this.personalityPrompt || this.baseSystemPrompt;
+    return [
+      personalityBlock,
+      this.currentProfilePrompt,
+      this.brevityHint
+    ].filter(Boolean).join('\n');
+  }
+
+  setPhase(phaseName = 'greeting') {
+    const normalized = String(phaseName || 'greeting').toLowerCase().trim();
+    const allowed = ['greeting', 'verification', 'resolution', 'closing'];
+    this.currentPhase = allowed.includes(normalized) ? normalized : 'greeting';
+  }
+
+  autoUpdatePhase(role, text, interactionCount) {
+    if (role !== 'user') return;
+    const body = String(text || '').toLowerCase();
+    if (body.match(/code|otp|verify|verification|password|pin|passcode/)) {
+      this.setPhase('verification');
+      return;
+    }
+    if (interactionCount > 6 && body.match(/thank|thanks|bye|goodbye|that.s all|done/)) {
+      this.setPhase('closing');
+      return;
+    }
+    if (interactionCount >= 2 && this.currentPhase === 'greeting') {
+      this.setPhase('resolution');
+      return;
+    }
+  }
+
+  setCallProfile(profileName = 'general') {
+    const key = String(profileName || 'general').toLowerCase().trim();
+    const profile = this.callProfiles[key] || this.callProfiles.general;
+    this.currentProfileName = profile.name;
+    this.currentProfilePrompt = profile.prompt;
+    this.systemPrompt = this.composeSystemPrompt();
+    this.updateSystemPromptWithPersonality(this.personalityPrompt);
+    console.log(`ðª Call profile set: ${this.currentProfileName}`.blue);
+  }
+
   // Set dynamic functions for this conversation
   setDynamicFunctions(tools, implementations) {
     this.dynamicTools = tools;
@@ -75,12 +158,12 @@ class EnhancedGptService extends EventEmitter {
   // Add the callSid to the chat context
   setCallSid(callSid) {
     this.callSid = callSid;
-    this.userContext.push({ 'role': 'system', 'content': `callSid: ${callSid}` });
+    this.metadataMessages.push({ role: 'system', content: `callSid: ${callSid}` });
   }
 
   setCustomerName(customerName) {
     if (!customerName) return;
-    this.userContext.push({ 'role': 'system', 'content': `customerName: ${customerName}` });
+    this.metadataMessages.push({ role: 'system', content: `customerName: ${customerName}` });
   }
 
   // Get current personality and adaptation info
@@ -107,11 +190,12 @@ class EnhancedGptService extends EventEmitter {
   }
 
   updateUserContext(name, role, text) {
-    if (name !== 'user') {
-      this.userContext.push({ 'role': role, 'name': name, 'content': text });
-    } else {
-      this.userContext.push({ 'role': role, 'content': text });
-    }
+    const entry = name !== 'user'
+      ? { role, name, content: text }
+      : { role, content: text };
+
+    this.userContext.push(entry);
+    this.addToPhaseWindow(entry);
   }
 
   // Enhanced completion method with dynamic functions and personality adaptation
@@ -127,6 +211,8 @@ class EnhancedGptService extends EventEmitter {
       timestamp: new Date().toISOString(),
       interactionCount: interactionCount
     });
+
+    this.autoUpdatePhase(role, text, interactionCount);
 
     // Analyze customer message and adapt personality if needed
     if (role === 'user') {
@@ -167,18 +253,32 @@ class EnhancedGptService extends EventEmitter {
 
     // Use dynamic tools if available, otherwise use default empty array
     const toolsToUse = this.dynamicTools.length > 0 ? this.dynamicTools : [];
+    const adaptiveMaxTokens = this.getAdaptiveMaxTokens();
+    const messages = this.buildModelMessages();
 
     // Send completion request with current personality-adapted context and dynamic tools
     let stream;
+    const startedAt = Date.now();
+    let firstChunkAt = null;
+    let stallTimer = null;
+    let fillerSent = false;
     try {
+      stallTimer = setTimeout(() => {
+        if (!firstChunkAt && !fillerSent) {
+          fillerSent = true;
+          this.emit('stall', this.fillerText);
+        }
+      }, this.stallTimeoutMs);
+
       stream = await this.openai.chat.completions.create({
         model: this.model,
-        messages: this.userContext,
+        messages,
         tools: toolsToUse,
-        max_tokens: this.maxTokens,
+        max_tokens: adaptiveMaxTokens,
         stream: true,
       });
     } catch (err) {
+      if (stallTimer) clearTimeout(stallTimer);
       this.emit('gpterror', err);
       throw err;
     }
@@ -201,6 +301,10 @@ class EnhancedGptService extends EventEmitter {
     }
 
     for await (const chunk of stream) {
+      if (!firstChunkAt) {
+        firstChunkAt = Date.now();
+        if (stallTimer) clearTimeout(stallTimer);
+      }
       let content = chunk.choices[0]?.delta?.content || '';
       let deltas = chunk.choices[0].delta;
       finishReason = chunk.choices[0].finish_reason;
@@ -266,6 +370,8 @@ class EnhancedGptService extends EventEmitter {
       }
     }
 
+    if (stallTimer) clearTimeout(stallTimer);
+
     // Store AI response in conversation history
     this.conversationHistory.push({
       role: 'assistant',
@@ -277,22 +383,92 @@ class EnhancedGptService extends EventEmitter {
     });
 
     this.userContext.push({'role': 'assistant', 'content': completeResponse});
+    this.addToPhaseWindow({ role: 'assistant', content: completeResponse });
     
     console.log(`ð§  Context: ${this.userContext.length} | Personality: ${this.personalityEngine.currentPersonality} | Functions: ${Object.keys(this.availableFunctions).length}`.green);
+
+    // Record latency metrics
+    const finishedAt = Date.now();
+    const ttfb = firstChunkAt ? (firstChunkAt - startedAt) : null;
+    const rtt = finishedAt - startedAt;
+    this.recordLatency(ttfb, rtt);
   }
 
   // Update system prompt with new personality
   updateSystemPromptWithPersonality(adaptedPrompt) {
+    this.personalityPrompt = adaptedPrompt || this.personalityPrompt || this.baseSystemPrompt;
+    this.systemPrompt = this.composeSystemPrompt(this.personalityPrompt);
+
     // Replace the first system message with the adapted prompt
     const systemMessageIndex = this.userContext.findIndex(msg => msg.role === 'system' && msg.content !== `callSid: ${this.callSid}`);
     
     if (systemMessageIndex !== -1) {
-      this.userContext[systemMessageIndex].content = adaptedPrompt;
+      this.userContext[systemMessageIndex].content = this.systemPrompt;
       console.log(`ð System prompt updated for new personality`.green);
     } else {
       // If no system message found, add one at the beginning
-      this.userContext.unshift({ 'role': 'system', 'content': adaptedPrompt });
+      this.userContext.unshift({ 'role': 'system', 'content': this.systemPrompt });
     }
+  }
+
+  recordLatency(ttfb, rtt) {
+    const entry = {
+      ttfb: typeof ttfb === 'number' ? ttfb : null,
+      rtt: typeof rtt === 'number' ? rtt : null
+    };
+    this.latencyHistory.push(entry);
+    if (this.latencyHistory.length > this.maxLatencySamples) {
+      this.latencyHistory.shift();
+    }
+  }
+
+  getAdaptiveMaxTokens() {
+    if (!this.latencyHistory.length) return this.maxTokens;
+    const recent = this.latencyHistory.slice(-this.maxLatencySamples);
+    const rtts = recent.map(r => r.rtt).filter(Boolean);
+    if (!rtts.length) return this.maxTokens;
+    const avg = rtts.reduce((a, b) => a + b, 0) / rtts.length;
+
+    if (avg > 4500) {
+      return Math.max(60, Math.floor(this.maxTokens * 0.5));
+    }
+    if (avg > 3000) {
+      return Math.max(80, Math.floor(this.maxTokens * 0.7));
+    }
+    return this.maxTokens;
+  }
+
+  addToPhaseWindow(entry) {
+    const phase = this.currentPhase || 'greeting';
+    const store = this.phaseWindows[phase] || (this.phaseWindows[phase] = []);
+    store.push(entry);
+    if (store.length > this.maxPerPhase) {
+      store.shift();
+    }
+
+    // Keep a small general window as a backstop
+    this.phaseWindows.general.push(entry);
+    if (this.phaseWindows.general.length > this.maxPerPhase) {
+      this.phaseWindows.general.shift();
+    }
+  }
+
+  buildModelMessages() {
+    const messages = [];
+    messages.push({ role: 'system', content: this.systemPrompt });
+    if (this.metadataMessages.length) {
+      messages.push(...this.metadataMessages);
+    }
+
+    const phaseEntries = (this.phaseWindows[this.currentPhase] || []).slice(-this.maxPerPhase);
+    const generalBackstop = this.phaseWindows.general.slice(-3);
+    const combined = [...phaseEntries, ...generalBackstop];
+
+    for (const entry of combined) {
+      messages.push(entry);
+    }
+
+    return messages;
   }
 
   // Get comprehensive conversation analysis

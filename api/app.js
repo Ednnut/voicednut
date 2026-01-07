@@ -204,6 +204,7 @@ async function ensureAwsSession(callSid) {
 
   gptService.setCallSid(callSid);
   gptService.setCustomerName(callConfig?.customer_name);
+  gptService.setCallProfile(callConfig?.purpose || callConfig?.business_context?.purpose);
 
   const session = {
     startTime: new Date(),
@@ -389,6 +390,7 @@ app.ws('/connection', (ws) => {
           
           gptService.setCallSid(callSid);
           gptService.setCustomerName(callConfig?.customer_name);
+          gptService.setCallProfile(callConfig?.purpose || callConfig?.business_context?.purpose);
 
           // Set up GPT reply handler with personality tracking
           gptService.on('gptreply', async (gptReply, icount) => {
@@ -415,9 +417,27 @@ app.ws('/connection', (ws) => {
               });
             } catch (dbError) {
               console.error('Database error adding AI transcript:', dbError);
+    }
+    
+    ttsService.generate(gptReply, icount);
+  });
+
+  gptService.on('stall', (fillerText) => {
+    webhookService.addLiveEvent(callSid, '⏳ One moment…', { force: true });
+    try {
+      ttsService.generate({ partialResponse: fillerText, personalityInfo: { name: 'filler' }, adaptationHistory: [] }, session.interactionCount);
+    } catch (err) {
+      console.error('Filler TTS error:', err);
+    }
+  });
+
+          gptService.on('stall', (fillerText) => {
+            webhookService.addLiveEvent(callSid, '⏳ One moment…', { force: true });
+            try {
+              ttsService.generate({ partialResponse: fillerText, personalityInfo: { name: 'filler' }, adaptationHistory: [] }, interactionCount);
+            } catch (err) {
+              console.error('Filler TTS error:', err);
             }
-            
-            ttsService.generate(gptReply, icount);
           });
 
           // Listen for personality changes
@@ -640,6 +660,7 @@ app.ws('/vonage/stream', (ws, req) => {
 
     gptService.setCallSid(callSid);
     gptService.setCustomerName(callConfig?.customer_name);
+    gptService.setCallProfile(callConfig?.purpose || callConfig?.business_context?.purpose);
 
     activeCalls.set(callSid, {
       startTime: new Date(),
@@ -672,6 +693,15 @@ app.ws('/vonage/stream', (ws, req) => {
       }
 
       await ttsService.generate(gptReply, icount);
+    });
+
+    gptService.on('stall', (fillerText) => {
+      webhookService.addLiveEvent(callSid, '⏳ One moment…', { force: true });
+      try {
+        ttsService.generate({ partialResponse: fillerText, personalityInfo: { name: 'filler' }, adaptationHistory: [] }, interactionCount);
+      } catch (err) {
+        console.error('Filler TTS error:', err);
+      }
     });
 
     gptService.on('gpterror', (err) => {
@@ -1494,7 +1524,15 @@ app.post('/outbound-call', async (req, res) => {
       provider: currentProvider,
       provider_metadata: providerMetadata,
       business_context: functionSystem.context,
-      function_count: functionSystem.functions.length
+      function_count: functionSystem.functions.length,
+      purpose: purpose || null,
+      business_id: business_id || null,
+      template: template || null,
+      template_id: template_id || null,
+      emotion: emotion || null,
+      urgency: urgency || null,
+      technical_level: technical_level || null,
+      voice_model: voice_model || null
     };
     
     callConfigurations.set(callId, callConfig);
