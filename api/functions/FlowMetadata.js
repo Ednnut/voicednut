@@ -1,0 +1,512 @@
+const {
+  RELATIONSHIP_PROFILE_TYPES,
+  RELATIONSHIP_OBJECTIVE_TAGS,
+  RELATIONSHIP_FLOW_TYPES,
+  RELATIONSHIP_PROFILE_ALIASES,
+  RELATIONSHIP_PROFILE_OBJECTIVE_MAP,
+  RELATIONSHIP_PROFILE_FLOW_MAP,
+  normalizeRelationshipProfileType,
+} = require("./Dating");
+
+const CORE_CALL_OBJECTIVE_IDS = Object.freeze([
+  "collect_payment",
+  "verify_identity",
+  "appointment_confirm",
+  "service_recovery",
+  "general_outreach",
+]);
+
+const CORE_CALL_FLOW_TYPES = Object.freeze([
+  "payment_collection",
+  "identity_verification",
+  "appointment_confirmation",
+  "service_recovery",
+  "general_outreach",
+]);
+
+const DOMAIN_FLOW_OBJECTIVE_TAG_MAP = Object.freeze({
+  tax_support: "tax_support_service",
+  tax_resolution: "tax_resolution_service",
+  bank_servicing: "bank_servicing_support",
+  fraud_review: "fraud_review_support",
+  collections_servicing: "collections_servicing_support",
+  identity_verification_plus: "identity_verification_plus",
+});
+
+const DOMAIN_CALL_OBJECTIVE_IDS = Object.freeze(
+  Array.from(new Set(Object.values(DOMAIN_FLOW_OBJECTIVE_TAG_MAP))),
+);
+
+const DOMAIN_CALL_FLOW_TYPES = Object.freeze(
+  Object.keys(DOMAIN_FLOW_OBJECTIVE_TAG_MAP),
+);
+
+const DOMAIN_SCRIPT_PROFILE_FLOW_TYPE_SET = new Set(DOMAIN_CALL_FLOW_TYPES);
+const PROFILE_FLOW_TYPE_SET = new Set(RELATIONSHIP_FLOW_TYPES);
+const PROFILE_SCRIPT_PROFILE_FLOW_TYPE_SET = new Set(
+  RELATIONSHIP_PROFILE_TYPES.filter((profileType) => !DOMAIN_SCRIPT_PROFILE_FLOW_TYPE_SET.has(profileType)),
+);
+
+const FLOW_OBJECTIVE_TAG_MAP = Object.freeze({
+  payment_collection: "collect_payment",
+  identity_verification: "verify_identity",
+  appointment_confirmation: "appointment_confirm",
+  service_recovery: "service_recovery",
+  general_outreach: "general_outreach",
+  ...DOMAIN_FLOW_OBJECTIVE_TAG_MAP,
+  ...RELATIONSHIP_FLOW_TYPES.reduce((acc, flowType) => {
+    const normalizedProfile = normalizeRelationshipProfileType(flowType, "");
+    const objectiveTag = RELATIONSHIP_PROFILE_OBJECTIVE_MAP[normalizedProfile];
+    if (objectiveTag) {
+      acc[flowType] = objectiveTag;
+    }
+    return acc;
+  }, {}),
+});
+
+const FLOW_OBJECTIVE_TAGS = Object.freeze(
+  Array.from(new Set(Object.values(FLOW_OBJECTIVE_TAG_MAP))),
+);
+
+const CALL_OBJECTIVE_IDS = Object.freeze([
+  ...CORE_CALL_OBJECTIVE_IDS,
+  ...DOMAIN_CALL_OBJECTIVE_IDS,
+  ...RELATIONSHIP_OBJECTIVE_TAGS,
+]);
+
+const CALL_SCRIPT_FLOW_TYPES = Object.freeze([
+  ...CORE_CALL_FLOW_TYPES,
+  ...DOMAIN_CALL_FLOW_TYPES,
+  ...RELATIONSHIP_FLOW_TYPES,
+  "general",
+]);
+
+const CALL_SCRIPT_FLOW_TYPE_ALIASES = Object.freeze(
+  (() => {
+    const aliases = {
+      payment_collection: "payment_collection",
+      "payment-collection": "payment_collection",
+      payment_flow: "payment_collection",
+      payment: "payment_collection",
+      collect_payment: "payment_collection",
+      "collect-payment": "payment_collection",
+      identity_verification: "identity_verification",
+      "identity-verification": "identity_verification",
+      identity: "identity_verification",
+      verify_identity: "identity_verification",
+      "verify-identity": "identity_verification",
+      otp: "identity_verification",
+      digit_capture: "identity_verification",
+      "digit-capture": "identity_verification",
+      appointment_confirmation: "appointment_confirmation",
+      "appointment-confirmation": "appointment_confirmation",
+      appointment_confirm: "appointment_confirmation",
+      "appointment-confirm": "appointment_confirmation",
+      appointment: "appointment_confirmation",
+      service_recovery: "service_recovery",
+      "service-recovery": "service_recovery",
+      recovery: "service_recovery",
+      general_outreach: "general_outreach",
+      "general-outreach": "general_outreach",
+      outreach: "general_outreach",
+      tax_support: "tax_support",
+      "tax-support": "tax_support",
+      tax_support_service: "tax_support",
+      "tax-support-service": "tax_support",
+      tax_resolution: "tax_resolution",
+      "tax-resolution": "tax_resolution",
+      tax_resolution_service: "tax_resolution",
+      "tax-resolution-service": "tax_resolution",
+      bank_servicing: "bank_servicing",
+      "bank-servicing": "bank_servicing",
+      bank_servicing_support: "bank_servicing",
+      "bank-servicing-support": "bank_servicing",
+      fraud_review: "fraud_review",
+      "fraud-review": "fraud_review",
+      fraud_review_support: "fraud_review",
+      "fraud-review-support": "fraud_review",
+      collections_servicing: "collections_servicing",
+      "collections-servicing": "collections_servicing",
+      collections_servicing_support: "collections_servicing",
+      "collections-servicing-support": "collections_servicing",
+      identity_verification_plus: "identity_verification_plus",
+      "identity-verification-plus": "identity_verification_plus",
+      identity_verification_plus_flow: "identity_verification_plus",
+      "identity-verification-plus-flow": "identity_verification_plus",
+      general: "general",
+      default: "general",
+    };
+
+    DOMAIN_CALL_FLOW_TYPES.forEach((flowType) => {
+      const objectiveTag = DOMAIN_FLOW_OBJECTIVE_TAG_MAP[flowType];
+      aliases[flowType] = flowType;
+      aliases[flowType.replace(/_/g, "-")] = flowType;
+      aliases[`${flowType}_flow`] = flowType;
+      aliases[`${flowType}-flow`] = flowType;
+      if (objectiveTag) {
+        aliases[objectiveTag] = flowType;
+        aliases[objectiveTag.replace(/_/g, "-")] = flowType;
+      }
+    });
+
+    RELATIONSHIP_PROFILE_TYPES.forEach((profileType) => {
+      const flowType = RELATIONSHIP_PROFILE_FLOW_MAP[profileType] || profileType;
+      const objectiveTag = RELATIONSHIP_PROFILE_OBJECTIVE_MAP[profileType];
+      aliases[profileType] = flowType;
+      aliases[flowType] = flowType;
+      aliases[`${profileType}_flow`] = flowType;
+      aliases[`${profileType}-flow`] = flowType;
+      if (objectiveTag) {
+        aliases[objectiveTag] = flowType;
+      }
+    });
+
+    Object.entries(RELATIONSHIP_PROFILE_ALIASES).forEach(([alias, profileType]) => {
+      const normalizedProfile = normalizeRelationshipProfileType(profileType, "");
+      const flowType = RELATIONSHIP_PROFILE_FLOW_MAP[normalizedProfile] || normalizedProfile;
+      if (flowType && PROFILE_FLOW_TYPE_SET.has(flowType)) {
+        aliases[String(alias || "").trim().toLowerCase()] = flowType;
+      }
+    });
+
+    return aliases;
+  })(),
+);
+
+const CALL_OBJECTIVE_TAG_ALIASES = Object.freeze(
+  (() => {
+    const aliases = {};
+    FLOW_OBJECTIVE_TAGS.forEach((objectiveTag) => {
+      aliases[objectiveTag] = objectiveTag;
+    });
+    Object.entries(CALL_SCRIPT_FLOW_TYPE_ALIASES).forEach(([alias, flowType]) => {
+      const objectiveTag = FLOW_OBJECTIVE_TAG_MAP[flowType];
+      if (objectiveTag) {
+        aliases[alias] = objectiveTag;
+      }
+    });
+    return aliases;
+  })(),
+);
+
+function normalizeCallScriptFlowType(value) {
+  if (value === undefined || value === null) return null;
+  const raw = String(value || "").trim().toLowerCase();
+  if (!raw) return null;
+  return CALL_SCRIPT_FLOW_TYPE_ALIASES[raw] || null;
+}
+
+function normalizeObjectiveTag(value) {
+  const raw = String(value || "").trim().toLowerCase();
+  if (!raw) return "";
+  return CALL_OBJECTIVE_TAG_ALIASES[raw] || raw;
+}
+
+function parseObjectiveTags(value) {
+  if (value === undefined || value === null) return [];
+  if (Array.isArray(value)) {
+    return value.map((entry) => normalizeObjectiveTag(entry)).filter(Boolean);
+  }
+  const raw = String(value || "").trim();
+  if (!raw) return [];
+  if (raw.startsWith("[")) {
+    try {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) {
+        return parsed.map((entry) => normalizeObjectiveTag(entry)).filter(Boolean);
+      }
+      return [];
+    } catch (_) {
+      return [];
+    }
+  }
+  return raw
+    .split(",")
+    .map((entry) => normalizeObjectiveTag(entry))
+    .filter(Boolean);
+}
+
+function buildObjectiveTagsForFlow(flowType = null, existingTags = []) {
+  const normalizedFlow = normalizeCallScriptFlowType(flowType);
+  const merged = Array.isArray(existingTags)
+    ? existingTags.map((entry) => normalizeObjectiveTag(entry)).filter(Boolean)
+    : [];
+  const keep = merged.filter((tag) => !FLOW_OBJECTIVE_TAGS.includes(tag));
+  if (!normalizedFlow || normalizedFlow === "general") {
+    return keep;
+  }
+  const mappedTag = FLOW_OBJECTIVE_TAG_MAP[normalizedFlow];
+  if (mappedTag && !keep.includes(mappedTag)) {
+    keep.push(mappedTag);
+  }
+  return keep;
+}
+
+function isProfileFlowType(value) {
+  const normalized = normalizeCallScriptFlowType(value) || normalizeRelationshipProfileType(value, "");
+  return PROFILE_FLOW_TYPE_SET.has(normalized);
+}
+
+const isRelationshipFlowType = isProfileFlowType;
+
+function normalizeScriptProfileAttachment(value) {
+  const normalizedFlow = normalizeCallScriptFlowType(value);
+  if (normalizedFlow && (
+    PROFILE_SCRIPT_PROFILE_FLOW_TYPE_SET.has(normalizedFlow) ||
+    DOMAIN_SCRIPT_PROFILE_FLOW_TYPE_SET.has(normalizedFlow)
+  )) {
+    return normalizedFlow;
+  }
+
+  const normalizedProfile = normalizeRelationshipProfileType(value, "");
+  return PROFILE_SCRIPT_PROFILE_FLOW_TYPE_SET.has(normalizedProfile) ? normalizedProfile : null;
+}
+
+function normalizeOptionalScriptBoolean(value) {
+  if (value === undefined || value === null || value === "") {
+    return null;
+  }
+  if (typeof value === "boolean") {
+    return value;
+  }
+  if (typeof value === "number") {
+    if (value === 1) {
+      return true;
+    }
+    if (value === 0) {
+      return false;
+    }
+    return null;
+  }
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    if (!normalized) {
+      return null;
+    }
+    if (["true", "1", "yes", "on"].includes(normalized)) {
+      return true;
+    }
+    if (["false", "0", "no", "off"].includes(normalized)) {
+      return false;
+    }
+  }
+  return null;
+}
+
+function normalizeScriptProfileLockMode(value) {
+  if (value === undefined || value === null || value === "") {
+    return null;
+  }
+  const normalized = String(value).trim().toLowerCase().replace(/[\s-]+/g, "_");
+  if (["locked", "unlocked", "auto"].includes(normalized)) {
+    return normalized;
+  }
+  return null;
+}
+
+function getCallScriptFlowTypes(script = {}) {
+  const rawFlowTypes = Array.isArray(script.flow_types)
+    ? script.flow_types
+    : script.flow_type
+      ? [script.flow_type]
+      : [];
+
+  const normalized = [];
+  rawFlowTypes.forEach((entry) => {
+    const flowType = normalizeCallScriptFlowType(entry);
+    if (flowType && !normalized.includes(flowType)) {
+      normalized.push(flowType);
+    }
+  });
+  if (normalized.length) {
+    return normalized;
+  }
+
+  const objectiveTags = Array.isArray(script.objective_tags)
+    ? script.objective_tags.map((entry) => normalizeObjectiveTag(entry))
+    : [];
+
+  const fallback = [];
+  const add = (flowType) => {
+    if (!fallback.includes(flowType)) {
+      fallback.push(flowType);
+    }
+  };
+
+  if (script.supports_payment === true || objectiveTags.includes("collect_payment")) {
+    add("payment_collection");
+  }
+
+  const defaultProfile = normalizeRelationshipProfileType(script.default_profile, "");
+  if (
+    script.supports_digit_capture === true ||
+    script.requires_otp === true ||
+    (defaultProfile && !PROFILE_FLOW_TYPE_SET.has(defaultProfile)) ||
+    objectiveTags.includes("verify_identity")
+  ) {
+    add("identity_verification");
+  }
+
+  if (objectiveTags.includes("appointment_confirm")) {
+    add("appointment_confirmation");
+  }
+  if (objectiveTags.includes("service_recovery")) {
+    add("service_recovery");
+  }
+  if (objectiveTags.includes("general_outreach")) {
+    add("general_outreach");
+  }
+
+  Object.entries(DOMAIN_FLOW_OBJECTIVE_TAG_MAP).forEach(([flowType, objectiveTag]) => {
+    if (objectiveTag && objectiveTags.includes(objectiveTag)) {
+      add(flowType);
+    }
+  });
+
+  RELATIONSHIP_FLOW_TYPES.forEach((flowType) => {
+    const objectiveTag = FLOW_OBJECTIVE_TAG_MAP[flowType];
+    if (objectiveTag && objectiveTags.includes(objectiveTag)) {
+      add(flowType);
+    }
+  });
+
+  const defaultFlow = normalizeCallScriptFlowType(script.default_profile);
+  if (defaultFlow && defaultFlow !== "general") {
+    add(defaultFlow);
+  }
+
+  if (!fallback.length) {
+    add("general");
+  }
+  return fallback;
+}
+
+function getPrimaryFlowType(script = {}) {
+  const flowTypes = getCallScriptFlowTypes(script);
+  return flowTypes[0] || "general";
+}
+
+function getEffectiveObjectiveTags(script = {}) {
+  const existingTags = Array.isArray(script.objective_tags)
+    ? script.objective_tags.map((entry) => normalizeObjectiveTag(entry)).filter(Boolean)
+    : [];
+  const primaryFlow = getPrimaryFlowType(script);
+  return buildObjectiveTagsForFlow(primaryFlow, existingTags);
+}
+
+function getAutoAttachedScriptProfileFlow(script = {}) {
+  const scriptFlowTypes = getCallScriptFlowTypes(script);
+  const profileFlow =
+    scriptFlowTypes.find((flowType) => PROFILE_SCRIPT_PROFILE_FLOW_TYPE_SET.has(flowType)) || null;
+  if (profileFlow) {
+    return profileFlow;
+  }
+
+  const primaryFlow = getPrimaryFlowType(script);
+  return DOMAIN_SCRIPT_PROFILE_FLOW_TYPE_SET.has(primaryFlow) ? primaryFlow : null;
+}
+
+function resolveScriptProfileRouting(script = {}, overrides = {}) {
+  const explicitAttachedProfile =
+    normalizeScriptProfileAttachment(overrides.attachedProfile) ||
+    normalizeScriptProfileAttachment(script.attached_profile) ||
+    normalizeScriptProfileAttachment(overrides.callProfile) ||
+    normalizeScriptProfileAttachment(script.call_profile) ||
+    normalizeScriptProfileAttachment(overrides.conversationProfile) ||
+    normalizeScriptProfileAttachment(script.conversation_profile) ||
+    normalizeScriptProfileAttachment(overrides.profile) ||
+    normalizeScriptProfileAttachment(script.profile);
+
+  const inferredAttachedProfile = getAutoAttachedScriptProfileFlow(script);
+  const attachedProfile = explicitAttachedProfile || inferredAttachedProfile;
+
+  const callProfile =
+    normalizeScriptProfileAttachment(overrides.callProfile) ||
+    normalizeScriptProfileAttachment(script.call_profile) ||
+    attachedProfile;
+
+  const conversationProfile =
+    normalizeScriptProfileAttachment(overrides.conversationProfile) ||
+    normalizeScriptProfileAttachment(script.conversation_profile) ||
+    callProfile;
+
+  const autoAttachProfile =
+    normalizeOptionalScriptBoolean(overrides.autoAttachProfile) ??
+    normalizeOptionalScriptBoolean(script.auto_attach_profile) ??
+    (inferredAttachedProfile ? true : null);
+
+  const explicitProfileLockMode =
+    normalizeScriptProfileLockMode(overrides.profileLockMode) ||
+    normalizeScriptProfileLockMode(script.profile_lock_mode);
+
+  const explicitConversationProfileLock =
+    normalizeOptionalScriptBoolean(overrides.conversationProfileLock) ??
+    normalizeOptionalScriptBoolean(overrides.profileLock) ??
+    normalizeOptionalScriptBoolean(script.conversation_profile_lock) ??
+    normalizeOptionalScriptBoolean(script.profile_lock);
+
+  const profileLockMode =
+    explicitProfileLockMode ||
+    (explicitConversationProfileLock === true
+      ? "locked"
+      : explicitConversationProfileLock === false
+        ? "unlocked"
+        : inferredAttachedProfile
+          ? "locked"
+          : null);
+
+  const conversationProfileLock =
+    explicitConversationProfileLock ??
+    (profileLockMode === "locked"
+      ? true
+      : profileLockMode === "unlocked"
+        ? false
+        : conversationProfile
+          ? true
+          : null);
+
+  const purpose =
+    overrides.purpose ||
+    script?.persona_config?.purpose ||
+    script?.purpose ||
+    callProfile ||
+    null;
+
+  return {
+    primaryFlow: getPrimaryFlowType(script),
+    flowTypes: getCallScriptFlowTypes(script),
+    objectiveTags: getEffectiveObjectiveTags(script),
+    attachedProfile,
+    autoAttachProfile,
+    callProfile,
+    conversationProfile,
+    profileLockMode,
+    conversationProfileLock,
+    purpose,
+    warnings: [],
+  };
+}
+
+module.exports = {
+  CORE_CALL_OBJECTIVE_IDS,
+  CORE_CALL_FLOW_TYPES,
+  DOMAIN_CALL_OBJECTIVE_IDS,
+  DOMAIN_CALL_FLOW_TYPES,
+  CALL_OBJECTIVE_IDS,
+  CALL_SCRIPT_FLOW_TYPES,
+  CALL_SCRIPT_FLOW_TYPE_ALIASES,
+  CALL_OBJECTIVE_TAG_ALIASES,
+  FLOW_OBJECTIVE_TAG_MAP,
+  FLOW_OBJECTIVE_TAGS,
+  normalizeCallScriptFlowType,
+  normalizeObjectiveTag,
+  parseObjectiveTags,
+  buildObjectiveTagsForFlow,
+  getCallScriptFlowTypes,
+  getPrimaryFlowType,
+  getEffectiveObjectiveTags,
+  getAutoAttachedScriptProfileFlow,
+  resolveScriptProfileRouting,
+  isProfileFlowType,
+  isRelationshipFlowType,
+};

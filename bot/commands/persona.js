@@ -1,6 +1,8 @@
 const axios = require('axios');
 const config = require('../config');
-const { getUser, isAdmin } = require('../db/db');
+const { withRetry } = require('../utils/httpClient');
+const { getAccessProfile } = require('../utils/capabilities');
+const { attachHmacAuth } = require('../utils/apiAuth');
 const {
   startOperation,
   ensureOperationActive,
@@ -11,7 +13,6 @@ const {
 } = require('../utils/sessionState');
 const {
   askOptionWithButtons,
-  getOptionLabel,
   MOOD_OPTIONS,
   URGENCY_OPTIONS,
   TECH_LEVEL_OPTIONS,
@@ -20,18 +21,28 @@ const {
 } = require('../utils/persona');
 
 const {
-  section,
-  tipLine,
-  buildLine,
-  escapeMarkdown,
-  emphasize
-} = require('../utils/messageStyle');
+  section
+} = require('../utils/ui');
 
 const personaApi = axios.create({
   baseURL: config.apiUrl.replace(/\/+$/, ''),
   timeout: 15000,
   headers: { 'Content-Type': 'application/json' }
 });
+
+let apiOrigin;
+try {
+  apiOrigin = new URL(config.apiUrl).origin;
+} catch (_) {
+  apiOrigin = null;
+}
+if (apiOrigin) {
+  attachHmacAuth(personaApi, {
+    secret: config.apiAuth?.hmacSecret,
+    allowedOrigins: [apiOrigin],
+    defaultBaseUrl: config.apiUrl
+  });
+}
 
 const CANCEL_KEYWORDS = new Set(['cancel', 'exit', 'stop']);
 
@@ -46,10 +57,10 @@ async function personaApiRequest(ctx, ensureActive, options) {
   const controller = new AbortController();
   const release = registerAbortController(ctx, controller);
   try {
-    const response = await personaApi.request({
+    const response = await withRetry(() => personaApi.request({
       ...options,
       signal: controller.signal
-    });
+    }), options.retry || {});
     ensureActive();
     return response.data;
   } finally {
@@ -73,28 +84,28 @@ async function deletePersona(ctx, ensureActive, slug) {
   return personaApiRequest(ctx, ensureActive, { method: 'delete', url: `/api/personas/${encodeURIComponent(slug)}` });
 }
 
-async function fetchCallTemplatesSummary(ctx, ensureActive) {
+async function fetchCallScriptsSummary(ctx, ensureActive) {
   try {
-    const data = await personaApiRequest(ctx, ensureActive, { method: 'get', url: '/api/call-templates' });
-    return Array.isArray(data.templates) ? data.templates : [];
+    const data = await personaApiRequest(ctx, ensureActive, { method: 'get', url: '/api/call-scripts' });
+    return Array.isArray(data.scripts) ? data.scripts : [];
   } catch (error) {
-    console.error('Failed to fetch call templates for persona command:', error?.message);
+    console.error('Failed to fetch call scripts for persona command:', error?.message);
     return [];
   }
 }
 
-async function fetchSmsTemplatesSummary(ctx, ensureActive) {
+async function fetchSmsScriptsSummary(ctx, ensureActive) {
   try {
     const data = await personaApiRequest(ctx, ensureActive, {
       method: 'get',
-      url: '/api/sms/templates',
+      url: '/api/sms/scripts',
       params: { include_builtins: true }
     });
-    const custom = Array.isArray(data.templates) ? data.templates : [];
+    const custom = Array.isArray(data.scripts) ? data.scripts : [];
     const builtin = Array.isArray(data.builtin) ? data.builtin : [];
     return [...custom, ...builtin];
   } catch (error) {
-    console.error('Failed to fetch SMS templates for persona command:', error?.message);
+    console.error('Failed to fetch SMS scripts for persona command:', error?.message);
     return [];
   }
 }
@@ -204,7 +215,7 @@ async function chooseTone(conversation, ctx, prompt, options, ensureActive, fall
   if (choice.id === 'skip') {
     return undefined;
   }
-  return choice.id;
+  return mapMoodSelection(choice, fallback);
 }
 
 async function createPersonaFlow(conversation, ctx, ensureActive) {
@@ -283,47 +294,47 @@ async function createPersonaFlow(conversation, ctx, ensureActive) {
     ensureActive
   );
 
-  const callTemplates = await fetchCallTemplatesSummary(ctx, ensureActive);
-  let callTemplateId = null;
-  if (callTemplates.length > 0) {
-    const options = callTemplates.slice(0, 10).map((template) => ({
-      id: template.id.toString(),
-      label: `📞 ${template.name}`
+  const callScripts = await fetchCallScriptsSummary(ctx, ensureActive);
+  let callScriptId = null;
+  if (callScripts.length > 0) {
+    const options = callScripts.slice(0, 10).map((script) => ({
+      id: script.id.toString(),
+      label: `📞 ${script.name}`
     }));
     options.push({ id: 'skip', label: '⏭️ Skip' });
 
     const selection = await askOptionWithButtons(
       conversation,
       ctx,
-      'Select a default call template (or skip):',
+      'Select a default call script (or skip):',
       options,
-      { prefix: 'persona-call-template', columns: 1, ensureActive: safeEnsureActiveFactory(ctx, ensureActive) }
+      { prefix: 'persona-call-script', columns: 1, ensureActive: safeEnsureActiveFactory(ctx, ensureActive) }
     );
 
     if (selection.id !== 'skip') {
-      callTemplateId = Number(selection.id);
+      callScriptId = Number(selection.id);
     }
   }
 
-  const smsTemplates = await fetchSmsTemplatesSummary(ctx, ensureActive);
-  let smsTemplateName = null;
-  if (smsTemplates.length > 0) {
-    const options = smsTemplates.slice(0, 10).map((template) => ({
-      id: template.name,
-      label: `${template.is_builtin ? '📦' : '📝'} ${template.name}`
+  const smsScripts = await fetchSmsScriptsSummary(ctx, ensureActive);
+  let smsScriptName = null;
+  if (smsScripts.length > 0) {
+    const options = smsScripts.slice(0, 10).map((script) => ({
+      id: script.name,
+      label: `${script.is_builtin ? '📦' : '📝'} ${script.name}`
     }));
     options.push({ id: 'skip', label: '⏭️ Skip' });
 
     const selection = await askOptionWithButtons(
       conversation,
       ctx,
-      'Select a default SMS template (or skip):',
+      'Select a default SMS script (or skip):',
       options,
-      { prefix: 'persona-sms-template', columns: 1, ensureActive: safeEnsureActiveFactory(ctx, ensureActive) }
+      { prefix: 'persona-sms-script', columns: 1, ensureActive: safeEnsureActiveFactory(ctx, ensureActive) }
     );
 
     if (selection.id !== 'skip') {
-      smsTemplateName = selection.id;
+      smsScriptName = selection.id;
     }
   }
 
@@ -346,8 +357,8 @@ async function createPersonaFlow(conversation, ctx, ensureActive) {
     default_emotion: defaultEmotion || null,
     default_urgency: defaultUrgency || null,
     default_technical_level: defaultTech || null,
-    call_template_id: callTemplateId,
-    sms_template_name: smsTemplateName,
+    call_script_id: callScriptId,
+    sms_script_name: smsScriptName,
     created_by: ctx.from.id.toString()
   };
 
@@ -428,11 +439,11 @@ async function editPersonaFlow(conversation, ctx, ensureActive, persona) {
     updates.default_technical_level = defaultTech || null;
   }
 
-  const callTemplates = await fetchCallTemplatesSummary(ctx, ensureActive);
-  if (callTemplates.length > 0) {
-    const options = callTemplates.slice(0, 10).map((template) => ({
-      id: template.id.toString(),
-      label: `📞 ${template.name}`
+  const callScripts = await fetchCallScriptsSummary(ctx, ensureActive);
+  if (callScripts.length > 0) {
+    const options = callScripts.slice(0, 10).map((script) => ({
+      id: script.id.toString(),
+      label: `📞 ${script.name}`
     }));
     options.push({ id: 'skip', label: '⏭️ Skip' });
     options.push({ id: 'clear', label: '🗑️ Clear' });
@@ -440,23 +451,23 @@ async function editPersonaFlow(conversation, ctx, ensureActive, persona) {
     const selection = await askOptionWithButtons(
       conversation,
       ctx,
-      `Select default call template (current: ${persona.call_template_id || 'none'})`,
+      `Select default call script (current: ${persona.call_script_id || 'none'})`,
       options,
       { prefix: 'persona-edit-call', columns: 1, ensureActive: safeEnsureActiveFactory(ctx, ensureActive) }
     );
 
     if (selection.id === 'clear') {
-      updates.call_template_id = null;
+      updates.call_script_id = null;
     } else if (selection.id !== 'skip') {
-      updates.call_template_id = Number(selection.id);
+      updates.call_script_id = Number(selection.id);
     }
   }
 
-  const smsTemplates = await fetchSmsTemplatesSummary(ctx, ensureActive);
-  if (smsTemplates.length > 0) {
-    const options = smsTemplates.slice(0, 10).map((template) => ({
-      id: template.name,
-      label: `${template.is_builtin ? '📦' : '📝'} ${template.name}`
+  const smsScripts = await fetchSmsScriptsSummary(ctx, ensureActive);
+  if (smsScripts.length > 0) {
+    const options = smsScripts.slice(0, 10).map((script) => ({
+      id: script.name,
+      label: `${script.is_builtin ? '📦' : '📝'} ${script.name}`
     }));
     options.push({ id: 'skip', label: '⏭️ Skip' });
     options.push({ id: 'clear', label: '🗑️ Clear' });
@@ -464,15 +475,15 @@ async function editPersonaFlow(conversation, ctx, ensureActive, persona) {
     const selection = await askOptionWithButtons(
       conversation,
       ctx,
-      `Select default SMS template (current: ${persona.sms_template_name || 'none'})`,
+      `Select default SMS script (current: ${persona.sms_script_name || 'none'})`,
       options,
       { prefix: 'persona-edit-sms', columns: 1, ensureActive: safeEnsureActiveFactory(ctx, ensureActive) }
     );
 
     if (selection.id === 'clear') {
-      updates.sms_template_name = null;
+      updates.sms_script_name = null;
     } else if (selection.id !== 'skip') {
-      updates.sms_template_name = selection.id;
+      updates.sms_script_name = selection.id;
     }
   }
 
@@ -529,17 +540,17 @@ async function personaFlow(conversation, ctx) {
   const ensureActive = () => ensureOperationActive(ctx, opId);
 
   try {
-    const user = await new Promise((resolve) => getUser(ctx.from.id, resolve));
+    const access = await getAccessProfile(ctx);
     ensureActive();
-    if (!user) {
-      await styledAlert(ctx, 'You are not authorized to use this bot.');
+    if (!access.isAuthorized) {
+      await styledAlert(ctx, 'Access denied. Your account is not authorized for this action.');
       return;
     }
 
-    const adminStatus = await new Promise((resolve) => isAdmin(ctx.from.id, resolve));
+    const adminStatus = Boolean(access.isAdmin);
     ensureActive();
     if (!adminStatus) {
-      await styledAlert(ctx, 'This command is for administrators only.');
+      await styledAlert(ctx, 'Access denied. This action is available to administrators only.');
       return;
     }
 
@@ -561,6 +572,11 @@ async function personaFlow(conversation, ctx) {
         ],
         { prefix: 'persona-menu', columns: 2, ensureActive }
       );
+
+      if (!choice?.id) {
+        await styledAlert(ctx, 'Selection expired. Please choose an option again.');
+        continue;
+      }
 
       switch (choice.id) {
         case 'list': {
@@ -674,14 +690,13 @@ async function personaFlow(conversation, ctx) {
 function registerPersonaCommand(bot) {
   bot.command('persona', async (ctx) => {
     try {
-      const user = await new Promise((resolve) => getUser(ctx.from.id, resolve));
-      if (!user) {
-        return ctx.reply('❌ You are not authorized to use this bot.');
+      const access = await getAccessProfile(ctx);
+      if (!access.isAuthorized) {
+        return ctx.reply('❌ Access denied. Your account is not authorized for this action.');
       }
 
-      const adminStatus = await new Promise((resolve) => isAdmin(ctx.from.id, resolve));
-      if (!adminStatus) {
-        return ctx.reply('❌ This command is for administrators only.');
+      if (!access.isAdmin) {
+        return ctx.reply('❌ Access denied. This action is available to administrators only.');
       }
 
       await ctx.conversation.enter('persona-conversation');
