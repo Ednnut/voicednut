@@ -72,6 +72,27 @@ describe("FlowMetadata", () => {
     );
   });
 
+  it("auto-attaches the dating profile for dating scripts", () => {
+    assert.deepEqual(
+      resolveScriptProfileRouting({
+        flow_type: "dating",
+      }),
+      {
+        primaryFlow: "dating",
+        flowTypes: ["dating"],
+        objectiveTags: ["dating_engagement"],
+        attachedProfile: "dating",
+        autoAttachProfile: true,
+        callProfile: "dating",
+        conversationProfile: "dating",
+        profileLockMode: "locked",
+        conversationProfileLock: true,
+        purpose: "dating",
+        warnings: [],
+      },
+    );
+  });
+
   it("preserves relationship precedence and skips unsupported flows", () => {
     assert.equal(
       getAutoAttachedScriptProfileFlow({

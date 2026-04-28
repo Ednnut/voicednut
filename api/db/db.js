@@ -1,5 +1,13 @@
 const sqlite3 = require('sqlite3').verbose();
 const path = require('path');
+const {
+    buildObjectiveTagsForFlow,
+    getEffectiveObjectiveTags,
+    getPrimaryFlowType,
+    normalizeCallScriptFlowType,
+    parseObjectiveTags,
+} = require('../functions/FlowMetadata');
+const { normalizeRelationshipProfileType } = require('../functions/Dating');
 
 const CALL_STATUS_ORDER = Object.freeze([
     'queued',
@@ -195,6 +203,25 @@ class EnhancedDatabase {
                 data TEXT,
                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
                 sequence_number INTEGER,
+                FOREIGN KEY(call_sid) REFERENCES calls(call_sid)
+            )`,
+
+            `CREATE TABLE IF NOT EXISTS call_outcomes (
+                call_sid TEXT PRIMARY KEY,
+                script_used TEXT,
+                script_version TEXT,
+                profile_used TEXT,
+                primary_flow TEXT,
+                objective_tags TEXT,
+                provider_used TEXT,
+                voice_used TEXT,
+                first_message_version TEXT,
+                disposition TEXT,
+                callback_action_created INTEGER DEFAULT 0,
+                review_case_action_created INTEGER DEFAULT 0,
+                secure_follow_up_action_created INTEGER DEFAULT 0,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY(call_sid) REFERENCES calls(call_sid)
             )`,
 
@@ -609,6 +636,9 @@ class EnhancedDatabase {
             'CREATE INDEX IF NOT EXISTS idx_states_call_sid ON call_states(call_sid)',
             'CREATE INDEX IF NOT EXISTS idx_states_timestamp ON call_states(timestamp)',
             'CREATE INDEX IF NOT EXISTS idx_states_state ON call_states(state)',
+            'CREATE INDEX IF NOT EXISTS idx_call_outcomes_primary_flow ON call_outcomes(primary_flow)',
+            'CREATE INDEX IF NOT EXISTS idx_call_outcomes_disposition ON call_outcomes(disposition)',
+            'CREATE INDEX IF NOT EXISTS idx_call_outcomes_updated_at ON call_outcomes(updated_at)',
             'CREATE INDEX IF NOT EXISTS idx_caller_flags_status ON caller_flags(status)',
             'CREATE INDEX IF NOT EXISTS idx_call_digits_call_sid ON call_digits(call_sid)',
             'CREATE INDEX IF NOT EXISTS idx_call_digits_profile ON call_digits(profile)',
@@ -1074,6 +1104,10 @@ class EnhancedDatabase {
         };
 
         await this.updateCallState(normalizedCallSid, CALL_DISPOSITION_STATE, payload);
+        await this.upsertCallOutcome({
+            call_sid: normalizedCallSid,
+            disposition: normalizedDisposition,
+        });
         return payload;
     }
 
@@ -3514,7 +3548,7 @@ class EnhancedDatabase {
         const metadata = reviewCase?.metadata && typeof reviewCase.metadata === 'object'
             ? JSON.stringify(reviewCase.metadata)
             : null;
-        return new Promise((resolve, reject) => {
+        const reviewCaseId = await new Promise((resolve, reject) => {
             const stmt = this.db.prepare(`
                 INSERT INTO review_cases (
                     call_sid,
@@ -3551,6 +3585,10 @@ class EnhancedDatabase {
             );
             stmt.finalize();
         });
+        if (reviewCase?.call_sid) {
+            await this.markCallOutcomeAction(reviewCase.call_sid, 'review_case');
+        }
+        return reviewCaseId;
     }
 
     async getReviewCase(review_case_id) {
@@ -3835,6 +3873,217 @@ class EnhancedDatabase {
                         .catch(reject);
                 }
             });
+        });
+    }
+
+    async upsertCallOutcome(outcome = {}) {
+        const normalizedCallSid = String(outcome.call_sid || outcome.callSid || '').trim();
+        if (!normalizedCallSid) {
+            throw new Error('call_sid is required');
+        }
+
+        const normalizedPrimaryFlow = normalizeCallScriptFlowType(
+            outcome.primary_flow || outcome.primaryFlow || '',
+        ) || null;
+        const normalizedProfile = normalizeRelationshipProfileType(
+            outcome.profile_used || outcome.profileUsed || '',
+            '',
+        ) || null;
+        const parsedObjectiveTags = parseObjectiveTags(
+            outcome.objective_tags ?? outcome.objectiveTags ?? [],
+        );
+        const normalizedObjectiveTags = buildObjectiveTagsForFlow(
+            normalizedPrimaryFlow,
+            Array.isArray(parsedObjectiveTags) ? parsedObjectiveTags : [],
+        );
+        const normalizedDisposition = (() => {
+            const candidate = normalizeCallDispositionForDb(
+                outcome.disposition || '',
+            );
+            return candidate && isValidCallDisposition(candidate) ? candidate : null;
+        })();
+        const nowIso = new Date().toISOString();
+        const callbackActionCreated =
+            outcome.callback_action_created === true || outcome.callbackActionCreated === true
+                ? 1
+                : 0;
+        const reviewCaseActionCreated =
+            outcome.review_case_action_created === true || outcome.reviewCaseActionCreated === true
+                ? 1
+                : 0;
+        const secureFollowUpActionCreated =
+            outcome.secure_follow_up_action_created === true || outcome.secureFollowUpActionCreated === true
+                ? 1
+                : 0;
+
+        const sql = `
+            INSERT INTO call_outcomes (
+                call_sid,
+                script_used,
+                script_version,
+                profile_used,
+                primary_flow,
+                objective_tags,
+                provider_used,
+                voice_used,
+                first_message_version,
+                disposition,
+                callback_action_created,
+                review_case_action_created,
+                secure_follow_up_action_created,
+                created_at,
+                updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(call_sid) DO UPDATE SET
+                script_used = COALESCE(excluded.script_used, call_outcomes.script_used),
+                script_version = COALESCE(excluded.script_version, call_outcomes.script_version),
+                profile_used = COALESCE(excluded.profile_used, call_outcomes.profile_used),
+                primary_flow = COALESCE(excluded.primary_flow, call_outcomes.primary_flow),
+                objective_tags = COALESCE(excluded.objective_tags, call_outcomes.objective_tags),
+                provider_used = COALESCE(excluded.provider_used, call_outcomes.provider_used),
+                voice_used = COALESCE(excluded.voice_used, call_outcomes.voice_used),
+                first_message_version = COALESCE(excluded.first_message_version, call_outcomes.first_message_version),
+                disposition = COALESCE(excluded.disposition, call_outcomes.disposition),
+                callback_action_created = CASE
+                    WHEN excluded.callback_action_created = 1 THEN 1
+                    ELSE call_outcomes.callback_action_created
+                END,
+                review_case_action_created = CASE
+                    WHEN excluded.review_case_action_created = 1 THEN 1
+                    ELSE call_outcomes.review_case_action_created
+                END,
+                secure_follow_up_action_created = CASE
+                    WHEN excluded.secure_follow_up_action_created = 1 THEN 1
+                    ELSE call_outcomes.secure_follow_up_action_created
+                END,
+                updated_at = excluded.updated_at
+        `;
+
+        await new Promise((resolve, reject) => {
+            this.db.run(
+                sql,
+                [
+                    normalizedCallSid,
+                    outcome.script_used || outcome.scriptUsed || null,
+                    outcome.script_version || outcome.scriptVersion || null,
+                    normalizedProfile,
+                    normalizedPrimaryFlow,
+                    normalizedObjectiveTags.length ? JSON.stringify(normalizedObjectiveTags) : null,
+                    outcome.provider_used || outcome.providerUsed || null,
+                    outcome.voice_used || outcome.voiceUsed || null,
+                    outcome.first_message_version || outcome.firstMessageVersion || null,
+                    normalizedDisposition,
+                    callbackActionCreated,
+                    reviewCaseActionCreated,
+                    secureFollowUpActionCreated,
+                    nowIso,
+                    nowIso,
+                ],
+                (err) => {
+                    if (err) {
+                        reject(err);
+                    } else {
+                        resolve();
+                    }
+                },
+            );
+        });
+
+        return this.getCallOutcome(normalizedCallSid);
+    }
+
+    async getCallOutcome(call_sid) {
+        return new Promise((resolve, reject) => {
+            const normalizedCallSid = String(call_sid || '').trim();
+            if (!normalizedCallSid) {
+                resolve(null);
+                return;
+            }
+            const sql = `SELECT * FROM call_outcomes WHERE call_sid = ?`;
+            this.db.get(sql, [normalizedCallSid], (err, row) => {
+                if (err) {
+                    reject(err);
+                    return;
+                }
+                if (!row) {
+                    resolve(null);
+                    return;
+                }
+                let objectiveTags = [];
+                try {
+                    objectiveTags = row.objective_tags ? JSON.parse(row.objective_tags) : [];
+                } catch (_) {
+                    objectiveTags = [];
+                }
+                resolve({
+                    ...row,
+                    objective_tags: Array.isArray(objectiveTags) ? objectiveTags : [],
+                    callback_action_created: row.callback_action_created === 1,
+                    review_case_action_created: row.review_case_action_created === 1,
+                    secure_follow_up_action_created: row.secure_follow_up_action_created === 1,
+                });
+            });
+        });
+    }
+
+    async recordCallOutcomeFromCallCreated(call_sid, state = {}) {
+        const normalizedCallSid = String(call_sid || '').trim();
+        if (!normalizedCallSid) {
+            throw new Error('call_sid is required');
+        }
+
+        const flowTypes = Array.isArray(state.flow_types) ? state.flow_types : [];
+        const primaryFlow =
+            normalizeCallScriptFlowType(state.primary_flow || state.flow_type || '') ||
+            getPrimaryFlowType({
+                ...state,
+                flow_types: flowTypes,
+            }) ||
+            null;
+        const objectiveTags = getEffectiveObjectiveTags({
+            ...state,
+            flow_types: flowTypes,
+            flow_type: primaryFlow,
+            primary_flow: primaryFlow,
+        });
+
+        return this.upsertCallOutcome({
+            call_sid: normalizedCallSid,
+            script_used: state.script_id || state.script || null,
+            script_version: state.script_version || null,
+            profile_used:
+                state.conversation_profile ||
+                state.call_profile ||
+                state.purpose ||
+                null,
+            primary_flow: primaryFlow,
+            objective_tags: objectiveTags,
+            provider_used: state.provider || null,
+            voice_used: state.voice_model || null,
+            first_message_version: state.first_message_version || null,
+        });
+    }
+
+    async markCallOutcomeAction(call_sid, action) {
+        const normalizedCallSid = String(call_sid || '').trim();
+        if (!normalizedCallSid) {
+            throw new Error('call_sid is required');
+        }
+
+        const actionFieldMap = {
+            callback: 'callback_action_created',
+            review_case: 'review_case_action_created',
+            secure_follow_up: 'secure_follow_up_action_created',
+        };
+        const field = actionFieldMap[String(action || '').trim().toLowerCase()];
+        if (!field) {
+            throw new Error(`Unsupported call outcome action: ${action}`);
+        }
+
+        return this.upsertCallOutcome({
+            call_sid: normalizedCallSid,
+            [field]: true,
         });
     }
 

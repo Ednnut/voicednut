@@ -40,10 +40,10 @@ const {
   buildConnectorPackImplementations,
 } = require("./functions/connectorPacks");
 const {
-  RELATIONSHIP_PROFILE_TYPES,
-  RELATIONSHIP_FLOW_TYPES,
-  RELATIONSHIP_PROFILE_OBJECTIVE_MAP,
-  RELATIONSHIP_PROFILE_FLOW_MAP,
+  PROFILE_TYPES,
+  PROFILE_FLOW_TYPES,
+  PROFILE_OBJECTIVE_MAP,
+  PROFILE_FLOW_MAP,
   normalizeRelationshipProfileType,
   deriveConversationProfileDecision,
   buildConversationProfilePromptBundle,
@@ -56,6 +56,9 @@ const { loadProfilePackDocument } = require("./functions/profileRegistry");
 const {
   CALL_OBJECTIVE_IDS,
   CALL_SCRIPT_FLOW_TYPES,
+  getCallScriptFlowTypes: getCallScriptFlowTypesShared,
+  getPrimaryFlowType: getPrimaryFlowTypeShared,
+  getEffectiveObjectiveTags: getEffectiveObjectiveTagsShared,
   normalizeCallScriptFlowType: normalizeCallScriptFlowTypeShared,
   normalizeObjectiveTag: normalizeObjectiveTagShared,
 } = require("./functions/FlowMetadata");
@@ -1540,9 +1543,33 @@ function parsePaymentPolicy(value) {
   }
 }
 
-const RELATIONSHIP_PROFILE_SET = new Set(RELATIONSHIP_PROFILE_TYPES);
+const PROFILE_TYPE_SET = new Set(PROFILE_TYPES);
 const normalizeCallScriptFlowType = normalizeCallScriptFlowTypeShared;
 const normalizeObjectiveTag = normalizeObjectiveTagShared;
+
+function buildCallCreatedState(baseState = {}) {
+  const flowTypes = getCallScriptFlowTypesShared(baseState);
+  const primaryFlow =
+    baseState.primary_flow ||
+    getPrimaryFlowTypeShared({
+      ...baseState,
+      flow_types: flowTypes,
+    });
+  const objectiveTags = getEffectiveObjectiveTagsShared({
+    ...baseState,
+    flow_types: flowTypes,
+    flow_type: primaryFlow,
+    primary_flow: primaryFlow,
+  });
+
+  return {
+    ...baseState,
+    flow_types: flowTypes,
+    primary_flow: primaryFlow,
+    objective_tags: objectiveTags,
+    first_message_version: baseState.first_message_version || null,
+  };
+}
 
 function parseCallScriptFlowFilter(value) {
   if (value === undefined || value === null) {
@@ -1751,7 +1778,7 @@ function normalizeScriptTemplateRecord(template = null) {
     ) {
       add("payment_collection");
     }
-    const nonDigitProfiles = new Set(RELATIONSHIP_FLOW_TYPES);
+    const nonDigitProfiles = new Set(PROFILE_FLOW_TYPES);
     if (
       normalized.supports_digit_capture === true ||
       normalizeBooleanFlag(normalized.requires_otp, false) === true ||
@@ -1770,10 +1797,10 @@ function normalizeScriptTemplateRecord(template = null) {
     if (tags.has("general_outreach")) {
       add("general_outreach");
     }
-    for (const profileType of RELATIONSHIP_PROFILE_TYPES) {
-      const objectiveTag = RELATIONSHIP_PROFILE_OBJECTIVE_MAP[profileType];
+    for (const profileType of PROFILE_TYPES) {
+      const objectiveTag = PROFILE_OBJECTIVE_MAP[profileType];
       if (!objectiveTag || !tags.has(objectiveTag)) continue;
-      const flowType = RELATIONSHIP_PROFILE_FLOW_MAP[profileType] || profileType;
+      const flowType = PROFILE_FLOW_MAP[profileType] || profileType;
       if (flowType) {
         add(flowType);
       }
@@ -1851,7 +1878,7 @@ function isProfileConfidenceAtLeast(actual, threshold) {
 
 function normalizeRelationshipProfileCandidate(value) {
   const normalized = normalizeRelationshipProfileType(value, "");
-  if (!normalized || !RELATIONSHIP_PROFILE_SET.has(normalized)) {
+  if (!normalized || !PROFILE_TYPE_SET.has(normalized)) {
     return "";
   }
   return normalized;
@@ -1912,12 +1939,12 @@ function resolveConversationProfileSelection(input = {}) {
       lockCandidate = explicitProfile;
       conversationProfileLockReason = "explicit_profile";
     } else if (
-      RELATIONSHIP_PROFILE_SET.has(conversationProfile) &&
+      PROFILE_TYPE_SET.has(conversationProfile) &&
       conversationProfileSource === "script_template"
     ) {
       lockCandidate = conversationProfile;
       conversationProfileLockReason = "script_template";
-    } else if (lockFlag === true && RELATIONSHIP_PROFILE_SET.has(conversationProfile)) {
+    } else if (lockFlag === true && PROFILE_TYPE_SET.has(conversationProfile)) {
       lockCandidate = conversationProfile;
       conversationProfileLockReason = "explicit_lock_flag";
     }
@@ -2019,7 +2046,7 @@ function validateProfilePacksAtStartup() {
       .toLowerCase() === "true";
   if (debugPackPaths) {
     console.log("🧭 Profile pack path debug enabled (PROFILE_PACK_DEBUG_PATHS=true)");
-    for (const profileType of RELATIONSHIP_PROFILE_TYPES) {
+    for (const profileType of PROFILE_TYPES) {
       const packDocument = loadProfilePackDocument(
         profileType,
         `${profileType} profile pack`,
@@ -2051,7 +2078,7 @@ function validateProfilePacksAtStartup() {
 
 function getProfilePurpose(profile) {
   const normalized = normalizeRelationshipProfileType(profile, "");
-  if (!normalized || !RELATIONSHIP_PROFILE_SET.has(normalized)) {
+  if (!normalized || !PROFILE_TYPE_SET.has(normalized)) {
     return null;
   }
   return normalized;
@@ -2717,7 +2744,7 @@ function buildProviderEventFingerprint(source, dedupePayload = {}) {
 
 function collectRelationshipContextSnapshot(callConfig = {}) {
   const payload = {};
-  for (const profileType of RELATIONSHIP_PROFILE_TYPES) {
+  for (const profileType of PROFILE_TYPES) {
     const key = `${profileType}_context`;
     const value = callConfig?.[key];
     if (value && typeof value === "object" && !Array.isArray(value)) {
@@ -2955,7 +2982,7 @@ async function restoreCallRuntimeState(callSid, callConfig = null) {
           const normalizedKey = String(key || "").trim().toLowerCase();
           if (!normalizedKey.endsWith("_context")) return;
           const profileType = normalizedKey.slice(0, -"_context".length);
-          if (!RELATIONSHIP_PROFILE_SET.has(profileType)) return;
+          if (!PROFILE_TYPE_SET.has(profileType)) return;
           if (!value || typeof value !== "object" || Array.isArray(value)) return;
           targetConfig[normalizedKey] = { ...value };
         });
@@ -3957,7 +3984,7 @@ async function ensureCallRecord(
       ),
       direction,
     });
-    await db.updateCallState(callSid, "call_created", {
+    const callCreatedState = buildCallCreatedState({
       inbound,
       source,
       from: from || null,
@@ -3991,6 +4018,7 @@ async function ensureCallRecord(
         callConfig.conversation_profile_locked === true,
       conversation_profile_lock_reason:
         callConfig.conversation_profile_lock_reason || null,
+      first_message_version: callConfig.first_message_version || null,
       conversation_profile_confidence_gate:
         callConfig.conversation_profile_confidence_gate || null,
       conversation_profile_gate_fallback_applied:
@@ -4018,6 +4046,8 @@ async function ensureCallRecord(
       payment_state_updated_at:
         callConfig.payment_state_updated_at || new Date().toISOString(),
     });
+    await db.updateCallState(callSid, "call_created", callCreatedState);
+    await db.recordCallOutcomeFromCallCreated(callSid, callCreatedState);
     return await db.getCall(callSid);
   } catch (error) {
     console.error("Failed to create inbound call record:", error);
@@ -11262,6 +11292,7 @@ function buildTelephonyImplementations(callSid, gptService = null) {
           purpose,
           domain,
         });
+        await db.markCallOutcomeAction(callSid, "secure_follow_up");
         const disposition =
           domain === "collections_servicing"
             ? getCollectionsDispositionForFollowup(args)
@@ -11348,6 +11379,7 @@ function buildTelephonyImplementations(callSid, gptService = null) {
           callback_task_id: callbackTaskId,
           run_at: runAt,
         });
+        await db.markCallOutcomeAction(callSid, "callback");
         if (domain === "tax_support") {
           await db.setCallDisposition(callSid, "tax_missing_docs_followup", {
             source: "createCallbackTask",
@@ -11840,7 +11872,7 @@ function configureCallTools(gptService, callSid, callConfig, functionSystem) {
   );
   if (
     normalizedProfile &&
-    RELATIONSHIP_PROFILE_SET.has(normalizedProfile) &&
+    PROFILE_TYPE_SET.has(normalizedProfile) &&
     digitFlowGuard.active !== true
   ) {
     const profileToolkit = createConversationProfileToolkit(
@@ -18155,13 +18187,19 @@ async function handleTwilioIncoming(req, res) {
                 const runAt = new Date(
                   Date.now() + delayMin * 60 * 1000,
                 ).toISOString();
-                await scheduleCallJob("callback_call", payload, runAt);
+                const callbackTaskId = await scheduleCallJob(
+                  "callback_call",
+                  payload,
+                  runAt,
+                );
                 await db
                   .updateCallState(callSid, "callback_scheduled", {
                     at: new Date().toISOString(),
                     run_at: runAt,
+                    callback_task_id: callbackTaskId,
                   })
                   .catch(() => {});
+                await db.markCallOutcomeAction(callSid, "callback").catch(() => {});
               } catch (callbackError) {
                 console.error("Failed to schedule callback:", callbackError);
               }
@@ -24952,12 +24990,13 @@ async function placeOutboundCall(payload, hostOverride = null) {
       ),
       direction: "outbound",
     });
-    await db.updateCallState(callId, "call_created", {
+    const callCreatedState = buildCallCreatedState({
       customer_name: customer_name || null,
       business_id: business_id || null,
       script: script || null,
       script_id: normalizedScriptId || null,
       script_version: resolvedScriptVersion || null,
+      first_message_version: callConfig.first_message_version || null,
       call_profile: callConfig.call_profile || null,
       conversation_profile_lock:
         callConfig.conversation_profile_lock ?? null,
@@ -25026,6 +25065,8 @@ async function placeOutboundCall(payload, hostOverride = null) {
       call_mode: callConfig.call_mode || "normal",
       digit_capture_active: callConfig.digit_capture_active === true,
     });
+    await db.updateCallState(callId, "call_created", callCreatedState);
+    await db.recordCallOutcomeFromCallCreated(callId, callCreatedState);
     setCallPhase(callId, "dialing", {
       source: "placeOutboundCall",
       reason: "outbound_created",

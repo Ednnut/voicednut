@@ -23,12 +23,12 @@ const CELEBRITY_OBJECTIVE_TAG = PROFILE_DEFINITIONS.celebrity.objectiveTag;
 const CELEBRITY_FLOW_TYPE = PROFILE_DEFINITIONS.celebrity.flowType;
 const CELEBRITY_PROMPT_MARKER = PROFILE_DEFINITIONS.celebrity.marker;
 
-const RELATIONSHIP_PROFILE_TYPES = Object.freeze(listProfileTypes());
-const RELATIONSHIP_OBJECTIVE_TAGS = Object.freeze(getRelationshipObjectiveTags());
-const RELATIONSHIP_FLOW_TYPES = Object.freeze(getRelationshipFlowTypes());
-const RELATIONSHIP_PROFILE_ALIASES = Object.freeze({ ...PROFILE_ALIASES });
-const RELATIONSHIP_PROFILE_OBJECTIVE_MAP = Object.freeze(
-  RELATIONSHIP_PROFILE_TYPES.reduce((acc, profileType) => {
+const PROFILE_TYPES = Object.freeze(listProfileTypes());
+const PROFILE_OBJECTIVE_TAGS = Object.freeze(getRelationshipObjectiveTags());
+const PROFILE_FLOW_TYPES = Object.freeze(getRelationshipFlowTypes());
+const PROFILE_TYPE_ALIASES = Object.freeze({ ...PROFILE_ALIASES });
+const PROFILE_OBJECTIVE_MAP = Object.freeze(
+  PROFILE_TYPES.reduce((acc, profileType) => {
     const definition = getProfileDefinition(profileType);
     if (definition?.objectiveTag) {
       acc[profileType] = definition.objectiveTag;
@@ -36,8 +36,8 @@ const RELATIONSHIP_PROFILE_OBJECTIVE_MAP = Object.freeze(
     return acc;
   }, {}),
 );
-const RELATIONSHIP_PROFILE_FLOW_MAP = Object.freeze(
-  RELATIONSHIP_PROFILE_TYPES.reduce((acc, profileType) => {
+const PROFILE_FLOW_MAP = Object.freeze(
+  PROFILE_TYPES.reduce((acc, profileType) => {
     const definition = getProfileDefinition(profileType);
     if (definition?.flowType) {
       acc[profileType] = definition.flowType;
@@ -45,12 +45,12 @@ const RELATIONSHIP_PROFILE_FLOW_MAP = Object.freeze(
     return acc;
   }, {}),
 );
-const PROFILE_TYPES = RELATIONSHIP_PROFILE_TYPES;
-const PROFILE_OBJECTIVE_TAGS = RELATIONSHIP_OBJECTIVE_TAGS;
-const PROFILE_FLOW_TYPES = RELATIONSHIP_FLOW_TYPES;
-const PROFILE_TYPE_ALIASES = RELATIONSHIP_PROFILE_ALIASES;
-const PROFILE_OBJECTIVE_MAP = RELATIONSHIP_PROFILE_OBJECTIVE_MAP;
-const PROFILE_FLOW_MAP = RELATIONSHIP_PROFILE_FLOW_MAP;
+const RELATIONSHIP_PROFILE_TYPES = PROFILE_TYPES;
+const RELATIONSHIP_OBJECTIVE_TAGS = PROFILE_OBJECTIVE_TAGS;
+const RELATIONSHIP_FLOW_TYPES = PROFILE_FLOW_TYPES;
+const RELATIONSHIP_PROFILE_ALIASES = PROFILE_TYPE_ALIASES;
+const RELATIONSHIP_PROFILE_OBJECTIVE_MAP = PROFILE_OBJECTIVE_MAP;
+const RELATIONSHIP_PROFILE_FLOW_MAP = PROFILE_FLOW_MAP;
 
 const PROFILE_TEXT_SIGNALS = Object.freeze({
   dating: ["dating", "girlfriend", "boyfriend", "romance", "situationship"],
@@ -85,7 +85,7 @@ function getProfileByObjectiveTag(tag = "") {
   if (normalized === "celebrity_fan_engagement") {
     return "celebrity";
   }
-  for (const profileType of RELATIONSHIP_PROFILE_TYPES) {
+  for (const profileType of PROFILE_TYPES) {
     const definition = getProfileDefinition(profileType);
     if (!definition) continue;
     if (normalizeLower(definition.objectiveTag) === normalized) {
@@ -191,7 +191,7 @@ function detectProfileFromMarkers(...texts) {
     .join(" ");
   if (!merged) return "";
 
-  for (const profileType of RELATIONSHIP_PROFILE_TYPES) {
+  for (const profileType of PROFILE_TYPES) {
     const definition = getProfileDefinition(profileType);
     const marker = normalizeLower(definition?.marker);
     if (!marker) continue;
@@ -363,7 +363,7 @@ function createProfileContextToolkit(profileType, options = {}) {
           properties: {
             profile_type: {
               type: "string",
-              enum: RELATIONSHIP_PROFILE_TYPES,
+              enum: PROFILE_TYPES,
               description: "Relationship profile type.",
             },
             stage: {

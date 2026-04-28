@@ -36,7 +36,7 @@ const { buildCallbackData, matchesCallbackPrefix, parseCallbackData } = require(
 const { attachHmacAuth } = require('../utils/apiAuth');
 const { getAccessProfile } = require('../utils/capabilities');
 const {
-  RELATIONSHIP_FLOW_TYPES: PROFILE_FLOW_TYPES,
+  PROFILE_FLOW_TYPES,
 } = require('../../api/functions/Dating');
 const {
   DOMAIN_CALL_FLOW_TYPES,
@@ -287,6 +287,12 @@ const CALL_SCRIPT_FLOW_BADGES = Object.freeze({
   ...PROFILE_FLOW_BADGES
 });
 
+const MARKETPLACE_STARTER_TEMPLATE = Object.freeze({
+  description: 'Marketplace seller support script for listings, transactions, or seller onboarding.',
+  prompt: 'You are a marketplace support caller helping a seller with account, listing, or transaction follow-up. Keep the conversation practical and clear, verify the issue or need, and guide the seller toward the next step without making unsupported promises.',
+  first_message: 'Hi, I am calling with a quick follow-up about your marketplace account and wanted to help with the next step.'
+});
+
 const CALL_SCRIPT_STARTER_TEMPLATES = Object.freeze({
   dating: {
     description: 'Warm dating opener that builds rapport quickly and smoothly transitions into a playful conversation.',
@@ -308,11 +314,8 @@ const CALL_SCRIPT_STARTER_TEMPLATES = Object.freeze({
     prompt: 'You are a community outreach caller. Be welcoming, informative, and concise. Focus on why the outreach matters, confirm interest or availability, and leave the person with a clear next step.',
     first_message: 'Hi, I am reaching out with a quick community update and wanted to connect with you directly.'
   },
-  marketplace_seller: {
-    description: 'Marketplace seller support script for listings, transactions, or seller onboarding.',
-    prompt: 'You are a marketplace support caller helping a seller with account, listing, or transaction follow-up. Keep the conversation practical and clear, verify the issue or need, and guide the seller toward the next step without making unsupported promises.',
-    first_message: 'Hi, I am calling with a quick follow-up about your marketplace account and wanted to help with the next step.'
-  },
+  marketplace: MARKETPLACE_STARTER_TEMPLATE,
+  marketplace_seller: MARKETPLACE_STARTER_TEMPLATE,
   real_estate_agent: {
     description: 'Real estate outreach script for prospect follow-up, listing interest, or appointment setting.',
     prompt: 'You are a professional real estate outreach caller. Qualify interest quickly, ask clear discovery questions, and guide the conversation toward a viewing, callback, or next action while staying helpful and low-pressure.',

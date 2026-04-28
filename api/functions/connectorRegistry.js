@@ -1,4 +1,4 @@
-const RELATIONSHIP_PROFILE_TYPES = new Set([
+const PROFILE_BACKED_TYPES = new Set([
   "dating",
   "celebrity",
   "fan",
@@ -563,13 +563,13 @@ function deriveIntentEnvelope(callConfig = {}, options = {}) {
     allowedCapabilities.add("identity");
   }
 
-  const isRelationshipProfile = RELATIONSHIP_PROFILE_TYPES.has(profile);
-  if (isRelationshipProfile) {
+  const isProfileBackedType = PROFILE_BACKED_TYPES.has(profile);
+  if (isProfileBackedType) {
     if (confidence === "low") {
       confidence = "medium";
     }
     if (intent === "general_assistance") {
-      intent = "relationship_flow";
+      intent = "profile_flow";
     }
     allowedCapabilities.add("relationship_context");
     allowedCapabilities.add("profile");

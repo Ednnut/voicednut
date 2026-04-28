@@ -25,7 +25,7 @@ const {
   guardAgainstCommandInterrupt
 } = require('../utils/sessionState');
 const {
-  RELATIONSHIP_FLOW_TYPES,
+  PROFILE_FLOW_TYPES,
   deriveConversationProfile,
 } = require('../../api/functions/Dating');
 const {
@@ -62,7 +62,7 @@ const { buildCallbackData } = require('../utils/actions');
 
 const scriptsApiBase = config.scriptsApiUrl.replace(/\/+$/, '');
 const DEFAULT_FIRST_MESSAGE = 'Hello! This is an automated call. How can I help you today?';
-const RELATIONSHIP_FLOW_TYPE_SET = new Set(RELATIONSHIP_FLOW_TYPES);
+const PROFILE_FLOW_TYPE_SET = new Set(PROFILE_FLOW_TYPES);
 
 const CORE_FLOW_LABELS = Object.freeze({
   payment_collection: 'Payment collection',
@@ -82,7 +82,7 @@ const CORE_FLOW_BADGES = Object.freeze({
   general: '🧩'
 });
 
-const RELATIONSHIP_FLOW_LABEL_OVERRIDES = Object.freeze({
+const PROFILE_FLOW_LABEL_OVERRIDES = Object.freeze({
   dating: 'Dating',
   celebrity: 'Celebrity fan engagement',
   fan: 'Fan engagement',
@@ -94,7 +94,7 @@ const RELATIONSHIP_FLOW_LABEL_OVERRIDES = Object.freeze({
   real_estate_agent: 'Real estate outreach'
 });
 
-const RELATIONSHIP_FLOW_BADGE_OVERRIDES = Object.freeze({
+const PROFILE_FLOW_BADGE_OVERRIDES = Object.freeze({
   dating: '💕',
   celebrity: '⭐',
   fan: '🌟',
@@ -114,28 +114,28 @@ function toTitleCase(value = '') {
     .join(' ');
 }
 
-const RELATIONSHIP_FLOW_LABELS = Object.freeze(
-  RELATIONSHIP_FLOW_TYPES.reduce((acc, flowType) => {
-    acc[flowType] = RELATIONSHIP_FLOW_LABEL_OVERRIDES[flowType] || toTitleCase(flowType);
+const PROFILE_FLOW_LABELS = Object.freeze(
+  PROFILE_FLOW_TYPES.reduce((acc, flowType) => {
+    acc[flowType] = PROFILE_FLOW_LABEL_OVERRIDES[flowType] || toTitleCase(flowType);
     return acc;
   }, {})
 );
 
-const RELATIONSHIP_FLOW_BADGES = Object.freeze(
-  RELATIONSHIP_FLOW_TYPES.reduce((acc, flowType) => {
-    acc[flowType] = RELATIONSHIP_FLOW_BADGE_OVERRIDES[flowType] || '💬';
+const PROFILE_FLOW_BADGES = Object.freeze(
+  PROFILE_FLOW_TYPES.reduce((acc, flowType) => {
+    acc[flowType] = PROFILE_FLOW_BADGE_OVERRIDES[flowType] || '💬';
     return acc;
   }, {})
 );
 
 const CALL_SCRIPT_FLOW_LABELS = Object.freeze({
   ...CORE_FLOW_LABELS,
-  ...RELATIONSHIP_FLOW_LABELS
+  ...PROFILE_FLOW_LABELS
 });
 
 const CALL_SCRIPT_FLOW_BADGES = Object.freeze({
   ...CORE_FLOW_BADGES,
-  ...RELATIONSHIP_FLOW_BADGES
+  ...PROFILE_FLOW_BADGES
 });
 
 const FOLLOW_UP_MODE_LABELS = Object.freeze({
@@ -583,7 +583,7 @@ async function buildCustomCallConfig(conversation, ctx, ensureActive, businessOp
 
     const customFlowOptions = [
       { id: 'general', label: `🧩 ${CALL_SCRIPT_FLOW_LABELS.general || 'General'}` },
-      ...RELATIONSHIP_FLOW_TYPES.map((flowType) => ({
+      ...PROFILE_FLOW_TYPES.map((flowType) => ({
         id: flowType,
         label: CALL_SCRIPT_FLOW_BADGES[flowType]
           ? `${CALL_SCRIPT_FLOW_BADGES[flowType]} ${CALL_SCRIPT_FLOW_LABELS[flowType] || flowType}`

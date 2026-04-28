@@ -1,10 +1,10 @@
 const {
-  RELATIONSHIP_PROFILE_TYPES,
-  RELATIONSHIP_OBJECTIVE_TAGS,
-  RELATIONSHIP_FLOW_TYPES,
-  RELATIONSHIP_PROFILE_ALIASES,
-  RELATIONSHIP_PROFILE_OBJECTIVE_MAP,
-  RELATIONSHIP_PROFILE_FLOW_MAP,
+  PROFILE_TYPES,
+  PROFILE_OBJECTIVE_TAGS,
+  PROFILE_FLOW_TYPES,
+  PROFILE_TYPE_ALIASES,
+  PROFILE_OBJECTIVE_MAP,
+  PROFILE_FLOW_MAP,
   normalizeRelationshipProfileType,
 } = require("./Dating");
 
@@ -42,9 +42,9 @@ const DOMAIN_CALL_FLOW_TYPES = Object.freeze(
 );
 
 const DOMAIN_SCRIPT_PROFILE_FLOW_TYPE_SET = new Set(DOMAIN_CALL_FLOW_TYPES);
-const PROFILE_FLOW_TYPE_SET = new Set(RELATIONSHIP_FLOW_TYPES);
+const PROFILE_FLOW_TYPE_SET = new Set(PROFILE_FLOW_TYPES);
 const PROFILE_SCRIPT_PROFILE_FLOW_TYPE_SET = new Set(
-  RELATIONSHIP_PROFILE_TYPES.filter((profileType) => !DOMAIN_SCRIPT_PROFILE_FLOW_TYPE_SET.has(profileType)),
+  PROFILE_TYPES.filter((profileType) => !DOMAIN_SCRIPT_PROFILE_FLOW_TYPE_SET.has(profileType)),
 );
 
 const FLOW_OBJECTIVE_TAG_MAP = Object.freeze({
@@ -54,9 +54,9 @@ const FLOW_OBJECTIVE_TAG_MAP = Object.freeze({
   service_recovery: "service_recovery",
   general_outreach: "general_outreach",
   ...DOMAIN_FLOW_OBJECTIVE_TAG_MAP,
-  ...RELATIONSHIP_FLOW_TYPES.reduce((acc, flowType) => {
+  ...PROFILE_FLOW_TYPES.reduce((acc, flowType) => {
     const normalizedProfile = normalizeRelationshipProfileType(flowType, "");
-    const objectiveTag = RELATIONSHIP_PROFILE_OBJECTIVE_MAP[normalizedProfile];
+    const objectiveTag = PROFILE_OBJECTIVE_MAP[normalizedProfile];
     if (objectiveTag) {
       acc[flowType] = objectiveTag;
     }
@@ -71,13 +71,13 @@ const FLOW_OBJECTIVE_TAGS = Object.freeze(
 const CALL_OBJECTIVE_IDS = Object.freeze([
   ...CORE_CALL_OBJECTIVE_IDS,
   ...DOMAIN_CALL_OBJECTIVE_IDS,
-  ...RELATIONSHIP_OBJECTIVE_TAGS,
+  ...PROFILE_OBJECTIVE_TAGS,
 ]);
 
 const CALL_SCRIPT_FLOW_TYPES = Object.freeze([
   ...CORE_CALL_FLOW_TYPES,
   ...DOMAIN_CALL_FLOW_TYPES,
-  ...RELATIONSHIP_FLOW_TYPES,
+  ...PROFILE_FLOW_TYPES,
   "general",
 ]);
 
@@ -149,9 +149,9 @@ const CALL_SCRIPT_FLOW_TYPE_ALIASES = Object.freeze(
       }
     });
 
-    RELATIONSHIP_PROFILE_TYPES.forEach((profileType) => {
-      const flowType = RELATIONSHIP_PROFILE_FLOW_MAP[profileType] || profileType;
-      const objectiveTag = RELATIONSHIP_PROFILE_OBJECTIVE_MAP[profileType];
+    PROFILE_TYPES.forEach((profileType) => {
+      const flowType = PROFILE_FLOW_MAP[profileType] || profileType;
+      const objectiveTag = PROFILE_OBJECTIVE_MAP[profileType];
       aliases[profileType] = flowType;
       aliases[flowType] = flowType;
       aliases[`${profileType}_flow`] = flowType;
@@ -161,9 +161,9 @@ const CALL_SCRIPT_FLOW_TYPE_ALIASES = Object.freeze(
       }
     });
 
-    Object.entries(RELATIONSHIP_PROFILE_ALIASES).forEach(([alias, profileType]) => {
+    Object.entries(PROFILE_TYPE_ALIASES).forEach(([alias, profileType]) => {
       const normalizedProfile = normalizeRelationshipProfileType(profileType, "");
-      const flowType = RELATIONSHIP_PROFILE_FLOW_MAP[normalizedProfile] || normalizedProfile;
+      const flowType = PROFILE_FLOW_MAP[normalizedProfile] || normalizedProfile;
       if (flowType && PROFILE_FLOW_TYPE_SET.has(flowType)) {
         aliases[String(alias || "").trim().toLowerCase()] = flowType;
       }
@@ -363,7 +363,7 @@ function getCallScriptFlowTypes(script = {}) {
     }
   });
 
-  RELATIONSHIP_FLOW_TYPES.forEach((flowType) => {
+  PROFILE_FLOW_TYPES.forEach((flowType) => {
     const objectiveTag = FLOW_OBJECTIVE_TAG_MAP[flowType];
     if (objectiveTag && objectiveTags.includes(objectiveTag)) {
       add(flowType);

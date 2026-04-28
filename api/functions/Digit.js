@@ -478,7 +478,7 @@ function createDigitCollectionService(options = {}) {
     'invoice_number',
     'confirmation_code'
   ]);
-  const RELATIONSHIP_PROFILE_HINTS = new Set([
+  const PROFILE_DIGIT_GUARD_HINTS = new Set([
     'dating',
     'friendship',
     'creator',
@@ -6311,7 +6311,7 @@ function createDigitCollectionService(options = {}) {
       return { blocked: false, reason: null, matched_profiles: [] };
     }
     const flowSignals = collectFlowSignals(callConfig);
-    const matchedProfiles = flowSignals.filter((signal) => RELATIONSHIP_PROFILE_HINTS.has(signal));
+    const matchedProfiles = flowSignals.filter((signal) => PROFILE_DIGIT_GUARD_HINTS.has(signal));
     if (!matchedProfiles.length) {
       return { blocked: false, reason: null, matched_profiles: [] };
     }
