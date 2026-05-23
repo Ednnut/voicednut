@@ -3,6 +3,8 @@ const {
   buildCanonicalSmsInboundEvent,
   buildCanonicalSmsDeliveryEvent,
 } = require("../adapters/providerFlowPolicy");
+const { createPaypalPaymentService } = require("./paypalPaymentService");
+const { createStripePaymentService } = require("./stripePaymentService");
 
 const WEBHOOK_AUTH_POLICIES = Object.freeze({
   telegram: Object.freeze({
@@ -55,10 +57,17 @@ const WEBHOOK_AUTH_POLICIES = Object.freeze({
     label: "/webhook/twilio-gather",
     verifier: "requireValidTwilioSignature",
   }),
-  aws_status: Object.freeze({
-    id: "aws_status",
-    label: "/webhook/aws/status",
-    verifier: "requireValidAwsWebhook",
+  plivo_answer: Object.freeze({
+    id: "plivo_answer",
+    label: "/plivo/answer",
+    verifier: "requireValidPlivoWebhook",
+    options: Object.freeze({ allowQuerySecret: true }),
+  }),
+  plivo_event: Object.freeze({
+    id: "plivo_event",
+    label: "/plivo/events",
+    verifier: "requireValidPlivoWebhook",
+    options: Object.freeze({ allowQuerySecret: true }),
   }),
   vonage_answer: Object.freeze({
     id: "vonage_answer",
@@ -107,7 +116,7 @@ function createWebhookAuthGuard(ctx = {}) {
         return handler(req, res, next);
       }
       const label = req?.path || req?.originalUrl || policy.label;
-      const ok = verifier(req, res, label);
+      const ok = verifier(req, res, label, policy.options || {});
       if (!ok) {
         console.warn("webhook_auth_rejected", {
           policy: policy.id,
@@ -1925,95 +1934,6 @@ function createSmsDeliveryWebhookHandler(ctx = {}) {
   };
 }
 
-function createAwsStatusWebhookHandler(ctx = {}) {
-  const {
-    requireValidAwsWebhook,
-    shouldProcessProviderEvent,
-    shouldProcessProviderEventAsync,
-    recordCallStatus,
-  } = ctx;
-  return async function handleAwsStatusWebhook(req, res) {
-    try {
-      if (!requireValidAwsWebhook(req, res, "/webhook/aws/status")) {
-        return;
-      }
-      const { contactId, status, duration, callSid } = req.body || {};
-      const awsContactMap =
-        typeof ctx.getAwsContactMap === "function"
-          ? ctx.getAwsContactMap()
-          : ctx.awsContactMap;
-      const resolvedCallSid =
-        callSid || (contactId ? awsContactMap?.get(contactId) : null);
-      if (!resolvedCallSid) {
-        return res.status(200).send("OK");
-      }
-
-      const dedupePayload = {
-        callSid: resolvedCallSid,
-        contactId: contactId || null,
-        status: String(status || "").toLowerCase() || null,
-        duration: duration || null,
-        timestamp:
-          req.body?.timestamp ||
-          req.body?.eventTimestamp ||
-          req.body?.updatedAt ||
-          null,
-      };
-      const dedupeDecision = await dedupeProviderEvent(
-        shouldProcessProviderEventAsync,
-        shouldProcessProviderEvent,
-        "aws_status",
-        dedupePayload,
-      );
-      if (shouldShortCircuitProviderDedupe(res, dedupeDecision)) {
-        logProviderDedupeFailure("aws_status_dedupe_unavailable", req, dedupeDecision);
-        logProviderDedupeSkip("aws_status_duplicate_ignored", req, dedupeDecision);
-        return;
-      }
-
-      const canonicalEvent = buildCanonicalCallStatusEvent(
-        "aws",
-        req.body || {},
-        { callSid: resolvedCallSid },
-      );
-      if (canonicalEvent.status) {
-        await recordCallStatus(
-          resolvedCallSid,
-          canonicalEvent.status,
-          canonicalEvent.notification_type,
-          {
-            duration: Number.isFinite(Number(canonicalEvent.duration))
-              ? Math.max(0, Math.floor(Number(canonicalEvent.duration)))
-              : duration
-                ? parseInt(duration, 10)
-                : undefined,
-          },
-        );
-        if (canonicalEvent.status === "completed") {
-          const activeCalls =
-            typeof ctx.getActiveCalls === "function"
-              ? ctx.getActiveCalls()
-              : ctx.activeCalls;
-          const session = activeCalls?.get(resolvedCallSid);
-          if (session?.startTime) {
-            await ctx.handleCallEnd(resolvedCallSid, session.startTime);
-          }
-          activeCalls?.delete(resolvedCallSid);
-          const dbRef = getDb(ctx);
-          if (dbRef?.deleteCallRuntimeState) {
-            await dbRef.deleteCallRuntimeState(resolvedCallSid).catch(() => {});
-          }
-        }
-      }
-
-      return res.status(200).send("OK");
-    } catch (error) {
-      console.error("AWS status webhook error:", error);
-      return res.status(200).send("OK");
-    }
-  };
-}
-
 function createVonageEventWebhookHandler(ctx = {}) {
   const {
     requireValidVonageWebhook,
@@ -2417,6 +2337,416 @@ function createVonageAnswerWebhookHandler(ctx = {}) {
   };
 }
 
+function escapeXml(value = "") {
+  return String(value || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
+}
+
+function createPlivoEventWebhookHandler(ctx = {}) {
+  const {
+    requireValidPlivoWebhook,
+    resolvePlivoCallSid,
+    rememberPlivoCallMapping,
+    getPlivoCallUuid,
+    shouldProcessProviderEvent,
+    shouldProcessProviderEventAsync,
+    recordCallStatus,
+    handleCallEnd,
+    clearPlivoCallMappings,
+  } = ctx;
+  return async function handlePlivoEvent(req, res) {
+    if (!requireValidPlivoWebhook(req, res, req.path || "/plivo/events")) {
+      return;
+    }
+    try {
+      const payload = req.body || {};
+      const plivoUuid = getPlivoCallUuid(payload);
+      const callSid = await resolvePlivoCallSid(req, payload);
+      if (callSid && plivoUuid) {
+        rememberPlivoCallMapping(callSid, plivoUuid, "event");
+      }
+      const dedupePayload = {
+        uuid: plivoUuid || null,
+        callSid: callSid || null,
+        status: String(payload.CallStatus || payload.callStatus || payload.status || "").toLowerCase() || null,
+        timestamp:
+          payload.Timestamp ||
+          payload.timestamp ||
+          payload.EventTimestamp ||
+          payload.eventTimestamp ||
+          null,
+      };
+      const dedupeDecision = await dedupeProviderEvent(
+        shouldProcessProviderEventAsync,
+        shouldProcessProviderEvent,
+        "plivo_event",
+        dedupePayload,
+      );
+      if (shouldShortCircuitProviderDedupe(res, dedupeDecision)) {
+        logProviderDedupeFailure("plivo_event_dedupe_unavailable", req, dedupeDecision);
+        logProviderDedupeSkip("plivo_event_duplicate_ignored", req, dedupeDecision);
+        return;
+      }
+
+      const canonicalEvent = buildCanonicalCallStatusEvent(
+        "plivo",
+        payload || {},
+        { callSid },
+      );
+      if (callSid && canonicalEvent.status) {
+        await recordCallStatus(
+          callSid,
+          canonicalEvent.status,
+          canonicalEvent.notification_type,
+          {
+            duration: Number.isFinite(Number(canonicalEvent.duration))
+              ? Math.max(0, Math.floor(Number(canonicalEvent.duration)))
+              : undefined,
+            raw_status: canonicalEvent.raw_status || null,
+            event_timestamp: canonicalEvent.timestamp || null,
+          },
+        );
+        if (canonicalEvent.status === "completed") {
+          const activeCalls =
+            typeof ctx.getActiveCalls === "function"
+              ? ctx.getActiveCalls()
+              : ctx.activeCalls;
+          const session = activeCalls?.get(callSid);
+          if (session?.startTime) {
+            await handleCallEnd(callSid, session.startTime);
+          }
+          activeCalls?.delete(callSid);
+          const dbRef = getDb(ctx);
+          if (dbRef?.deleteCallRuntimeState) {
+            await dbRef.deleteCallRuntimeState(callSid).catch(() => {});
+          }
+          clearPlivoCallMappings(callSid);
+        }
+      }
+      if (!callSid) {
+        console.warn("Plivo event callback could not resolve internal callSid", {
+          uuid: plivoUuid || null,
+          status: payload.CallStatus || payload.status || null,
+        });
+      }
+      return res.status(200).send("OK");
+    } catch (error) {
+      console.error("Plivo webhook error:", error);
+      return res.status(200).send("OK");
+    }
+  };
+}
+
+function createPlivoAnswerWebhookHandler(ctx = {}) {
+  const {
+    requireValidPlivoWebhook,
+    resolvePlivoCallSid,
+    rememberPlivoCallMapping,
+    getPlivoCallUuid,
+    buildPlivoInboundCallSid,
+    refreshInboundDefaultScript,
+    hydrateCallConfigFromDb,
+    ensureCallSetup,
+    ensureCallRecord,
+    normalizePhoneForFlag,
+    shouldRateLimitInbound,
+    buildPlivoWebsocketUrl,
+    getPlivoStreamContentType,
+    resolveHost,
+    config,
+    webhookService,
+  } = ctx;
+  const buildUnavailableXml = () =>
+    '<?xml version="1.0" encoding="UTF-8"?><Response><Speak>We are unable to connect this call right now. Please try again shortly.</Speak><Hangup /></Response>';
+  const buildTalkHangupXml = (message) =>
+    `<?xml version="1.0" encoding="UTF-8"?><Response><Speak>${escapeXml(message)}</Speak><Hangup /></Response>`;
+
+  return async function handlePlivoAnswer(req, res) {
+    if (!requireValidPlivoWebhook(req, res, req.path || "/plivo/answer", {
+      allowQuerySecret: true,
+    })) {
+      return;
+    }
+    try {
+      const payload = {
+        ...(req.query || {}),
+        ...(req.body || {}),
+      };
+      const plivoUuid = getPlivoCallUuid(payload);
+      let callSid = await resolvePlivoCallSid(req, payload);
+      let synthesizedInbound = false;
+      if (!callSid && plivoUuid && typeof buildPlivoInboundCallSid === "function") {
+        callSid = buildPlivoInboundCallSid(plivoUuid);
+        synthesizedInbound = Boolean(callSid);
+      }
+      const callConfigurations =
+        typeof ctx.getCallConfigurations === "function"
+          ? ctx.getCallConfigurations()
+          : ctx.callConfigurations;
+      const callFunctionSystems =
+        typeof ctx.getCallFunctionSystems === "function"
+          ? ctx.getCallFunctionSystems()
+          : ctx.callFunctionSystems;
+      const callDirections =
+        typeof ctx.getCallDirections === "function"
+          ? ctx.getCallDirections()
+          : ctx.callDirections;
+      const db = getDb(ctx);
+      const existingCallConfig = callSid ? callConfigurations?.get(callSid) : null;
+      const direction = String(payload.Direction || payload.direction || "").toLowerCase();
+      const isInbound =
+        typeof existingCallConfig?.inbound === "boolean"
+          ? existingCallConfig.inbound
+          : synthesizedInbound ||
+            String(callSid || "").startsWith("plivo-in-") ||
+            direction.includes("inbound");
+      if (callSid && plivoUuid) {
+        rememberPlivoCallMapping(callSid, plivoUuid, "answer");
+      }
+      if (callSid) {
+        if (isInbound && typeof refreshInboundDefaultScript === "function") {
+          await refreshInboundDefaultScript();
+        }
+        let setup =
+          existingCallConfig && callFunctionSystems?.get(callSid)
+            ? {
+                callConfig: existingCallConfig,
+                functionSystem: callFunctionSystems.get(callSid),
+              }
+            : null;
+        if (!setup && !isInbound && typeof hydrateCallConfigFromDb === "function") {
+          const hydrated = await hydrateCallConfigFromDb(callSid);
+          if (hydrated?.callConfig && hydrated?.functionSystem) {
+            setup = hydrated;
+          }
+        }
+        if (!setup && typeof ensureCallSetup === "function") {
+          setup = ensureCallSetup(callSid, payload, {
+            provider: "plivo",
+            inbound: isInbound,
+          });
+        }
+        if (setup?.callConfig && callConfigurations) {
+          if (!setup.callConfig.provider_metadata) {
+            setup.callConfig.provider_metadata = {};
+          }
+          setup.callConfig.provider = "plivo";
+          setup.callConfig.inbound = isInbound;
+          if (plivoUuid) {
+            setup.callConfig.provider_metadata.plivo_uuid = String(plivoUuid);
+          }
+          callConfigurations.set(callSid, setup.callConfig);
+        }
+        if (callDirections?.set) {
+          callDirections.set(callSid, isInbound ? "inbound" : "outbound");
+        }
+
+        if (isInbound && typeof ensureCallRecord === "function") {
+          const callRecord = await ensureCallRecord(
+            callSid,
+            {
+              ...payload,
+              from: payload.From || payload.from,
+              to: payload.To || payload.to,
+            },
+            "plivo_answer",
+            {
+              provider: "plivo",
+              inbound: true,
+            },
+          );
+          const chatId = callRecord?.user_chat_id || config?.telegram?.adminChatId;
+          const callerLookup = callRecord?.phone_number
+            ? normalizePhoneForFlag?.(callRecord.phone_number) || callRecord.phone_number
+            : null;
+          let callerFlag = null;
+          if (callerLookup && db?.getCallerFlag) {
+            callerFlag = await db.getCallerFlag(callerLookup).catch(() => null);
+          }
+          if (callerFlag?.status === "blocked") {
+            if (db?.updateCallState) {
+              await db
+                .updateCallState(callSid, "caller_blocked", {
+                  at: new Date().toISOString(),
+                  phone_number: callerLookup || callRecord?.phone_number || null,
+                  status: callerFlag.status,
+                  note: callerFlag.note || null,
+                  provider: "plivo",
+                })
+                .catch(() => {});
+            }
+            res.type("text/xml");
+            return res.send(buildTalkHangupXml("We cannot take your call at this time."));
+          }
+          if (
+            callerFlag?.status !== "allowed" &&
+            typeof shouldRateLimitInbound === "function"
+          ) {
+            const rateLimit = shouldRateLimitInbound(req, payload || {});
+            if (rateLimit.limited) {
+              if (db?.updateCallState) {
+                await db
+                  .updateCallState(callSid, "inbound_rate_limited", {
+                    at: new Date().toISOString(),
+                    key: rateLimit.key,
+                    count: rateLimit.count,
+                    reset_at: rateLimit.resetAt,
+                    provider: "plivo",
+                  })
+                  .catch(() => {});
+              }
+              res.type("text/xml");
+              return res.send(
+                buildTalkHangupXml(
+                  "We are experiencing high call volume. Please try again later.",
+                ),
+              );
+            }
+          }
+          if (chatId && webhookService) {
+            webhookService
+              .sendCallStatusUpdate(callSid, "ringing", chatId, {
+                status_source: "plivo_inbound",
+              })
+              .catch(() => {});
+            webhookService.setInboundGate(callSid, "answered", { chatId });
+          }
+        }
+      }
+      const wsUrl = callSid
+        ? buildPlivoWebsocketUrl(req, callSid, {
+            uuid: plivoUuid || undefined,
+            direction: isInbound ? "inbound" : "outbound",
+            from: payload.From || payload.from || undefined,
+            to: payload.To || payload.to || undefined,
+          })
+        : "";
+      if (!callSid || !wsUrl) {
+        console.warn("Plivo answer callback missing callSid/host", {
+          callSid: callSid || null,
+          uuid: plivoUuid || null,
+          host: resolveHost(req) || null,
+        });
+        res.type("text/xml");
+        return res.send(buildUnavailableXml());
+      }
+
+      res.type("text/xml");
+      return res.send(
+        `<?xml version="1.0" encoding="UTF-8"?><Response><Stream bidirectional="true" keepCallAlive="true" contentType="${escapeXml(getPlivoStreamContentType())}">${escapeXml(wsUrl)}</Stream></Response>`,
+      );
+    } catch (error) {
+      console.error("Plivo answer callback error:", error);
+      res.type("text/xml");
+      return res.send(buildUnavailableXml());
+    }
+  };
+}
+
+function createPaypalWebhookHandler(ctx = {}) {
+  const db = getDb(ctx);
+  const service =
+    ctx.paypalPaymentService ||
+    createPaypalPaymentService({
+      db,
+      config: ctx.config?.payment?.paypal,
+      fetchFn: ctx.fetchFn,
+    });
+
+  return async function handlePaypalWebhook(req, res) {
+    try {
+      if (!service.isEnabled()) {
+        return res.status(404).json({
+          error: "paypal_disabled",
+          message: "PayPal connector is disabled.",
+        });
+      }
+
+      const verification = await service.verifyWebhookSignature(req.body || {}, req.headers || {});
+      if (!verification.ok) {
+        console.warn("PayPal webhook verification failed:", {
+          error: verification.error,
+          verification_status: verification.verification_status || null,
+        });
+        return res.status(401).json(verification);
+      }
+
+      const result = await service.handleWebhookEvent(req.body || {});
+      if (!result.ok) {
+        return res.status(400).json(result);
+      }
+      return res.status(200).json({
+        status: "ok",
+        ...result,
+      });
+    } catch (error) {
+      console.error("PayPal webhook handler error:", error);
+      return res.status(500).json({
+        error: "paypal_webhook_failed",
+        message: "Unable to process PayPal webhook.",
+      });
+    }
+  };
+}
+
+function createStripeWebhookHandler(ctx = {}) {
+  const db = getDb(ctx);
+  const service =
+    ctx.stripePaymentService ||
+    createStripePaymentService({
+      db,
+      config: ctx.config?.payment?.stripe,
+      fetchFn: ctx.fetchFn,
+    });
+
+  return async function handleStripeWebhook(req, res) {
+    try {
+      if (!service.isEnabled()) {
+        return res.status(404).json({
+          error: "stripe_disabled",
+          message: "Stripe connector is disabled.",
+        });
+      }
+
+      const rawBody =
+        typeof req.rawBody === "string"
+          ? req.rawBody
+          : Buffer.isBuffer(req.rawBody)
+            ? req.rawBody.toString("utf8")
+            : JSON.stringify(req.body || {});
+      const verification = await service.verifyWebhookSignature(
+        rawBody,
+        req.headers || {},
+      );
+      if (!verification.ok) {
+        console.warn("Stripe webhook verification failed:", {
+          error: verification.error,
+        });
+        return res.status(401).json(verification);
+      }
+
+      const result = await service.handleWebhookEvent(req.body || {});
+      if (!result.ok) {
+        return res.status(400).json(result);
+      }
+      return res.status(200).json({
+        status: "ok",
+        ...result,
+      });
+    } catch (error) {
+      console.error("Stripe webhook handler error:", error);
+      return res.status(500).json({
+        error: "stripe_webhook_failed",
+        message: "Unable to process Stripe webhook.",
+      });
+    }
+  };
+}
+
 function registerWebhookRoutes(app, ctx = {}) {
   const withWebhookAuth = createWebhookAuthGuard(ctx);
   const handleSecureCaptureView =
@@ -2450,21 +2780,29 @@ function registerWebhookRoutes(app, ctx = {}) {
     createEmailUnsubscribeWebhookHandler(ctx);
   const handleSmsDeliveryWebhook =
     ctx.handleSmsDeliveryWebhook || createSmsDeliveryWebhookHandler(ctx);
-  const handleAwsStatusWebhook =
-    ctx.handleAwsStatusWebhook || createAwsStatusWebhookHandler(ctx);
+  const handlePlivoAnswer =
+    ctx.handlePlivoAnswer || createPlivoAnswerWebhookHandler(ctx);
+  const handlePlivoEvent =
+    ctx.handlePlivoEvent || createPlivoEventWebhookHandler(ctx);
   const handleVonageAnswer =
     ctx.handleVonageAnswer || createVonageAnswerWebhookHandler(ctx);
   const handleVonageEvent =
     ctx.handleVonageEvent || createVonageEventWebhookHandler(ctx);
+  const handlePaypalWebhook =
+    ctx.handlePaypalWebhook || createPaypalWebhookHandler(ctx);
+  const handleStripeWebhook =
+    ctx.handleStripeWebhook || createStripeWebhookHandler(ctx);
 
   app.get("/capture/secure", handleSecureCaptureView);
   app.post("/capture/secure", handleSecureCaptureSubmit);
   app.post("/webhook/telegram", withWebhookAuth("telegram", handleTelegramWebhook));
+  app.get("/plivo/answer", withWebhookAuth("plivo_answer", handlePlivoAnswer));
+  app.post("/plivo/answer", withWebhookAuth("plivo_answer", handlePlivoAnswer));
+  app.post("/plivo/events", withWebhookAuth("plivo_event", handlePlivoEvent));
   app.get("/va", withWebhookAuth("vonage_answer", handleVonageAnswer));
   app.get("/answer", withWebhookAuth("vonage_answer", handleVonageAnswer));
   app.post("/ve", withWebhookAuth("vonage_event", handleVonageEvent));
   app.post("/event", withWebhookAuth("vonage_event", handleVonageEvent));
-  app.post("/webhook/aws/status", withWebhookAuth("aws_status", handleAwsStatusWebhook));
   app.post(
     "/webhook/call-status",
     withWebhookAuth("twilio_call_status", handleCallStatusWebhook),
@@ -2495,6 +2833,8 @@ function registerWebhookRoutes(app, ctx = {}) {
   app.get("/vd", withWebhookAuth("vonage_delivery", handleVonageSmsDeliveryWebhook));
   app.post("/vd", withWebhookAuth("vonage_delivery", handleVonageSmsDeliveryWebhook));
   app.post("/webhook/email", withWebhookAuth("email_events", handleEmailWebhook));
+  app.post("/webhook/paypal", handlePaypalWebhook);
+  app.post("/webhook/stripe", handleStripeWebhook);
   app.get("/webhook/email-unsubscribe", handleEmailUnsubscribeWebhook);
   app.post(
     "/webhook/twilio-gather",
@@ -2509,6 +2849,10 @@ function registerWebhookRoutes(app, ctx = {}) {
 module.exports = {
   registerWebhookRoutes,
   createVonageEventWebhookHandler,
+  createPlivoEventWebhookHandler,
+  createPlivoAnswerWebhookHandler,
+  createPaypalWebhookHandler,
+  createStripeWebhookHandler,
   __testables: {
     WEBHOOK_AUTH_POLICIES,
     createWebhookAuthGuard,

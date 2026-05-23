@@ -1,12 +1,12 @@
 const EventEmitter = require('events');
 const crypto = require('crypto');
+const fetch = require('node-fetch');
 const config = require('../config');
-const { PinpointClient, SendMessagesCommand } = require('@aws-sdk/client-pinpoint');
 const { Vonage } = require('@vonage/server-sdk');
 const { resolveProviderExecutionOrder } = require('../adapters/providerFlowPolicy');
 const { runWithTimeout } = require('../utils/asyncControl');
 
-const SUPPORTED_SMS_PROVIDERS = ['twilio', 'aws', 'vonage'];
+const SUPPORTED_SMS_PROVIDERS = ['twilio', 'plivo', 'vonage'];
 const RETRYABLE_NETWORK_CODES = new Set([
     'ECONNRESET',
     'ECONNABORTED',
@@ -246,13 +246,24 @@ class TwilioSmsAdapter {
     }
 }
 
-class AwsPinpointSmsAdapter {
+async function parseProviderResponse(response) {
+    const text = await response.text();
+    if (!text) return null;
+    try {
+        return JSON.parse(text);
+    } catch {
+        return { raw: text };
+    }
+}
+
+class PlivoSmsAdapter {
     constructor(options = {}) {
-        this.provider = 'aws';
-        this.applicationId = options.applicationId || null;
+        this.provider = 'plivo';
+        this.authId = options.authId || null;
+        this.authToken = options.authToken || null;
         this.defaultFrom = options.defaultFrom || null;
-        this.region = options.region || null;
-        this.client = this.region ? new PinpointClient({ region: this.region }) : null;
+        this.apiBaseUrl = String(options.apiBaseUrl || 'https://api.plivo.com').replace(/\/+$/, '');
+        this.fetch = options.fetch || fetch;
     }
 
     resolveFromNumber(from) {
@@ -260,7 +271,11 @@ class AwsPinpointSmsAdapter {
     }
 
     isConfigured() {
-        return !!(this.client && this.applicationId && this.defaultFrom);
+        return !!(this.authId && this.authToken && this.defaultFrom);
+    }
+
+    buildAuthHeader() {
+        return `Basic ${Buffer.from(`${this.authId}:${this.authToken}`).toString('base64')}`;
     }
 
     mapError(error) {
@@ -268,81 +283,82 @@ class AwsPinpointSmsAdapter {
             return error;
         }
         const status = Number(error?.status || error?.statusCode || error?.response?.status);
-        const sdkCode = String(error?.name || error?.Code || error?.code || '').toUpperCase();
+        const providerCode = String(
+            error?.providerCode || error?.name || error?.Code || error?.code || '',
+        ).toUpperCase();
         const retryable =
             status === 429 ||
             (status >= 500 && status < 600) ||
-            RETRYABLE_NETWORK_CODES.has(sdkCode) ||
-            sdkCode.includes('THROTT') ||
-            sdkCode.includes('TOOMANYREQUESTS');
+            RETRYABLE_NETWORK_CODES.has(providerCode);
         return createSmsProviderError(this.provider, {
-            message: error?.message || 'AWS Pinpoint SMS send failed',
+            message: error?.message || 'Plivo SMS send failed',
             code: 'sms_provider_error',
             status,
             retryable,
-            providerCode: sdkCode || null,
+            providerCode: providerCode || null,
             cause: error,
         });
     }
 
     async sendSms(payload, options = {}) {
         const { withTimeout, providerTimeoutMs } = options;
-        if (!this.client || !this.applicationId) {
+        if (!this.authId || !this.authToken) {
             throw createSmsProviderError(this.provider, {
-                message: 'AWS Pinpoint is not configured',
+                message: 'Plivo SMS adapter is not configured',
                 code: 'sms_config_error',
                 retryable: false,
             });
         }
         if (payload.mediaUrl) {
             throw createSmsProviderError(this.provider, {
-                message: 'Media messages are not supported by AWS Pinpoint adapter',
+                message: 'Media messages are not supported by Plivo SMS adapter',
                 code: 'sms_validation_failed',
                 retryable: false,
             });
         }
-        const command = new SendMessagesCommand({
-            ApplicationId: this.applicationId,
-            MessageRequest: {
-                Addresses: {
-                    [payload.to]: {
-                        ChannelType: 'SMS',
-                    },
-                },
-                MessageConfiguration: {
-                    SMSMessage: {
-                        Body: payload.body,
-                        OriginationNumber: payload.from,
-                        MessageType: 'TRANSACTIONAL',
-                    },
-                },
-                TraceId: payload.idempotencyKey || undefined,
-            },
-        });
+        const requestPayload = {
+            src: payload.from,
+            dst: payload.to,
+            text: payload.body,
+        };
         try {
             const response = await withTimeout(
-                this.client.send(command),
+                this.fetch(
+                    `${this.apiBaseUrl}/v1/Account/${encodeURIComponent(this.authId)}/Message/`,
+                    {
+                        method: 'POST',
+                        headers: {
+                            Authorization: this.buildAuthHeader(),
+                            'Content-Type': 'application/json',
+                        },
+                        body: JSON.stringify(requestPayload),
+                    },
+                ),
                 providerTimeoutMs,
                 'sms_provider_timeout',
             );
-            const result = response?.MessageResponse?.Result?.[payload.to] || {};
-            const statusCode = Number(result?.StatusCode);
-            if (Number.isFinite(statusCode) && statusCode >= 400) {
-                const retryable = statusCode === 429 || statusCode >= 500;
+            const parsed = await parseProviderResponse(response);
+            if (!response.ok) {
                 throw createSmsProviderError(this.provider, {
-                    message: result?.StatusMessage || 'AWS Pinpoint rejected SMS',
+                    message:
+                        parsed?.error ||
+                        parsed?.message ||
+                        `Plivo SMS rejected request with HTTP ${response.status}`,
                     code: 'sms_provider_error',
-                    status: statusCode,
-                    retryable,
-                    providerCode: result?.DeliveryStatus || null,
+                    status: response.status,
+                    retryable: response.status === 429 || response.status >= 500,
+                    providerCode: parsed?.api_id || null,
                 });
             }
+            const messageUuid = Array.isArray(parsed?.message_uuid)
+                ? parsed.message_uuid[0]
+                : parsed?.message_uuid || parsed?.messageUuid || parsed?.api_id || null;
             return {
                 provider: this.provider,
-                messageSid: result?.MessageId || null,
-                status: 'accepted',
+                messageSid: messageUuid || null,
+                status: 'queued',
                 from: payload.from,
-                response: response || null,
+                response: parsed || null,
             };
         } catch (error) {
             if (error?.provider === this.provider) {
@@ -470,10 +486,7 @@ class EnhancedSmsService extends EventEmitter {
             typeof options.getActiveProvider === 'function'
                 ? options.getActiveProvider
                 : () => config.sms?.provider || 'twilio';
-        this.twilio = require('twilio')(
-            config.twilio.accountSid,
-            config.twilio.authToken
-        );
+        this.twilio = options.twilioClient || null;
         this.smsAdapters = new Map();
         this.openai = new(require('openai'))({
             baseURL: "https://openrouter.ai/api/v1",
@@ -628,6 +641,32 @@ class EnhancedSmsService extends EventEmitter {
         return provider;
     }
 
+    getTwilioClient() {
+        if (this.twilio) {
+            return this.twilio;
+        }
+        const accountSid = String(config.twilio?.accountSid || '').trim();
+        const authToken = String(config.twilio?.authToken || '').trim();
+        if (!accountSid || !authToken) {
+            throw createSmsProviderError('twilio', {
+                message: 'Twilio SMS adapter is not configured',
+                code: 'sms_config_error',
+                retryable: false,
+            });
+        }
+        try {
+            this.twilio = require('twilio')(accountSid, authToken);
+            return this.twilio;
+        } catch (error) {
+            throw createSmsProviderError('twilio', {
+                message: error?.message || 'Twilio SMS adapter is not configured',
+                code: 'sms_config_error',
+                retryable: false,
+                cause: error,
+            });
+        }
+    }
+
     getProviderReadiness() {
         const vonageWebhookMode = String(config.vonage?.webhookValidation || 'warn').toLowerCase();
         const vonageWebhookReady =
@@ -638,10 +677,10 @@ class EnhancedSmsService extends EventEmitter {
                 config.twilio?.authToken &&
                 config.twilio?.fromNumber
             ),
-            aws: !!(
-                config.aws?.pinpoint?.applicationId &&
-                config.aws?.pinpoint?.originationNumber &&
-                config.aws?.pinpoint?.region
+            plivo: !!(
+                config.plivo?.authId &&
+                config.plivo?.authToken &&
+                config.plivo?.sms?.fromNumber
             ),
             vonage: !!(
                 config.vonage?.apiKey &&
@@ -660,14 +699,15 @@ class EnhancedSmsService extends EventEmitter {
         let adapter = null;
         if (resolved === 'twilio') {
             adapter = new TwilioSmsAdapter({
-                client: this.twilio,
+                client: this.getTwilioClient(),
                 defaultFrom: config.twilio?.fromNumber,
             });
-        } else if (resolved === 'aws') {
-            adapter = new AwsPinpointSmsAdapter({
-                applicationId: config.aws?.pinpoint?.applicationId,
-                defaultFrom: config.aws?.pinpoint?.originationNumber,
-                region: config.aws?.pinpoint?.region || config.aws?.region,
+        } else if (resolved === 'plivo') {
+            adapter = new PlivoSmsAdapter({
+                authId: config.plivo?.authId,
+                authToken: config.plivo?.authToken,
+                apiBaseUrl: config.plivo?.apiBaseUrl,
+                defaultFrom: config.plivo?.sms?.fromNumber,
             });
         } else if (resolved === 'vonage') {
             adapter = new VonageSmsAdapter({
@@ -1906,7 +1946,7 @@ module.exports = {
     __testables: {
         TwilioSmsAdapter,
         VonageSmsAdapter,
-        AwsPinpointSmsAdapter,
+        PlivoSmsAdapter,
         getSmsSegmentInfo,
         createSmsProviderError,
     },

@@ -2,9 +2,15 @@ const twilio = require("twilio");
 const fetch = require("node-fetch");
 const { Vonage } = require("@vonage/server-sdk");
 const {
-  ConnectClient,
-  ListInstancesCommand,
-} = require("@aws-sdk/client-connect");
+  PAYPAL_AGENT_TOOLKIT_BLOCKED_TOOLS,
+  PAYPAL_AGENT_TOOLKIT_PACKAGE,
+  PAYPAL_AGENT_TOOLKIT_READ_TOOLS,
+  createPaypalPaymentService,
+} = require("../services/paypalPaymentService");
+const {
+  DEFAULT_API_VERSION: STRIPE_DEFAULT_API_VERSION,
+  createStripePaymentService,
+} = require("../services/stripePaymentService");
 const { runWithTimeout } = require("../utils/asyncControl");
 
 const CHECK_STATUS = Object.freeze({
@@ -15,8 +21,9 @@ const CHECK_STATUS = Object.freeze({
 });
 
 const SUPPORTED_PROVIDER_PREFLIGHT_CHANNELS = Object.freeze({
-  call: Object.freeze(["twilio", "aws", "vonage"]),
-  sms: Object.freeze(["twilio", "vonage"]),
+  call: Object.freeze(["twilio", "plivo", "vonage"]),
+  sms: Object.freeze(["twilio", "plivo", "vonage"]),
+  payment: Object.freeze(["paypal", "stripe"]),
 });
 
 const REQUIRED_ROUTE_GROUPS = Object.freeze({
@@ -70,19 +77,27 @@ const REQUIRED_ROUTE_GROUPS = Object.freeze({
         ]),
       }),
     ]),
-    aws: Object.freeze([
+    plivo: Object.freeze([
       Object.freeze({
-        id: "aws_transcripts",
-        label: "AWS transcripts webhook route",
+        id: "plivo_answer",
+        label: "Plivo answer webhook route",
         anyOf: Object.freeze([
-          Object.freeze({ method: "POST", path: "/aws/transcripts" }),
+          Object.freeze({ method: "GET", path: "/plivo/answer" }),
+          Object.freeze({ method: "POST", path: "/plivo/answer" }),
         ]),
       }),
       Object.freeze({
-        id: "aws_stream_ws",
-        label: "AWS media websocket route",
+        id: "plivo_event",
+        label: "Plivo call event webhook route",
         anyOf: Object.freeze([
-          Object.freeze({ method: "GET", path: "/aws/stream" }),
+          Object.freeze({ method: "POST", path: "/plivo/events" }),
+        ]),
+      }),
+      Object.freeze({
+        id: "plivo_stream_ws",
+        label: "Plivo media websocket route",
+        anyOf: Object.freeze([
+          Object.freeze({ method: "GET", path: "/plivo/stream" }),
         ]),
       }),
     ]),
@@ -126,6 +141,26 @@ const REQUIRED_ROUTE_GROUPS = Object.freeze({
         anyOf: Object.freeze([
           Object.freeze({ method: "GET", path: "/vd" }),
           Object.freeze({ method: "POST", path: "/vd" }),
+        ]),
+      }),
+    ]),
+  }),
+  payment: Object.freeze({
+    paypal: Object.freeze([
+      Object.freeze({
+        id: "paypal_webhook",
+        label: "PayPal webhook route",
+        anyOf: Object.freeze([
+          Object.freeze({ method: "POST", path: "/webhook/paypal" }),
+        ]),
+      }),
+    ]),
+    stripe: Object.freeze([
+      Object.freeze({
+        id: "stripe_webhook",
+        label: "Stripe webhook route",
+        anyOf: Object.freeze([
+          Object.freeze({ method: "POST", path: "/webhook/stripe" }),
         ]),
       }),
     ]),
@@ -307,7 +342,13 @@ function collectRegisteredRoutes(app, routes = new Set(), layers = null) {
     if (layer?.route?.path) {
       const methods = collectRouteMethods(layer);
       for (const method of methods) {
-        routes.add(`${method} ${layer.route.path}`);
+        const routePath = String(layer.route.path || "");
+        routes.add(`${method} ${routePath}`);
+        if (routePath.endsWith("/.websocket")) {
+          routes.add(`${method} ${routePath.slice(0, -"/.websocket".length)}`);
+        } else if (routePath.endsWith(".websocket")) {
+          routes.add(`${method} ${routePath.slice(0, -".websocket".length)}`);
+        }
       }
       continue;
     }
@@ -378,24 +419,22 @@ function buildVonageCallbackUrls(channel, config, options = {}) {
   };
 }
 
-function buildAwsCallbackUrls(channel, config, options = {}) {
-  const normalizedChannel = normalizeChannel(channel);
+function buildPlivoCallbackUrls(channel, config, options = {}) {
   const host = normalizeHost(options.hostOverride || config?.server?.hostname);
-  if (!host) {
-    return {
-      host: "",
-      base_url: "",
-      urls: [],
-      reason: "SERVER is not configured for AWS callback URLs",
-    };
-  }
-  const baseUrl = `https://${host}`;
-  if (normalizedChannel === "call") {
+  const baseUrl = host ? `https://${host}` : "";
+  if (normalizeChannel(channel) === "call") {
+    const answerUrl = String(config?.plivo?.voice?.answerUrl || "").trim();
+    const eventUrl = String(config?.plivo?.voice?.eventUrl || "").trim();
     return {
       host,
       base_url: baseUrl,
-      urls: [`${baseUrl}/aws/transcripts`, `${baseUrl}/aws/stream`],
-      reason: null,
+      urls: [
+        answerUrl || (baseUrl ? `${baseUrl}/plivo/answer` : ""),
+        eventUrl || (baseUrl ? `${baseUrl}/plivo/events` : ""),
+      ].filter(Boolean),
+      reason: !answerUrl && !eventUrl && !baseUrl
+        ? "Neither SERVER nor explicit PLIVO_ANSWER_URL/PLIVO_EVENT_URL is configured"
+        : null,
     };
   }
   return {
@@ -406,16 +445,60 @@ function buildAwsCallbackUrls(channel, config, options = {}) {
   };
 }
 
+function buildPaypalCallbackUrls(channel, config, options = {}) {
+  const host = normalizeHost(options.hostOverride || config?.server?.hostname);
+  if (!host) {
+    return {
+      host: "",
+      base_url: "",
+      urls: [],
+      reason: "SERVER is not configured for PayPal webhook callbacks",
+    };
+  }
+  const baseUrl = `https://${host}`;
+  return {
+    host,
+    base_url: baseUrl,
+    urls: [`${baseUrl}/webhook/paypal`],
+    reason: null,
+  };
+}
+
+function buildStripeCallbackUrls(channel, config, options = {}) {
+  const host = normalizeHost(options.hostOverride || config?.server?.hostname);
+  if (!host) {
+    return {
+      host: "",
+      base_url: "",
+      urls: [],
+      reason: "SERVER is not configured for Stripe webhook callbacks",
+    };
+  }
+  const baseUrl = `https://${host}`;
+  return {
+    host,
+    base_url: baseUrl,
+    urls: [`${baseUrl}/webhook/stripe`],
+    reason: null,
+  };
+}
+
 function buildProviderCallbackUrls(provider, channel, config, options = {}) {
   const normalizedProvider = normalizeProvider(provider);
   if (normalizedProvider === "twilio") {
     return buildTwilioCallbackUrls(channel, config, options);
   }
-  if (normalizedProvider === "aws") {
-    return buildAwsCallbackUrls(channel, config, options);
+  if (normalizedProvider === "plivo") {
+    return buildPlivoCallbackUrls(channel, config, options);
   }
   if (normalizedProvider === "vonage") {
     return buildVonageCallbackUrls(channel, config, options);
+  }
+  if (normalizedProvider === "paypal") {
+    return buildPaypalCallbackUrls(channel, config, options);
+  }
+  if (normalizedProvider === "stripe") {
+    return buildStripeCallbackUrls(channel, config, options);
   }
   return {
     host: "",
@@ -621,21 +704,47 @@ async function runVonageCredentialCheck(channel, config, options = {}) {
   }
 }
 
-async function runAwsCredentialCheck(channel, config, options = {}) {
+async function runPlivoCredentialCheck(channel, config) {
   const missing = [];
-  if (!config?.aws?.region) missing.push("AWS_REGION");
-  if (normalizeChannel(channel) === "call") {
-    if (!config?.aws?.connect?.instanceId) missing.push("AWS_CONNECT_INSTANCE_ID");
-    if (!config?.aws?.connect?.contactFlowId) {
-      missing.push("AWS_CONNECT_CONTACT_FLOW_ID");
-    }
+  if (!config?.plivo?.authId) missing.push("PLIVO_AUTH_ID");
+  if (!config?.plivo?.authToken) missing.push("PLIVO_AUTH_TOKEN");
+  const normalizedChannel = normalizeChannel(channel);
+  if (normalizedChannel === "call" && !config?.plivo?.voice?.fromNumber) {
+    missing.push("PLIVO_VOICE_FROM_NUMBER");
+  }
+  if (normalizedChannel === "sms" && !config?.plivo?.sms?.fromNumber) {
+    missing.push("PLIVO_SMS_FROM_NUMBER");
   }
 
   if (missing.length > 0) {
     return {
       status: CHECK_STATUS.FAIL,
       reason: `Missing required credentials: ${missing.join(", ")}`,
-      suggestedFix: "Set required AWS env vars and redeploy.",
+      suggestedFix: "Set required Plivo env vars and redeploy.",
+      details: { missing },
+    };
+  }
+
+  return {
+    status: CHECK_STATUS.PASS,
+    details: {
+      auth_probe: "configuration_only",
+      channel: normalizedChannel,
+    },
+  };
+}
+
+async function runPaypalCredentialCheck(channel, config, options = {}) {
+  const paypalConfig = config?.payment?.paypal || {};
+  const missing = [];
+  if (!paypalConfig.clientId) missing.push("PAYPAL_CLIENT_ID");
+  if (!paypalConfig.clientSecret) missing.push("PAYPAL_CLIENT_SECRET");
+
+  if (missing.length > 0) {
+    return {
+      status: CHECK_STATUS.FAIL,
+      reason: `Missing required credentials: ${missing.join(", ")}`,
+      suggestedFix: "Set required PayPal env vars and redeploy.",
       details: { missing },
     };
   }
@@ -645,36 +754,37 @@ async function runAwsCredentialCheck(channel, config, options = {}) {
       status: CHECK_STATUS.WARN,
       reason: "Network auth probe skipped (allowNetwork=false)",
       suggestedFix: "Run live preflight with network checks enabled before promotion.",
+      details: {
+        environment: paypalConfig.environment || "sandbox",
+        auth_probe: "skipped",
+        channel: normalizeChannel(channel),
+      },
     };
   }
 
   try {
-    const client = new ConnectClient({
-      region: config.aws.region,
-    });
-    const response = await runWithTimeout(
-      client.send(
-        new ListInstancesCommand({
-          MaxResults: 1,
-        }),
-      ),
-      {
-        timeoutMs: options.timeoutMs,
-        label: "provider_preflight_aws_auth_probe",
-        timeoutCode: "aws_auth_probe_timeout",
-        logger: console,
-        meta: {
-          provider: "aws",
-          scope: "provider_preflight",
-        },
+    const service = createPaypalPaymentService({
+      config: {
+        ...paypalConfig,
+        enabled: true,
+        timeoutMs: options.timeoutMs || paypalConfig.timeoutMs,
       },
-    );
+    });
+    await runWithTimeout(service.getAccessToken(), {
+      timeoutMs: options.timeoutMs || paypalConfig.timeoutMs,
+      label: "provider_preflight_paypal_auth_probe",
+      timeoutCode: "paypal_auth_probe_timeout",
+      logger: console,
+      meta: {
+        provider: "paypal",
+        scope: "provider_preflight",
+      },
+    });
     return {
       status: CHECK_STATUS.PASS,
       details: {
-        instance_count: Array.isArray(response?.InstanceSummaryList)
-          ? response.InstanceSummaryList.length
-          : 0,
+        environment: paypalConfig.environment || "sandbox",
+        auth_probe: "oauth_token",
         channel: normalizeChannel(channel),
       },
     };
@@ -683,7 +793,72 @@ async function runAwsCredentialCheck(channel, config, options = {}) {
       status: CHECK_STATUS.FAIL,
       reason: redactError(error),
       suggestedFix:
-        "Confirm AWS credentials/region are valid and IAM allows Amazon Connect list operations.",
+        "Confirm PayPal credentials are valid and API access is allowed from this environment.",
+    };
+  }
+}
+
+async function runStripeCredentialCheck(channel, config, options = {}) {
+  const stripeConfig = config?.payment?.stripe || {};
+  const missing = [];
+  if (!stripeConfig.secretKey) missing.push("STRIPE_SECRET_KEY");
+
+  if (missing.length > 0) {
+    return {
+      status: CHECK_STATUS.FAIL,
+      reason: `Missing required credentials: ${missing.join(", ")}`,
+      suggestedFix: "Set required Stripe env vars and redeploy.",
+      details: { missing },
+    };
+  }
+
+  if (options.allowNetwork !== true) {
+    return {
+      status: CHECK_STATUS.WARN,
+      reason: "Network auth probe skipped (allowNetwork=false)",
+      suggestedFix: "Run live preflight with network checks enabled before promotion.",
+      details: {
+        environment: stripeConfig.environment || "test",
+        auth_probe: "skipped",
+        api_version: stripeConfig.apiVersion || STRIPE_DEFAULT_API_VERSION,
+        channel: normalizeChannel(channel),
+      },
+    };
+  }
+
+  try {
+    const service = createStripePaymentService({
+      config: {
+        ...stripeConfig,
+        enabled: true,
+        timeoutMs: options.timeoutMs || stripeConfig.timeoutMs,
+      },
+    });
+    await runWithTimeout(service.request("/v1/balance"), {
+      timeoutMs: options.timeoutMs || stripeConfig.timeoutMs,
+      label: "provider_preflight_stripe_auth_probe",
+      timeoutCode: "stripe_auth_probe_timeout",
+      logger: console,
+      meta: {
+        provider: "stripe",
+        scope: "provider_preflight",
+      },
+    });
+    return {
+      status: CHECK_STATUS.PASS,
+      details: {
+        environment: stripeConfig.environment || "test",
+        auth_probe: "balance",
+        api_version: stripeConfig.apiVersion || STRIPE_DEFAULT_API_VERSION,
+        channel: normalizeChannel(channel),
+      },
+    };
+  } catch (error) {
+    return {
+      status: CHECK_STATUS.FAIL,
+      reason: redactError(error),
+      suggestedFix:
+        "Confirm Stripe credentials are valid and API access is allowed from this environment.",
     };
   }
 }
@@ -758,40 +933,32 @@ function runWebhookAuthCheck(provider, channel, config, options = {}) {
     };
   }
 
-  if (normalizedProvider === "aws") {
-    const mode = String(config?.aws?.webhookValidation || "warn").toLowerCase();
+  if (normalizedProvider === "plivo") {
+    const mode = String(config?.plivo?.webhookValidation || "warn").toLowerCase();
     if (mode === "off") {
       return {
         status: CHECK_STATUS.FAIL,
-        reason: "AWS_WEBHOOK_VALIDATION is off",
-        suggestedFix: "Set AWS_WEBHOOK_VALIDATION to warn or strict.",
+        reason: "PLIVO_WEBHOOK_VALIDATION is off",
+        suggestedFix: "Set PLIVO_WEBHOOK_VALIDATION to warn or strict.",
       };
     }
-    const hasAwsSecret = Boolean(String(config?.aws?.webhookSecret || "").trim());
+    const hasPlivoSecret = Boolean(String(config?.plivo?.webhookSecret || "").trim());
     const hasHmacSecret = Boolean(String(config?.apiAuth?.hmacSecret || "").trim());
-    if (mode === "strict" && !hasAwsSecret && !hasHmacSecret) {
+    if (mode === "strict" && !hasPlivoSecret && !hasHmacSecret) {
       return {
         status: CHECK_STATUS.FAIL,
         reason:
-          "Strict AWS webhook validation requires AWS_WEBHOOK_SECRET or API_SECRET/API_HMAC_SECRET",
+          "Strict Plivo webhook validation requires PLIVO_WEBHOOK_SECRET or API_SECRET/API_HMAC_SECRET",
         suggestedFix:
-          "Set AWS_WEBHOOK_SECRET (or shared HMAC secret) or lower AWS_WEBHOOK_VALIDATION risk mode.",
+          "Set PLIVO_WEBHOOK_SECRET (or shared HMAC secret) or lower PLIVO_WEBHOOK_VALIDATION risk mode.",
       };
     }
-    if (options?.guards?.awsWebhook !== true) {
+    if (options?.guards?.plivo !== true) {
       return {
         status: CHECK_STATUS.FAIL,
-        reason: "AWS webhook guard is not wired",
+        reason: "Plivo webhook guard is not wired",
         suggestedFix:
-          "Ensure AWS webhook handlers call requireValidAwsWebhook before state mutation.",
-      };
-    }
-    if (normalizedChannel === "call" && options?.guards?.awsStream !== true) {
-      return {
-        status: CHECK_STATUS.FAIL,
-        reason: "AWS stream webhook guard is not wired",
-        suggestedFix:
-          "Ensure AWS stream handlers call verifyAwsStreamAuth before processing media.",
+          "Ensure Plivo webhook handlers call requireValidPlivoWebhook before state mutation.",
       };
     }
     return {
@@ -799,8 +966,58 @@ function runWebhookAuthCheck(provider, channel, config, options = {}) {
       details: {
         validation_mode: mode,
         channel: normalizedChannel,
-        has_aws_secret: hasAwsSecret,
+        has_plivo_secret: hasPlivoSecret,
         has_hmac_secret: hasHmacSecret,
+      },
+    };
+  }
+
+  if (normalizedProvider === "paypal") {
+    if (!config?.payment?.paypal?.webhookId) {
+      return {
+        status: CHECK_STATUS.FAIL,
+        reason: "PAYPAL_WEBHOOK_ID missing for webhook signature validation",
+        suggestedFix: "Set PAYPAL_WEBHOOK_ID for the configured PayPal app webhook.",
+      };
+    }
+    if (options?.guards?.paypal !== true) {
+      return {
+        status: CHECK_STATUS.FAIL,
+        reason: "PayPal webhook signature guard is not wired",
+        suggestedFix:
+          "Ensure the PayPal webhook handler verifies the signature before state mutation.",
+      };
+    }
+    return {
+      status: CHECK_STATUS.PASS,
+      details: {
+        validation_mode: "paypal_webhook_signature",
+        channel: normalizedChannel,
+      },
+    };
+  }
+
+  if (normalizedProvider === "stripe") {
+    if (!config?.payment?.stripe?.webhookSecret) {
+      return {
+        status: CHECK_STATUS.FAIL,
+        reason: "STRIPE_WEBHOOK_SECRET missing for webhook signature validation",
+        suggestedFix: "Set STRIPE_WEBHOOK_SECRET for the configured Stripe webhook endpoint.",
+      };
+    }
+    if (options?.guards?.stripe !== true) {
+      return {
+        status: CHECK_STATUS.FAIL,
+        reason: "Stripe webhook signature guard is not wired",
+        suggestedFix:
+          "Ensure the Stripe webhook handler verifies the signature before state mutation.",
+      };
+    }
+    return {
+      status: CHECK_STATUS.PASS,
+      details: {
+        validation_mode: "stripe_webhook_signature",
+        channel: normalizedChannel,
       },
     };
   }
@@ -937,6 +1154,39 @@ function runRequiredRouteCheck(provider, channel, app) {
   };
 }
 
+function runPaypalAgentToolkitCheck(config) {
+  const paypalConfig = config?.payment?.paypal || {};
+  const service = createPaypalPaymentService({
+    config: {
+      ...paypalConfig,
+      enabled: true,
+    },
+  });
+  const allowedTools = service.getAgentToolkitReadToolNames().sort();
+  if (allowedTools.length === 0) {
+    return {
+      status: CHECK_STATUS.FAIL,
+      reason: "No safe PayPal Agent Toolkit read tools are enabled",
+      suggestedFix:
+        "Set PAYPAL_AGENT_TOOLKIT_READ_TOOLS to a subset of get_invoice,get_order,get_refund,list_invoices or remove it to use defaults.",
+      details: {
+        package: PAYPAL_AGENT_TOOLKIT_PACKAGE,
+        default_read_tools: PAYPAL_AGENT_TOOLKIT_READ_TOOLS,
+        blocked_tools: PAYPAL_AGENT_TOOLKIT_BLOCKED_TOOLS,
+      },
+    };
+  }
+  return {
+    status: CHECK_STATUS.PASS,
+    details: {
+      package: PAYPAL_AGENT_TOOLKIT_PACKAGE,
+      allowed_read_tools: allowedTools,
+      default_read_tools: PAYPAL_AGENT_TOOLKIT_READ_TOOLS,
+      blocked_tools: PAYPAL_AGENT_TOOLKIT_BLOCKED_TOOLS,
+    },
+  };
+}
+
 async function runProviderPreflight(options = {}) {
   const provider = normalizeProvider(options.provider);
   const channel = normalizeChannel(options.channel || "call");
@@ -970,14 +1220,23 @@ async function runProviderPreflight(options = {}) {
           timeoutMs: options.timeoutMs,
         });
       }
-      if (provider === "aws") {
-        return runAwsCredentialCheck(channel, config, {
+      if (provider === "plivo") {
+        return runPlivoCredentialCheck(channel, config);
+      }
+      if (provider === "vonage") {
+        return runVonageCredentialCheck(channel, config, {
           allowNetwork: options.allowNetwork,
           timeoutMs: options.timeoutMs,
         });
       }
-      if (provider === "vonage") {
-        return runVonageCredentialCheck(channel, config, {
+      if (provider === "paypal") {
+        return runPaypalCredentialCheck(channel, config, {
+          allowNetwork: options.allowNetwork,
+          timeoutMs: options.timeoutMs,
+        });
+      }
+      if (provider === "stripe") {
+        return runStripeCredentialCheck(channel, config, {
           allowNetwork: options.allowNetwork,
           timeoutMs: options.timeoutMs,
         });
@@ -1017,6 +1276,15 @@ async function runProviderPreflight(options = {}) {
     "Required route registration",
     async () => runRequiredRouteCheck(provider, channel, options.app),
   );
+
+  if (provider === "paypal") {
+    await runCheck(
+      report,
+      "agent_toolkit_read_surface",
+      "Agent Toolkit read-only surface",
+      async () => runPaypalAgentToolkitCheck(config),
+    );
+  }
 
   return finalizeReport(report);
 }

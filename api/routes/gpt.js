@@ -1075,9 +1075,9 @@ class EnhancedGptService extends EventEmitter {
       policy.timeoutMs = Math.min(policy.timeoutMs, 9000);
     }
 
-    if (provider === 'aws') {
-      policy.timeoutMs = Math.min(20000, policy.timeoutMs + 2000);
-      policy.backoffBaseMs += 100;
+    if (provider === 'plivo') {
+      policy.timeoutMs = Math.min(18000, policy.timeoutMs + 1000);
+      policy.jitterMs += 20;
     } else if (provider === 'vonage') {
       policy.timeoutMs = Math.min(18000, policy.timeoutMs + 1000);
       policy.jitterMs += 20;

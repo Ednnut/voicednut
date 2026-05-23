@@ -7,9 +7,9 @@ const PROVIDER_CHANNELS = Object.freeze({
 });
 
 const SUPPORTED_PROVIDERS = Object.freeze({
-  [PROVIDER_CHANNELS.CALL]: Object.freeze(["twilio", "aws", "vonage"]),
-  [PROVIDER_CHANNELS.SMS]: Object.freeze(["twilio", "aws", "vonage"]),
-  [PROVIDER_CHANNELS.EMAIL]: Object.freeze(["sendgrid", "mailgun", "ses"]),
+  [PROVIDER_CHANNELS.CALL]: Object.freeze(["twilio", "plivo", "vonage"]),
+  [PROVIDER_CHANNELS.SMS]: Object.freeze(["twilio", "plivo", "vonage"]),
+  [PROVIDER_CHANNELS.EMAIL]: Object.freeze(["sendgrid", "mailgun"]),
 });
 
 function normalizeChannel(channel) {

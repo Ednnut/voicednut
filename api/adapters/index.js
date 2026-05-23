@@ -1,5 +1,4 @@
 module.exports = {
-  AwsConnectAdapter: require('./AwsConnectAdapter'),
-  AwsTtsAdapter: require('./AwsTtsAdapter'),
+  PlivoVoiceAdapter: require('./PlivoVoiceAdapter'),
   VonageVoiceAdapter: require('./VonageVoiceAdapter'),
 };

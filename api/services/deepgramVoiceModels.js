@@ -100,7 +100,6 @@ function normalizeVoiceModelId(value) {
 function isLegacyVoiceAlias(value) {
   const model = normalizeVoiceModelId(value);
   if (!model) return false;
-  if (model.startsWith("Polly.")) return true;
   return LEGACY_TWILIO_VOICE_ALIASES.has(model.toLowerCase());
 }
 

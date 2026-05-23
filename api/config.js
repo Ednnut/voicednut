@@ -415,6 +415,41 @@ const vonageVoiceRetryJitterMs = Number(
 const vonageUuidReconcileIntervalMs = Number(
   readEnv("VONAGE_UUID_RECONCILE_INTERVAL_MS") || "120000",
 );
+const plivoWebhookValidationRaw = (
+  readEnv("PLIVO_WEBHOOK_VALIDATION") || (isProduction ? "strict" : "warn")
+).toLowerCase();
+const plivoWebhookValidationModes = new Set(["strict", "warn", "off"]);
+const plivoWebhookValidation = plivoWebhookValidationModes.has(
+  plivoWebhookValidationRaw,
+)
+  ? plivoWebhookValidationRaw
+  : isProduction
+    ? "strict"
+    : "warn";
+const plivoVoiceRequestTimeoutMs = Number(
+  readEnv("PLIVO_VOICE_REQUEST_TIMEOUT_MS") || "15000",
+);
+const plivoVoiceRetryAttempts = Number(
+  readEnv("PLIVO_VOICE_RETRY_ATTEMPTS") || "1",
+);
+const plivoVoiceCreateRetryAttempts = Number(
+  readEnv("PLIVO_VOICE_CREATE_RETRY_ATTEMPTS") || "0",
+);
+const plivoVoiceRetryBaseMs = Number(
+  readEnv("PLIVO_VOICE_RETRY_BASE_MS") || "250",
+);
+const plivoVoiceRetryMaxDelayMs = Number(
+  readEnv("PLIVO_VOICE_RETRY_MAX_DELAY_MS") || "2000",
+);
+const plivoVoiceRetryJitterMs = Number(
+  readEnv("PLIVO_VOICE_RETRY_JITTER_MS") || "120",
+);
+const plivoSmsRequestTimeoutMs = Number(
+  readEnv("PLIVO_SMS_REQUEST_TIMEOUT_MS") || "15000",
+);
+const plivoSmsRetryAttempts = Number(
+  readEnv("PLIVO_SMS_RETRY_ATTEMPTS") || "1",
+);
 const telegramWebhookValidationRaw = (
   readEnv("TELEGRAM_WEBHOOK_VALIDATION") || (isProduction ? "strict" : "warn")
 ).toLowerCase();
@@ -426,21 +461,7 @@ const telegramWebhookValidation = telegramWebhookValidationModes.has(
   : isProduction
     ? "strict"
     : "warn";
-const awsWebhookValidationRaw = (
-  readEnv("AWS_WEBHOOK_VALIDATION") || (isProduction ? "strict" : "warn")
-).toLowerCase();
-const awsWebhookValidationModes = new Set(["strict", "warn", "off"]);
-const awsWebhookValidation = awsWebhookValidationModes.has(
-  awsWebhookValidationRaw,
-)
-  ? awsWebhookValidationRaw
-  : isProduction
-    ? "strict"
-    : "warn";
-const awsWebhookSecret = readEnv("AWS_WEBHOOK_SECRET");
-
 const callProvider = ensure("CALL_PROVIDER", "twilio").toLowerCase();
-const awsRegion = ensure("AWS_REGION", "us-east-1");
 const apiSecret = readEnv("API_SECRET");
 const adminApiToken = apiSecret || readEnv("ADMIN_API_TOKEN");
 const complianceModeRaw = (
@@ -805,6 +826,45 @@ const paymentSmsFallbackSecret =
 const paymentSmsFallbackMaxPerCall = Number(
   readEnv("PAYMENT_SMS_FALLBACK_MAX_PER_CALL") || "1",
 );
+const paypalConnectorEnabled =
+  String(readEnv("PAYPAL_CONNECTOR_ENABLED") || "false").toLowerCase() === "true";
+const paypalEnvironmentRaw =
+  String(readEnv("PAYPAL_ENVIRONMENT") || readEnv("PAYPAL_ENV") || "sandbox")
+    .trim()
+    .toLowerCase();
+const paypalEnvironment =
+  paypalEnvironmentRaw === "live" || paypalEnvironmentRaw === "production"
+    ? "production"
+    : "sandbox";
+const paypalClientId = readEnv("PAYPAL_CLIENT_ID") || "";
+const paypalClientSecret = readEnv("PAYPAL_CLIENT_SECRET") || "";
+const paypalWebhookId = readEnv("PAYPAL_WEBHOOK_ID") || "";
+const paypalReturnUrl = readEnv("PAYPAL_RETURN_URL") || "";
+const paypalCancelUrl = readEnv("PAYPAL_CANCEL_URL") || "";
+const paypalBrandName = readEnv("PAYPAL_BRAND_NAME") || "VoicedNut";
+const paypalTimeoutMs = Number(readEnv("PAYPAL_TIMEOUT_MS") || "7000");
+const paypalAgentToolkitReadTools = parseList(
+  readEnv("PAYPAL_AGENT_TOOLKIT_READ_TOOLS"),
+).map((toolName) => String(toolName || "").trim().toLowerCase());
+const stripeConnectorEnabled =
+  String(readEnv("STRIPE_CONNECTOR_ENABLED") || "false").toLowerCase() === "true";
+const stripeEnvironmentRaw =
+  String(readEnv("STRIPE_ENVIRONMENT") || readEnv("STRIPE_ENV") || "test")
+    .trim()
+    .toLowerCase();
+const stripeEnvironment =
+  stripeEnvironmentRaw === "live" || stripeEnvironmentRaw === "production"
+    ? "production"
+    : "test";
+const stripeSecretKey = readEnv("STRIPE_SECRET_KEY") || "";
+const stripeWebhookSecret = readEnv("STRIPE_WEBHOOK_SECRET") || "";
+const stripeReturnUrl = readEnv("STRIPE_RETURN_URL") || "";
+const stripeCancelUrl = readEnv("STRIPE_CANCEL_URL") || "";
+const stripeApiVersion = readEnv("STRIPE_API_VERSION") || "2026-02-25.clover";
+const stripeTimeoutMs = Number(readEnv("STRIPE_TIMEOUT_MS") || "7000");
+const stripeWebhookToleranceSeconds = Number(
+  readEnv("STRIPE_WEBHOOK_TOLERANCE_SECONDS") || "300",
+);
 
 function loadPrivateKey(rawValue) {
   if (!rawValue) {
@@ -1010,14 +1070,6 @@ const sendgridBaseUrl = readEnv("SENDGRID_BASE_URL");
 const mailgunApiKey = readEnv("MAILGUN_API_KEY");
 const mailgunDomain = readEnv("MAILGUN_DOMAIN");
 const mailgunBaseUrl = readEnv("MAILGUN_BASE_URL");
-const sesRegion = readEnv("SES_REGION") || awsRegion;
-const sesAccessKeyId =
-  readEnv("SES_ACCESS_KEY_ID") || readEnv("AWS_ACCESS_KEY_ID");
-const sesSecretAccessKey =
-  readEnv("SES_SECRET_ACCESS_KEY") || readEnv("AWS_SECRET_ACCESS_KEY");
-const sesSessionToken =
-  readEnv("SES_SESSION_TOKEN") || readEnv("AWS_SESSION_TOKEN");
-
 module.exports = {
   platform: {
     provider: callProvider,
@@ -1039,38 +1091,56 @@ module.exports = {
     ttsPrewarmEnabled: twilioTtsPrewarmEnabled,
     webhookValidation: twilioWebhookValidation,
   },
-  aws: {
-    region: awsRegion,
-    connect: {
-      instanceId: ensure("AWS_CONNECT_INSTANCE_ID", ""),
-      contactFlowId: ensure("AWS_CONNECT_CONTACT_FLOW_ID", ""),
-      queueId: readEnv("AWS_CONNECT_QUEUE_ID"),
-      sourcePhoneNumber: readEnv("AWS_CONNECT_SOURCE_PHONE_NUMBER"),
-      transcriptsQueueUrl: readEnv("AWS_TRANSCRIPTS_QUEUE_URL"),
-      eventBusName: readEnv("AWS_EVENT_BUS_NAME"),
+  plivo: {
+    authId: readEnv("PLIVO_AUTH_ID"),
+    authToken: readEnv("PLIVO_AUTH_TOKEN"),
+    apiBaseUrl: readEnv("PLIVO_API_BASE_URL") || "https://api.plivo.com",
+    webhookValidation: plivoWebhookValidation,
+    webhookSecret: readEnv("PLIVO_WEBHOOK_SECRET") || "",
+    voice: {
+      fromNumber: readEnv("PLIVO_VOICE_FROM_NUMBER") || readEnv("PLIVO_FROM_NUMBER"),
+      answerUrl: readEnv("PLIVO_ANSWER_URL"),
+      eventUrl: readEnv("PLIVO_EVENT_URL"),
+      streamContentType:
+        readEnv("PLIVO_STREAM_CONTENT_TYPE") || "audio/x-mulaw;rate=8000",
+      requestTimeoutMs:
+        Number.isFinite(plivoVoiceRequestTimeoutMs) && plivoVoiceRequestTimeoutMs > 0
+          ? Math.floor(plivoVoiceRequestTimeoutMs)
+          : 15000,
+      retryAttempts:
+        Number.isFinite(plivoVoiceRetryAttempts) && plivoVoiceRetryAttempts >= 0
+          ? Math.floor(plivoVoiceRetryAttempts)
+          : 1,
+      createRetryAttempts:
+        Number.isFinite(plivoVoiceCreateRetryAttempts) &&
+        plivoVoiceCreateRetryAttempts >= 0
+          ? Math.floor(plivoVoiceCreateRetryAttempts)
+          : 0,
+      retryBaseMs:
+        Number.isFinite(plivoVoiceRetryBaseMs) && plivoVoiceRetryBaseMs >= 0
+          ? Math.floor(plivoVoiceRetryBaseMs)
+          : 250,
+      retryMaxDelayMs:
+        Number.isFinite(plivoVoiceRetryMaxDelayMs) &&
+        plivoVoiceRetryMaxDelayMs >= 0
+          ? Math.floor(plivoVoiceRetryMaxDelayMs)
+          : 2000,
+      retryJitterMs:
+        Number.isFinite(plivoVoiceRetryJitterMs) && plivoVoiceRetryJitterMs >= 0
+          ? Math.floor(plivoVoiceRetryJitterMs)
+          : 120,
     },
-    polly: {
-      voiceId: ensure("AWS_POLLY_VOICE_ID", "Joanna"),
-      outputBucket: readEnv("AWS_POLLY_OUTPUT_BUCKET"),
-      outputPrefix: readEnv("AWS_POLLY_OUTPUT_PREFIX") || "tts/",
+    sms: {
+      fromNumber: readEnv("PLIVO_SMS_FROM_NUMBER") || readEnv("PLIVO_FROM_NUMBER"),
+      requestTimeoutMs:
+        Number.isFinite(plivoSmsRequestTimeoutMs) && plivoSmsRequestTimeoutMs > 0
+          ? Math.floor(plivoSmsRequestTimeoutMs)
+          : 15000,
+      retryAttempts:
+        Number.isFinite(plivoSmsRetryAttempts) && plivoSmsRetryAttempts >= 0
+          ? Math.floor(plivoSmsRetryAttempts)
+          : 1,
     },
-    s3: {
-      mediaBucket:
-        readEnv("AWS_MEDIA_BUCKET") || readEnv("AWS_POLLY_OUTPUT_BUCKET"),
-    },
-    pinpoint: {
-      applicationId: readEnv("AWS_PINPOINT_APPLICATION_ID"),
-      originationNumber:
-        readEnv("AWS_PINPOINT_ORIGINATION_NUMBER") ||
-        readEnv("AWS_CONNECT_SOURCE_PHONE_NUMBER"),
-      region: readEnv("AWS_PINPOINT_REGION") || awsRegion,
-    },
-    transcribe: {
-      languageCode: ensure("AWS_TRANSCRIBE_LANGUAGE_CODE", "en-US"),
-      vocabularyFilterName: readEnv("AWS_TRANSCRIBE_VOCABULARY_FILTER_NAME"),
-    },
-    webhookValidation: awsWebhookValidation,
-    webhookSecret: awsWebhookSecret,
   },
   vonage: {
     apiKey: readEnv("VONAGE_API_KEY"),
@@ -1427,12 +1497,6 @@ module.exports = {
       domain: mailgunDomain,
       baseUrl: mailgunBaseUrl,
     },
-    ses: {
-      region: sesRegion,
-      accessKeyId: sesAccessKeyId,
-      secretAccessKey: sesSecretAccessKey,
-      sessionToken: sesSessionToken,
-    },
   },
   smsDefaults: {
     businessId: defaultSmsBusinessId,
@@ -1695,6 +1759,39 @@ module.exports = {
       maxPerCall: Number.isFinite(paymentSmsFallbackMaxPerCall)
         ? Math.max(1, Math.min(5, Math.floor(paymentSmsFallbackMaxPerCall)))
         : 1,
+    },
+    paypal: {
+      enabled: paypalConnectorEnabled,
+      environment: paypalEnvironment,
+      clientId: String(paypalClientId || "").trim(),
+      clientSecret: String(paypalClientSecret || "").trim(),
+      webhookId: String(paypalWebhookId || "").trim(),
+      returnUrl: String(paypalReturnUrl || "").trim(),
+      cancelUrl: String(paypalCancelUrl || "").trim(),
+      brandName: String(paypalBrandName || "").trim(),
+      defaultCurrency: paymentDefaultCurrency,
+      timeoutMs: Number.isFinite(paypalTimeoutMs)
+        ? Math.max(1000, Math.min(30000, Math.floor(paypalTimeoutMs)))
+        : 7000,
+      ...(paypalAgentToolkitReadTools.length > 0
+        ? { agentToolkitReadTools: paypalAgentToolkitReadTools }
+        : {}),
+    },
+    stripe: {
+      enabled: stripeConnectorEnabled,
+      environment: stripeEnvironment,
+      secretKey: String(stripeSecretKey || "").trim(),
+      webhookSecret: String(stripeWebhookSecret || "").trim(),
+      returnUrl: String(stripeReturnUrl || "").trim(),
+      cancelUrl: String(stripeCancelUrl || "").trim(),
+      apiVersion: String(stripeApiVersion || "2026-02-25.clover").trim(),
+      defaultCurrency: paymentDefaultCurrency,
+      timeoutMs: Number.isFinite(stripeTimeoutMs)
+        ? Math.max(1000, Math.min(30000, Math.floor(stripeTimeoutMs)))
+        : 7000,
+      webhookToleranceSeconds: Number.isFinite(stripeWebhookToleranceSeconds)
+        ? Math.max(30, Math.min(900, Math.floor(stripeWebhookToleranceSeconds)))
+        : 300,
     },
   },
   webhook: {

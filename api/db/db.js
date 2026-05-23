@@ -487,6 +487,60 @@ class EnhancedDatabase {
                 updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )`,
 
+            // Durable PayPal connector state for payment links, invoices, and refunds
+            `CREATE TABLE IF NOT EXISTS paypal_payment_sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                call_sid TEXT,
+                action TEXT NOT NULL,
+                external_id TEXT NOT NULL UNIQUE,
+                status TEXT,
+                amount TEXT,
+                currency TEXT,
+                approval_url TEXT,
+                idempotency_key TEXT,
+                metadata TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )`,
+
+            // PayPal webhook/event idempotency ledger
+            `CREATE TABLE IF NOT EXISTS paypal_payment_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                external_event_id TEXT NOT NULL UNIQUE,
+                event_type TEXT,
+                resource_id TEXT,
+                status TEXT,
+                payload TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )`,
+
+            // Durable Stripe connector state for checkout sessions, invoices, and refunds
+            `CREATE TABLE IF NOT EXISTS stripe_payment_sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                call_sid TEXT,
+                action TEXT NOT NULL,
+                external_id TEXT NOT NULL UNIQUE,
+                status TEXT,
+                amount TEXT,
+                currency TEXT,
+                approval_url TEXT,
+                idempotency_key TEXT,
+                metadata TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )`,
+
+            // Stripe webhook/event idempotency ledger
+            `CREATE TABLE IF NOT EXISTS stripe_payment_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                external_event_id TEXT NOT NULL UNIQUE,
+                event_type TEXT,
+                resource_id TEXT,
+                status TEXT,
+                payload TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )`,
+
             // Durable provider webhook idempotency guard
             `CREATE TABLE IF NOT EXISTS provider_event_idempotency (
                 event_key TEXT PRIMARY KEY,
@@ -684,6 +738,16 @@ class EnhancedDatabase {
             'CREATE INDEX IF NOT EXISTS idx_gpt_tool_audit_created ON gpt_tool_audit(created_at)',
             'CREATE INDEX IF NOT EXISTS idx_gpt_tool_idem_status ON gpt_tool_idempotency(status)',
             'CREATE INDEX IF NOT EXISTS idx_gpt_tool_idem_updated ON gpt_tool_idempotency(updated_at)',
+            'CREATE INDEX IF NOT EXISTS idx_paypal_payment_sessions_call_sid ON paypal_payment_sessions(call_sid)',
+            'CREATE INDEX IF NOT EXISTS idx_paypal_payment_sessions_status ON paypal_payment_sessions(status)',
+            'CREATE INDEX IF NOT EXISTS idx_paypal_payment_sessions_updated ON paypal_payment_sessions(updated_at)',
+            'CREATE INDEX IF NOT EXISTS idx_paypal_payment_events_type ON paypal_payment_events(event_type)',
+            'CREATE INDEX IF NOT EXISTS idx_paypal_payment_events_resource ON paypal_payment_events(resource_id)',
+            'CREATE INDEX IF NOT EXISTS idx_stripe_payment_sessions_call_sid ON stripe_payment_sessions(call_sid)',
+            'CREATE INDEX IF NOT EXISTS idx_stripe_payment_sessions_status ON stripe_payment_sessions(status)',
+            'CREATE INDEX IF NOT EXISTS idx_stripe_payment_sessions_updated ON stripe_payment_sessions(updated_at)',
+            'CREATE INDEX IF NOT EXISTS idx_stripe_payment_events_type ON stripe_payment_events(event_type)',
+            'CREATE INDEX IF NOT EXISTS idx_stripe_payment_events_resource ON stripe_payment_events(resource_id)',
             'CREATE INDEX IF NOT EXISTS idx_provider_event_idem_source ON provider_event_idempotency(source)',
             'CREATE INDEX IF NOT EXISTS idx_provider_event_idem_expires ON provider_event_idempotency(expires_at)',
             'CREATE INDEX IF NOT EXISTS idx_outbound_call_idem_provider ON outbound_call_idempotency(provider)',
@@ -2396,6 +2460,438 @@ class EnhancedDatabase {
                         reject(err);
                     } else {
                         resolve(this.changes || 0);
+                    }
+                }
+            );
+        });
+    }
+
+    async upsertPaypalPaymentSession(payload = {}) {
+        const externalId = String(payload.external_id || '').trim();
+        const action = String(payload.action || '').trim();
+        if (!externalId || !action) return 0;
+
+        const metadata =
+            payload.metadata && typeof payload.metadata === 'object'
+                ? JSON.stringify(payload.metadata)
+                : payload.metadata || null;
+
+        return new Promise((resolve, reject) => {
+            const sql = `
+                INSERT INTO paypal_payment_sessions (
+                    call_sid, action, external_id, status, amount, currency,
+                    approval_url, idempotency_key, metadata, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(external_id) DO UPDATE SET
+                    call_sid = COALESCE(excluded.call_sid, paypal_payment_sessions.call_sid),
+                    action = excluded.action,
+                    status = COALESCE(excluded.status, paypal_payment_sessions.status),
+                    amount = COALESCE(excluded.amount, paypal_payment_sessions.amount),
+                    currency = COALESCE(excluded.currency, paypal_payment_sessions.currency),
+                    approval_url = COALESCE(excluded.approval_url, paypal_payment_sessions.approval_url),
+                    idempotency_key = COALESCE(excluded.idempotency_key, paypal_payment_sessions.idempotency_key),
+                    metadata = COALESCE(excluded.metadata, paypal_payment_sessions.metadata),
+                    updated_at = CURRENT_TIMESTAMP
+            `;
+            this.db.run(
+                sql,
+                [
+                    payload.call_sid || null,
+                    action,
+                    externalId,
+                    payload.status || null,
+                    payload.amount != null ? String(payload.amount) : null,
+                    payload.currency || null,
+                    payload.approval_url || null,
+                    payload.idempotency_key || null,
+                    metadata,
+                ],
+                function(err) {
+                    if (err) {
+                        reject(err);
+                    } else {
+                        resolve(this.changes || 0);
+                    }
+                }
+            );
+        });
+    }
+
+    async getPaypalPaymentSession(external_id) {
+        const externalId = String(external_id || '').trim();
+        if (!externalId) return null;
+        return new Promise((resolve, reject) => {
+            this.db.get(
+                `SELECT *
+                 FROM paypal_payment_sessions
+                 WHERE external_id = ?
+                 LIMIT 1`,
+                [externalId],
+                (err, row) => {
+                    if (err) {
+                        reject(err);
+                    } else {
+                        resolve(row || null);
+                    }
+                }
+            );
+        });
+    }
+
+    async listPaypalPaymentSessions(filters = {}) {
+        const externalId = String(filters.external_id || '').trim();
+        const callSid = String(filters.call_sid || '').trim();
+        const limit = Math.max(1, Math.min(25, Number(filters.limit) || 10));
+        if (!externalId && !callSid) return [];
+
+        const where = [];
+        const params = [];
+        if (externalId) {
+            where.push('external_id = ?');
+            params.push(externalId);
+        }
+        if (callSid) {
+            where.push('call_sid = ?');
+            params.push(callSid);
+        }
+        params.push(limit);
+
+        return new Promise((resolve, reject) => {
+            this.db.all(
+                `SELECT *
+                 FROM paypal_payment_sessions
+                 WHERE ${where.join(' OR ')}
+                 ORDER BY updated_at DESC, id DESC
+                 LIMIT ?`,
+                params,
+                (err, rows) => {
+                    if (err) {
+                        reject(err);
+                    } else {
+                        resolve(rows || []);
+                    }
+                }
+            );
+        });
+    }
+
+    async updatePaypalPaymentSessionStatus(external_id, payload = {}) {
+        const externalId = String(external_id || '').trim();
+        if (!externalId) return 0;
+        const metadata =
+            payload.metadata && typeof payload.metadata === 'object'
+                ? JSON.stringify(payload.metadata)
+                : payload.metadata || null;
+        return new Promise((resolve, reject) => {
+            this.db.run(
+                `UPDATE paypal_payment_sessions
+                 SET status = COALESCE(?, status),
+                     amount = COALESCE(?, amount),
+                     currency = COALESCE(?, currency),
+                     metadata = COALESCE(?, metadata),
+                     updated_at = CURRENT_TIMESTAMP
+                 WHERE external_id = ?`,
+                [
+                    payload.status || null,
+                    payload.amount != null ? String(payload.amount) : null,
+                    payload.currency || null,
+                    metadata,
+                    externalId,
+                ],
+                function(err) {
+                    if (err) {
+                        reject(err);
+                    } else {
+                        resolve(this.changes || 0);
+                    }
+                }
+            );
+        });
+    }
+
+    async listPaypalPaymentEvents(filters = {}) {
+        const externalId = String(filters.external_id || '').trim();
+        const callSid = String(filters.call_sid || '').trim();
+        const limit = Math.max(1, Math.min(25, Number(filters.limit) || 10));
+        if (!externalId && !callSid) return [];
+
+        const eventIds = new Set();
+        if (externalId) eventIds.add(externalId);
+        if (callSid) {
+            const sessions = await this.listPaypalPaymentSessions({
+                call_sid: callSid,
+                limit,
+            });
+            sessions.forEach((session) => {
+                if (session?.external_id) eventIds.add(session.external_id);
+            });
+        }
+        if (eventIds.size === 0) return [];
+
+        const placeholders = Array.from(eventIds).map(() => '?').join(', ');
+        const params = Array.from(eventIds);
+        params.push(limit);
+
+        return new Promise((resolve, reject) => {
+            this.db.all(
+                `SELECT *
+                 FROM paypal_payment_events
+                 WHERE resource_id IN (${placeholders})
+                 ORDER BY created_at DESC, id DESC
+                 LIMIT ?`,
+                params,
+                (err, rows) => {
+                    if (err) {
+                        reject(err);
+                    } else {
+                        resolve(rows || []);
+                    }
+                }
+            );
+        });
+    }
+
+    async recordPaypalPaymentEvent(payload = {}) {
+        const externalEventId = String(payload.external_event_id || '').trim();
+        if (!externalEventId) return { inserted: false };
+        return new Promise((resolve, reject) => {
+            const sql = `
+                INSERT OR IGNORE INTO paypal_payment_events (
+                    external_event_id, event_type, resource_id, status, payload
+                )
+                VALUES (?, ?, ?, ?, ?)
+            `;
+            this.db.run(
+                sql,
+                [
+                    externalEventId,
+                    payload.event_type || null,
+                    payload.resource_id || null,
+                    payload.status || null,
+                    payload.payload ? JSON.stringify(payload.payload) : null,
+                ],
+                function(err) {
+                    if (err) {
+                        reject(err);
+                    } else {
+                        resolve({ inserted: (this.changes || 0) > 0 });
+                    }
+                }
+            );
+        });
+    }
+
+    async upsertStripePaymentSession(payload = {}) {
+        const externalId = String(payload.external_id || '').trim();
+        const action = String(payload.action || '').trim();
+        if (!externalId || !action) return 0;
+
+        const metadata =
+            payload.metadata && typeof payload.metadata === 'object'
+                ? JSON.stringify(payload.metadata)
+                : payload.metadata || null;
+
+        return new Promise((resolve, reject) => {
+            const sql = `
+                INSERT INTO stripe_payment_sessions (
+                    call_sid, action, external_id, status, amount, currency,
+                    approval_url, idempotency_key, metadata, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(external_id) DO UPDATE SET
+                    call_sid = COALESCE(excluded.call_sid, stripe_payment_sessions.call_sid),
+                    action = excluded.action,
+                    status = COALESCE(excluded.status, stripe_payment_sessions.status),
+                    amount = COALESCE(excluded.amount, stripe_payment_sessions.amount),
+                    currency = COALESCE(excluded.currency, stripe_payment_sessions.currency),
+                    approval_url = COALESCE(excluded.approval_url, stripe_payment_sessions.approval_url),
+                    idempotency_key = COALESCE(excluded.idempotency_key, stripe_payment_sessions.idempotency_key),
+                    metadata = COALESCE(excluded.metadata, stripe_payment_sessions.metadata),
+                    updated_at = CURRENT_TIMESTAMP
+            `;
+            this.db.run(
+                sql,
+                [
+                    payload.call_sid || null,
+                    action,
+                    externalId,
+                    payload.status || null,
+                    payload.amount != null ? String(payload.amount) : null,
+                    payload.currency || null,
+                    payload.approval_url || null,
+                    payload.idempotency_key || null,
+                    metadata,
+                ],
+                function(err) {
+                    if (err) {
+                        reject(err);
+                    } else {
+                        resolve(this.changes || 0);
+                    }
+                }
+            );
+        });
+    }
+
+    async getStripePaymentSession(external_id) {
+        const externalId = String(external_id || '').trim();
+        if (!externalId) return null;
+        return new Promise((resolve, reject) => {
+            this.db.get(
+                `SELECT *
+                 FROM stripe_payment_sessions
+                 WHERE external_id = ?
+                 LIMIT 1`,
+                [externalId],
+                (err, row) => {
+                    if (err) {
+                        reject(err);
+                    } else {
+                        resolve(row || null);
+                    }
+                }
+            );
+        });
+    }
+
+    async listStripePaymentSessions(filters = {}) {
+        const externalId = String(filters.external_id || '').trim();
+        const callSid = String(filters.call_sid || '').trim();
+        const limit = Math.max(1, Math.min(25, Number(filters.limit) || 10));
+        if (!externalId && !callSid) return [];
+
+        const where = [];
+        const params = [];
+        if (externalId) {
+            where.push('external_id = ?');
+            params.push(externalId);
+        }
+        if (callSid) {
+            where.push('call_sid = ?');
+            params.push(callSid);
+        }
+        params.push(limit);
+
+        return new Promise((resolve, reject) => {
+            this.db.all(
+                `SELECT *
+                 FROM stripe_payment_sessions
+                 WHERE ${where.join(' OR ')}
+                 ORDER BY updated_at DESC, id DESC
+                 LIMIT ?`,
+                params,
+                (err, rows) => {
+                    if (err) {
+                        reject(err);
+                    } else {
+                        resolve(rows || []);
+                    }
+                }
+            );
+        });
+    }
+
+    async updateStripePaymentSessionStatus(external_id, payload = {}) {
+        const externalId = String(external_id || '').trim();
+        if (!externalId) return 0;
+        const metadata =
+            payload.metadata && typeof payload.metadata === 'object'
+                ? JSON.stringify(payload.metadata)
+                : payload.metadata || null;
+        return new Promise((resolve, reject) => {
+            this.db.run(
+                `UPDATE stripe_payment_sessions
+                 SET status = COALESCE(?, status),
+                     amount = COALESCE(?, amount),
+                     currency = COALESCE(?, currency),
+                     metadata = COALESCE(?, metadata),
+                     updated_at = CURRENT_TIMESTAMP
+                 WHERE external_id = ?`,
+                [
+                    payload.status || null,
+                    payload.amount != null ? String(payload.amount) : null,
+                    payload.currency || null,
+                    metadata,
+                    externalId,
+                ],
+                function(err) {
+                    if (err) {
+                        reject(err);
+                    } else {
+                        resolve(this.changes || 0);
+                    }
+                }
+            );
+        });
+    }
+
+    async listStripePaymentEvents(filters = {}) {
+        const externalId = String(filters.external_id || '').trim();
+        const callSid = String(filters.call_sid || '').trim();
+        const limit = Math.max(1, Math.min(25, Number(filters.limit) || 10));
+        if (!externalId && !callSid) return [];
+
+        const eventIds = new Set();
+        if (externalId) eventIds.add(externalId);
+        if (callSid) {
+            const sessions = await this.listStripePaymentSessions({
+                call_sid: callSid,
+                limit,
+            });
+            sessions.forEach((session) => {
+                if (session?.external_id) eventIds.add(session.external_id);
+            });
+        }
+        if (eventIds.size === 0) return [];
+
+        const placeholders = Array.from(eventIds).map(() => '?').join(', ');
+        const params = Array.from(eventIds);
+        params.push(limit);
+
+        return new Promise((resolve, reject) => {
+            this.db.all(
+                `SELECT *
+                 FROM stripe_payment_events
+                 WHERE resource_id IN (${placeholders})
+                 ORDER BY created_at DESC, id DESC
+                 LIMIT ?`,
+                params,
+                (err, rows) => {
+                    if (err) {
+                        reject(err);
+                    } else {
+                        resolve(rows || []);
+                    }
+                }
+            );
+        });
+    }
+
+    async recordStripePaymentEvent(payload = {}) {
+        const externalEventId = String(payload.external_event_id || '').trim();
+        if (!externalEventId) return { inserted: false };
+        return new Promise((resolve, reject) => {
+            const sql = `
+                INSERT OR IGNORE INTO stripe_payment_events (
+                    external_event_id, event_type, resource_id, status, payload
+                )
+                VALUES (?, ?, ?, ?, ?)
+            `;
+            this.db.run(
+                sql,
+                [
+                    externalEventId,
+                    payload.event_type || null,
+                    payload.resource_id || null,
+                    payload.status || null,
+                    payload.payload ? JSON.stringify(payload.payload) : null,
+                ],
+                function(err) {
+                    if (err) {
+                        reject(err);
+                    } else {
+                        resolve({ inserted: (this.changes || 0) > 0 });
                     }
                 }
             );

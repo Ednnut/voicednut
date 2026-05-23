@@ -107,8 +107,7 @@ const {
   verifyMiniAppSessionToken,
 } = require("./services/miniappAuth");
 const {
-  AwsConnectAdapter,
-  AwsTtsAdapter,
+  PlivoVoiceAdapter,
   VonageVoiceAdapter,
 } = require("./adapters");
 const { v4: uuidv4 } = require("uuid");
@@ -230,10 +229,10 @@ const HMAC_BYPASS_PATH_PREFIXES = [
   "/webhook/",
   "/capture/",
   "/incoming",
-  "/aws/transcripts",
+  "/plivo/",
   "/connection",
   "/vonage/stream",
-  "/aws/stream",
+  "/plivo/stream",
 ];
 
 let db;
@@ -6627,14 +6626,92 @@ function getVonageWebsocketContentType() {
   return getVonageWebsocketAudioSpec().contentType;
 }
 
+function getPlivoStreamContentType() {
+  return (
+    String(config.plivo?.voice?.streamContentType || "").trim() ||
+    "audio/x-mulaw;rate=8000"
+  );
+}
+
+function getPlivoStreamAudioSpec() {
+  const raw = getPlivoStreamContentType().toLowerCase();
+  const parts = raw
+    .split(";")
+    .map((part) => part.trim())
+    .filter(Boolean);
+  const mediaType = parts[0] || "audio/x-mulaw";
+  const params = {};
+  parts.slice(1).forEach((part) => {
+    const [key, value] = part.split("=");
+    if (!key || !value) return;
+    params[String(key).toLowerCase()] = String(value).toLowerCase();
+  });
+  const rateCandidate =
+    Number(params.rate) ||
+    Number(params.sample_rate) ||
+    Number(params.samplerate);
+  const sampleRate =
+    Number.isFinite(rateCandidate) && rateCandidate > 0 ? rateCandidate : 8000;
+  const isLinear = mediaType === "audio/x-l16" || mediaType === "audio/l16";
+
+  return {
+    contentType: isLinear ? `audio/x-l16;rate=${sampleRate}` : `audio/x-mulaw;rate=${sampleRate}`,
+    sampleRate,
+    sttEncoding: isLinear ? "linear16" : "mulaw",
+    ttsEncoding: isLinear ? "linear16" : "mulaw",
+  };
+}
+
 function buildVonageAnswerWebhookUrl(req, callSid, extraParams = {}) {
   const host = resolveHost(req) || config.server?.hostname;
   const defaultBase = host ? `https://${host}/va` : "";
   const baseUrl = config.vonage?.voice?.answerUrl || defaultBase;
   return appendQueryParamsToUrl(baseUrl, {
     callSid: callSid || undefined,
+    secret: config.plivo?.webhookSecret || undefined,
     ...extraParams,
   });
+}
+
+function buildPlivoAnswerWebhookUrl(req, callSid, extraParams = {}) {
+  const host = resolveHost(req) || config.server?.hostname;
+  const defaultBase = host ? `https://${host}/plivo/answer` : "";
+  const baseUrl = config.plivo?.voice?.answerUrl || defaultBase;
+  return appendQueryParamsToUrl(baseUrl, {
+    callSid: callSid || undefined,
+    secret: config.plivo?.webhookSecret || undefined,
+    ...extraParams,
+  });
+}
+
+function buildPlivoEventWebhookUrl(req, callSid, extraParams = {}) {
+  const host = resolveHost(req) || config.server?.hostname;
+  const defaultBase = host ? `https://${host}/plivo/events` : "";
+  const baseUrl = config.plivo?.voice?.eventUrl || defaultBase;
+  return appendQueryParamsToUrl(baseUrl, {
+    callSid: callSid || undefined,
+    ...extraParams,
+  });
+}
+
+function buildPlivoWebsocketUrl(req, callSid, extraParams = {}) {
+  const host = resolveHost(req) || config.server?.hostname;
+  if (!host || !callSid) return "";
+  const params = new URLSearchParams();
+  params.set("callSid", String(callSid));
+  Object.entries(extraParams || {}).forEach(([key, value]) => {
+    if (value === undefined || value === null || value === "") return;
+    params.set(key, String(value));
+  });
+  if (config.streamAuth?.secret) {
+    const timestamp = String(Date.now());
+    const token = buildStreamAuthToken(String(callSid), timestamp);
+    if (token) {
+      params.set("ts", timestamp);
+      params.set("token", token);
+    }
+  }
+  return `wss://${host}/plivo/stream?${params.toString()}`;
 }
 
 function buildVonageEventWebhookUrl(req, callSid, extraParams = {}) {
@@ -6843,22 +6920,22 @@ function requireValidTelegramWebhook(req, res, label = "") {
   return true;
 }
 
-function verifyAwsWebhookAuth(req, options = {}) {
+function verifyPlivoWebhookAuth(req, options = {}) {
   const { allowQuerySecret = false } = options;
-  const expectedSecret = config.aws?.webhookSecret;
-  const providedHeaderSecret = req?.headers?.["x-aws-webhook-secret"];
+  const expectedSecret = config.plivo?.webhookSecret;
+  const providedHeaderSecret = req?.headers?.["x-plivo-webhook-secret"];
   const providedQuerySecret = allowQuerySecret
-    ? req.query?.awsWebhookSecret || req.query?.secret
+    ? req.query?.plivoWebhookSecret || req.query?.secret
     : null;
   const providedSecret = providedHeaderSecret || providedQuerySecret;
   if (expectedSecret) {
     if (!providedSecret) {
-      return { ok: false, reason: "missing_aws_secret" };
+      return { ok: false, reason: "missing_plivo_secret" };
     }
     if (!safeCompareSecret(providedSecret, expectedSecret)) {
-      return { ok: false, reason: "invalid_aws_secret" };
+      return { ok: false, reason: "invalid_plivo_secret" };
     }
-    return { ok: true, method: "aws_secret" };
+    return { ok: true, method: "plivo_secret" };
   }
 
   const hmac = verifyHmacSignature(req);
@@ -6871,14 +6948,14 @@ function verifyAwsWebhookAuth(req, options = {}) {
   return { ok: false, reason: hmac.reason || "invalid_hmac" };
 }
 
-function requireValidAwsWebhook(req, res, label = "", options = {}) {
-  const mode = String(config.aws?.webhookValidation || "warn").toLowerCase();
+function requireValidPlivoWebhook(req, res, label = "", options = {}) {
+  const mode = String(config.plivo?.webhookValidation || "warn").toLowerCase();
   if (mode === "off") return true;
-  const verification = verifyAwsWebhookAuth(req, options);
+  const verification = verifyPlivoWebhookAuth(req, options);
   if (verification.ok) return true;
   const path = label || req.originalUrl || req.path || "unknown";
   console.warn(
-    `⚠️ AWS webhook auth failed for ${path}: ${verification.reason || "unknown"}`,
+    `⚠️ Plivo webhook auth failed for ${path}: ${verification.reason || "unknown"}`,
   );
   if (mode === "strict") {
     res.status(401).send("Unauthorized");
@@ -6929,18 +7006,18 @@ function requireValidEmailWebhook(req, res, label = "") {
   return true;
 }
 
-function verifyAwsStreamAuth(callSid, req) {
+function verifyPlivoStreamAuth(callSid, req) {
   const streamAuth = verifyStreamAuth(callSid, req);
   if (streamAuth.ok || streamAuth.skipped) {
     return { ok: true, method: "stream_auth" };
   }
-  const awsFallback = verifyAwsWebhookAuth(req, { allowQuerySecret: true });
-  if (awsFallback.ok) {
-    return { ok: true, method: awsFallback.method };
+  const plivoFallback = verifyPlivoWebhookAuth(req, { allowQuerySecret: true });
+  if (plivoFallback.ok) {
+    return { ok: true, method: plivoFallback.method };
   }
   return {
     ok: false,
-    reason: streamAuth.reason || awsFallback.reason || "unauthorized",
+    reason: streamAuth.reason || plivoFallback.reason || "unauthorized",
   };
 }
 
@@ -12304,13 +12381,124 @@ function syncRuntimeProviderMirrors() {
   currentEmailProvider = getActiveEmailProvider();
   storedEmailProvider = getStoredEmailProvider();
 }
-const awsContactMap = new Map();
+const plivoCallMap = new Map();
 const vonageCallMap = new Map();
 
-let awsConnectAdapter = null;
-let awsTtsAdapter = null;
+let plivoVoiceAdapter = null;
 let vonageVoiceAdapter = null;
 let vonageMappingReconcileTimer = null;
+
+function rememberPlivoCallMapping(callSid, plivoUuid, source = "unknown") {
+  if (!callSid || !plivoUuid) return;
+  const normalizedCallSid = String(callSid);
+  const normalizedPlivoUuid = String(plivoUuid);
+  plivoCallMap.set(normalizedPlivoUuid, normalizedCallSid);
+  const callConfig = callConfigurations.get(normalizedCallSid);
+  if (callConfig) {
+    if (!callConfig.provider_metadata) {
+      callConfig.provider_metadata = {};
+    }
+    if (callConfig.provider_metadata.plivo_uuid !== normalizedPlivoUuid) {
+      callConfig.provider_metadata.plivo_uuid = normalizedPlivoUuid;
+      callConfigurations.set(normalizedCallSid, callConfig);
+      if (db?.updateCallState) {
+        db.updateCallState(normalizedCallSid, "provider_metadata_updated", {
+          provider: "plivo",
+          plivo_uuid: normalizedPlivoUuid,
+          source,
+          at: new Date().toISOString(),
+        }).catch(() => {});
+      }
+    }
+  }
+}
+
+function resolvePlivoCallSidFromUuid(plivoUuid) {
+  if (!plivoUuid) return null;
+  const normalizedUuid = String(plivoUuid);
+  const inMemory = plivoCallMap.get(normalizedUuid);
+  if (inMemory) return inMemory;
+  for (const [callSid, cfg] of callConfigurations.entries()) {
+    const cfgUuid = cfg?.provider_metadata?.plivo_uuid;
+    if (cfgUuid && String(cfgUuid) === normalizedUuid) {
+      rememberPlivoCallMapping(callSid, normalizedUuid, "memory_scan");
+      return callSid;
+    }
+  }
+  return null;
+}
+
+function resolvePlivoHangupUuid(callSid, callConfig) {
+  const direct =
+    callConfig?.provider_metadata?.plivo_uuid;
+  if (direct) return String(direct);
+  for (const [uuid, mappedCallSid] of plivoCallMap.entries()) {
+    if (String(mappedCallSid) === String(callSid)) {
+      return String(uuid);
+    }
+  }
+  return null;
+}
+
+function getPlivoCallUuid(payload = {}) {
+  const candidates = [
+    payload.CallUUID,
+    payload.call_uuid,
+    payload.callUuid,
+    payload.uuid,
+    payload.request_uuid,
+    payload.RequestUUID,
+  ];
+  for (const candidate of candidates) {
+    const normalized = String(candidate || "").trim();
+    if (normalized) return normalized;
+  }
+  return "";
+}
+
+function buildPlivoInboundCallSid(plivoUuid) {
+  const normalized = String(plivoUuid || "")
+    .trim()
+    .replace(/[^a-zA-Z0-9_-]/g, "");
+  if (!normalized) return null;
+  return `plivo-in-${normalized}`;
+}
+
+async function resolvePlivoCallSid(req, payload = {}) {
+  const query = req?.query || {};
+  const body = payload || {};
+  const direct =
+    query.callSid ||
+    query.call_sid ||
+    body.callSid ||
+    body.call_sid ||
+    body.client_ref ||
+    query.client_ref;
+  if (direct) return String(direct);
+  const uuidCandidates = [
+    query.uuid,
+    query.plivo_uuid,
+    query.call_uuid,
+    body.uuid,
+    body.plivo_uuid,
+    body.call_uuid,
+    body.CallUUID,
+  ].filter(Boolean);
+  for (const candidate of uuidCandidates) {
+    const resolved = resolvePlivoCallSidFromUuid(candidate);
+    if (resolved) return String(resolved);
+  }
+  return null;
+}
+
+function clearPlivoCallMappings(callSid) {
+  if (!callSid) return;
+  for (const [uuid, mappedCallSid] of plivoCallMap.entries()) {
+    if (String(mappedCallSid) === String(callSid)) {
+      plivoCallMap.delete(uuid);
+    }
+  }
+}
 
 function rememberVonageCallMapping(callSid, vonageUuid, source = "unknown") {
   if (!callSid || !vonageUuid) return;
@@ -12828,12 +13016,14 @@ function shouldRunProviderPreflightForSelection(channel, provider) {
   ) {
     return false;
   }
-  if (normalizedProvider === "twilio" || normalizedProvider === "vonage") {
+  if (
+    normalizedProvider === "twilio" ||
+    normalizedProvider === "vonage" ||
+    normalizedProvider === "plivo"
+  ) {
     return true;
   }
-  return (
-    normalizedChannel === PROVIDER_CHANNELS.CALL && normalizedProvider === "aws"
-  );
+  return false;
 }
 
 function summarizePreflightReport(report) {
@@ -12876,9 +13066,10 @@ async function evaluateProviderPreflightReport(options = {}) {
     timeoutMs,
     guards: {
       twilio: typeof requireValidTwilioSignature === "function",
-      awsWebhook: typeof requireValidAwsWebhook === "function",
-      awsStream: typeof verifyAwsStreamAuth === "function",
+      plivo: typeof requireValidPlivoWebhook === "function",
       vonage: typeof requireValidVonageWebhook === "function",
+      paypal: true,
+      stripe: true,
     },
   });
   console.log(
@@ -13236,6 +13427,22 @@ function scheduleVonageKeypadDtmfWatchdog(callSid, callConfig) {
 }
 
 function getProviderReadiness() {
+  const plivoHasCredentials = !!(
+    config.plivo?.authId &&
+    config.plivo?.authToken &&
+    config.plivo?.voice?.fromNumber
+  );
+  const plivoHasRouting = !!(
+    config.server?.hostname ||
+    config.plivo?.voice?.answerUrl ||
+    config.plivo?.voice?.eventUrl
+  );
+  const plivoWebhookMode = String(
+    config.plivo?.webhookValidation || "warn",
+  ).toLowerCase();
+  const plivoWebhookReady =
+    plivoWebhookMode !== "strict" ||
+    Boolean(config.plivo?.webhookSecret || config.apiAuth?.hmacSecret);
   const vonageHasCredentials = !!(
     config.vonage.apiKey &&
     config.vonage.apiSecret &&
@@ -13271,7 +13478,7 @@ function getProviderReadiness() {
       config.twilio.authToken &&
       config.twilio.fromNumber
     ),
-    aws: !!(config.aws.connect.instanceId && config.aws.connect.contactFlowId),
+    plivo: plivoHasCredentials && plivoHasRouting && plivoWebhookReady,
     vonage: vonageHasCredentials && vonageHasRouting && vonageWebhookReady,
   };
 }
@@ -13292,10 +13499,10 @@ function getSmsProviderReadiness() {
       config.twilio?.authToken &&
       config.twilio?.fromNumber
     ),
-    aws: !!(
-      config.aws?.pinpoint?.applicationId &&
-      config.aws?.pinpoint?.originationNumber &&
-      config.aws?.pinpoint?.region
+    plivo: !!(
+      config.plivo?.authId &&
+      config.plivo?.authToken &&
+      config.plivo?.sms?.fromNumber
     ),
     vonage: !!(
       config.vonage?.apiKey &&
@@ -13313,11 +13520,6 @@ function getEmailProviderReadiness() {
   return {
     sendgrid: !!config.email?.sendgrid?.apiKey,
     mailgun: !!(config.email?.mailgun?.apiKey && config.email?.mailgun?.domain),
-    ses: !!(
-      config.email?.ses?.region &&
-      config.email?.ses?.accessKeyId &&
-      config.email?.ses?.secretAccessKey
-    ),
   };
 }
 
@@ -13621,13 +13823,6 @@ function warnIfMachineDetectionDisabled(context = "") {
   warnedMachineDetection = true;
 }
 
-function getAwsConnectAdapter() {
-  if (!awsConnectAdapter) {
-    awsConnectAdapter = new AwsConnectAdapter(config.aws);
-  }
-  return awsConnectAdapter;
-}
-
 function getVonageVoiceAdapter() {
   if (!vonageVoiceAdapter) {
     vonageVoiceAdapter = new VonageVoiceAdapter(config.vonage);
@@ -13635,11 +13830,11 @@ function getVonageVoiceAdapter() {
   return vonageVoiceAdapter;
 }
 
-function getAwsTtsAdapter() {
-  if (!awsTtsAdapter) {
-    awsTtsAdapter = new AwsTtsAdapter(config.aws);
+function getPlivoVoiceAdapter() {
+  if (!plivoVoiceAdapter) {
+    plivoVoiceAdapter = new PlivoVoiceAdapter(config.plivo);
   }
-  return awsTtsAdapter;
+  return plivoVoiceAdapter;
 }
 
 async function endCallForProvider(callSid) {
@@ -13657,16 +13852,6 @@ async function endCallForProvider(callSid) {
     return;
   }
 
-  if (provider === "aws") {
-    const contactId = callConfig?.provider_metadata?.contact_id;
-    if (!contactId) {
-      throw new Error("AWS contact id not available");
-    }
-    const awsAdapter = getAwsConnectAdapter();
-    await awsAdapter.stopContact({ contactId });
-    return;
-  }
-
   if (provider === "vonage") {
     const callUuid = resolveVonageHangupUuid(callSid, callConfig);
     if (!callUuid) {
@@ -13676,6 +13861,18 @@ async function endCallForProvider(callSid) {
     }
     const vonageAdapter = getVonageVoiceAdapter();
     await vonageAdapter.hangupCall(callUuid);
+    return;
+  }
+
+  if (provider === "plivo") {
+    const callUuid = resolvePlivoHangupUuid(callSid, callConfig);
+    if (!callUuid) {
+      throw new Error(
+        "Plivo call UUID not available for hangup; ensure event webhook mapping is configured",
+      );
+    }
+    const plivoAdapter = getPlivoVoiceAdapter();
+    await plivoAdapter.hangupCall(callUuid);
     return;
   }
 
@@ -14069,36 +14266,6 @@ async function speakAndEndCall(callSid, message, reason = "completed") {
 
   const delayMs = estimateSpeechDurationMs(text);
 
-  if (provider === "aws") {
-    try {
-      const ttsAdapter = getAwsTtsAdapter();
-      const voiceId = resolveVoiceModel(callConfig);
-      const { key } = await ttsAdapter.synthesizeToS3(
-        text,
-        voiceId ? { voiceId } : {},
-      );
-      const contactId = callConfig?.provider_metadata?.contact_id;
-      if (contactId) {
-        const awsAdapter = getAwsConnectAdapter();
-        await awsAdapter.enqueueAudioPlayback({ contactId, audioKey: key });
-      }
-      scheduleSpeechTicks(
-        callSid,
-        "agent_speaking",
-        estimateSpeechDurationMs(text),
-        0.5,
-      );
-    } catch (ttsError) {
-      console.error("AWS closing TTS error:", ttsError);
-    }
-    setTimeout(() => {
-      endCallForProvider(callSid).catch((err) =>
-        console.error("End call error:", err),
-      );
-    }, delayMs);
-    return;
-  }
-
   if (provider === "twilio" && !session?.ttsService) {
     try {
       const accountSid = config.twilio.accountSid;
@@ -14199,270 +14366,6 @@ async function recordCallStatus(callSid, status, notificationType, extra = {}) {
       call.user_chat_id,
     );
   }
-}
-
-async function ensureAwsSession(callSid) {
-  if (activeCalls.has(callSid)) {
-    return activeCalls.get(callSid);
-  }
-
-  const callConfig = callConfigurations.get(callSid);
-  const functionSystem = callFunctionSystems.get(callSid);
-  if (!callConfig) {
-    throw new Error(`Missing call configuration for ${callSid}`);
-  }
-  const runtimeRestore = await restoreCallRuntimeState(callSid, callConfig);
-
-  let gptService;
-  if (functionSystem) {
-    gptService = new EnhancedGptService(
-      callConfig.prompt,
-      callConfig.first_message,
-      {
-        db,
-        webhookService,
-        channel: "voice",
-        provider: callConfig?.provider || getCurrentProvider(),
-        traceId: `call:${callSid}`,
-        responsePolicyGate: buildCallResponsePolicyGate(callSid, callConfig),
-      },
-    );
-  } else {
-    gptService = new EnhancedGptService(
-      callConfig.prompt,
-      callConfig.first_message,
-      {
-        db,
-        webhookService,
-        channel: "voice",
-        provider: callConfig?.provider || getCurrentProvider(),
-        traceId: `call:${callSid}`,
-        responsePolicyGate: buildCallResponsePolicyGate(callSid, callConfig),
-      },
-    );
-  }
-
-  gptService.setCallSid(callSid);
-  gptService.setExecutionContext({
-    traceId: `call:${callSid}`,
-    channel: "voice",
-    provider: callConfig?.provider || getCurrentProvider(),
-  });
-  const conversationProfile = resolveConversationProfile({
-    purpose:
-      callConfig?.conversation_profile ||
-      callConfig?.purpose ||
-      callConfig?.business_context?.purpose,
-    prompt: callConfig?.prompt,
-    firstMessage: callConfig?.first_message,
-  });
-  gptService.setCustomerName(
-    callConfig?.customer_name || callConfig?.victim_name,
-  );
-  gptService.setCallProfile(conversationProfile);
-  gptService.setPersonaContext({
-    domain: conversationProfile || "general",
-    channel: "voice",
-    urgency: callConfig?.urgency || "normal",
-  });
-  const intentLine = `Call intent: ${callConfig?.script || "general"} | profile: ${conversationProfile || "general"} | purpose: ${callConfig?.purpose || conversationProfile || "general"} | business: ${callConfig?.business_context?.business_id || callConfig?.business_id || "unspecified"}. Keep replies concise and on-task.`;
-  gptService.setCallIntent(intentLine);
-  const restoredCount = Number(runtimeRestore?.interactionCount || 0);
-  await applyInitialDigitIntent(callSid, callConfig, gptService, restoredCount);
-  configureCallTools(gptService, callSid, callConfig, functionSystem);
-
-  const session = {
-    startTime: new Date(),
-    transcripts: [],
-    gptService,
-    callConfig,
-    functionSystem,
-    personalityChanges: [],
-    interactionCount: restoredCount,
-  };
-
-  gptService.on("gptreply", async (gptReply, icount) => {
-    try {
-      markGptReplyProgress(callSid);
-      setCallPhase(callSid, "active", {
-        source: "aws_gptreply",
-        reason: "agent_response",
-      });
-      if (session?.ending) {
-        return;
-      }
-      const personalityInfo = gptReply.personalityInfo || {};
-
-      webhookService.recordTranscriptTurn(
-        callSid,
-        "agent",
-        gptReply.partialResponse,
-      );
-      webhookService
-        .setLiveCallPhase(callSid, "agent_responding")
-        .catch(() => {});
-
-      try {
-        await db.addTranscript({
-          call_sid: callSid,
-          speaker: "ai",
-          message: gptReply.partialResponse,
-          interaction_count: icount,
-          personality_used: personalityInfo.name || "default",
-          adaptation_data: JSON.stringify(gptReply.adaptationHistory || []),
-        });
-
-        await db.updateCallState(callSid, "ai_responded", {
-          message: gptReply.partialResponse,
-          interaction_count: icount,
-          personality: personalityInfo.name,
-        });
-      } catch (dbError) {
-        console.error("Database error adding AI transcript:", dbError);
-      }
-
-      try {
-        const ttsAdapter = getAwsTtsAdapter();
-        const voiceId = resolveVoiceModel(callConfig);
-        const { key } = await ttsAdapter.synthesizeToS3(
-          gptReply.partialResponse,
-          voiceId ? { voiceId } : {},
-        );
-        const contactId = callConfig?.provider_metadata?.contact_id;
-        if (contactId) {
-          const awsAdapter = getAwsConnectAdapter();
-          await awsAdapter.enqueueAudioPlayback({
-            contactId,
-            audioKey: key,
-          });
-          webhookService
-            .setLiveCallPhase(callSid, "agent_speaking")
-            .catch(() => {});
-          scheduleSpeechTicks(
-            callSid,
-            "agent_speaking",
-            estimateSpeechDurationMs(gptReply.partialResponse),
-            0.55,
-          );
-          scheduleSilenceTimer(callSid);
-        }
-      } catch (ttsError) {
-        console.error("AWS TTS playback error:", ttsError);
-      }
-    } catch (gptReplyError) {
-      console.error("AWS session GPT reply handler error:", gptReplyError);
-    }
-  });
-
-  gptService.on("stall", async (fillerText) => {
-    handleGptStall(callSid, fillerText, async (speechText) => {
-      try {
-        const ttsAdapter = getAwsTtsAdapter();
-        const voiceId = resolveVoiceModel(callConfig);
-        const { key } = await ttsAdapter.synthesizeToS3(
-          speechText,
-          voiceId ? { voiceId } : {},
-        );
-        const contactId = callConfig?.provider_metadata?.contact_id;
-        if (contactId) {
-          const awsAdapter = getAwsConnectAdapter();
-          await awsAdapter.enqueueAudioPlayback({
-            contactId,
-            audioKey: key,
-          });
-          webhookService
-            .setLiveCallPhase(callSid, "agent_speaking")
-            .catch(() => {});
-        }
-      } catch (err) {
-        console.error("AWS filler TTS error:", err);
-      }
-    });
-  });
-
-  activeCalls.set(callSid, session);
-  queuePersistCallRuntimeState(callSid, {
-    interaction_count: session.interactionCount,
-    snapshot: { source: "ensureAwsSession" },
-  });
-
-  try {
-    const initialExpectation = digitService?.getExpectation(callSid);
-    const firstMessage =
-      callConfig.first_message ||
-      (initialExpectation
-        ? digitService.buildDigitPrompt(initialExpectation)
-        : "Hello!");
-    const ttsAdapter = getAwsTtsAdapter();
-    const voiceId = resolveVoiceModel(callConfig);
-    const { key } = await ttsAdapter.synthesizeToS3(
-      firstMessage,
-      voiceId ? { voiceId } : {},
-    );
-    const contactId = callConfig?.provider_metadata?.contact_id;
-    if (contactId) {
-      const awsAdapter = getAwsConnectAdapter();
-      await awsAdapter.enqueueAudioPlayback({
-        contactId,
-        audioKey: key,
-      });
-      webhookService.recordTranscriptTurn(callSid, "agent", firstMessage);
-      webhookService
-        .setLiveCallPhase(callSid, "agent_speaking")
-        .catch(() => {});
-      setCallPhase(callSid, "greeting", {
-        source: "aws_initial_greeting",
-        reason: "initial_prompt",
-      });
-      scheduleGreetingRecoveryWatchdog(callSid, {
-        runtime: "legacy",
-        source: "aws_initial_greeting",
-        recover: async ({ prompt }) => {
-          const recoveryPrompt = String(prompt || GREETING_RECOVERY_DEFAULT_PROMPT).trim();
-          if (!recoveryPrompt) return;
-          const recovery = await ttsAdapter.synthesizeToS3(
-            recoveryPrompt,
-            voiceId ? { voiceId } : {},
-          );
-          const recoveryKey = recovery?.key;
-          if (recoveryKey && contactId) {
-            await awsAdapter.enqueueAudioPlayback({
-              contactId,
-              audioKey: recoveryKey,
-            });
-            webhookService.addLiveEvent(callSid, "🔁 Replaying greeting prompt", {
-              force: true,
-            });
-          }
-        },
-        fallback: async ({ message }) => {
-          await speakAndEndCall(
-            callSid,
-            String(message || GREETING_RECOVERY_DEFAULT_FALLBACK).trim(),
-            "greeting_watchdog_timeout",
-          );
-        },
-      });
-      scheduleSpeechTicks(
-        callSid,
-        "agent_speaking",
-        estimateSpeechDurationMs(firstMessage),
-        0.5,
-      );
-      if (digitService?.hasExpectation(callSid)) {
-        digitService.markDigitPrompted(callSid, gptService, 0, "dtmf", {
-          allowCallEnd: true,
-          prompt_text: firstMessage,
-        });
-        digitService.scheduleDigitTimeout(callSid, gptService, 0);
-      }
-      scheduleSilenceTimer(callSid);
-    }
-  } catch (error) {
-    console.error("AWS first message playback error:", error);
-  }
-
-  return session;
 }
 
 async function startServer(options = {}) {
@@ -17467,134 +17370,216 @@ app.ws("/vonage/stream", async (ws, req) => {
   }
 });
 
-// AWS websocket media handler (external audio forwarder -> Deepgram -> GPT -> Polly)
-app.ws("/aws/stream", (ws, req) => {
+app.ws("/plivo/stream", async (ws, req) => {
   try {
-    const callSid = req.query?.callSid;
-    const contactId = req.query?.contactId;
-    if (!callSid || !contactId) {
+    const plivoUuid =
+      req.query?.uuid || req.query?.plivo_uuid || req.query?.call_uuid;
+    let callSid = req.query?.callSid;
+    if (!callSid && plivoUuid) {
+      callSid = resolvePlivoCallSidFromUuid(plivoUuid);
+    }
+    if (!callSid) {
+      console.warn("Plivo websocket missing callSid; closing connection", {
+        uuid: plivoUuid || null,
+      });
       ws.close();
       return;
     }
 
-    const awsWebhookMode = String(config.aws?.webhookValidation || "warn")
-      .toLowerCase()
-      .trim();
-    if (awsWebhookMode !== "off") {
-      const authResult = verifyAwsStreamAuth(callSid, req);
-      if (!authResult.ok) {
-        console.warn("AWS websocket auth failed", {
-          callSid,
-          contactId,
-          reason: authResult.reason || "unknown",
-        });
-        if (awsWebhookMode === "strict") {
-          ws.close();
-          return;
-        }
-      }
+    const streamAuth = verifyPlivoStreamAuth(callSid, req);
+    if (!streamAuth.ok) {
+      console.warn("Plivo websocket auth failed", {
+        callSid,
+        reason: streamAuth.reason || "invalid",
+      });
+      ws.close();
+      return;
     }
 
-    const callConfig = callConfigurations.get(callSid);
-	    if (!callConfig) {
-	      ws.close();
-	      return;
-	    }
-	    setCallPhase(callSid, "connected", {
-	      source: "aws_stream_start",
-	      reason: "stream_connected",
-	    });
+    if (plivoUuid) {
+      rememberPlivoCallMapping(callSid, plivoUuid, "stream_open");
+    }
 
+    let interactionCount = 0;
+    let callConfig = callConfigurations.get(callSid);
+    let functionSystem = callFunctionSystems.get(callSid);
+    if (!callConfig) {
+      const hydrated = await hydrateCallConfigFromDb(callSid);
+      callConfig = hydrated?.callConfig || callConfig;
+      functionSystem = hydrated?.functionSystem || functionSystem;
+    }
+    if (!callConfig) {
+      console.warn(`Plivo websocket missing call configuration for ${callSid}`);
+      ws.close();
+      return;
+    }
+    if (!functionSystem) {
+      functionSystem = functionEngine.generateAdaptiveFunctionSystem(
+        callConfig?.prompt || DEFAULT_INBOUND_PROMPT,
+        callConfig?.first_message || DEFAULT_INBOUND_FIRST_MESSAGE,
+      );
+      callFunctionSystems.set(callSid, functionSystem);
+    }
     if (!callConfig.provider_metadata) {
       callConfig.provider_metadata = {};
     }
-    if (!callConfig.provider_metadata.contact_id) {
-      callConfig.provider_metadata.contact_id = contactId;
+    if (plivoUuid) {
+      callConfig.provider_metadata.plivo_uuid = String(plivoUuid);
     }
-    awsContactMap.set(contactId, callSid);
-
-    const sampleRate = Number(req.query?.sampleRate) || 16000;
-    const encoding = req.query?.encoding || "pcm";
-
-    const transcriptionService = new TranscriptionService({
-      encoding: encoding,
-      sampleRate: sampleRate,
+    callConfig.provider = "plivo";
+    callConfigurations.set(callSid, callConfig);
+    streamStartTimes.set(callSid, Date.now());
+    streamFirstMediaSeen.delete(callSid);
+    clearFirstMediaWatchdog(callSid);
+    scheduleFirstMediaWatchdog(
+      callSid,
+      resolveHost(req) || config.server?.hostname,
+      callConfig,
+    );
+    setCallPhase(callSid, "connected", {
+      source: "plivo_stream_start",
+      reason: "stream_connected",
     });
 
-    const handleSttFailure = async (tag, error) => {
-      if (!callSid) return;
-      console.error(
-        `STT failure (${tag}) for ${callSid}`,
-        error?.message || error || "",
+    const plivoAudioSpec = getPlivoStreamAudioSpec();
+    const startedAt = new Date().toISOString();
+    if (db?.updateCallStatus) {
+      await db
+        .updateCallStatus(callSid, "started", { started_at: startedAt })
+        .catch(() => {});
+    }
+    if (db?.updateCallState) {
+      await db
+        .updateCallState(callSid, "stream_started", {
+          stream_provider: "plivo",
+          started_at: startedAt,
+          plivo_uuid: plivoUuid || callConfig?.provider_metadata?.plivo_uuid,
+          stream_audio_content_type: plivoAudioSpec.contentType,
+          stream_audio_encoding: plivoAudioSpec.sttEncoding,
+          stream_audio_sample_rate: plivoAudioSpec.sampleRate,
+        })
+        .catch(() => {});
+    }
+    activeStreamConnections.set(callSid, {
+      ws,
+      streamSid: plivoUuid || null,
+      provider: "plivo",
+      connectedAt: startedAt,
+    });
+
+    const runtimeRestore = await restoreCallRuntimeState(callSid, callConfig);
+    if (runtimeRestore?.restored) {
+      interactionCount = Math.max(
+        interactionCount,
+        Number(runtimeRestore.interactionCount || 0),
       );
-      const session = activeCalls.get(callSid);
-      await activateDtmfFallback(
-        callSid,
-        session?.callConfig || callConfig,
-        session?.gptService,
-        session?.interactionCount || interactionCount,
-        tag,
-      );
-    };
+    }
+
+    const ttsService = new TextToSpeechService({
+      encoding: plivoAudioSpec.ttsEncoding,
+      sampleRate: plivoAudioSpec.sampleRate,
+    });
+    ttsService
+      .generate(
+        { partialResponseIndex: null, partialResponse: "warming up" },
+        -1,
+        { silent: true },
+      )
+      .catch(() => {});
+    const transcriptionService = new TranscriptionService({
+      encoding: plivoAudioSpec.sttEncoding,
+      sampleRate: plivoAudioSpec.sampleRate,
+    });
+
+    const gptService = new EnhancedGptService(
+      callConfig?.prompt,
+      callConfig?.first_message,
+      {
+        db,
+        webhookService,
+        channel: "voice",
+        provider: "plivo",
+        traceId: `call:${callSid}`,
+        responsePolicyGate: buildCallResponsePolicyGate(callSid, callConfig),
+      },
+    );
+
+    gptService.setCallSid(callSid);
+    gptService.setExecutionContext({
+      traceId: `call:${callSid}`,
+      channel: "voice",
+      provider: "plivo",
+    });
+    const conversationProfile = resolveConversationProfile({
+      purpose:
+        callConfig?.conversation_profile ||
+        callConfig?.purpose ||
+        callConfig?.business_context?.purpose,
+      prompt: callConfig?.prompt,
+      firstMessage: callConfig?.first_message,
+    });
+    gptService.setCustomerName(
+      callConfig?.customer_name || callConfig?.victim_name,
+    );
+    gptService.setCallProfile(conversationProfile);
+    gptService.setPersonaContext({
+      domain: conversationProfile || "general",
+      channel: "voice",
+      urgency: callConfig?.urgency || "normal",
+    });
+    gptService.setCallIntent(
+      `Call intent: ${callConfig?.script || "general"} | profile: ${conversationProfile || "general"} | purpose: ${callConfig?.purpose || conversationProfile || "general"} | business: ${callConfig?.business_context?.business_id || callConfig?.business_id || "unspecified"}. Keep replies concise and on-task.`,
+    );
+    await applyInitialDigitIntent(
+      callSid,
+      callConfig,
+      gptService,
+      interactionCount,
+    );
+    configureCallTools(gptService, callSid, callConfig, functionSystem);
+
+    activeCalls.set(callSid, {
+      startTime: new Date(),
+      transcripts: [],
+      gptService,
+      callConfig,
+      functionSystem,
+      personalityChanges: [],
+      ws,
+      ttsService,
+      interactionCount,
+    });
+    queuePersistCallRuntimeState(callSid, {
+      interaction_count: interactionCount,
+      snapshot: { source: "plivo_stream_start" },
+    });
+    clearKeypadCallState(callSid);
 
     transcriptionService.on("error", (error) => {
-      void handleSttFailure("stt_error", error).catch((sttFailureError) => {
-        console.error("STT fallback activation error:", sttFailureError);
-      });
+      console.error("Plivo STT error:", error?.message || error || "");
     });
-    transcriptionService.on("close", () => {
-      void handleSttFailure("stt_closed").catch((sttFailureError) => {
-        console.error("STT fallback activation error:", sttFailureError);
-      });
-    });
-
-    const sessionPromise = ensureAwsSession(callSid).catch((sessionError) => {
-      console.error("Failed to initialize AWS call session:", sessionError);
-      try {
-        ws.close();
-      } catch {}
-      return null;
-    });
-    let interactionCount = 0;
-
     transcriptionService.on("utterance", (text) => {
       clearSilenceTimer(callSid);
       if (text && text.trim().length > 0) {
-        markGreetingRecoveryProgress(callSid, "aws_utterance");
+        markGreetingRecoveryProgress(callSid, "plivo_utterance");
         setCallPhase(callSid, "active", {
-          source: "aws_utterance",
+          source: "plivo_utterance",
           reason: "user_speaking",
         });
-        webhookService
-          .setLiveCallPhase(callSid, "user_speaking")
-          .catch(() => {});
+        webhookService.setLiveCallPhase(callSid, "user_speaking").catch(() => {});
       }
     });
-
     transcriptionService.on("transcription", async (text) => {
       try {
         if (!text) return;
         clearSilenceTimer(callSid);
-        markGreetingRecoveryProgress(callSid, "aws_transcription");
+        markGreetingRecoveryProgress(callSid, "plivo_transcription");
         setCallPhase(callSid, "active", {
-          source: "aws_transcription",
+          source: "plivo_transcription",
           reason: "user_transcribed",
         });
-        const session = await sessionPromise;
-        if (!session?.gptService) {
-          return;
-        }
-        interactionCount = Math.max(
-          interactionCount,
-          Number(session.interactionCount || 0),
-        );
-        const digitFlowGuard = getDigitFlowGuardState(callSid, session?.callConfig);
-        const isDigitIntent =
-          session?.callConfig?.digit_intent?.mode === "dtmf" ||
-          digitFlowGuard.captureActive ||
-          digitFlowGuard.hasExpectation ||
-          digitFlowGuard.hasPlan;
-        const captureActive = digitFlowGuard.captureActive;
+        sttLastFrameAt.set(callSid, Date.now());
+        markStreamMediaSeen(callSid);
         const otpContext = digitService.getOtpContext(text, callSid);
         try {
           await db.addTranscript({
@@ -17611,49 +17596,19 @@ app.ws("/aws/stream", (ws, req) => {
             collected_codes: otpContext.codes?.join(", ") || null,
           });
         } catch (dbError) {
-          console.error("Database error adding user transcript:", dbError);
+          console.error("Database error adding Plivo user transcript:", dbError);
         }
-
         webhookService.recordTranscriptTurn(callSid, "user", otpContext.raw);
-        if (
-          (isDigitIntent || captureActive) &&
-          otpContext.codes &&
-          otpContext.codes.length &&
-          digitService?.hasExpectation(callSid)
-        ) {
-          const activeExpectation = digitService.getExpectation(callSid);
-          const progress = digitService.formatOtpForDisplay(
-            otpContext.codes[otpContext.codes.length - 1],
-            "progress",
-            activeExpectation?.max_digits,
-          );
-          webhookService.addLiveEvent(callSid, `🔢 ${progress}`, { force: true });
-          const collection = digitService.recordDigits(
-            callSid,
-            otpContext.codes[otpContext.codes.length - 1],
-            {
-              timestamp: Date.now(),
-              source: "spoken",
-              full_input: true,
-              attempt_id: activeExpectation?.attempt_id || null,
-              plan_id: activeExpectation?.plan_id || null,
-              plan_step_index: activeExpectation?.plan_step_index || null,
-              channel_session_id: activeExpectation?.channel_session_id || null,
-            },
-          );
-          await digitService.handleCollectionResult(
-            callSid,
-            collection,
-            session.gptService,
-            interactionCount,
-            "spoken",
-            { allowCallEnd: true },
-          );
-        }
-        if (digitFlowGuard.active) {
+
+        if (!otpContext.maskedForGpt || !otpContext.maskedForGpt.trim()) {
+          interactionCount += 1;
+          const session = activeCalls.get(callSid);
+          if (session) session.interactionCount = interactionCount;
+          queuePersistCallRuntimeState(callSid, {
+            interaction_count: interactionCount,
+          });
           return;
         }
-
         if (
           shouldCloseConversation(otpContext.maskedForGpt) &&
           interactionCount >= 1
@@ -17664,77 +17619,169 @@ app.ws("/aws/stream", (ws, req) => {
             "user_goodbye",
           );
           interactionCount += 1;
-          session.interactionCount = interactionCount;
+          const session = activeCalls.get(callSid);
+          if (session) session.interactionCount = interactionCount;
           queuePersistCallRuntimeState(callSid, {
             interaction_count: interactionCount,
           });
           return;
         }
-
         const getInteractionCount = () => interactionCount;
         const setInteractionCount = (nextCount) => {
           interactionCount = nextCount;
-          session.interactionCount = nextCount;
+          const session = activeCalls.get(callSid);
+          if (session) session.interactionCount = nextCount;
           queuePersistCallRuntimeState(callSid, {
             interaction_count: nextCount,
           });
         };
-        if (isDigitIntent) {
-          await enqueueGptTask(callSid, async () => {
-            const currentCount = interactionCount;
-            try {
-              await session.gptService.completion(
-                otpContext.maskedForGpt,
-                currentCount,
-              );
-            } catch (gptError) {
-              console.error("GPT completion error:", gptError);
-              webhookService.addLiveEvent(callSid, "⚠️ GPT error, retrying", {
-                force: true,
-              });
-            }
-            setInteractionCount(currentCount + 1);
-          });
-          return;
-        }
         await processNormalFlowTranscript(
           callSid,
           otpContext.maskedForGpt,
-          session.gptService,
+          gptService,
           getInteractionCount,
           setInteractionCount,
         );
       } catch (transcriptionError) {
-        console.error("AWS transcription handler error:", transcriptionError);
+        console.error("Plivo transcription handler error:", transcriptionError);
       }
     });
 
-    ws.on("message", (data) => {
-      if (!data) return;
-      if (Buffer.isBuffer(data)) {
-        transcriptionService.sendBuffer(data);
+    gptService.on("gptreply", async (gptReply, icount) => {
+      try {
+        markGptReplyProgress(callSid);
+        const activeSession = activeCalls.get(callSid);
+        if (activeSession?.ending) return;
+        webhookService.recordTranscriptTurn(
+          callSid,
+          "agent",
+          gptReply.partialResponse,
+        );
+        webhookService.setLiveCallPhase(callSid, "agent_responding").catch(() => {});
+        try {
+          await db.addTranscript({
+            call_sid: callSid,
+            speaker: "ai",
+            message: gptReply.partialResponse,
+            interaction_count: icount,
+            personality_used: gptReply.personalityInfo?.name || "default",
+            adaptation_data: JSON.stringify(gptReply.adaptationHistory || []),
+          });
+          await db.updateCallState(callSid, "ai_responded", {
+            message: gptReply.partialResponse,
+            interaction_count: icount,
+          });
+        } catch (dbError) {
+          console.error("Database error adding Plivo AI transcript:", dbError);
+        }
+        await ttsService.generate(gptReply, icount);
+        scheduleSilenceTimer(callSid);
+      } catch (gptReplyError) {
+        console.error("Plivo GPT reply handler error:", gptReplyError);
+      }
+    });
+    gptService.on("stall", (fillerText) => {
+      handleGptStall(callSid, fillerText, (speechText) => {
+        try {
+          ttsService.generate(
+            {
+              partialResponse: speechText,
+              personalityInfo: { name: "filler" },
+              adaptationHistory: [],
+            },
+            interactionCount,
+          );
+        } catch (err) {
+          console.error("Plivo filler TTS error:", err);
+        }
+      });
+    });
+    gptService.on("gpterror", async (err) => {
+      const message = err?.message || "GPT error";
+      webhookService.addLiveEvent(callSid, `⚠️ GPT error: ${message}`, {
+        force: true,
+      });
+    });
+    ttsService.on("speech", (responseIndex, audio) => {
+      const level = estimateAudioLevelFromBase64(audio);
+      webhookService
+        .setLiveCallPhase(callSid, "agent_speaking", { level })
+        .catch(() => {});
+      scheduleSpeechTicksFromAudio(callSid, "agent_speaking", audio);
+      if (callSid) {
+        db.updateCallState(callSid, "tts_ready", {
+          response_index: responseIndex,
+          interaction_count: interactionCount,
+          audio_bytes: audio?.length || null,
+          provider: "plivo",
+        }).catch(() => {});
+      }
+      try {
+        ws.send(JSON.stringify({
+          event: "playAudio",
+          media: {
+            contentType: plivoAudioSpec.contentType.split(";")[0],
+            sampleRate: plivoAudioSpec.sampleRate,
+            payload: audio,
+          },
+        }));
+      } catch (error) {
+        console.error("Plivo websocket send error:", error);
+      }
+    });
+
+    ws.on("message", (raw) => {
+      let msg = null;
+      try {
+        msg = typeof raw === "string" ? JSON.parse(raw) : JSON.parse(raw.toString());
+      } catch {
         return;
       }
-      const str = data.toString();
-      try {
-        const payload = JSON.parse(str);
-        if (payload?.audio) {
-          transcriptionService.send(payload.audio);
+      const event = String(msg.event || msg.type || "").toLowerCase();
+      if (event === "start") {
+        const streamUuid = msg?.start?.streamId || msg?.streamId || msg?.stream_id;
+        if (streamUuid) {
+          callConfig.provider_metadata.plivo_stream_uuid = String(streamUuid);
         }
-      } catch {
-        // ignore non-JSON text frames
+        return;
+      }
+      if (event === "media") {
+        const payload = msg?.media?.payload || msg?.payload || "";
+        if (payload) {
+          streamLastMediaAt.set(callSid, Date.now());
+          markStreamMediaSeen(callSid);
+          setCallPhase(callSid, "active", {
+            source: "plivo_stream_media",
+            reason: "media_received",
+          });
+          try {
+            transcriptionService.sendBuffer(Buffer.from(payload, "base64"));
+          } catch (error) {
+            console.error("Plivo media forwarding error:", error);
+          }
+        }
+        return;
+      }
+      if (event === "stop" || event === "closed") {
+        ws.close();
       }
     });
 
     ws.on("close", async () => {
       transcriptionService.close();
+      clearFirstMediaWatchdog(callSid);
+      streamStartTimes.delete(callSid);
+      streamFirstMediaSeen.delete(callSid);
+      streamLastMediaAt.delete(callSid);
+      sttLastFrameAt.delete(callSid);
+      streamWatchdogState.delete(callSid);
       try {
         const session = activeCalls.get(callSid);
         if (session?.startTime) {
           await handleCallEnd(callSid, session.startTime);
         }
       } catch (closeError) {
-        console.error("AWS websocket close handler error:", closeError);
+        console.error("Plivo websocket close handler error:", closeError);
       } finally {
         activeCalls.delete(callSid);
         callToolInFlight.delete(callSid);
@@ -17742,24 +17789,73 @@ app.ws("/aws/stream", (ws, req) => {
         if (digitService) {
           digitService.clearCallState(callSid);
         }
+        clearSpeechTicks(callSid);
         clearGptQueue(callSid);
         clearNormalFlowState(callSid);
-	        clearCallEndLock(callSid);
-	        clearSilenceTimer(callSid);
-	        clearGreetingRecoveryWatchdog(callSid, {
-	          clearPhase: false,
-	          source: "aws_ws_close",
-	        });
-        sttFallbackCalls.delete(callSid);
-        streamTimeoutCalls.delete(callSid);
+        clearCallEndLock(callSid);
+        clearSilenceTimer(callSid);
+        clearGreetingRecoveryWatchdog(callSid, {
+          clearPhase: false,
+          source: "plivo_ws_close",
+        });
+        if (callSid && activeStreamConnections.get(callSid)?.ws === ws) {
+          activeStreamConnections.delete(callSid);
+        }
       }
     });
 
-    recordCallStatus(callSid, "in-progress", "call_in_progress").catch(
-      () => {},
-    );
+    const firstMessage = callConfig?.first_message || "";
+    if (firstMessage) {
+      let promptUsed = "";
+      try {
+        const primaryResult = await ttsService.generate(
+          { partialResponseIndex: null, partialResponse: firstMessage },
+          0,
+          {
+            maxChars: FIRST_MESSAGE_TTS_MAX_CHARS,
+            throwOnError: true,
+          },
+        );
+        if (primaryResult?.ok) {
+          promptUsed = String(primaryResult.text || firstMessage).trim();
+        }
+      } catch (ttsError) {
+        console.error("Plivo initial TTS error:", ttsError);
+      }
+      if (promptUsed) {
+        webhookService.recordTranscriptTurn(callSid, "agent", promptUsed);
+        setCallPhase(callSid, "greeting", {
+          source: "plivo_initial_greeting",
+          reason: "initial_prompt",
+        });
+        scheduleGreetingRecoveryWatchdog(callSid, {
+          runtime: "legacy",
+          source: "plivo_initial_greeting",
+          recover: async ({ prompt }) => {
+            const recoveryPrompt = String(prompt || GREETING_RECOVERY_DEFAULT_PROMPT).trim();
+            if (!recoveryPrompt) return;
+            await ttsService.generate(
+              { partialResponseIndex: null, partialResponse: recoveryPrompt },
+              0,
+              {
+                maxChars: FIRST_MESSAGE_TTS_MAX_CHARS,
+                throwOnError: false,
+              },
+            );
+          },
+          fallback: async ({ message }) => {
+            await speakAndEndCall(
+              callSid,
+              String(message || GREETING_RECOVERY_DEFAULT_FALLBACK).trim(),
+              "greeting_watchdog_timeout",
+            );
+          },
+        });
+      }
+      scheduleSilenceTimer(callSid);
+    }
   } catch (error) {
-    console.error("AWS websocket error:", error);
+    console.error("Plivo websocket error:", error);
     ws.close();
   }
 });
@@ -18426,81 +18522,6 @@ function buildVonageUnavailableNcco() {
   ];
 }
 
-app.post("/aws/transcripts", async (req, res) => {
-  try {
-    if (!requireValidAwsWebhook(req, res, "/aws/transcripts")) {
-      return;
-    }
-    const { callSid, transcript, isPartial } = req.body || {};
-    const normalizedCallSid = String(callSid || "").trim();
-    const normalizedTranscript = String(transcript || "").trim();
-    const partialFlag =
-      isPartial === true ||
-      isPartial === 1 ||
-      String(isPartial || "").toLowerCase() === "true";
-    if (
-      !normalizedCallSid ||
-      !normalizedTranscript ||
-      !isSafeId(normalizedCallSid, { max: 128 })
-    ) {
-      return res
-        .status(400)
-        .json({ success: false, error: "callSid and transcript required" });
-    }
-    if (normalizedTranscript.length > 4000) {
-      return res.status(400).json({
-        success: false,
-        error: "transcript too long",
-      });
-    }
-    if (partialFlag) {
-      return res.status(200).json({ success: true });
-    }
-    const session = await ensureAwsSession(normalizedCallSid);
-    clearSilenceTimer(normalizedCallSid);
-    await db.addTranscript({
-      call_sid: normalizedCallSid,
-      speaker: "user",
-      message: normalizedTranscript,
-      interaction_count: session.interactionCount,
-    });
-    await db.updateCallState(normalizedCallSid, "user_spoke", {
-      message: normalizedTranscript,
-      interaction_count: session.interactionCount,
-    });
-    if (
-      shouldCloseConversation(normalizedTranscript) &&
-      session.interactionCount >= 1
-    ) {
-      await speakAndEndCall(
-        normalizedCallSid,
-        CALL_END_MESSAGES.user_goodbye,
-        "user_goodbye",
-      );
-      session.interactionCount += 1;
-      return res.status(200).json({ success: true });
-    }
-    enqueueGptTask(normalizedCallSid, async () => {
-      const currentCount = session.interactionCount || 0;
-      try {
-        await session.gptService.completion(normalizedTranscript, currentCount);
-      } catch (gptError) {
-        console.error("GPT completion error:", gptError);
-        webhookService.addLiveEvent(normalizedCallSid, "⚠️ GPT error, retrying", {
-          force: true,
-        });
-      }
-      session.interactionCount = currentCount + 1;
-    });
-    res.status(200).json({ success: true });
-  } catch (error) {
-    console.error("AWS transcript webhook error:", error);
-    res
-      .status(500)
-      .json({ success: false, error: "Failed to ingest transcript" });
-  }
-});
-
 // Provider status/update endpoints (admin only)
 function getProviderStateSnapshot() {
   const callReadiness = getProviderReadiness();
@@ -18512,7 +18533,7 @@ function getProviderStateSnapshot() {
     supported_providers: SUPPORTED_PROVIDERS,
     readiness: callReadiness,
     twilio_ready: callReadiness.twilio,
-    aws_ready: callReadiness.aws,
+    plivo_ready: callReadiness.plivo,
     vonage_ready: callReadiness.vonage,
   };
   const smsState = {
@@ -21604,7 +21625,7 @@ app.get("/admin/provider", requireAdminToken, async (req, res) => {
     stored_provider: selectedState.stored_provider,
     supported_providers: selectedState.supported_providers,
     twilio_ready: callState.twilio_ready,
-    aws_ready: callState.aws_ready,
+    plivo_ready: callState.plivo_ready,
     vonage_ready: callState.vonage_ready,
     vonage_dtmf_ready: config.vonage?.dtmfWebhookEnabled === true,
     keypad_guard_enabled: config.keypadGuard?.enabled === true,
@@ -21648,7 +21669,11 @@ app.get("/admin/voice-models", requireAdminToken, async (req, res) => {
 
 app.get("/admin/provider/preflight", requireAdminToken, async (req, res) => {
   syncRuntimeProviderMirrors();
-  const requestedChannel = resolveProviderChannel(req.query?.channel);
+  const rawChannel = String(req.query?.channel || "")
+    .trim()
+    .toLowerCase();
+  const requestedChannel =
+    rawChannel === "payment" ? "payment" : resolveProviderChannel(req.query?.channel);
   if (!requestedChannel && req.query?.channel) {
     return res.status(400).json({
       success: false,
@@ -21658,7 +21683,10 @@ app.get("/admin/provider/preflight", requireAdminToken, async (req, res) => {
 
   const channel = requestedChannel || PROVIDER_CHANNELS.CALL;
   const stateSnapshot = getProviderStateSnapshot();
-  const selectedState = getProviderStateByChannel(channel, stateSnapshot);
+  const selectedState =
+    channel === "payment"
+      ? { provider: "paypal", supported_providers: ["paypal"] }
+      : getProviderStateByChannel(channel, stateSnapshot);
   const requestedProvider = String(req.query?.provider || "")
     .trim()
     .toLowerCase();
@@ -24628,22 +24656,35 @@ async function placeOutboundCall(payload, hostOverride = null) {
         );
         callId = call.sid;
         callStatus = call.status || "queued";
-      } else if (provider === "aws") {
-        const awsAdapter = getAwsConnectAdapter();
+      } else if (provider === "plivo") {
+        const plivoAdapter = getPlivoVoiceAdapter();
         callId = uuidv4();
-        const response = await awsAdapter.startOutboundCall({
-          destinationPhoneNumber: number,
-          clientToken: callId,
-          attributes: {
-            CALL_SID: callId,
-            FIRST_MESSAGE: effectiveFirstMessage,
-          },
-        });
-        providerMetadata = { contact_id: response.ContactId };
-        if (response.ContactId) {
-          awsContactMap.set(response.ContactId, callId);
+        const webhookReq = reqForHost(host);
+        const answerUrl = buildPlivoAnswerWebhookUrl(webhookReq, callId);
+        const eventUrl = buildPlivoEventWebhookUrl(webhookReq, callId);
+        if (!answerUrl) {
+          throw new Error(
+            "Plivo requires a public SERVER hostname or PLIVO_ANSWER_URL",
+          );
         }
-        callStatus = "queued";
+        const response = await plivoAdapter.createOutboundCall({
+          to: number,
+          callSid: callId,
+          answerUrl,
+          eventUrl,
+        });
+        const plivoUuid = PlivoVoiceAdapter.extractPlivoCallUuid(response);
+        providerMetadata = {
+          plivo_uuid: plivoUuid || null,
+          plivo_request_uuid: response?.request_uuid || null,
+          answer_url: answerUrl || null,
+          event_url: eventUrl || null,
+          idempotency_key: normalizedOutboundIdempotencyKey || null,
+        };
+        if (plivoUuid) {
+          rememberPlivoCallMapping(callId, plivoUuid, "outbound_create");
+        }
+        callStatus = response?.status || "queued";
       } else if (provider === "vonage") {
         const vonageAdapter = getVonageVoiceAdapter();
         callId = uuidv4();
@@ -29194,9 +29235,10 @@ registerStatusRoutes(app, {
 
 registerWebhookRoutes(app, {
   config,
+  fetchFn: fetch,
   handleTwilioGatherWebhook,
   requireValidTwilioSignature,
-  requireValidAwsWebhook,
+  requireValidPlivoWebhook,
   requireValidEmailWebhook,
   requireValidVonageWebhook,
   requireValidTelegramWebhook,
@@ -29207,6 +29249,13 @@ registerWebhookRoutes(app, {
   shouldProcessProviderEvent,
   shouldProcessProviderEventAsync,
   recordCallStatus,
+  getPlivoCallUuid,
+  resolvePlivoCallSid,
+  rememberPlivoCallMapping,
+  clearPlivoCallMappings,
+  buildPlivoWebsocketUrl,
+  getPlivoStreamContentType,
+  buildPlivoInboundCallSid,
   getVonageCallPayload,
   getVonageDtmfDigits,
   resolveVonageCallSid,
@@ -29242,7 +29291,6 @@ registerWebhookRoutes(app, {
   getCallConfigurations: () => callConfigurations,
   getCallFunctionSystems: () => callFunctionSystems,
   getCallDirections: () => callDirections,
-  getAwsContactMap: () => awsContactMap,
   getActiveCalls: () => activeCalls,
   handleCallEnd,
   maskPhoneForLog,
@@ -29578,8 +29626,6 @@ module.exports = {
     resolveApiHmacReplayValidationMode,
     resetHmacReplayCacheForTests,
     verifyTelegramWebhookAuth,
-    verifyAwsWebhookAuth,
-    verifyAwsStreamAuth,
     requireValidTwilioSignature,
     requireValidVonageWebhook,
     evaluateProviderPreflightReport,

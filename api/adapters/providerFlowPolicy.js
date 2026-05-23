@@ -27,10 +27,11 @@ const PROVIDER_FLOW_REGISTRY = Object.freeze({
         "digit_capture",
       ]),
     }),
-    aws: Object.freeze({
-      label: "AWS Connect",
+    plivo: Object.freeze({
+      label: "Plivo Voice",
       flows: Object.freeze([
         "outbound_voice",
+        "inbound_voice",
         "status_webhooks",
         "voice_stream",
       ]),
@@ -54,8 +55,8 @@ const PROVIDER_FLOW_REGISTRY = Object.freeze({
         "delivery_receipts",
       ]),
     }),
-    aws: Object.freeze({
-      label: "AWS Pinpoint SMS",
+    plivo: Object.freeze({
+      label: "Plivo SMS",
       flows: Object.freeze([
         "outbound_sms",
       ]),
@@ -68,10 +69,6 @@ const PROVIDER_FLOW_REGISTRY = Object.freeze({
     }),
     mailgun: Object.freeze({
       label: "Mailgun",
-      flows: Object.freeze(["outbound_email", "delivery_events"]),
-    }),
-    ses: Object.freeze({
-      label: "AWS SES",
       flows: Object.freeze(["outbound_email", "delivery_events"]),
     }),
   }),
@@ -109,14 +106,24 @@ const CALL_STATUS_MAP = Object.freeze({
     timeout: "no-answer",
     unanswered: "no-answer",
   }),
-  aws: Object.freeze({
+  plivo: Object.freeze({
+    queued: "queued",
     initiated: "initiated",
-    connected: "answered",
-    ended: "completed",
+    ringing: "ringing",
+    answered: "answered",
+    "in-progress": "in-progress",
+    in_progress: "in-progress",
+    completed: "completed",
+    hangup: "completed",
     failed: "failed",
-    no_answer: "no-answer",
-    "no-answer": "no-answer",
     busy: "busy",
+    timeout: "no-answer",
+    unanswered: "no-answer",
+    "no-answer": "no-answer",
+    no_answer: "no-answer",
+    canceled: "canceled",
+    cancelled: "canceled",
+    rejected: "canceled",
   }),
 });
 

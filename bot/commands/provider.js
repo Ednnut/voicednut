@@ -6,7 +6,7 @@ const { buildCallbackData } = require('../utils/actions');
 const { getAccessProfile } = require('../utils/capabilities');
 
 const ADMIN_HEADER_NAME = 'x-admin-token';
-const SUPPORTED_PROVIDERS = ['twilio', 'aws', 'vonage'];
+const SUPPORTED_PROVIDERS = ['twilio', 'plivo', 'vonage'];
 const STATUS_CACHE_TTL_MS = 8000;
 const statusCache = {
     value: null,
@@ -26,7 +26,7 @@ function buildCallReadinessMap(status = {}) {
     const callReadiness = status.providers?.call?.readiness || {};
     return {
         twilio: typeof callReadiness.twilio === 'boolean' ? callReadiness.twilio : !!status.twilio_ready,
-        aws: typeof callReadiness.aws === 'boolean' ? callReadiness.aws : !!status.aws_ready,
+        plivo: typeof callReadiness.plivo === 'boolean' ? callReadiness.plivo : !!status.plivo_ready,
         vonage: typeof callReadiness.vonage === 'boolean' ? callReadiness.vonage : !!status.vonage_ready
     };
 }

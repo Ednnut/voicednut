@@ -1,11 +1,20 @@
 const crypto = require("crypto");
+const {
+  PAYPAL_AGENT_TOOLKIT_PACKAGE,
+  PAYPAL_AGENT_TOOLKIT_READ_TOOLS,
+  createPaypalPaymentService,
+  isPaypalConnectorName,
+} = require("../services/paypalPaymentService");
+const {
+  createStripePaymentService,
+  isStripeConnectorName,
+} = require("../services/stripePaymentService");
 
 const DEFAULT_TRUSTED_DOMAINS = Object.freeze([
   "openrouter.ai",
   "developers.deepgram.com",
   "www.twilio.com",
   "developer.vonage.com",
-  "docs.aws.amazon.com",
   "platform.openai.com",
   "developers.openai.com",
   "support.google.com",
@@ -363,6 +372,14 @@ function makeConnectorTools() {
             amount: { type: "number" },
             currency: { type: "string" },
             description: { type: "string" },
+            payment_connector: {
+              type: "string",
+              description: "Optional payment connector override, for example paypal or stripe.",
+            },
+            connector: {
+              type: "string",
+              description: "Alias for payment_connector when a connector-specific payment path is required.",
+            },
             confirm_write: { type: "boolean" },
           },
           required: ["amount", "confirm_write"],
@@ -389,6 +406,14 @@ function makeConnectorTools() {
             currency: { type: "string" },
             due_date: { type: "string" },
             customer_ref: { type: "string" },
+            payment_connector: {
+              type: "string",
+              description: "Optional payment connector override, for example paypal or stripe.",
+            },
+            connector: {
+              type: "string",
+              description: "Alias for payment_connector when a connector-specific payment path is required.",
+            },
             confirm_write: { type: "boolean" },
           },
           required: ["amount", "customer_ref", "confirm_write"],
@@ -411,8 +436,110 @@ function makeConnectorTools() {
           type: "object",
           properties: {
             payment_intent_id: { type: "string" },
+            checkout_session_id: { type: "string" },
+            payment_link_id: { type: "string" },
+            invoice_id: { type: "string" },
+            refund_id: { type: "string" },
+            payment_connector: {
+              type: "string",
+              description: "Optional payment connector override, for example paypal or stripe.",
+            },
+            connector: {
+              type: "string",
+              description: "Alias for payment_connector when a connector-specific payment path is required.",
+            },
           },
-          required: ["payment_intent_id"],
+          required: [],
+        },
+      },
+    },
+    {
+      type: "function",
+      function: {
+        name: "payment_session_history",
+        description:
+          "Payment connector: inspect local payment session and webhook history for checkout, order, invoice, refund, or call follow-up.",
+        connector: connector(
+          "billing_payment_session_history",
+          "read",
+          "medium",
+          ["payment", "billing", "business_ops", "audit"],
+        ),
+        parameters: {
+          type: "object",
+          properties: {
+            payment_intent_id: { type: "string" },
+            checkout_session_id: { type: "string" },
+            payment_link_id: { type: "string" },
+            order_id: { type: "string" },
+            invoice_id: { type: "string" },
+            refund_id: { type: "string" },
+            call_sid: { type: "string" },
+            payment_connector: {
+              type: "string",
+              description: "Optional payment connector override, for example paypal or stripe.",
+            },
+            connector: {
+              type: "string",
+              description: "Alias for payment_connector when a connector-specific payment path is required.",
+            },
+            limit: { type: "integer", minimum: 1, maximum: 25 },
+          },
+          required: [],
+        },
+      },
+    },
+    {
+      type: "function",
+      function: {
+        name: "paypal_agent_toolkit_manifest",
+        description:
+          "Payment connector: inspect official PayPal Agent Toolkit tools configured for this deployment.",
+        connector: connector(
+          "billing_paypal_agent_toolkit_manifest",
+          "read",
+          "medium",
+          ["payment", "billing", "business_ops", "audit"],
+        ),
+        parameters: {
+          type: "object",
+          properties: {
+            payment_connector: { type: "string" },
+            connector: { type: "string" },
+          },
+          required: [],
+        },
+      },
+    },
+    {
+      type: "function",
+      function: {
+        name: "paypal_agent_toolkit_execute",
+        description:
+          "Payment connector: execute an allowlisted read-only official PayPal Agent Toolkit tool.",
+        connector: connector(
+          "billing_paypal_agent_toolkit_execute",
+          "read",
+          "medium",
+          ["payment", "billing", "business_ops", "audit"],
+        ),
+        parameters: {
+          type: "object",
+          properties: {
+            tool_name: {
+              type: "string",
+              enum: PAYPAL_AGENT_TOOLKIT_READ_TOOLS,
+              description: "Read-only PayPal Agent Toolkit tool name.",
+            },
+            input: {
+              type: "object",
+              additionalProperties: true,
+              description: "JSON input passed directly to the selected PayPal toolkit tool.",
+            },
+            payment_connector: { type: "string" },
+            connector: { type: "string" },
+          },
+          required: ["tool_name", "input"],
         },
       },
     },
@@ -433,12 +560,21 @@ function makeConnectorTools() {
           type: "object",
           properties: {
             payment_intent_id: { type: "string" },
+            charge_id: { type: "string" },
             reason: { type: "string" },
+            payment_connector: {
+              type: "string",
+              description: "Optional payment connector override, for example paypal or stripe.",
+            },
+            connector: {
+              type: "string",
+              description: "Alias for payment_connector when a connector-specific payment path is required.",
+            },
             confirm_primary: { type: "boolean" },
             confirm_secondary: { type: "boolean" },
             confirm_write: { type: "boolean" },
           },
-          required: ["payment_intent_id", "reason", "confirm_primary", "confirm_secondary", "confirm_write"],
+          required: ["reason", "confirm_primary", "confirm_secondary", "confirm_write"],
         },
       },
     },
@@ -667,6 +803,31 @@ function buildConnectorPackImplementations(options = {}) {
       ? options.getCurrentProvider
       : () => "twilio";
   const fetchFn = options.fetchFn;
+  let paypalPaymentService = null;
+  let stripePaymentService = null;
+
+  const getPaypalPaymentService = () => {
+    if (!paypalPaymentService) {
+      paypalPaymentService = createPaypalPaymentService({
+        db,
+        fetchFn,
+        config: options.paypalConfig,
+        agentToolkitFactory: options.paypalAgentToolkitFactory,
+      });
+    }
+    return paypalPaymentService;
+  };
+
+  const getStripePaymentService = () => {
+    if (!stripePaymentService) {
+      stripePaymentService = createStripePaymentService({
+        db,
+        fetchFn,
+        config: options.stripeConfig,
+      });
+    }
+    return stripePaymentService;
+  };
 
   const logAudit = async (action, status, payload = {}) => {
     const safePayload =
@@ -860,6 +1021,61 @@ function buildConnectorPackImplementations(options = {}) {
     } finally {
       clearTimeout(timeout);
     }
+  };
+
+  const getRequestedPaymentConnector = (args = {}) => {
+    const callConfig = getCallConfig() || {};
+    return normalizeText(
+      args.payment_connector ||
+        args.connector ||
+        callConfig.payment_connector ||
+        callConfig?.payment?.connector,
+      80,
+    ).toLowerCase();
+  };
+
+  const shouldUsePaypalConnector = (args = {}) => {
+    const requestedConnector = getRequestedPaymentConnector(args);
+    if (requestedConnector) {
+      return isPaypalConnectorName(requestedConnector);
+    }
+    return String(process.env.PAYPAL_CONNECTOR_ENABLED || "").toLowerCase() === "true";
+  };
+
+  const maybeInvokePaypalConnector = async (action, args = {}) => {
+    if (!shouldUsePaypalConnector(args)) {
+      return null;
+    }
+    const result = await getPaypalPaymentService().execute(action, args, {
+      callSid,
+      callConfig: getCallConfig() || {},
+    });
+    if (result?.error) {
+      return { ok: false, data: result };
+    }
+    return { ok: true, data: result };
+  };
+
+  const shouldUseStripeConnector = (args = {}) => {
+    const requestedConnector = getRequestedPaymentConnector(args);
+    if (requestedConnector) {
+      return isStripeConnectorName(requestedConnector);
+    }
+    return String(process.env.STRIPE_CONNECTOR_ENABLED || "").toLowerCase() === "true";
+  };
+
+  const maybeInvokeStripeConnector = async (action, args = {}) => {
+    if (!shouldUseStripeConnector(args)) {
+      return null;
+    }
+    const result = await getStripePaymentService().execute(action, args, {
+      callSid,
+      callConfig: getCallConfig() || {},
+    });
+    if (result?.error) {
+      return { ok: false, data: result };
+    }
+    return { ok: true, data: result };
   };
 
   const requireScopedKey = (scope, mode = "read") => {
@@ -1285,9 +1501,27 @@ function buildConnectorPackImplementations(options = {}) {
         });
       }
       const managed = await maybeInvokeManagedEndpoint("payment", "payment_link_generate", args);
+      const stripe =
+        managed?.ok === true
+          ? null
+          : await maybeInvokeStripeConnector("payment_link_generate", args);
+      if (stripe?.ok === false) {
+        return blockedResult("payment_link_generate", stripe.data);
+      }
+      const paypal =
+        managed?.ok === true || stripe?.ok === true
+          ? null
+          : await maybeInvokePaypalConnector("payment_link_generate", args);
+      if (paypal?.ok === false) {
+        return blockedResult("payment_link_generate", paypal.data);
+      }
       const result =
         managed?.ok === true
           ? { status: "ok", connector_mode: "managed", ...managed.data }
+          : stripe?.ok === true
+            ? { status: "ok", connector_mode: "stripe", ...stripe.data }
+          : paypal?.ok === true
+            ? { status: "ok", connector_mode: "paypal", ...paypal.data }
           : {
               status: "ok",
               connector_mode: "stub",
@@ -1320,9 +1554,25 @@ function buildConnectorPackImplementations(options = {}) {
         });
       }
       const managed = await maybeInvokeManagedEndpoint("payment", "invoice_create", args);
+      const stripe =
+        managed?.ok === true ? null : await maybeInvokeStripeConnector("invoice_create", args);
+      if (stripe?.ok === false) {
+        return blockedResult("invoice_create", stripe.data);
+      }
+      const paypal =
+        managed?.ok === true || stripe?.ok === true
+          ? null
+          : await maybeInvokePaypalConnector("invoice_create", args);
+      if (paypal?.ok === false) {
+        return blockedResult("invoice_create", paypal.data);
+      }
       const result =
         managed?.ok === true
           ? { status: "ok", connector_mode: "managed", ...managed.data }
+          : stripe?.ok === true
+            ? { status: "ok", connector_mode: "stripe", ...stripe.data }
+          : paypal?.ok === true
+            ? { status: "ok", connector_mode: "paypal", ...paypal.data }
           : {
               status: "ok",
               connector_mode: "stub",
@@ -1337,17 +1587,46 @@ function buildConnectorPackImplementations(options = {}) {
     },
 
     payment_intent_status: async (args = {}) => {
-      const intentId = normalizeText(args.payment_intent_id, 120);
+      const intentId = normalizeText(
+        args.payment_intent_id || args.order_id || args.payment_link_id || args.invoice_id,
+        120,
+      );
       if (!intentId) {
         return {
           error: "invalid_payment_intent_id",
-          message: "payment_intent_id is required.",
+          message: "payment_intent_id, order_id, payment_link_id, or invoice_id is required.",
         };
       }
       const managed = await maybeInvokeManagedEndpoint("payment", "payment_intent_status", args);
+      const stripe =
+        managed?.ok === true
+          ? null
+          : await maybeInvokeStripeConnector("payment_intent_status", args);
+      if (stripe?.ok === false) {
+        await logAudit("payment_intent_status", "blocked", {
+          payment_intent_id: intentId,
+          error: stripe.data?.error || "stripe_error",
+        });
+        return stripe.data;
+      }
+      const paypal =
+        managed?.ok === true || stripe?.ok === true
+          ? null
+          : await maybeInvokePaypalConnector("payment_intent_status", args);
+      if (paypal?.ok === false) {
+        await logAudit("payment_intent_status", "blocked", {
+          payment_intent_id: intentId,
+          error: paypal.data?.error || "paypal_error",
+        });
+        return paypal.data;
+      }
       const result =
         managed?.ok === true
           ? { status: "ok", connector_mode: "managed", ...managed.data }
+          : stripe?.ok === true
+            ? { status: "ok", connector_mode: "stripe", ...stripe.data }
+          : paypal?.ok === true
+            ? { status: "ok", connector_mode: "paypal", ...paypal.data }
           : {
               status: "ok",
               connector_mode: "stub",
@@ -1356,6 +1635,159 @@ function buildConnectorPackImplementations(options = {}) {
               updated_at: new Date().toISOString(),
             };
       await logAudit("payment_intent_status", "ok", { payment_intent_id: intentId });
+      return result;
+    },
+
+    payment_session_history: async (args = {}) => {
+      const lookupId = normalizeText(
+        args.payment_intent_id ||
+          args.order_id ||
+          args.payment_link_id ||
+          args.invoice_id ||
+          args.refund_id ||
+          args.external_id,
+        160,
+      );
+      const lookupCallSid = normalizeText(args.call_sid || callSid, 160);
+      if (!lookupId && !lookupCallSid) {
+        return {
+          error: "invalid_payment_session_lookup",
+          message: "payment_intent_id, order_id, invoice_id, refund_id, or call_sid is required.",
+        };
+      }
+
+      const lookupArgs = {
+        ...args,
+        payment_intent_id: lookupId || args.payment_intent_id,
+        call_sid: lookupCallSid || args.call_sid,
+        limit: clampNumber(args.limit, 1, 25, 10),
+      };
+      const managed = await maybeInvokeManagedEndpoint(
+        "payment",
+        "payment_session_history",
+        lookupArgs,
+      );
+      const stripe =
+        managed?.ok === true
+          ? null
+          : await maybeInvokeStripeConnector("payment_session_history", lookupArgs);
+      if (stripe?.ok === false) {
+        await logAudit("payment_session_history", "blocked", {
+          payment_intent_id: lookupId || null,
+          call_sid: lookupCallSid || null,
+          error: stripe.data?.error || "stripe_error",
+        });
+        return stripe.data;
+      }
+      const paypal =
+        managed?.ok === true || stripe?.ok === true
+          ? null
+          : await maybeInvokePaypalConnector("payment_session_history", lookupArgs);
+      if (paypal?.ok === false) {
+        await logAudit("payment_session_history", "blocked", {
+          payment_intent_id: lookupId || null,
+          call_sid: lookupCallSid || null,
+          error: paypal.data?.error || "paypal_error",
+        });
+        return paypal.data;
+      }
+      const result =
+        managed?.ok === true
+          ? { status: "ok", connector_mode: "managed", ...managed.data }
+          : stripe?.ok === true
+            ? { status: "ok", connector_mode: "stripe", ...stripe.data }
+          : paypal?.ok === true
+            ? { status: "ok", connector_mode: "paypal", ...paypal.data }
+          : {
+              status: "ok",
+              connector_mode: "stub",
+              payment_intent_id: lookupId || null,
+              call_sid: lookupCallSid || null,
+              status_value: "UNKNOWN",
+              sessions: [],
+              events: [],
+              updated_at: new Date().toISOString(),
+            };
+      await logAudit("payment_session_history", "ok", {
+        payment_intent_id: lookupId || null,
+        call_sid: lookupCallSid || null,
+      });
+      return result;
+    },
+
+    paypal_agent_toolkit_manifest: async (args = {}) => {
+      const paypal = await maybeInvokePaypalConnector("agent_toolkit_manifest", args);
+      if (paypal?.ok === false) {
+        await logAudit("paypal_agent_toolkit_manifest", "blocked", {
+          error: paypal.data?.error || "paypal_error",
+        });
+        return paypal.data;
+      }
+      const result =
+        paypal?.ok === true
+          ? { status: "ok", connector_mode: "paypal", ...paypal.data }
+          : {
+              status: "ok",
+              connector_mode: "stub",
+              provider: "paypal",
+              provider_action: "agent_toolkit_manifest",
+              package: PAYPAL_AGENT_TOOLKIT_PACKAGE,
+              toolkit_surface: "ai-sdk",
+              tool_count: 0,
+              tools: [],
+              message:
+                "PayPal connector disabled. Set PAYPAL_CONNECTOR_ENABLED=true or payment_connector=paypal to inspect toolkit tools.",
+            };
+      await logAudit("paypal_agent_toolkit_manifest", "ok", {
+        tool_count: result.tool_count || 0,
+      });
+      return result;
+    },
+
+    paypal_agent_toolkit_execute: async (args = {}) => {
+      const toolName = normalizeText(args.tool_name || args.tool || args.name, 120).toLowerCase();
+      const input = args.input;
+      if (!toolName) {
+        return blockedResult("paypal_agent_toolkit_execute", {
+          error: "missing_paypal_agent_tool",
+          message: "tool_name is required.",
+        });
+      }
+      if (!input || typeof input !== "object" || Array.isArray(input)) {
+        return blockedResult("paypal_agent_toolkit_execute", {
+          error: "invalid_paypal_agent_tool_input",
+          message: "input must be a JSON object passed to the PayPal Agent Toolkit tool.",
+        });
+      }
+      const safe = ensurePaymentSafety(input);
+      if (!safe.ok) return blockedResult("paypal_agent_toolkit_execute", safe);
+
+      const paypal = await maybeInvokePaypalConnector("agent_toolkit_execute", {
+        ...args,
+        tool_name: toolName,
+        input,
+      });
+      if (paypal?.ok === false) {
+        await logAudit("paypal_agent_toolkit_execute", "blocked", {
+          tool_name: toolName,
+          error: paypal.data?.error || "paypal_error",
+        });
+        return paypal.data;
+      }
+      if (paypal?.ok !== true) {
+        return blockedResult("paypal_agent_toolkit_execute", {
+          error: "paypal_connector_disabled",
+          message:
+            "PayPal connector must be enabled or selected with payment_connector=paypal to execute PayPal Agent Toolkit tools.",
+          tool_name: toolName,
+          allowed_tools: PAYPAL_AGENT_TOOLKIT_READ_TOOLS,
+        });
+      }
+
+      const result = { status: "ok", connector_mode: "paypal", ...paypal.data };
+      await logAudit("paypal_agent_toolkit_execute", "ok", {
+        tool_name: toolName,
+      });
       return result;
     },
 
@@ -1382,9 +1814,27 @@ function buildConnectorPackImplementations(options = {}) {
         });
       }
       const managed = await maybeInvokeManagedEndpoint("payment", "refund_request_initiate", args);
+      const stripe =
+        managed?.ok === true
+          ? null
+          : await maybeInvokeStripeConnector("refund_request_initiate", args);
+      if (stripe?.ok === false) {
+        return blockedResult("refund_request_initiate", stripe.data);
+      }
+      const paypal =
+        managed?.ok === true || stripe?.ok === true
+          ? null
+          : await maybeInvokePaypalConnector("refund_request_initiate", args);
+      if (paypal?.ok === false) {
+        return blockedResult("refund_request_initiate", paypal.data);
+      }
       const result =
         managed?.ok === true
           ? { status: "ok", connector_mode: "managed", ...managed.data }
+          : stripe?.ok === true
+            ? { status: "ok", connector_mode: "stripe", ...stripe.data }
+          : paypal?.ok === true
+            ? { status: "ok", connector_mode: "paypal", ...paypal.data }
           : {
               status: "ok",
               connector_mode: "stub",

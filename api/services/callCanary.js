@@ -8,7 +8,7 @@ const {
   listProfileTypes,
 } = require("../functions/profileRegistry");
 
-const KNOWN_CALL_PROVIDERS = new Set(["twilio", "vonage", "aws"]);
+const KNOWN_CALL_PROVIDERS = new Set(["twilio", "vonage", "plivo"]);
 const URL_REGEX = /\bhttps?:\/\/[^\s]+/i;
 const MARKDOWN_TOKEN_REGEX = /[`*_~#>[\]]/;
 const NON_SPOKEN_TOKEN_REGEX = /(^|\s)(lol|lmao|rofl|brb|ttyl)(\s|$)/i;
@@ -301,7 +301,7 @@ async function runCallCanarySweep(options = {}) {
   const configuredProviders = normalizeList(canaryConfig.providers).map(normalizeProvider);
   const providerCandidates = (configuredProviders.length
     ? configuredProviders
-    : ["twilio", "vonage"])
+    : ["twilio", "plivo", "vonage"])
     .filter(Boolean)
     .filter((provider, index, arr) => arr.indexOf(provider) === index)
     .filter((provider) => readiness?.[provider] === true);
@@ -532,7 +532,7 @@ async function evaluateCallCanarySloGuardrail(options = {}) {
     db,
     config = {},
     onBreach,
-    supportedProviders = ["twilio", "vonage", "aws"],
+    supportedProviders = ["twilio", "vonage", "plivo"],
   } = options;
   const canaryConfig = config.callCanary || {};
   const sloConfig = canaryConfig.slo || {};

@@ -8,7 +8,7 @@ const SECTIONS = [
   {
     comments: [
       '# --- API Environment --------------------------',
-      '# Primary call provider (twilio | aws | vonage)',
+      '# Primary call provider (twilio | plivo | vonage)',
     ],
     fields: [
       { key: 'CALL_PROVIDER', prompt: 'Primary call provider', defaultValue: 'twilio' },
@@ -34,29 +34,15 @@ const SECTIONS = [
     ],
   },
   {
-    comments: ['# AWS Connect stack (required when CALL_PROVIDER=aws)'],
+    comments: ['# Plivo Voice/SMS (required when CALL_PROVIDER=plivo or SMS_PROVIDER=plivo)'],
     fields: [
-      { key: 'AWS_REGION', prompt: 'AWS Region', defaultValue: 'us-east-1' },
-      { key: 'AWS_CONNECT_INSTANCE_ID', prompt: 'AWS Connect Instance ID' },
-      { key: 'AWS_CONNECT_CONTACT_FLOW_ID', prompt: 'AWS Connect Contact Flow ID' },
-      { key: 'AWS_CONNECT_QUEUE_ID', prompt: 'AWS Connect Queue ID' },
-      { key: 'AWS_CONNECT_SOURCE_PHONE_NUMBER', prompt: 'AWS Connect Source Phone Number (E.164)' },
-      { key: 'AWS_TRANSCRIPTS_QUEUE_URL', prompt: 'AWS Transcripts Queue URL' },
-      { key: 'AWS_EVENT_BUS_NAME', prompt: 'AWS EventBridge Bus Name' },
-    ],
-  },
-  {
-    comments: ['# AWS media + speech'],
-    fields: [
-      { key: 'AWS_POLLY_VOICE_ID', prompt: 'AWS Polly Voice ID', defaultValue: 'Joanna' },
-      { key: 'AWS_POLLY_OUTPUT_BUCKET', prompt: 'AWS Polly Output Bucket' },
-      { key: 'AWS_POLLY_OUTPUT_PREFIX', prompt: 'AWS Polly Output Prefix', defaultValue: 'tts/' },
-      { key: 'AWS_MEDIA_BUCKET', prompt: 'AWS Media Bucket (recordings)' },
-      { key: 'AWS_PINPOINT_APPLICATION_ID', prompt: 'AWS Pinpoint Application ID' },
-      { key: 'AWS_PINPOINT_ORIGINATION_NUMBER', prompt: 'AWS Pinpoint Origination Number (E.164)' },
-      { key: 'AWS_PINPOINT_REGION', prompt: 'AWS Pinpoint Region', defaultValue: 'us-east-1' },
-      { key: 'AWS_TRANSCRIBE_LANGUAGE_CODE', prompt: 'AWS Transcribe Language Code', defaultValue: 'en-US' },
-      { key: 'AWS_TRANSCRIBE_VOCABULARY_FILTER_NAME', prompt: 'AWS Transcribe Vocabulary Filter Name' },
+      { key: 'PLIVO_AUTH_ID', prompt: 'Plivo Auth ID' },
+      { key: 'PLIVO_AUTH_TOKEN', prompt: 'Plivo Auth Token' },
+      { key: 'PLIVO_VOICE_FROM_NUMBER', prompt: 'Plivo Voice From Number (E.164)' },
+      { key: 'PLIVO_SMS_FROM_NUMBER', prompt: 'Plivo SMS From Number (E.164)' },
+      { key: 'PLIVO_ANSWER_URL', prompt: 'Plivo Answer URL (optional)' },
+      { key: 'PLIVO_EVENT_URL', prompt: 'Plivo Event URL (optional)' },
+      { key: 'PLIVO_WEBHOOK_SECRET', prompt: 'Plivo Webhook Secret (optional)' },
     ],
   },
   {

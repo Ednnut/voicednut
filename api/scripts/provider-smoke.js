@@ -4,6 +4,7 @@ const twilio = require("twilio");
 const { Vonage } = require("@vonage/server-sdk");
 const config = require("../config");
 const { __testables: smsTestables } = require("../routes/sms");
+const PlivoVoiceAdapter = require("../adapters/PlivoVoiceAdapter");
 const VonageVoiceAdapter = require("../adapters/VonageVoiceAdapter");
 const {
   resolvePaymentExecutionMode,
@@ -11,7 +12,7 @@ const {
 } = require("../adapters/providerFlowPolicy");
 const { buildProviderCallbackUrls } = require("../adapters/providerPreflight");
 
-const { TwilioSmsAdapter, VonageSmsAdapter } = smsTestables || {};
+const { TwilioSmsAdapter, PlivoSmsAdapter, VonageSmsAdapter } = smsTestables || {};
 
 function boolFrom(value, fallback = false) {
   if (value === undefined || value === null || value === "") {
@@ -143,7 +144,7 @@ function createRunner() {
 }
 
 async function runOfflineChecks(runner) {
-  if (!TwilioSmsAdapter || !VonageSmsAdapter) {
+  if (!TwilioSmsAdapter || !PlivoSmsAdapter || !VonageSmsAdapter) {
     throw new Error("SMS adapter test hooks are unavailable");
   }
 
@@ -242,6 +243,50 @@ async function runOfflineChecks(runner) {
     };
   });
 
+  await runner.runCheck("sms.plivo.request_and_normalization", async () => {
+    const calls = [];
+    const adapter = new PlivoSmsAdapter({
+      authId: "auth-id",
+      authToken: "auth-token",
+      defaultFrom: "+15550001111",
+      fetch: async (url, payload) => {
+        calls.push({ url, payload });
+        return {
+          ok: true,
+          status: 202,
+          text: async () => JSON.stringify({
+            api_id: "PLIVO_API_ID",
+            message_uuid: ["PLIVO_MESSAGE_UUID"],
+          }),
+        };
+      },
+    });
+
+    const response = await adapter.sendSms(
+      {
+        to: "+15550003333",
+        from: "+15550001111",
+        body: "hello parity",
+      },
+      {
+        withTimeout: (promise) => Promise.resolve(promise),
+        providerTimeoutMs: 1000,
+      },
+    );
+
+    assert(calls.length === 1, "Plivo adapter did not invoke fetch");
+    const parsedBody = JSON.parse(calls[0].payload.body);
+    assert(parsedBody.src === "+15550001111", "Plivo request missing src");
+    assert(parsedBody.dst === "+15550003333", "Plivo request missing dst");
+    assert(parsedBody.text === "hello parity", "Plivo request missing text");
+    assert(response.provider === "plivo", "Plivo response provider normalization failed");
+    assert(response.messageSid === "PLIVO_MESSAGE_UUID", "Plivo message UUID normalization failed");
+    return {
+      request_keys: Object.keys(parsedBody).sort(),
+      normalized_status: response.status,
+    };
+  });
+
   await runner.runCheck("voice.vonage.adapter_interface", async () => {
     const observed = {
       outboundPayload: null,
@@ -287,11 +332,51 @@ async function runOfflineChecks(runner) {
     };
   });
 
+  await runner.runCheck("voice.plivo.adapter_interface", async () => {
+    const calls = [];
+    const adapter = new PlivoVoiceAdapter({
+      authId: "auth-id",
+      authToken: "auth-token",
+      voice: {
+        fromNumber: "+15550001111",
+      },
+      fetch: async (url, payload) => {
+        calls.push({ url, payload });
+        return {
+          ok: true,
+          status: 201,
+          text: async () => JSON.stringify({
+            request_uuid: "PLIVO_CALL_UUID",
+            status: "queued",
+          }),
+        };
+      },
+    }, { info: () => {}, warn: () => {} });
+
+    const result = await adapter.createOutboundCall({
+      to: "+15550004444",
+      callSid: "call-smoke-1",
+      answerUrl: "https://smoke.example/plivo/answer",
+      eventUrl: "https://smoke.example/plivo/events",
+    });
+
+    assert(result.request_uuid === "PLIVO_CALL_UUID", "Plivo adapter did not return outbound call response");
+    const parsedBody = JSON.parse(calls[0].payload.body);
+    assert(parsedBody.answer_url === "https://smoke.example/plivo/answer", "Plivo adapter did not map answer_url");
+    assert(parsedBody.hangup_url === "https://smoke.example/plivo/events", "Plivo adapter did not map hangup_url");
+    return {
+      payload_keys: Object.keys(parsedBody).sort(),
+    };
+  });
+
   await runner.runCheck("voice.callback_url_mapping", async () => {
     const twilioCallbacks = buildProviderCallbackUrls("twilio", "call", config, {
       hostOverride: "smoke.example",
     });
     const vonageCallbacks = buildProviderCallbackUrls("vonage", "call", config, {
+      hostOverride: "smoke.example",
+    });
+    const plivoCallbacks = buildProviderCallbackUrls("plivo", "call", config, {
       hostOverride: "smoke.example",
     });
 
@@ -304,8 +389,17 @@ async function runOfflineChecks(runner) {
       "Twilio callback mapping missing /webhook/call-status",
     );
     assert(vonageCallbacks.urls.length >= 2, "Vonage callback mapping missing answer/event URLs");
+    assert(
+      plivoCallbacks.urls.includes("https://smoke.example/plivo/answer"),
+      "Plivo callback mapping missing /plivo/answer",
+    );
+    assert(
+      plivoCallbacks.urls.includes("https://smoke.example/plivo/events"),
+      "Plivo callback mapping missing /plivo/events",
+    );
     return {
       twilio_urls: twilioCallbacks.urls,
+      plivo_urls: plivoCallbacks.urls,
       vonage_urls: vonageCallbacks.urls,
     };
   });
@@ -324,6 +418,13 @@ async function runOfflineChecks(runner) {
       "vonage",
       {
         status: "completed",
+      },
+      { callSid: "CA_SMOKE_1" },
+    );
+    const plivoCompleted = buildCanonicalCallStatusEvent(
+      "plivo",
+      {
+        CallStatus: "completed",
       },
       { callSid: "CA_SMOKE_1" },
     );
@@ -347,10 +448,11 @@ async function runOfflineChecks(runner) {
 
     assert(twilioCompleted.status === "completed", "Twilio canonical status mismatch");
     assert(vonageCompleted.status === "completed", "Vonage canonical completed mapping mismatch");
+    assert(plivoCompleted.status === "completed", "Plivo canonical completed mapping mismatch");
     assert(twilioNoAnswer.status === "no-answer", "Twilio canonical no-answer mismatch");
     assert(vonageNoAnswer.status === "no-answer", "Vonage canonical no-answer mismatch");
     return {
-      canonical_completed: [twilioCompleted.status, vonageCompleted.status],
+      canonical_completed: [twilioCompleted.status, plivoCompleted.status, vonageCompleted.status],
       canonical_no_answer: [twilioNoAnswer.status, vonageNoAnswer.status],
     };
   });

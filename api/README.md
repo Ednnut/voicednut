@@ -23,31 +23,119 @@ For the phased enterprise hardening plan of digit-capture profiles (reprompts, r
 
 - `api/docs/digit-capture-enterprise-roadmap.md`
 
-## AWS Connect Mode
+## Plivo Mode
 
-Twilio Media Streams is still supported, but the API now ships with an AWS-native path that uses Amazon Connect, Kinesis/Transcribe, and Polly for end-to-end audio orchestration. Flip the provider by setting `CALL_PROVIDER=aws` and providing the following environment variables:
+Twilio Media Streams is still supported, and the selectable alternate provider is now Plivo. Flip the provider by setting `CALL_PROVIDER=plivo` and providing the following environment variables:
 
-- `AWS_REGION`, `AWS_CONNECT_INSTANCE_ID`, and `AWS_CONNECT_CONTACT_FLOW_ID`
-- `AWS_POLLY_OUTPUT_BUCKET` (Polly audio will be persisted here for Connect to play)
-- `AWS_PINPOINT_APPLICATION_ID` and `AWS_PINPOINT_ORIGINATION_NUMBER` for SMS
-- `AWS_WEBHOOK_VALIDATION` and one of:
-  - API HMAC headers (`x-api-timestamp`, `x-api-signature`) on `POST /webhook/aws/status` and `POST /aws/transcripts`
-  - or `AWS_WEBHOOK_SECRET` sent as `x-aws-webhook-secret` for callback forwarders
-- Optional: `AWS_TRANSCRIBE_LANGUAGE_CODE`, custom queue/phone routing, and vocabulary filters
+- `PLIVO_AUTH_ID` and `PLIVO_AUTH_TOKEN`
+- `PLIVO_VOICE_FROM_NUMBER` for outbound calls
+- `PLIVO_SMS_FROM_NUMBER` for outbound SMS
+- `SERVER` or explicit `PLIVO_ANSWER_URL` / `PLIVO_EVENT_URL`
+- `PLIVO_WEBHOOK_VALIDATION` and one of:
+  - API HMAC headers (`x-api-timestamp`, `x-api-signature`)
+  - or `PLIVO_WEBHOOK_SECRET` sent as `x-plivo-webhook-secret`
 
-When running in AWS mode:
+When running in Plivo mode:
 
-- Outbound calls are initiated through `AwsConnectAdapter.startOutboundCall`, which sets Connect contact attributes that your contact flow can read.
-- Real-time transcriptions should be forwarded to the API via the new `POST /aws/transcripts` endpoint (used by the StreamAdapter worker).
-- Contact state changes from Connect can be normalized by posting to `POST /aws/contact-events`.
-- AI responses are synthesized with Polly and queued for playback through contact attributes, so the contact flow can fetch the latest S3 object and play it back to the caller.
-- `WS /aws/stream` requires stream auth query params (`token`, `ts`) or the `AWS_WEBHOOK_SECRET` query/header fallback.
+- Outbound calls are initiated through the Plivo Voice REST API with `answer_url` and lifecycle callback URLs.
+- `GET` or `POST /plivo/answer` returns Plivo XML with a bidirectional `<Stream>` pointed at `WS /plivo/stream`.
+- `POST /plivo/events` normalizes Plivo call lifecycle events into the existing provider status pipeline.
+- Outbound SMS uses the Plivo Message API with `src`, `dst`, and `text`.
 
-Keep the Twilio credentials in place if you want a rapid rollback path—switching the provider back to `twilio` will re-enable the original websocket-based flow without redeploying code.
+Known Plivo parity gaps are explicit and should stay visible during rollout:
+
+- Voice: native Twilio payment flow is not available on Plivo; payment must use SMS fallback or remain disabled.
+- Voice: DTMF/digit-capture parity should be treated as limited until a live Plivo DTMF webhook path is verified.
+- SMS: inbound SMS, delivery receipts, and status reconciliation are not enabled for Plivo in the current route set.
+
+Keep the Twilio credentials in place if you want a rapid rollback path; switching the provider back to `twilio` will re-enable the original websocket-based flow without redeploying code.
+
+Local Plivo smoke command:
+
+```bash
+npm run smoke:plivo --prefix api
+```
+
+By default this validates local configuration and optional API preflight only. To place a real Plivo call and send a real SMS, configure a public HTTPS `SERVER` or explicit Plivo URLs, set real Plivo credentials and test target numbers, then run:
+
+```bash
+PLIVO_SMOKE_LIVE=1 \
+PLIVO_SMOKE_TO_NUMBER=+15555550123 \
+npm run smoke:plivo --prefix api
+```
+
+Production webhook validation should use `PLIVO_WEBHOOK_VALIDATION=strict` with either API HMAC headers through ingress or `PLIVO_WEBHOOK_SECRET` passed as `x-plivo-webhook-secret`.
+
+Reference docs:
+
+- Plivo Voice Call API: https://www.plivo.com/docs/voice/api/call/overview
+- Plivo Message API: https://www.plivo.com/docs/messaging/api/message/send-a-message
+- Plivo Audio Stream protocol: https://www.plivo.com/docs/voice/audio-streaming/audio-streaming
+
+## PayPal Payment Connector
+
+Payment tools stay behind the existing connector policy gates: payment feature flags, scoped payment key, write confirmation, amount limits, and refund double-confirmation. To route those tools to PayPal instead of the stub connector, set `payment_connector=paypal` on the call/template or enable `PAYPAL_CONNECTOR_ENABLED=true`.
+
+Required environment:
+
+```bash
+PAYPAL_CONNECTOR_ENABLED=true
+PAYPAL_ENVIRONMENT=sandbox
+PAYPAL_CLIENT_ID=...
+PAYPAL_CLIENT_SECRET=...
+PAYPAL_WEBHOOK_ID=...
+PAYPAL_RETURN_URL=https://your-app.example/paypal/return
+PAYPAL_CANCEL_URL=https://your-app.example/paypal/cancel
+PAYPAL_AGENT_TOOLKIT_READ_TOOLS=get_invoice,get_order,get_refund,list_invoices
+CONNECTOR_PAYMENT_API_KEY=...
+```
+
+The current integration uses PayPal REST APIs through the existing `payment_link_generate`, `invoice_create`, `payment_intent_status`, `payment_session_history`, and `refund_request_initiate` tool surface. Configure the PayPal app webhook URL as `https://your-app.example/webhook/paypal`; incoming events are verified with `PAYPAL_WEBHOOK_ID`, deduplicated by PayPal event ID, and reconciled into `paypal_payment_sessions` for checkout order, capture, refund, and invoice status updates. Agents can call `payment_session_history` to inspect local PayPal session and webhook history by order, invoice, refund, or call SID without making a live PayPal API request.
+
+The official `@paypal/agent-toolkit` package is integrated behind the same service boundary. Use `paypal_agent_toolkit_manifest` with `payment_connector=paypal` or `PAYPAL_CONNECTOR_ENABLED=true` to inspect the configured AI SDK tool names and descriptions without exposing raw SDK handlers or credentials. Use `paypal_agent_toolkit_execute` only for the allowlisted read-only toolkit tools: `get_invoice`, `get_order`, `get_refund`, and `list_invoices`. `PAYPAL_AGENT_TOOLKIT_READ_TOOLS` can narrow that list for an environment, but unsafe write/payment-mutating toolkit tools are ignored even if included. Direct card data is blocked before toolkit execution; use PayPal-hosted/tokenized flows only. Live payment, invoice creation/sending, and refund execution remain on the existing approval-gated tools above.
+
+PayPal production observability reuses the existing database-backed health and call metric tables. Connector executions, webhook signature checks, and webhook reconciliation outcomes write sanitized `paypal_connector` entries to `service_health_logs`; call-scoped connector executions also write `paypal_connector_event` rows to `call_metrics`. These records include action names, statuses, tool names, event IDs, event types, and update counts only; raw PayPal payloads, tool input, card-like values, credentials, and SDK responses are not logged.
+
+Sandbox smoke validation is available with `npm run smoke:paypal --prefix api`. With credentials present, the default run validates configuration without making live PayPal calls. Set `PAYPAL_SMOKE_LIVE=1` to create a sandbox checkout order through `payment_link_generate` and read it back through the read-only `get_order` Agent Toolkit tool. The smoke script does not capture, refund, or send invoices.
+
+PayPal readiness can also be checked through the provider preflight gate without changing the active call/SMS/email provider:
+
+```bash
+npm run preflight:provider --prefix api -- --channel payment --provider paypal --network 0 --reachability 0
+```
+
+For promotion, run it with `--network 1 --reachability 1` so the preflight verifies PayPal OAuth credentials and the public callback base URL. The PayPal preflight checks required credentials, `PAYPAL_WEBHOOK_ID` signature validation configuration, `POST /webhook/paypal` route registration, HTTPS webhook URL generation, and the read-only Agent Toolkit allowlist.
+
+## Stripe Payment Connector
+
+Stripe can use the same approval-gated payment tools as PayPal without adding a Stripe SDK dependency. To route tool calls to Stripe, set `payment_connector=stripe` on the call/template or enable `STRIPE_CONNECTOR_ENABLED=true`.
+
+Required environment:
+
+```bash
+STRIPE_CONNECTOR_ENABLED=true
+STRIPE_ENVIRONMENT=test
+STRIPE_SECRET_KEY=...
+STRIPE_WEBHOOK_SECRET=...
+STRIPE_RETURN_URL=https://your-app.example/stripe/return
+STRIPE_CANCEL_URL=https://your-app.example/stripe/cancel
+STRIPE_API_VERSION=2026-02-25.clover
+CONNECTOR_PAYMENT_API_KEY=...
+```
+
+The Stripe connector supports hosted Checkout Session creation through `payment_link_generate`, invoice creation/finalization/sending through `invoice_create`, live status lookups through `payment_intent_status`, local session/event history through `payment_session_history`, and guarded refunds through `refund_request_initiate`. Configure the Stripe webhook URL as `https://your-app.example/webhook/stripe`; incoming events are verified with `STRIPE_WEBHOOK_SECRET`, deduplicated by Stripe event ID, and reconciled into `stripe_payment_sessions`.
+
+Smoke validation is available with `npm run smoke:stripe --prefix api`. The default run validates configuration only; set `STRIPE_SMOKE_LIVE=1` to create and read back a test-mode Checkout Session. Readiness can also be checked with:
+
+```bash
+npm run preflight:provider --prefix api -- --channel payment --provider stripe --network 0 --reachability 0
+```
+
+For promotion, run it with `--network 1 --reachability 1` so preflight verifies Stripe credentials, HTTPS callback generation, `STRIPE_WEBHOOK_SECRET`, and `POST /webhook/stripe` route registration.
 
 ## Provider Preflight Gate and Parity Smoke
 
-Provider activation is fail-closed for `twilio` and `vonage` on `call` and `sms` channels:
+Provider activation is fail-closed for `twilio`, `plivo`, and `vonage` on `call` and `sms` channels:
 
 - `POST /admin/provider` now runs provider preflight before activation.
 - On preflight failure, activation is blocked and the currently active provider remains in place.
@@ -58,7 +146,7 @@ Preflight checks include:
 - Credential/auth probe (minimal safe provider API call).
 - Webhook auth mode + signing secret + validation guard coverage.
 - Callback URL configuration and optional reachability probe.
-- Required route registration for voice and SMS webhooks.
+- Required route registration for voice, SMS, and payment webhooks.
 
 CLI helper:
 
@@ -82,7 +170,7 @@ LIVE_SMOKE=1 npm run parity:providers
 - `CALL_JOB_DLQ_ALERT_THRESHOLD` emits health alerts when open call-job DLQ entries exceed the threshold.
 - `CALL_JOB_DLQ_MAX_REPLAYS` limits replay attempts for a single call-job DLQ entry.
 - `WEBHOOK_TELEGRAM_TIMEOUT_MS` sets Telegram send/edit timeout for notification delivery.
-- `EMAIL_REQUEST_TIMEOUT_MS` sets HTTP timeout for SendGrid/Mailgun/SES provider calls.
+- `EMAIL_REQUEST_TIMEOUT_MS` sets HTTP timeout for SendGrid/Mailgun provider calls.
 - `EMAIL_DLQ_ALERT_THRESHOLD` emits health alerts when open email DLQ entries exceed the threshold.
 - `EMAIL_DLQ_MAX_REPLAYS` limits replay attempts for a single email DLQ entry.
 - Admin DLQ control endpoints:

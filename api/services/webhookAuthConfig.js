@@ -37,14 +37,17 @@ function assertTwilioWebhookAuthConfiguration(config = {}) {
   );
 }
 
-function assertAwsWebhookAuthConfiguration(config = {}) {
-  const mode = normalizeMode(config.aws?.webhookValidation);
+function assertPlivoWebhookAuthConfiguration(config = {}) {
+  const mode = normalizeMode(config.plivo?.webhookValidation);
   if (mode !== "strict") return;
-  const hasAwsSecret = hasSecret(config.aws?.webhookSecret);
+  const activeCallProvider = String(config.platform?.provider || "").toLowerCase();
+  const activeSmsProvider = String(config.sms?.provider || "").toLowerCase();
+  if (activeCallProvider !== "plivo" && activeSmsProvider !== "plivo") return;
+  const hasPlivoSecret = hasSecret(config.plivo?.webhookSecret);
   const hasHmacSecret = hasSecret(config.apiAuth?.hmacSecret);
-  if (hasAwsSecret || hasHmacSecret) return;
+  if (hasPlivoSecret || hasHmacSecret) return;
   throw new Error(
-    "AWS_WEBHOOK_VALIDATION is strict but no AWS webhook auth secret is configured. Set AWS_WEBHOOK_SECRET or API_SECRET/API_HMAC_SECRET.",
+    "PLIVO_WEBHOOK_VALIDATION is strict but no Plivo webhook auth secret is configured. Set PLIVO_WEBHOOK_SECRET or API_SECRET/API_HMAC_SECRET.",
   );
 }
 
@@ -61,7 +64,7 @@ function assertWebhookAuthConfiguration(config = {}) {
   assertEmailWebhookAuthConfiguration(config);
   assertVonageWebhookAuthConfiguration(config);
   assertTwilioWebhookAuthConfiguration(config);
-  assertAwsWebhookAuthConfiguration(config);
+  assertPlivoWebhookAuthConfiguration(config);
   assertTelegramWebhookAuthConfiguration(config);
 }
 
@@ -70,6 +73,6 @@ module.exports = {
   assertEmailWebhookAuthConfiguration,
   assertVonageWebhookAuthConfiguration,
   assertTwilioWebhookAuthConfiguration,
-  assertAwsWebhookAuthConfiguration,
+  assertPlivoWebhookAuthConfiguration,
   assertTelegramWebhookAuthConfiguration,
 };

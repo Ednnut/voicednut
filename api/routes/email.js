@@ -2,19 +2,6 @@ const crypto = require('crypto');
 const axios = require('axios');
 const config = require('../config');
 
-let SignatureV4;
-let HttpRequest;
-let Sha256;
-try {
-  ({ SignatureV4 } = require('@aws-sdk/signature-v4'));
-  ({ HttpRequest } = require('@aws-sdk/protocol-http'));
-  ({ Sha256 } = require('@aws-sdk/hash-node'));
-} catch (err) {
-  SignatureV4 = null;
-  HttpRequest = null;
-  Sha256 = null;
-}
-
 function stableStringify(value) {
   if (value === null || typeof value !== 'object') {
     return JSON.stringify(value);
@@ -108,7 +95,7 @@ function safeParseJson(value) {
   }
 }
 
-const SUPPORTED_EMAIL_PROVIDERS = ['sendgrid', 'mailgun', 'ses'];
+const SUPPORTED_EMAIL_PROVIDERS = ['sendgrid', 'mailgun'];
 const RETRYABLE_NETWORK_CODES = new Set([
   'ECONNRESET',
   'ETIMEDOUT',
@@ -328,90 +315,6 @@ class MailgunAdapter extends ProviderAdapter {
   }
 }
 
-class SesAdapter extends ProviderAdapter {
-  constructor(options = {}) {
-    super('ses');
-    this.region = options.region;
-    this.accessKeyId = options.accessKeyId;
-    this.secretAccessKey = options.secretAccessKey;
-    this.sessionToken = options.sessionToken;
-    this.requestTimeoutMs = Number(options.requestTimeoutMs) || 15000;
-  }
-
-  async sendEmail(message) {
-    if (!SignatureV4 || !HttpRequest || !Sha256) {
-      throw new Error('SES adapter requires AWS SDK signing helpers');
-    }
-    if (!this.region || !this.accessKeyId || !this.secretAccessKey) {
-      throw new Error('SES credentials or region missing');
-    }
-
-    const host = `email.${this.region}.amazonaws.com`;
-    const url = `https://${host}/v2/email/outbound-emails`;
-    const body = {
-      FromEmailAddress: message.from,
-      Destination: {
-        ToAddresses: [message.to]
-      },
-      Content: {
-        Simple: {
-          Subject: { Data: message.subject || '' },
-          Body: {
-            ...(message.text ? { Text: { Data: message.text } } : {}),
-            ...(message.html ? { Html: { Data: message.html } } : {})
-          }
-        }
-      },
-      ...(message.headers ? { EmailTags: Object.entries(message.headers).map(([Name, Value]) => ({ Name, Value: String(Value) })) } : {})
-    };
-    if (message.messageId) {
-      body.EmailTags = body.EmailTags || [];
-      body.EmailTags.push({ Name: 'message_id', Value: message.messageId });
-    }
-
-    const request = new HttpRequest({
-      protocol: 'https:',
-      hostname: host,
-      method: 'POST',
-      path: '/v2/email/outbound-emails',
-      headers: {
-        'Content-Type': 'application/json',
-        host
-      },
-      body: JSON.stringify(body)
-    });
-
-    const signer = new SignatureV4({
-      credentials: {
-        accessKeyId: this.accessKeyId,
-        secretAccessKey: this.secretAccessKey,
-        sessionToken: this.sessionToken
-      },
-      region: this.region,
-      service: 'ses',
-      sha256: Sha256
-    });
-
-    const signed = await signer.sign(request);
-    try {
-      const response = await runProviderRequestWithTimeout({
-        timeoutMs: this.requestTimeoutMs,
-        provider: this.providerName,
-        action: 'send_email',
-        request: ({ signal, timeoutMs }) => axios.post(url, body, {
-          timeout: timeoutMs,
-          signal,
-          headers: signed.headers,
-        }),
-      });
-      const providerMessageId = response.data?.MessageId || null;
-      return { providerMessageId, response: response.data };
-    } catch (err) {
-      throw this.mapError(err);
-    }
-  }
-}
-
 class EmailService {
   constructor({
     db,
@@ -488,11 +391,6 @@ class EmailService {
     return {
       sendgrid: !!this.config?.sendgrid?.apiKey,
       mailgun: !!(this.config?.mailgun?.apiKey && this.config?.mailgun?.domain),
-      ses: !!(
-        this.config?.ses?.region &&
-        this.config?.ses?.accessKeyId &&
-        this.config?.ses?.secretAccessKey
-      ),
     };
   }
 
@@ -510,11 +408,6 @@ class EmailService {
     } else if (resolved === 'mailgun') {
       adapter = new MailgunAdapter({
         ...(this.config.mailgun || {}),
-        requestTimeoutMs: this.requestTimeoutMs,
-      });
-    } else if (resolved === 'ses') {
-      adapter = new SesAdapter({
-        ...(this.config.ses || {}),
         requestTimeoutMs: this.requestTimeoutMs,
       });
     } else {

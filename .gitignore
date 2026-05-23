@@ -54,7 +54,12 @@ tests/
 #
 # Local databases or data files
 api/db/data.db
+api/db/data.db-shm
+api/db/data.db-wal
 bot/db/data.db
+
+# Local Codex runtime marker
+.codex
 
 # Instruction files
 .github/implementation.md
