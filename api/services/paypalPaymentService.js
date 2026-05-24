@@ -1,6 +1,7 @@
 "use strict";
 
 const crypto = require("crypto");
+const { normalizePaymentEvent } = require("./paymentEventNormalizer");
 
 const DEFAULT_TIMEOUT_MS = 7000;
 const PAYPAL_AGENT_TOOLKIT_PACKAGE = "@paypal/agent-toolkit";
@@ -306,6 +307,32 @@ function collectPaypalWebhookSessionIds(resource = {}) {
   return Array.from(ids);
 }
 
+function buildFailureSummary(provider, history = {}, nowIso) {
+  const sessions = Array.isArray(history.sessions) ? history.sessions : [];
+  const events = Array.isArray(history.events) ? history.events : [];
+  const records = [...sessions, ...events];
+  const failedStatuses = new Set(["CANCELLED", "DENIED", "REVERSED", "VOIDED"]);
+  const successStatuses = new Set(["COMPLETED", "PAID"]);
+  const failed = records.filter((record) =>
+    failedStatuses.has(normalizePaypalStatus(record.status || record.status_value, "")),
+  );
+  const successful = records.filter((record) =>
+    successStatuses.has(normalizePaypalStatus(record.status || record.status_value, "")),
+  );
+  const latestFailure = failed[0] || null;
+  return {
+    provider,
+    provider_action: "payment_failure_summary",
+    payment_intent_id: history.payment_intent_id || history.query?.external_id || null,
+    call_sid: history.query?.call_sid || null,
+    failed_attempts: failed.length,
+    successful_payments: successful.length,
+    latest_failure: latestFailure,
+    recommended_action: failed.length > 0 && successful.length === 0 ? "send_retry_link" : "none",
+    updated_at: history.updated_at || nowIso,
+  };
+}
+
 async function findPreferredPaypalSessionId(db, sessionIds = [], fallbackId = null) {
   const normalizedFallback = normalizeText(fallbackId, 160);
   const ids = Array.from(
@@ -368,7 +395,11 @@ class PaypalPaymentService {
       }, context);
       return result;
     }
-    const isLocalHistoryAction = actionName === "payment_session_history";
+    const isLocalHistoryAction = new Set([
+      "payment_session_history",
+      "payment_failure_summary",
+      "customer_payment_profile",
+    ]).has(actionName);
     if (!this.isConfigured() && !isLocalHistoryAction) {
       const result = {
         error: "paypal_not_configured",
@@ -385,12 +416,23 @@ class PaypalPaymentService {
       let result;
       if (actionName === "payment_link_generate") {
         result = await this.createPaymentLink(args, context);
+      } else if (actionName === "payment_retry_link_generate") {
+        result = await this.createPaymentLink(args, context, {
+          action: "payment_retry_link_generate",
+          recovery: true,
+        });
       } else if (actionName === "invoice_create") {
         result = await this.createInvoice(args, context);
+      } else if (actionName === "invoice_reminder_send") {
+        result = await this.sendInvoiceReminder(args, context);
       } else if (actionName === "payment_intent_status") {
         result = await this.getPaymentStatus(args, context);
       } else if (actionName === "payment_session_history") {
         result = await this.getPaymentSessionHistory(args, context);
+      } else if (actionName === "payment_failure_summary") {
+        result = await this.getPaymentFailureSummary(args, context);
+      } else if (actionName === "customer_payment_profile") {
+        result = await this.getCustomerPaymentProfile(args, context);
       } else if (actionName === "agent_toolkit_manifest") {
         result = await this.getAgentToolkitManifest(args, context);
       } else if (actionName === "agent_toolkit_execute") {
@@ -464,7 +506,7 @@ class PaypalPaymentService {
     await Promise.allSettled(tasks);
   }
 
-  async createPaymentLink(args = {}, context = {}) {
+  async createPaymentLink(args = {}, context = {}, options = {}) {
     const amount = normalizeAmount(args.amount);
     if (!amount) {
       return { error: "invalid_amount", message: "amount must be a positive number." };
@@ -474,7 +516,7 @@ class PaypalPaymentService {
     const description =
       normalizeText(args.description, 127) ||
       normalizeText(context?.callConfig?.payment_description, 127) ||
-      "Voice payment";
+      (options.recovery ? "Voice payment retry" : "Voice payment");
     const order = await this.request("/v2/checkout/orders", {
       method: "POST",
       idempotencyKey: args.idempotency_key || args.idempotencyKey || createRequestId("order"),
@@ -503,7 +545,7 @@ class PaypalPaymentService {
     const approvalUrl = findLink(order.links, "approve");
     await this.saveSession({
       call_sid: context.callSid || null,
-      action: "payment_link_generate",
+      action: options.action || "payment_link_generate",
       external_id: order.id,
       status: order.status || "CREATED",
       amount,
@@ -515,7 +557,7 @@ class PaypalPaymentService {
 
     return {
       provider: "paypal",
-      provider_action: "create_order",
+      provider_action: options.recovery ? "create_recovery_order" : "create_order",
       payment_link_id: order.id,
       payment_intent_id: order.id,
       order_id: order.id,
@@ -525,6 +567,7 @@ class PaypalPaymentService {
       amount: Number(amount),
       currency,
       expires_at: null,
+      recovery: Boolean(options.recovery),
     };
   }
 
@@ -610,6 +653,51 @@ class PaypalPaymentService {
       amount: Number(amount),
       currency,
       due_date: args.due_date || null,
+    };
+  }
+
+  async sendInvoiceReminder(args = {}, context = {}) {
+    const invoiceId = normalizeText(args.invoice_id || args.paypal_invoice_id, 120);
+    if (!invoiceId) {
+      return {
+        error: "missing_paypal_invoice_id",
+        message: "PayPal invoice reminders require invoice_id.",
+      };
+    }
+
+    const idempotencyKey = args.idempotency_key || args.idempotencyKey || createRequestId("invoice-send");
+    await this.request(`/v2/invoicing/invoices/${encodeURIComponent(invoiceId)}/send`, {
+      method: "POST",
+      idempotencyKey,
+      body: {
+        send_to_invoicer: false,
+        send_to_recipient: true,
+      },
+    });
+
+    await this.saveSession({
+      call_sid: context.callSid || null,
+      action: "invoice_reminder_send",
+      external_id: invoiceId,
+      status: "SENT",
+      amount: null,
+      currency: normalizeCurrency(args.currency, this.config.defaultCurrency),
+      approval_url: null,
+      idempotency_key: idempotencyKey,
+      metadata: {
+        connector: "paypal",
+        customer_ref: normalizeText(args.customer_ref, 120) || null,
+      },
+    });
+
+    return {
+      provider: "paypal",
+      provider_action: "send_invoice_reminder",
+      invoice_id: invoiceId,
+      customer_ref: normalizeText(args.customer_ref, 80),
+      reminder_sent: true,
+      status_value: "SENT",
+      sent_at: this.now().toISOString(),
     };
   }
 
@@ -707,6 +795,50 @@ class PaypalPaymentService {
       sessions: normalizedSessions,
       events: normalizedEvents,
       updated_at: latestSession?.updated_at || latestEvent?.created_at || this.now().toISOString(),
+    };
+  }
+
+  async getPaymentFailureSummary(args = {}, context = {}) {
+    const history = await this.getPaymentSessionHistory(args, context);
+    if (history.error) return history;
+    return buildFailureSummary("paypal", history, this.now().toISOString());
+  }
+
+  async getCustomerPaymentProfile(args = {}, context = {}) {
+    const customerRef = normalizeText(
+      args.customer_ref || args.customer_id || args.customer_email,
+      160,
+    );
+    const history = await this.getPaymentSessionHistory(
+      {
+        ...args,
+        call_sid: args.call_sid || context.callSid,
+        limit: args.limit,
+      },
+      context,
+    );
+    if (history.error) return history;
+
+    const sessions = Array.isArray(history.sessions) ? history.sessions : [];
+    const failedStatuses = new Set(["CANCELLED", "DENIED", "REVERSED", "VOIDED"]);
+    const successStatuses = new Set(["COMPLETED", "PAID"]);
+    const successfulPayments = sessions.filter((session) =>
+      successStatuses.has(normalizePaypalStatus(session.status || session.status_value, "")),
+    );
+    const failedPayments = sessions.filter((session) =>
+      failedStatuses.has(normalizePaypalStatus(session.status || session.status_value, "")),
+    );
+    return {
+      provider: "paypal",
+      provider_action: "customer_payment_profile",
+      customer_ref: customerRef || null,
+      call_sid: history.query?.call_sid || null,
+      total_sessions: sessions.length,
+      successful_payments: successfulPayments.length,
+      failed_payments: failedPayments.length,
+      payment_methods: [],
+      latest_session: sessions[0] || null,
+      updated_at: history.updated_at || this.now().toISOString(),
     };
   }
 
@@ -1031,6 +1163,13 @@ class PaypalPaymentService {
       sessionIds,
       resourceId || webhookEvent.resource_id,
     );
+    const normalizedEvent = normalizePaymentEvent("paypal", webhookEvent, {
+      resource,
+      resource_id: preferredResourceId || resourceId || null,
+      status,
+      amount: amount.amount,
+      currency: amount.currency,
+    });
 
     if (typeof this.db?.recordPaypalPaymentEvent === "function") {
       const eventRecord = await this.db.recordPaypalPaymentEvent({
@@ -1038,6 +1177,7 @@ class PaypalPaymentService {
         event_type: eventType,
         resource_id: preferredResourceId || null,
         status,
+        normalized_event: normalizedEvent,
         payload: webhookEvent,
       });
       if (eventRecord?.inserted === false) {
@@ -1048,6 +1188,7 @@ class PaypalPaymentService {
           event_type: eventType,
           resource_id: preferredResourceId || null,
           status,
+          normalized_event: normalizedEvent,
           updated_sessions: 0,
         };
         await this.recordObservability("paypal_webhook_reconcile", "duplicate", {
@@ -1087,6 +1228,7 @@ class PaypalPaymentService {
       event_type: eventType,
       resource_id: preferredResourceId || resourceId || null,
       status,
+      normalized_event: normalizedEvent,
       updated_sessions: updatedSessions,
       ...(ignoredSessionIds.length > 0 ? { ignored_sessions: ignoredSessionIds } : {}),
     };

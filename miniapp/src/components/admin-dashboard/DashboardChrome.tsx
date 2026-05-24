@@ -24,6 +24,7 @@ type DashboardMainHeaderProps = {
   loading: boolean;
   compact?: boolean;
   onOpenSettings: () => void;
+  onOpenOverflowMenu?: () => void;
 };
 
 type DashboardModuleNavProps = {
@@ -39,6 +40,7 @@ type DashboardFocusedHeaderProps = {
   userAvatarFallback: string;
   loading: boolean;
   onOpenSettings: () => void;
+  onOpenOverflowMenu?: () => void;
 };
 
 type DashboardBottomNavProps = {
@@ -55,6 +57,24 @@ type DashboardProfileAvatarButtonProps = {
   compact?: boolean;
   loading: boolean;
   onOpenSettings: () => void;
+};
+
+type DashboardOverflowTriggerProps = {
+  loading: boolean;
+  onOpenOverflowMenu?: () => void;
+};
+
+type DashboardOverflowMenuProps = {
+  open: boolean;
+  loading: boolean;
+  closeDisabled: boolean;
+  settingsStatusLabel: string;
+  featureFlagsCount: number | string;
+  onClose: () => void;
+  onOpenSettings: () => void;
+  onRefreshDashboard: () => void;
+  onShareMiniApp: () => void;
+  onCloseMiniApp?: () => void;
 };
 
 function DashboardProfileAvatarButton({
@@ -98,6 +118,35 @@ function resolveHeaderPosture(sessionRole: string): { label: string; tone: 'succ
   return { label: 'Ready for work', tone: 'info' };
 }
 
+function formatFeatureFlagsLabel(featureFlagsCount: number | string): string {
+  if (typeof featureFlagsCount === 'number') {
+    return featureFlagsCount > 0 ? `${featureFlagsCount} active` : 'default';
+  }
+  const normalized = String(featureFlagsCount).trim();
+  return normalized.length > 0 ? normalized : 'default';
+}
+
+function DashboardOverflowTrigger({
+  loading,
+  onOpenOverflowMenu,
+}: DashboardOverflowTriggerProps) {
+  if (!onOpenOverflowMenu) {
+    return null;
+  }
+  return (
+    <UiButton
+      variant="plain"
+      className="va-overflow-trigger"
+      aria-label="Open Mini App menu"
+      title="Open menu"
+      onClick={onOpenOverflowMenu}
+      disabled={loading}
+    >
+      <span className="va-overflow-dots" aria-hidden>...</span>
+    </UiButton>
+  );
+}
+
 export function DashboardMainHeader({
   userLabel,
   userAvatarUrl,
@@ -111,20 +160,19 @@ export function DashboardMainHeader({
   loading,
   compact = false,
   onOpenSettings,
+  onOpenOverflowMenu,
 }: DashboardMainHeaderProps) {
   const posture = resolveHeaderPosture(sessionRole);
   const normalizedRoleSource = sessionRoleSource.replace(/_/g, ' ');
   const sessionIdentityLabel = describeSessionIdentityLabel(sessionRole);
   const sessionAccessLabel = describeSessionRole(sessionRole);
   const sessionSourceLabel = describeSessionSource(sessionRole, sessionRoleSource);
-  const flagsLabel = typeof featureFlagsCount === 'number'
-    ? `${featureFlagsCount} active`
-    : String(featureFlagsCount);
+  const flagsLabel = formatFeatureFlagsLabel(featureFlagsCount);
 
   return (
     <header className={`va-title-card va-header${compact ? ' is-compact' : ''}`}>
-      <div className="va-title-card-head va-header-primary">
-        <div className="va-title-card-avatar-shell va-header-avatar-shell">
+      <div className="va-telegram-topbar">
+        <div className="va-telegram-topbar-left">
           <DashboardProfileAvatarButton
             userLabel={userLabel}
             userAvatarUrl={userAvatarUrl}
@@ -133,45 +181,53 @@ export function DashboardMainHeader({
             loading={loading}
             onOpenSettings={onOpenSettings}
           />
-        </div>
-        <div className="va-title-card-copy va-header-copy">
-          <div className="va-title-card-eyebrow-row va-header-eyebrow-row">
-            <p className="va-title-card-eyebrow va-header-eyebrow">Telegram operations workspace</p>
-            <span className="va-title-card-chip va-header-brand-chip">Mini App</span>
-          </div>
-          <div className="va-title-card-title-row va-header-title-row">
-            <h1 className="va-title-card-title">VOICEDNUT</h1>
-            <span className={`va-title-card-chip va-header-posture is-${posture.tone}`}>{posture.label}</span>
-          </div>
-          <p className="va-title-card-subtitle va-header-subtitle">Operations command center</p>
-          <div className="va-title-card-story va-header-story">
-            <p className="va-title-card-note va-header-lead">
-              One professional workspace for delivery, calling, provider health, and incident response.
-            </p>
-            <p className="va-module-context-line va-muted">
-              <span className="va-module-context-icon" aria-hidden>{activeModuleGlyph}</span>
-              <span>{moduleDetail}</span>
-            </p>
+          <div className="va-telegram-app-title">
+            <span>Voicednut</span>
+            <small>Mini App admin</small>
           </div>
         </div>
+        <DashboardOverflowTrigger
+          loading={loading}
+          onOpenOverflowMenu={onOpenOverflowMenu}
+        />
       </div>
-      <div className="va-title-card-meta va-header-meta">
-        <div className="va-title-card-stat va-header-signal-card">
-          <span className="va-title-card-stat-label va-header-signal-label">{sessionIdentityLabel}</span>
-          <strong>{userLabel}</strong>
-          <span className="va-title-card-note va-header-signal-note">{sessionSourceLabel}</span>
+
+      <div className="va-wallet-hero">
+        <div className="va-wallet-hero-copy">
+          <span className={`va-wallet-status-pill is-${posture.tone}`}>{posture.label}</span>
+          <h1 className="va-title-card-title">VOICEDNUT</h1>
+          <p className="va-module-context-line va-muted">
+            <span className="va-module-context-icon" aria-hidden>{activeModuleGlyph}</span>
+            <span>{moduleDetail}</span>
+          </p>
         </div>
-        <div className="va-title-card-stat-grid va-header-signal-grid">
-          <div className="va-title-card-stat va-header-signal-card">
-            <span className="va-title-card-stat-label va-header-signal-label">Access</span>
+        <div className="va-wallet-hero-glyph" aria-hidden>{activeModuleGlyph}</div>
+      </div>
+
+      <div className="va-wallet-action-grid" aria-label="Workspace summary">
+        <div className="va-wallet-action-card">
+          <span className="va-wallet-action-icon" aria-hidden>U</span>
+          <span className="va-wallet-action-copy">
+            <small>{sessionIdentityLabel}</small>
+            <strong>{userLabel}</strong>
+            <em>{sessionSourceLabel}</em>
+          </span>
+        </div>
+        <div className="va-wallet-action-card">
+          <span className="va-wallet-action-icon" aria-hidden>A</span>
+          <span className="va-wallet-action-copy">
+            <small>Access</small>
             <strong>{sessionAccessLabel}</strong>
-            <span className="va-title-card-note va-header-signal-note">Source {normalizedRoleSource}</span>
-          </div>
-          <div className="va-title-card-stat va-header-signal-card">
-            <span className="va-title-card-stat-label va-header-signal-label">Workspace</span>
+            <em>Source {normalizedRoleSource}</em>
+          </span>
+        </div>
+        <div className="va-wallet-action-card">
+          <span className="va-wallet-action-icon" aria-hidden>W</span>
+          <span className="va-wallet-action-copy">
+            <small>Workspace</small>
             <strong>{settingsStatusLabel}</strong>
-            <span className="va-title-card-note va-header-signal-note">Feature flags {flagsLabel}</span>
-          </div>
+            <em>Flags {flagsLabel}</em>
+          </span>
         </div>
       </div>
     </header>
@@ -212,33 +268,122 @@ export function DashboardFocusedHeader({
   userAvatarFallback,
   loading,
   onOpenSettings,
+  onOpenOverflowMenu,
 }: DashboardFocusedHeaderProps) {
   return (
     <header className="va-title-card va-focused-header">
-      <div className="va-title-card-head va-focused-main">
-        <div className="va-title-card-copy va-focused-copy">
-          <div className="va-title-card-eyebrow-row va-focused-eyebrow-row">
-            <p className="va-title-card-eyebrow va-focused-eyebrow">Focused workspace</p>
-            <span className="va-title-card-chip va-focused-chip">Live module</span>
-          </div>
-          <h2 className="va-page-title va-title-card-title">{title}</h2>
-          <p className="va-title-card-subtitle va-focused-subtitle">Operations workspace</p>
-          <div className="va-title-card-story va-focused-story">
-            <p className="va-muted va-title-card-note">{subtitle}</p>
+      <div className="va-telegram-topbar">
+        <div className="va-telegram-topbar-left">
+          <DashboardProfileAvatarButton
+            userLabel={title}
+            userAvatarUrl={userAvatarUrl}
+            userAvatarFallback={userAvatarFallback}
+            compact
+            loading={loading}
+            onOpenSettings={onOpenSettings}
+          />
+          <div className="va-telegram-app-title">
+            <span>{title}</span>
+            <small>Focused workspace</small>
           </div>
         </div>
-      </div>
-      <div className="va-title-card-actions va-focused-actions">
-        <DashboardProfileAvatarButton
-          userLabel={title}
-          userAvatarUrl={userAvatarUrl}
-          userAvatarFallback={userAvatarFallback}
-          compact
+        <DashboardOverflowTrigger
           loading={loading}
-          onOpenSettings={onOpenSettings}
+          onOpenOverflowMenu={onOpenOverflowMenu}
         />
       </div>
+      <div className="va-focused-summary">
+        <h2 className="va-page-title va-title-card-title">{title}</h2>
+        <p className="va-muted va-title-card-note">{subtitle}</p>
+      </div>
     </header>
+  );
+}
+
+export function DashboardOverflowMenu({
+  open,
+  loading,
+  closeDisabled,
+  settingsStatusLabel,
+  featureFlagsCount,
+  onClose,
+  onOpenSettings,
+  onRefreshDashboard,
+  onShareMiniApp,
+  onCloseMiniApp,
+}: DashboardOverflowMenuProps) {
+  if (!open) {
+    return null;
+  }
+
+  return (
+    <>
+      <button
+        type="button"
+        className="va-overflow-backdrop"
+        aria-label="Close Mini App menu"
+        onClick={onClose}
+      />
+      <aside className="va-overflow-menu" role="dialog" aria-modal="true" aria-label="Mini App menu">
+        <div className="va-overflow-menu-head">
+          <span>
+            <strong>Voicednut</strong>
+            <small>{settingsStatusLabel}</small>
+          </span>
+          <UiButton
+            variant="plain"
+            className="va-overflow-close"
+            aria-label="Close menu"
+            onClick={onClose}
+          >
+            x
+          </UiButton>
+        </div>
+        <div className="va-overflow-menu-meta">
+          <span>Feature flags</span>
+          <strong>{formatFeatureFlagsLabel(featureFlagsCount)}</strong>
+        </div>
+        <div className="va-overflow-menu-list">
+          <UiButton
+            variant="plain"
+            className="va-overflow-menu-row"
+            onClick={onOpenSettings}
+            disabled={loading}
+          >
+            <span aria-hidden>S</span>
+            <strong>Settings</strong>
+          </UiButton>
+          <UiButton
+            variant="plain"
+            className="va-overflow-menu-row"
+            onClick={onRefreshDashboard}
+            disabled={loading}
+          >
+            <span aria-hidden>R</span>
+            <strong>Refresh workspace</strong>
+          </UiButton>
+          <UiButton
+            variant="plain"
+            className="va-overflow-menu-row"
+            onClick={onShareMiniApp}
+          >
+            <span aria-hidden>L</span>
+            <strong>Share Mini App</strong>
+          </UiButton>
+          {onCloseMiniApp ? (
+            <UiButton
+              variant="plain"
+              className="va-overflow-menu-row is-danger"
+              onClick={onCloseMiniApp}
+              disabled={closeDisabled}
+            >
+              <span aria-hidden>X</span>
+              <strong>Close Mini App</strong>
+            </UiButton>
+          ) : null}
+        </div>
+      </aside>
+    </>
   );
 }
 

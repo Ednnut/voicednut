@@ -129,6 +129,12 @@ const {
   evaluateCallCanarySloGuardrail,
 } = require("./services/callCanary");
 const { runPostCallQaEvaluation } = require("./services/postCallQaService");
+const { PostCallAutomationService } = require("./services/postCallAutomationService");
+const {
+  buildCallCompletionAutomationPayload,
+  runPostCallAutomationTrigger,
+} = require("./services/postCallAutomationTriggers");
+const { CrmContactSyncService } = require("./services/crmContactSyncService");
 const { assertWebhookAuthConfiguration } = require("./services/webhookAuthConfig");
 const {
   VOICE_RUNTIME_CONTROL_SETTING_KEY,
@@ -242,6 +248,8 @@ let smsService = new EnhancedSmsService({
   getActiveProvider: () => getActiveSmsProvider(),
 });
 let emailService;
+let crmContactSyncService;
+let postCallAutomationService;
 const sttFallbackCalls = new Set();
 const streamTimeoutCalls = new Set();
 const inboundRateBuckets = new Map();
@@ -11755,6 +11763,8 @@ function applyTelephonyTools(
         },
         db,
         webhookService,
+        emailService,
+        crmContactSyncService,
         getPaymentFeatureConfig,
         isPaymentFeatureEnabledForProvider,
         getCurrentProvider: () => currentProvider,
@@ -14422,6 +14432,23 @@ async function startServer(options = {}) {
       config,
       providerResolver: () => getActiveEmailProvider(),
     });
+    crmContactSyncService = new CrmContactSyncService({
+      db,
+      config: config.crm || {},
+      logger: console,
+    });
+    postCallAutomationService = new PostCallAutomationService({
+      db,
+      emailService,
+      crmService: crmContactSyncService,
+      logger: console,
+    });
+    const defaultAutomationRules = await postCallAutomationService.ensureDefaultRules();
+    if (defaultAutomationRules.installed > 0) {
+      console.log(
+        `✅ Installed ${defaultAutomationRules.installed} default post-call automation rule(s)`,
+      );
+    }
     await loadStoredCallProvider();
     await loadStoredSmsProvider();
     await loadStoredEmailProvider();
@@ -18028,6 +18055,23 @@ async function handleCallEnd(callSid, callStartTime) {
           .catch(() => {});
       });
 
+    void runPostCallAutomationTrigger({
+      service: postCallAutomationService,
+      webhookService,
+      db,
+      logger: console,
+      callSid,
+      payload: buildCallCompletionAutomationPayload({
+        callSid,
+        call: qaCallRecord,
+        transcripts,
+        summary,
+        finalStatus,
+        notificationType,
+        duration,
+      }),
+    });
+
     // Create enhanced webhook notification for completion
     if (callDetails && callDetails.user_chat_id) {
       if (callDetails.last_otp) {
@@ -19127,6 +19171,10 @@ async function buildMiniAppBootstrapPayload(req) {
 
 const MINI_APP_SUPPORTED_ACTIONS = Object.freeze([
   "audit.feed",
+  "automation.preview",
+  "automation.rules.list",
+  "automation.run.retry",
+  "automation.runs.list",
   "callback_tasks.list",
   "review_cases.list",
   "callerflags.list",
@@ -19151,6 +19199,7 @@ const MINI_APP_SUPPORTED_ACTIONS = Object.freeze([
   "email.bulk.stats",
   "email.message.status",
   "email.preview",
+  "email.provider.health",
   "emailtemplate.create",
   "emailtemplate.delete",
   "emailtemplate.get",
@@ -19158,6 +19207,7 @@ const MINI_APP_SUPPORTED_ACTIONS = Object.freeze([
   "emailtemplate.update",
   "incidents.summary",
   "persona.list",
+  "crm.health",
   "provider.get",
   "provider.preflight",
   "provider.rollback",
@@ -19206,7 +19256,21 @@ const MINI_APP_DASHBOARD_MODULE_DEFINITIONS = [
     label: "Ops Dashboard",
     capability: "dashboard_view",
     command: "/status",
-    action_contracts: ["runtime.status", "calls.list", "calls.search", "calls.get", "calls.events", "callback_tasks.list", "review_cases.list"],
+    action_contracts: [
+      "runtime.status",
+      "calls.list",
+      "calls.search",
+      "calls.get",
+      "calls.events",
+      "callback_tasks.list",
+      "review_cases.list",
+      "email.provider.health",
+      "crm.health",
+      "automation.rules.list",
+      "automation.preview",
+      "automation.runs.list",
+      "automation.run.retry",
+    ],
     order: 0,
     enabled: true,
   },
@@ -19231,6 +19295,7 @@ const MINI_APP_DASHBOARD_MODULE_DEFINITIONS = [
       "email.bulk.job",
       "email.bulk.history",
       "email.bulk.stats",
+      "email.provider.health",
     ],
     order: 2,
     enabled: true,
@@ -19240,7 +19305,7 @@ const MINI_APP_DASHBOARD_MODULE_DEFINITIONS = [
     label: "Provider Control",
     capability: "provider_manage",
     command: "/provider",
-    action_contracts: ["provider.preflight", "provider.set", "provider.rollback"],
+    action_contracts: ["provider.preflight", "provider.set", "provider.rollback", "crm.health"],
     order: 3,
     enabled: true,
   },
@@ -20433,6 +20498,133 @@ function buildMiniAppActionSpec(action, payload = {}) {
     };
   }
 
+  if (normalizedAction === "email.provider.health") {
+    const provider = String(input.provider || "")
+      .trim()
+      .toLowerCase();
+    const mode = String(input.mode || "")
+      .trim()
+      .toLowerCase();
+    const body = {
+      ...(input && typeof input === "object" ? input : {}),
+      provider: provider || undefined,
+      live: input.live === true || mode === "live",
+    };
+    if (!body.provider) {
+      delete body.provider;
+    }
+    return {
+      capability: "email_bulk_manage",
+      method: "POST",
+      path: "/email/provider-health",
+      body,
+    };
+  }
+
+  if (normalizedAction === "crm.health") {
+    const provider = String(input.provider || "")
+      .trim()
+      .toLowerCase();
+    const body = {
+      ...(input && typeof input === "object" ? input : {}),
+      provider: provider || undefined,
+    };
+    if (!body.provider) {
+      delete body.provider;
+    }
+    return {
+      capability: "provider_manage",
+      method: "POST",
+      path: "/crm/contact-sync/health",
+      body,
+    };
+  }
+
+  if (normalizedAction === "automation.rules.list") {
+    const limit = parseBoundedInteger(input.limit, {
+      defaultValue: 20,
+      min: 1,
+      max: 100,
+    });
+    const triggerEvent = String(input.trigger_event || input.triggerEvent || input.trigger || "")
+      .trim()
+      .toLowerCase();
+    const query = { limit };
+    if (triggerEvent) {
+      query.trigger_event = triggerEvent;
+    }
+    if (input.enabled !== undefined) {
+      query.enabled = String(input.enabled).toLowerCase() !== "false";
+    }
+    return {
+      capability: "dashboard_view",
+      method: "GET",
+      path: "/post-call/automation/rules",
+      query,
+    };
+  }
+
+  if (normalizedAction === "automation.preview") {
+    return {
+      capability: "dashboard_view",
+      method: "POST",
+      path: "/post-call/automation/preview",
+      body:
+        input && typeof input === "object"
+          ? input
+          : {},
+    };
+  }
+
+  if (normalizedAction === "automation.runs.list") {
+    const limit = parseBoundedInteger(input.limit, {
+      defaultValue: 12,
+      min: 1,
+      max: 100,
+    });
+    const query = { limit };
+    const callSid = String(input.call_sid || input.callSid || "").trim();
+    const ruleId = String(input.rule_id || input.ruleId || "").trim();
+    const status = String(input.status || "").trim().toLowerCase();
+    const triggerEvent = String(input.trigger_event || input.triggerEvent || input.trigger || "")
+      .trim()
+      .toLowerCase();
+    const retryOfRunId = String(input.retry_of_run_id || input.retryOfRunId || "").trim();
+    if (callSid) query.call_sid = callSid;
+    if (ruleId) query.rule_id = ruleId;
+    if (status) query.status = status;
+    if (triggerEvent) query.trigger_event = triggerEvent;
+    if (retryOfRunId) query.retry_of_run_id = retryOfRunId;
+    return {
+      capability: "dashboard_view",
+      method: "GET",
+      path: "/post-call/automation/runs",
+      query,
+    };
+  }
+
+  if (normalizedAction === "automation.run.retry") {
+    const runId = String(input.run_id || input.runId || input.id || "").trim();
+    if (!isSafeId(runId, { max: 160 })) {
+      return { error: "Valid run_id is required" };
+    }
+    const payloadOverrides =
+      input.payload_overrides
+      && typeof input.payload_overrides === "object"
+      && !Array.isArray(input.payload_overrides)
+        ? input.payload_overrides
+        : undefined;
+    return {
+      capability: "provider_manage",
+      method: "POST",
+      path: `/post-call/automation/runs/${encodeURIComponent(runId)}/retry`,
+      body: {
+        force: input.force === true,
+        payload_overrides: payloadOverrides,
+      },
+    };
+  }
+
   if (normalizedAction === "sms.bulk.status") {
     const limit = parseBoundedInteger(input.limit, {
       defaultValue: 10,
@@ -20727,8 +20919,11 @@ function buildMiniAppActionSpec(action, payload = {}) {
 }
 
 const MINI_APP_READ_ONLY_POST_ACTIONS = new Set([
+  "automation.preview",
   "callscript.simulate",
+  "crm.health",
   "email.preview",
+  "email.provider.health",
 ]);
 
 function requiresMiniAppActionIdempotency(action, spec = {}) {
@@ -25833,6 +26028,399 @@ app.post("/email/preview", requireOutboundAuthorization, async (req, res) => {
   }
 });
 
+app.post("/email/provider-health", requireOutboundAuthorization, async (req, res) => {
+  try {
+    if (!emailService) {
+      return sendApiError(
+        res,
+        500,
+        "email_service_unavailable",
+        "Email service not initialized",
+        req.requestId,
+      );
+    }
+    const payload = { ...(req.body || {}) };
+    if (!payload.provider) {
+      payload.provider = getActiveEmailProvider();
+    }
+    const result = await runWithTimeout(
+      emailService.validateProviderHealth(payload),
+      Number(config.outboundLimits?.handlerTimeoutMs) || 30000,
+      "email provider health handler",
+      "email_handler_timeout",
+    );
+    res.status(result.ok ? 200 : 422).json({
+      success: result.ok,
+      request_id: req.requestId || null,
+      ...result,
+    });
+  } catch (error) {
+    const status =
+      error.code === "email_handler_timeout"
+        ? 504
+        : error.code === "validation_error"
+          ? 400
+          : 500;
+    sendApiError(
+      res,
+      status,
+      error.code || "email_provider_health_failed",
+      error.message || "Email provider health check failed",
+      req.requestId,
+    );
+  }
+});
+
+app.post("/email/sendgrid/health-check", requireOutboundAuthorization, async (req, res) => {
+  try {
+    if (!emailService) {
+      return sendApiError(
+        res,
+        500,
+        "email_service_unavailable",
+        "Email service not initialized",
+        req.requestId,
+      );
+    }
+    const result = await runWithTimeout(
+      emailService.validateProviderHealth({ ...(req.body || {}), provider: "sendgrid" }),
+      Number(config.outboundLimits?.handlerTimeoutMs) || 30000,
+      "sendgrid health handler",
+      "email_handler_timeout",
+    );
+    res.status(result.ok ? 200 : 422).json({
+      success: result.ok,
+      request_id: req.requestId || null,
+      ...result,
+    });
+  } catch (error) {
+    const status = error.code === "email_handler_timeout" ? 504 : 500;
+    sendApiError(
+      res,
+      status,
+      error.code || "sendgrid_health_failed",
+      error.message || "SendGrid health check failed",
+      req.requestId,
+    );
+  }
+});
+
+app.post("/email/templates/select", requireOutboundAuthorization, async (req, res) => {
+  try {
+    if (!emailService) {
+      return sendApiError(
+        res,
+        500,
+        "email_service_unavailable",
+        "Email service not initialized",
+        req.requestId,
+      );
+    }
+    const result = await emailService.selectTemplateForContext(req.body || {});
+    res.status(result.selected_template_id ? 200 : 404).json({
+      success: Boolean(result.selected_template_id),
+      request_id: req.requestId || null,
+      ...result,
+    });
+  } catch (error) {
+    sendApiError(
+      res,
+      error.code === "validation_error" ? 400 : 500,
+      error.code || "email_template_selection_failed",
+      error.message || "Email template selection failed",
+      req.requestId,
+    );
+  }
+});
+
+app.get("/post-call/automation/rules", requireOutboundAuthorization, async (req, res) => {
+  try {
+    if (!postCallAutomationService) {
+      return sendApiError(
+        res,
+        500,
+        "post_call_automation_unavailable",
+        "Post-call automation service not initialized",
+        req.requestId,
+      );
+    }
+    const filters = {
+      trigger_event: req.query?.trigger_event,
+      limit: req.query?.limit,
+    };
+    if (req.query?.enabled !== undefined) {
+      filters.enabled = String(req.query.enabled).toLowerCase() !== "false";
+    }
+    const rules = await postCallAutomationService.listRules(filters);
+    res.json({
+      success: true,
+      request_id: req.requestId || null,
+      rules,
+    });
+  } catch (error) {
+    sendApiError(
+      res,
+      500,
+      error.code || "post_call_rules_list_failed",
+      error.message || "Post-call automation rules could not be listed",
+      req.requestId,
+    );
+  }
+});
+
+app.post("/post-call/automation/rules", requireOutboundAuthorization, async (req, res) => {
+  try {
+    if (!postCallAutomationService) {
+      return sendApiError(
+        res,
+        500,
+        "post_call_automation_unavailable",
+        "Post-call automation service not initialized",
+        req.requestId,
+      );
+    }
+    const rule = await postCallAutomationService.upsertRule(req.body || {});
+    res.json({
+      success: true,
+      request_id: req.requestId || null,
+      rule,
+    });
+  } catch (error) {
+    sendApiError(
+      res,
+      error.code === "validation_error" ? 400 : 500,
+      error.code || "post_call_rule_save_failed",
+      error.message || "Post-call automation rule could not be saved",
+      req.requestId,
+    );
+  }
+});
+
+app.post("/post-call/automation/rules/defaults", requireOutboundAuthorization, async (req, res) => {
+  try {
+    if (!postCallAutomationService) {
+      return sendApiError(
+        res,
+        500,
+        "post_call_automation_unavailable",
+        "Post-call automation service not initialized",
+        req.requestId,
+      );
+    }
+    const result = await postCallAutomationService.ensureDefaultRules({
+      overwrite: req.body?.overwrite === true,
+    });
+    res.json({
+      success: true,
+      request_id: req.requestId || null,
+      ...result,
+    });
+  } catch (error) {
+    sendApiError(
+      res,
+      error.code === "validation_error" ? 400 : 500,
+      error.code || "post_call_default_rules_failed",
+      error.message || "Default post-call automation rules could not be installed",
+      req.requestId,
+    );
+  }
+});
+
+app.post("/post-call/automation/preview", requireOutboundAuthorization, async (req, res) => {
+  try {
+    if (!postCallAutomationService) {
+      return sendApiError(
+        res,
+        500,
+        "post_call_automation_unavailable",
+        "Post-call automation service not initialized",
+        req.requestId,
+      );
+    }
+    const result = await postCallAutomationService.preview(req.body || {});
+    res.json({
+      success: true,
+      request_id: req.requestId || null,
+      ...result,
+    });
+  } catch (error) {
+    sendApiError(
+      res,
+      error.code === "validation_error" ? 400 : 500,
+      error.code || "post_call_preview_failed",
+      error.message || "Post-call automation preview failed",
+      req.requestId,
+    );
+  }
+});
+
+app.get("/post-call/automation/runs", requireOutboundAuthorization, async (req, res) => {
+  try {
+    if (!postCallAutomationService) {
+      return sendApiError(
+        res,
+        500,
+        "post_call_automation_unavailable",
+        "Post-call automation service not initialized",
+        req.requestId,
+      );
+    }
+    const runs = await postCallAutomationService.listRuns({
+      call_sid: req.query?.call_sid,
+      rule_id: req.query?.rule_id,
+      status: req.query?.status,
+      trigger_event: req.query?.trigger_event,
+      retry_of_run_id: req.query?.retry_of_run_id,
+      limit: req.query?.limit,
+    });
+    res.json({
+      success: true,
+      request_id: req.requestId || null,
+      runs,
+    });
+  } catch (error) {
+    sendApiError(
+      res,
+      500,
+      error.code || "post_call_runs_list_failed",
+      error.message || "Post-call automation runs could not be listed",
+      req.requestId,
+    );
+  }
+});
+
+app.post("/post-call/automation/run", requireOutboundAuthorization, async (req, res) => {
+  try {
+    if (!postCallAutomationService) {
+      return sendApiError(
+        res,
+        500,
+        "post_call_automation_unavailable",
+        "Post-call automation service not initialized",
+        req.requestId,
+      );
+    }
+    const result = await runWithTimeout(
+      postCallAutomationService.evaluateAndRun(req.body || {}),
+      Number(config.outboundLimits?.handlerTimeoutMs) || 30000,
+      "post-call automation handler",
+      "post_call_automation_timeout",
+    );
+    res.json({
+      success: true,
+      request_id: req.requestId || null,
+      ...result,
+    });
+  } catch (error) {
+    sendApiError(
+      res,
+      error.code === "post_call_automation_timeout" ? 504 : error.code === "validation_error" ? 400 : 500,
+      error.code || "post_call_automation_failed",
+      error.message || "Post-call automation failed",
+      req.requestId,
+    );
+  }
+});
+
+app.post("/post-call/automation/runs/:run_id/retry", requireOutboundAuthorization, async (req, res) => {
+  try {
+    if (!postCallAutomationService) {
+      return sendApiError(
+        res,
+        500,
+        "post_call_automation_unavailable",
+        "Post-call automation service not initialized",
+        req.requestId,
+      );
+    }
+    const result = await runWithTimeout(
+      postCallAutomationService.retryRun(req.params.run_id, req.body || {}),
+      Number(config.outboundLimits?.handlerTimeoutMs) || 30000,
+      "post-call automation retry handler",
+      "post_call_automation_timeout",
+    );
+    res.json({
+      success: true,
+      request_id: req.requestId || null,
+      ...result,
+    });
+  } catch (error) {
+    const status =
+      error.code === "post_call_automation_timeout"
+        ? 504
+        : error.code === "validation_error"
+          ? 400
+          : error.code === "not_found"
+            ? 404
+            : error.code === "conflict"
+              ? 409
+              : 500;
+    sendApiError(
+      res,
+      status,
+      error.code || "post_call_retry_failed",
+      error.message || "Post-call automation retry failed",
+      req.requestId,
+    );
+  }
+});
+
+app.post("/crm/contact-sync", requireOutboundAuthorization, async (req, res) => {
+  try {
+    if (!crmContactSyncService) {
+      return sendApiError(
+        res,
+        500,
+        "crm_sync_unavailable",
+        "CRM contact sync service not initialized",
+        req.requestId,
+      );
+    }
+    const result = await crmContactSyncService.syncPostCallRecord(req.body || {});
+    res.json({
+      success: true,
+      request_id: req.requestId || null,
+      ...result,
+    });
+  } catch (error) {
+    sendApiError(
+      res,
+      error.code === "validation_error" ? 400 : 500,
+      error.code || "crm_contact_sync_failed",
+      error.message || "CRM contact sync failed",
+      req.requestId,
+    );
+  }
+});
+
+app.post("/crm/contact-sync/health", requireOutboundAuthorization, async (req, res) => {
+  try {
+    if (!crmContactSyncService) {
+      return sendApiError(
+        res,
+        500,
+        "crm_sync_unavailable",
+        "CRM contact sync service not initialized",
+        req.requestId,
+      );
+    }
+    const result = await crmContactSyncService.health(req.body || {});
+    res.status(result.ok ? 200 : 422).json({
+      success: result.ok,
+      request_id: req.requestId || null,
+      ...result,
+    });
+  } catch (error) {
+    sendApiError(
+      res,
+      500,
+      error.code || "crm_contact_sync_health_failed",
+      error.message || "CRM contact sync health check failed",
+      req.requestId,
+    );
+  }
+});
+
 function extractEmailTemplateVariables(text = "") {
   if (!text) return [];
   const matches = text.match(/{{\s*([\w.-]+)\s*}}/g) || [];
@@ -29285,6 +29873,7 @@ registerWebhookRoutes(app, {
   buildCallbackPayload,
   endCallForProvider,
   webhookService,
+  postCallAutomationService,
   buildVonageTalkHangupNcco,
   buildVonageUnavailableNcco,
   buildTwilioStreamTwiml,

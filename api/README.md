@@ -90,7 +90,7 @@ PAYPAL_AGENT_TOOLKIT_READ_TOOLS=get_invoice,get_order,get_refund,list_invoices
 CONNECTOR_PAYMENT_API_KEY=...
 ```
 
-The current integration uses PayPal REST APIs through the existing `payment_link_generate`, `invoice_create`, `payment_intent_status`, `payment_session_history`, and `refund_request_initiate` tool surface. Configure the PayPal app webhook URL as `https://your-app.example/webhook/paypal`; incoming events are verified with `PAYPAL_WEBHOOK_ID`, deduplicated by PayPal event ID, and reconciled into `paypal_payment_sessions` for checkout order, capture, refund, and invoice status updates. Agents can call `payment_session_history` to inspect local PayPal session and webhook history by order, invoice, refund, or call SID without making a live PayPal API request.
+The current integration uses PayPal REST APIs through the existing `payment_link_generate`, `payment_retry_link_generate`, `invoice_create`, `invoice_reminder_send`, `payment_intent_status`, `payment_session_history`, `payment_failure_summary`, `customer_payment_profile`, and `refund_request_initiate` tool surface. Configure the PayPal app webhook URL as `https://your-app.example/webhook/paypal`; incoming events are verified with `PAYPAL_WEBHOOK_ID`, deduplicated by PayPal event ID, and reconciled into `paypal_payment_sessions` for checkout order, capture, refund, and invoice status updates. Agents can call `payment_session_history` to inspect local PayPal session and webhook history by order, invoice, refund, or call SID without making a live PayPal API request.
 
 The official `@paypal/agent-toolkit` package is integrated behind the same service boundary. Use `paypal_agent_toolkit_manifest` with `payment_connector=paypal` or `PAYPAL_CONNECTOR_ENABLED=true` to inspect the configured AI SDK tool names and descriptions without exposing raw SDK handlers or credentials. Use `paypal_agent_toolkit_execute` only for the allowlisted read-only toolkit tools: `get_invoice`, `get_order`, `get_refund`, and `list_invoices`. `PAYPAL_AGENT_TOOLKIT_READ_TOOLS` can narrow that list for an environment, but unsafe write/payment-mutating toolkit tools are ignored even if included. Direct card data is blocked before toolkit execution; use PayPal-hosted/tokenized flows only. Live payment, invoice creation/sending, and refund execution remain on the existing approval-gated tools above.
 
@@ -123,7 +123,7 @@ STRIPE_API_VERSION=2026-02-25.clover
 CONNECTOR_PAYMENT_API_KEY=...
 ```
 
-The Stripe connector supports hosted Checkout Session creation through `payment_link_generate`, invoice creation/finalization/sending through `invoice_create`, live status lookups through `payment_intent_status`, local session/event history through `payment_session_history`, and guarded refunds through `refund_request_initiate`. Configure the Stripe webhook URL as `https://your-app.example/webhook/stripe`; incoming events are verified with `STRIPE_WEBHOOK_SECRET`, deduplicated by Stripe event ID, and reconciled into `stripe_payment_sessions`.
+The Stripe connector supports hosted Checkout Session creation through `payment_link_generate` and `payment_retry_link_generate`, invoice creation/finalization/sending through `invoice_create`, invoice sends through `invoice_reminder_send`, live status lookups through `payment_intent_status`, local session/event history through `payment_session_history`, payment health rollups through `payment_failure_summary` and `customer_payment_profile`, and guarded refunds through `refund_request_initiate`. Configure the Stripe webhook URL as `https://your-app.example/webhook/stripe`; incoming events are verified with `STRIPE_WEBHOOK_SECRET`, deduplicated by Stripe event ID, and reconciled into `stripe_payment_sessions`.
 
 Smoke validation is available with `npm run smoke:stripe --prefix api`. The default run validates configuration only; set `STRIPE_SMOKE_LIVE=1` to create and read back a test-mode Checkout Session. Readiness can also be checked with:
 
@@ -132,6 +132,38 @@ npm run preflight:provider --prefix api -- --channel payment --provider stripe -
 ```
 
 For promotion, run it with `--network 1 --reachability 1` so preflight verifies Stripe credentials, HTTPS callback generation, `STRIPE_WEBHOOK_SECRET`, and `POST /webhook/stripe` route registration.
+
+## Square Payment Connector
+
+Square can use the same approval-gated payment connector switchboard without adding a Square SDK dependency. To route tool calls to Square, set `payment_connector=square` on the call/template or enable `SQUARE_CONNECTOR_ENABLED=true`.
+
+Required environment:
+
+```bash
+SQUARE_CONNECTOR_ENABLED=true
+SQUARE_ENVIRONMENT=sandbox
+SQUARE_ACCESS_TOKEN=...
+SQUARE_LOCATION_ID=...
+SQUARE_WEBHOOK_SIGNATURE_KEY=...
+SQUARE_WEBHOOK_URL=https://your-app.example/webhook/square
+SQUARE_RETURN_URL=https://your-app.example/square/return
+SQUARE_API_VERSION=2026-05-20
+CONNECTOR_PAYMENT_API_KEY=...
+```
+
+The Square connector supports hosted checkout links through `payment_link_generate` and `payment_retry_link_generate`, live status lookups through `payment_intent_status` by `payment_id`, `payment_link_id`, `order_id`, or `refund_id`, local session/event history through `payment_session_history`, payment health rollups through `payment_failure_summary` and `customer_payment_profile`, and guarded refunds through `refund_request_initiate` using `payment_id`. Square invoices are intentionally not routed through this connector yet, so `invoice_create` and `invoice_reminder_send` continue to use Stripe, PayPal, managed endpoints, or stubs.
+
+Configure the Square webhook URL as `https://your-app.example/webhook/square`. Incoming events are verified with `SQUARE_WEBHOOK_SIGNATURE_KEY` and the exact `SQUARE_WEBHOOK_URL`, deduplicated by Square event ID when persistence helpers are available, normalized with the shared payment event shape, and reconciled into local Square payment session history.
+
+Optional payment connector policy gates can be set globally or per call/template:
+
+```bash
+PAYMENT_CONNECTOR_ALLOWED_PROVIDERS=stripe,paypal,square
+PAYMENT_CONNECTOR_MAX_PAYMENT_AMOUNT=500
+PAYMENT_CONNECTOR_MAX_REFUND_AMOUNT=100
+```
+
+Use `payment_connector_policy_evaluate` to inspect whether a proposed connector write would be allowed before requesting write confirmation. These gates run before live provider execution and before scoped payment keys are consumed.
 
 ## Provider Preflight Gate and Parity Smoke
 
@@ -178,6 +210,51 @@ LIVE_SMOKE=1 npm run parity:providers
   - `POST /admin/call-jobs/dlq/:id/replay`
   - `GET /admin/email/dlq`
   - `POST /admin/email/dlq/:id/replay`
+
+## Voice Connector Pack Email Follow-Up
+
+When connector packs are enabled, the voice agent can use `email_send_followup` to queue a SendGrid follow-up email after explicit write confirmation. The tool reuses the existing email queue and sender validation, forces `provider=sendgrid`, supports stored email scripts via `script_id`/`template_id`, and records connector audit events without logging full recipient addresses.
+
+Required environment:
+
+- `EMAIL_PROVIDER=sendgrid`
+- `SENDGRID_API_KEY`
+- `EMAIL_DEFAULT_FROM`
+- `EMAIL_VERIFIED_DOMAINS` when sender-domain allowlisting is enforced
+
+Operational email controls:
+
+- `POST /email/provider-health` validates the active email provider credentials, sender identity, template availability, and domain allowlist without sending a production message.
+- `POST /email/sendgrid/health-check` runs the same SendGrid-focused validation path.
+- `POST /email/templates/select` previews the template the voice agent would choose for call intent, customer, booking, payment, and transcript context.
+- SendGrid delivery events are accepted through the existing email provider event/webhook flow and persisted for delivery, bounce, block, drop, spam report, and unsubscribe tracking.
+
+## Post-Call Automation and CRM Sync
+
+Post-call automation rules can now be seeded with the default payment receipt, missed-booking follow-up, and escalation case summary workflows. Runs store the original payload so failed automations can be inspected and retried safely.
+
+Manual API controls:
+
+- `POST /post-call/automation/rules/defaults` installs the default rules. Use `{ "overwrite": true }` to refresh existing default rule definitions.
+- `GET /post-call/automation/rules` lists configured rules.
+- `POST /post-call/automation/rules` creates or updates a rule.
+- `POST /post-call/automation/preview` shows matching rules without executing actions.
+- `POST /post-call/automation/run` evaluates and executes matching rules.
+- `GET /post-call/automation/runs` lists stored runs by `call_sid`, `rule_id`, `status`, `trigger_event`, or `retry_of_run_id`.
+- `POST /post-call/automation/runs/:run_id/retry` retries a failed run with stable action idempotency.
+- `POST /crm/contact-sync` syncs a contact plus post-call note.
+- `POST /crm/contact-sync/health` checks whether the configured CRM provider can run in native mode.
+
+CRM provider environment:
+
+- `CRM_PROVIDER=stub|hubspot|airtable|gohighlevel|salesforce|managed`
+- `CRM_REQUEST_TIMEOUT_MS=15000`
+- `HUBSPOT_API_KEY`
+- `AIRTABLE_API_KEY`, `AIRTABLE_BASE_ID`, `AIRTABLE_CONTACTS_TABLE`, `AIRTABLE_ACTIVITIES_TABLE`
+- `GOHIGHLEVEL_API_KEY`, `GOHIGHLEVEL_LOCATION_ID`
+- `SALESFORCE_ACCESS_TOKEN`, `SALESFORCE_INSTANCE_URL`
+
+When native CRM credentials are missing, the sync endpoints keep using local interface persistence and return `pending_provider_adapter` instead of failing the whole post-call workflow.
 
 ## Telegram Mini App Replay Validation
 

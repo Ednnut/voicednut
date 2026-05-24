@@ -1,6 +1,7 @@
 "use strict";
 
 const crypto = require("crypto");
+const { normalizePaymentEvent } = require("./paymentEventNormalizer");
 
 const DEFAULT_TIMEOUT_MS = 7000;
 const DEFAULT_API_VERSION = "2026-02-25.clover";
@@ -248,6 +249,32 @@ function getStripeWebhookAmount(resource = {}) {
   };
 }
 
+function buildFailureSummary(provider, history = {}, nowIso) {
+  const sessions = Array.isArray(history.sessions) ? history.sessions : [];
+  const events = Array.isArray(history.events) ? history.events : [];
+  const records = [...sessions, ...events];
+  const failedStatuses = new Set(["CANCELED", "CANCELLED", "EXPIRED", "FAILED"]);
+  const successStatuses = new Set(["COMPLETE", "PAID", "SUCCEEDED"]);
+  const failed = records.filter((record) =>
+    failedStatuses.has(normalizeStripeStatus(record.status || record.status_value, "")),
+  );
+  const successful = records.filter((record) =>
+    successStatuses.has(normalizeStripeStatus(record.status || record.status_value, "")),
+  );
+  const latestFailure = failed[0] || null;
+  return {
+    provider,
+    provider_action: "payment_failure_summary",
+    payment_intent_id: history.payment_intent_id || history.query?.external_id || null,
+    call_sid: history.query?.call_sid || null,
+    failed_attempts: failed.length,
+    successful_payments: successful.length,
+    latest_failure: latestFailure,
+    recommended_action: failed.length > 0 && successful.length === 0 ? "send_retry_link" : "none",
+    updated_at: history.updated_at || nowIso,
+  };
+}
+
 function toUnixDateTime(value) {
   const parsed = Number(value);
   if (!Number.isFinite(parsed) || parsed <= 0) return null;
@@ -291,7 +318,11 @@ class StripePaymentService {
       return result;
     }
 
-    const isLocalHistoryAction = actionName === "payment_session_history";
+    const isLocalHistoryAction = new Set([
+      "payment_session_history",
+      "payment_failure_summary",
+      "customer_payment_profile",
+    ]).has(actionName);
     if (!this.isConfigured() && !isLocalHistoryAction) {
       const result = {
         error: "stripe_not_configured",
@@ -308,12 +339,23 @@ class StripePaymentService {
       let result;
       if (actionName === "payment_link_generate") {
         result = await this.createPaymentLink(args, context);
+      } else if (actionName === "payment_retry_link_generate") {
+        result = await this.createPaymentLink(args, context, {
+          action: "payment_retry_link_generate",
+          recovery: true,
+        });
       } else if (actionName === "invoice_create") {
         result = await this.createInvoice(args, context);
+      } else if (actionName === "invoice_reminder_send") {
+        result = await this.sendInvoiceReminder(args, context);
       } else if (actionName === "payment_intent_status") {
         result = await this.getPaymentStatus(args, context);
       } else if (actionName === "payment_session_history") {
         result = await this.getPaymentSessionHistory(args, context);
+      } else if (actionName === "payment_failure_summary") {
+        result = await this.getPaymentFailureSummary(args, context);
+      } else if (actionName === "customer_payment_profile") {
+        result = await this.getCustomerPaymentProfile(args, context);
       } else if (actionName === "refund_request_initiate") {
         result = await this.createRefund(args, context);
       } else {
@@ -382,7 +424,7 @@ class StripePaymentService {
     await Promise.allSettled(tasks);
   }
 
-  async createPaymentLink(args = {}, context = {}) {
+  async createPaymentLink(args = {}, context = {}, options = {}) {
     const amountCents = normalizeAmountCents(args.amount);
     if (!amountCents) {
       return { error: "invalid_amount", message: "amount must be a positive number." };
@@ -403,7 +445,7 @@ class StripePaymentService {
     const description =
       normalizeText(args.description, 255) ||
       normalizeText(context?.callConfig?.payment_description, 255) ||
-      "Voice payment";
+      (options.recovery ? "Voice payment retry" : "Voice payment");
     const idempotencyKey = args.idempotency_key || args.idempotencyKey || createRequestId("checkout");
     const session = await this.request("/v1/checkout/sessions", {
       method: "POST",
@@ -437,7 +479,7 @@ class StripePaymentService {
 
     await this.saveSession({
       call_sid: context.callSid || null,
-      action: "payment_link_generate",
+      action: options.action || "payment_link_generate",
       external_id: session.id,
       status: session.payment_status || session.status || "open",
       amount: centsToAmount(amountCents),
@@ -453,7 +495,9 @@ class StripePaymentService {
 
     return {
       provider: "stripe",
-      provider_action: "create_checkout_session",
+      provider_action: options.recovery
+        ? "create_recovery_checkout_session"
+        : "create_checkout_session",
       payment_link_id: session.id,
       payment_intent_id: session.payment_intent || session.id,
       checkout_session_id: session.id,
@@ -463,6 +507,7 @@ class StripePaymentService {
       amount: centsToAmount(amountCents),
       currency,
       expires_at: toUnixDateTime(session.expires_at),
+      recovery: Boolean(options.recovery),
     };
   }
 
@@ -569,6 +614,48 @@ class StripePaymentService {
       amount: centsToAmount(amountCents),
       currency,
       due_date: finalInvoice.due_date ? toUnixDateTime(finalInvoice.due_date) : null,
+    };
+  }
+
+  async sendInvoiceReminder(args = {}, context = {}) {
+    const invoiceId = normalizeText(args.invoice_id || args.stripe_invoice_id, 160);
+    if (!invoiceId) {
+      return {
+        error: "missing_stripe_invoice_id",
+        message: "Stripe invoice reminders require invoice_id.",
+      };
+    }
+    const idempotencyKey = args.idempotency_key || args.idempotencyKey || createRequestId("invoice-send");
+    const invoice = await this.request(`/v1/invoices/${encodeURIComponent(invoiceId)}/send`, {
+      method: "POST",
+      idempotencyKey,
+      body: {},
+    });
+
+    await this.saveSession({
+      call_sid: context.callSid || null,
+      action: "invoice_reminder_send",
+      external_id: invoice.id || invoiceId,
+      status: invoice.status || "sent",
+      amount: centsToAmount(invoice.amount_due || invoice.amount_remaining),
+      currency: normalizeCurrency(invoice.currency, this.config.defaultCurrency),
+      approval_url: invoice.hosted_invoice_url || null,
+      idempotency_key: idempotencyKey,
+      metadata: {
+        connector: "stripe",
+        customer_id: invoice.customer || null,
+      },
+    });
+
+    return {
+      provider: "stripe",
+      provider_action: "send_invoice_reminder",
+      invoice_id: invoice.id || invoiceId,
+      invoice_url: invoice.hosted_invoice_url || null,
+      customer_ref: normalizeText(args.customer_ref, 80) || invoice.customer || null,
+      reminder_sent: true,
+      status_value: invoice.status || "sent",
+      sent_at: this.now().toISOString(),
     };
   }
 
@@ -696,6 +783,50 @@ class StripePaymentService {
       sessions: normalizedSessions,
       events: normalizedEvents,
       updated_at: latestSession?.updated_at || latestEvent?.created_at || this.now().toISOString(),
+    };
+  }
+
+  async getPaymentFailureSummary(args = {}, context = {}) {
+    const history = await this.getPaymentSessionHistory(args, context);
+    if (history.error) return history;
+    return buildFailureSummary("stripe", history, this.now().toISOString());
+  }
+
+  async getCustomerPaymentProfile(args = {}, context = {}) {
+    const customerRef = normalizeText(
+      args.customer_ref || args.customer_id || args.customer_email,
+      160,
+    );
+    const history = await this.getPaymentSessionHistory(
+      {
+        ...args,
+        call_sid: args.call_sid || context.callSid,
+        limit: args.limit,
+      },
+      context,
+    );
+    if (history.error) return history;
+
+    const sessions = Array.isArray(history.sessions) ? history.sessions : [];
+    const failedStatuses = new Set(["CANCELED", "CANCELLED", "EXPIRED", "FAILED"]);
+    const successStatuses = new Set(["COMPLETE", "PAID", "SUCCEEDED"]);
+    const successfulPayments = sessions.filter((session) =>
+      successStatuses.has(normalizeStripeStatus(session.status || session.status_value, "")),
+    );
+    const failedPayments = sessions.filter((session) =>
+      failedStatuses.has(normalizeStripeStatus(session.status || session.status_value, "")),
+    );
+    return {
+      provider: "stripe",
+      provider_action: "customer_payment_profile",
+      customer_ref: customerRef || null,
+      call_sid: history.query?.call_sid || null,
+      total_sessions: sessions.length,
+      successful_payments: successfulPayments.length,
+      failed_payments: failedPayments.length,
+      payment_methods: [],
+      latest_session: sessions[0] || null,
+      updated_at: history.updated_at || this.now().toISOString(),
     };
   }
 
@@ -890,6 +1021,13 @@ class StripePaymentService {
 
     const amount = getStripeWebhookAmount(resource);
     const sessionIds = collectStripeWebhookSessionIds(resource);
+    const normalizedEvent = normalizePaymentEvent("stripe", webhookEvent, {
+      resource,
+      resource_id: resourceId || sessionIds[0] || null,
+      status,
+      amount: amount.amount,
+      currency: amount.currency,
+    });
 
     if (typeof this.db?.recordStripePaymentEvent === "function") {
       const eventRecord = await this.db.recordStripePaymentEvent({
@@ -897,6 +1035,7 @@ class StripePaymentService {
         event_type: eventType,
         resource_id: resourceId || sessionIds[0] || null,
         status,
+        normalized_event: normalizedEvent,
         payload: webhookEvent,
       });
       if (eventRecord?.inserted === false) {
@@ -907,6 +1046,7 @@ class StripePaymentService {
           event_type: eventType,
           resource_id: resourceId || sessionIds[0] || null,
           status,
+          normalized_event: normalizedEvent,
           updated_sessions: 0,
         };
         await this.recordObservability("stripe_webhook_reconcile", "duplicate", {
@@ -946,6 +1086,7 @@ class StripePaymentService {
       event_type: eventType,
       resource_id: resourceId || sessionIds[0] || null,
       status,
+      normalized_event: normalizedEvent,
       updated_sessions: updatedSessions,
       ...(ignoredSessionIds.length > 0 ? { ignored_sessions: ignoredSessionIds } : {}),
     };

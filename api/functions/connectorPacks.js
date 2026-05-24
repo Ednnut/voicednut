@@ -2,13 +2,13 @@ const crypto = require("crypto");
 const {
   PAYPAL_AGENT_TOOLKIT_PACKAGE,
   PAYPAL_AGENT_TOOLKIT_READ_TOOLS,
-  createPaypalPaymentService,
-  isPaypalConnectorName,
 } = require("../services/paypalPaymentService");
 const {
-  createStripePaymentService,
-  isStripeConnectorName,
-} = require("../services/stripePaymentService");
+  createPaymentProviderSwitchboard,
+} = require("../services/paymentProviderSwitchboard");
+const {
+  evaluatePaymentConnectorPolicy,
+} = require("../services/paymentConnectorPolicy");
 
 const DEFAULT_TRUSTED_DOMAINS = Object.freeze([
   "openrouter.ai",
@@ -25,11 +25,39 @@ const DEFAULT_QUOTE_WORD_LIMIT = 25;
 const DEFAULT_MIN_SOURCE_CONFIDENCE = 0.65;
 const DEFAULT_FRESHNESS_HOURS = 72;
 const DEFAULT_STALE_DOC_HOURS = 24 * 30;
+const PAYMENT_WRITE_ACTIONS = new Set([
+  "payment_link_generate",
+  "payment_retry_link_generate",
+  "invoice_create",
+  "invoice_reminder_send",
+  "refund_request_initiate",
+]);
 
 function normalizeText(value, maxLength = 240) {
   const text = String(value || "").trim();
   if (!text) return "";
   return text.slice(0, maxLength);
+}
+
+function normalizeEmailAddress(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
+function isLikelyEmailAddress(value) {
+  const email = normalizeEmailAddress(value);
+  if (!email || !email.includes("@")) return false;
+  const parts = email.split("@");
+  return parts.length === 2 && Boolean(parts[0]) && Boolean(parts[1]);
+}
+
+function getEmailDomain(value) {
+  const email = normalizeEmailAddress(value);
+  const parts = email.split("@");
+  return parts.length === 2 ? parts[1] : "";
+}
+
+function normalizeObject(value) {
+  return value && typeof value === "object" && !Array.isArray(value) ? value : {};
 }
 
 function parseCsvDomains(value) {
@@ -71,6 +99,10 @@ function clampNumber(value, min, max, fallback) {
   const parsed = Number(value);
   if (!Number.isFinite(parsed)) return fallback;
   return Math.max(min, Math.min(max, parsed));
+}
+
+function isTruthyFlag(value) {
+  return value === true || String(value || "").trim().toLowerCase() === "true";
 }
 
 function truncateWords(value = "", maxWords = DEFAULT_QUOTE_WORD_LIMIT) {
@@ -311,6 +343,67 @@ function makeConnectorTools() {
     {
       type: "function",
       function: {
+        name: "email_send_followup",
+        description:
+          "SendGrid connector: queue a post-call follow-up email through the configured SendGrid provider with write confirmation and audit trail.",
+        connector: connector(
+          "business_sendgrid_followup",
+          "side_effect",
+          "medium",
+          ["email", "sendgrid", "follow_up", "business_ops"],
+          true,
+        ),
+        parameters: {
+          type: "object",
+          properties: {
+            to: { type: "string", description: "Recipient email address." },
+            from: {
+              type: "string",
+              description: "Optional sender email. Falls back to EMAIL_DEFAULT_FROM.",
+            },
+            subject: { type: "string" },
+            text: { type: "string", description: "Plain-text email body." },
+            html: { type: "string", description: "HTML email body." },
+            script_id: {
+              type: "string",
+              description: "Optional stored email template/script id.",
+            },
+            template_id: {
+              type: "string",
+              description: "Alias for script_id.",
+            },
+            select_template: {
+              type: "boolean",
+              description:
+                "Select an approved email template from call/payment/booking/support context.",
+            },
+            call_intent: { type: "string" },
+            customer_status: { type: "string" },
+            booking_state: { type: "string" },
+            payment_state: { type: "string" },
+            call_outcome: { type: "string" },
+            transcript_summary: { type: "string" },
+            variables: {
+              type: "object",
+              additionalProperties: true,
+              description: "Template variables when script_id/template_id is used.",
+            },
+            send_at: {
+              type: "string",
+              description: "Optional future ISO timestamp for scheduled send.",
+            },
+            is_marketing: { type: "boolean" },
+            tenant_id: { type: "string" },
+            idempotency_key: { type: "string" },
+            confirm_write: { type: "boolean" },
+          },
+          required: ["to", "confirm_write"],
+        },
+      },
+    },
+    {
+      type: "function",
+      function: {
         name: "calendar_check_availability",
         description:
           "Business connector: check calendar availability for scheduling.",
@@ -356,6 +449,65 @@ function makeConnectorTools() {
     {
       type: "function",
       function: {
+        name: "payment_connector_health",
+        description:
+          "Payment connector: inspect PayPal, Stripe, Square, managed endpoint, and scoped-key readiness without exposing secrets.",
+        connector: connector(
+          "billing_payment_connector_health",
+          "read",
+          "medium",
+          ["payment", "billing", "business_ops", "audit"],
+        ),
+        parameters: {
+          type: "object",
+          properties: {
+            payment_connector: {
+              type: "string",
+              description: "Optional payment connector override, for example paypal, stripe, or square.",
+            },
+            connector: {
+              type: "string",
+              description: "Alias for payment_connector when a connector-specific payment path is required.",
+            },
+          },
+          required: [],
+        },
+      },
+    },
+    {
+      type: "function",
+      function: {
+        name: "payment_connector_policy_evaluate",
+        description:
+          "Payment connector: evaluate connector routing and amount guardrails before attempting payment writes.",
+        connector: connector(
+          "billing_payment_connector_policy",
+          "read",
+          "medium",
+          ["payment", "billing", "business_ops", "audit"],
+        ),
+        parameters: {
+          type: "object",
+          properties: {
+            action: { type: "string" },
+            amount: { type: "number" },
+            currency: { type: "string" },
+            payment_connector: {
+              type: "string",
+              description: "Optional payment connector override, for example paypal, stripe, or square.",
+            },
+            connector: {
+              type: "string",
+              description: "Alias for payment_connector when a connector-specific payment path is required.",
+            },
+          },
+          required: ["action"],
+        },
+      },
+    },
+    {
+      type: "function",
+      function: {
         name: "payment_link_generate",
         description:
           "Payment connector: generate a PCI-safe payment link. Never capture raw card data in model output.",
@@ -374,13 +526,58 @@ function makeConnectorTools() {
             description: { type: "string" },
             payment_connector: {
               type: "string",
-              description: "Optional payment connector override, for example paypal or stripe.",
+              description: "Optional payment connector override, for example paypal, stripe, or square.",
             },
             connector: {
               type: "string",
               description: "Alias for payment_connector when a connector-specific payment path is required.",
             },
             confirm_write: { type: "boolean" },
+            dry_run: { type: "boolean" },
+            live_mode: { type: "boolean" },
+            idempotency_key: { type: "string" },
+          },
+          required: ["amount", "confirm_write"],
+        },
+      },
+    },
+    {
+      type: "function",
+      function: {
+        name: "payment_retry_link_generate",
+        description:
+          "Payment connector: generate a retry/recovery checkout link for a failed or abandoned payment. Never capture raw card data in model output.",
+        connector: connector(
+          "billing_payment_retry_link",
+          "side_effect",
+          "high",
+          ["payment", "billing", "business_ops", "risk"],
+          true,
+        ),
+        parameters: {
+          type: "object",
+          properties: {
+            amount: { type: "number" },
+            currency: { type: "string" },
+            description: { type: "string" },
+            customer_ref: { type: "string" },
+            customer_email: { type: "string" },
+            payment_intent_id: { type: "string" },
+            checkout_session_id: { type: "string" },
+            payment_link_id: { type: "string" },
+            order_id: { type: "string" },
+            payment_connector: {
+              type: "string",
+              description: "Optional payment connector override, for example paypal, stripe, or square.",
+            },
+            connector: {
+              type: "string",
+              description: "Alias for payment_connector when a connector-specific payment path is required.",
+            },
+            confirm_write: { type: "boolean" },
+            dry_run: { type: "boolean" },
+            live_mode: { type: "boolean" },
+            idempotency_key: { type: "string" },
           },
           required: ["amount", "confirm_write"],
         },
@@ -408,6 +605,41 @@ function makeConnectorTools() {
             customer_ref: { type: "string" },
             payment_connector: {
               type: "string",
+              description: "Optional payment connector override, for example paypal, stripe, or square.",
+            },
+            connector: {
+              type: "string",
+              description: "Alias for payment_connector when a connector-specific payment path is required.",
+            },
+            confirm_write: { type: "boolean" },
+            dry_run: { type: "boolean" },
+            live_mode: { type: "boolean" },
+            idempotency_key: { type: "string" },
+          },
+          required: ["amount", "customer_ref", "confirm_write"],
+        },
+      },
+    },
+    {
+      type: "function",
+      function: {
+        name: "invoice_reminder_send",
+        description:
+          "Payment connector: send an invoice reminder through the selected billing provider with audit trail.",
+        connector: connector(
+          "billing_invoice_reminder",
+          "side_effect",
+          "high",
+          ["billing", "payment", "business_ops"],
+          true,
+        ),
+        parameters: {
+          type: "object",
+          properties: {
+            invoice_id: { type: "string" },
+            customer_ref: { type: "string" },
+            payment_connector: {
+              type: "string",
               description: "Optional payment connector override, for example paypal or stripe.",
             },
             connector: {
@@ -415,8 +647,11 @@ function makeConnectorTools() {
               description: "Alias for payment_connector when a connector-specific payment path is required.",
             },
             confirm_write: { type: "boolean" },
+            dry_run: { type: "boolean" },
+            live_mode: { type: "boolean" },
+            idempotency_key: { type: "string" },
           },
-          required: ["amount", "customer_ref", "confirm_write"],
+          required: ["invoice_id", "confirm_write"],
         },
       },
     },
@@ -440,9 +675,11 @@ function makeConnectorTools() {
             payment_link_id: { type: "string" },
             invoice_id: { type: "string" },
             refund_id: { type: "string" },
+            order_id: { type: "string" },
+            payment_id: { type: "string" },
             payment_connector: {
               type: "string",
-              description: "Optional payment connector override, for example paypal or stripe.",
+              description: "Optional payment connector override, for example paypal, stripe, or square.",
             },
             connector: {
               type: "string",
@@ -472,12 +709,83 @@ function makeConnectorTools() {
             checkout_session_id: { type: "string" },
             payment_link_id: { type: "string" },
             order_id: { type: "string" },
+            payment_id: { type: "string" },
             invoice_id: { type: "string" },
             refund_id: { type: "string" },
             call_sid: { type: "string" },
             payment_connector: {
               type: "string",
-              description: "Optional payment connector override, for example paypal or stripe.",
+              description: "Optional payment connector override, for example paypal, stripe, or square.",
+            },
+            connector: {
+              type: "string",
+              description: "Alias for payment_connector when a connector-specific payment path is required.",
+            },
+            limit: { type: "integer", minimum: 1, maximum: 25 },
+          },
+          required: [],
+        },
+      },
+    },
+    {
+      type: "function",
+      function: {
+        name: "payment_failure_summary",
+        description:
+          "Payment connector: summarize recent failed, expired, or canceled checkout attempts for recovery follow-up.",
+        connector: connector(
+          "billing_payment_failure_summary",
+          "read",
+          "medium",
+          ["payment", "billing", "business_ops", "audit", "risk"],
+        ),
+        parameters: {
+          type: "object",
+          properties: {
+            payment_intent_id: { type: "string" },
+            checkout_session_id: { type: "string" },
+            payment_link_id: { type: "string" },
+            order_id: { type: "string" },
+            payment_id: { type: "string" },
+            invoice_id: { type: "string" },
+            refund_id: { type: "string" },
+            call_sid: { type: "string" },
+            payment_connector: {
+              type: "string",
+              description: "Optional payment connector override, for example paypal, stripe, or square.",
+            },
+            connector: {
+              type: "string",
+              description: "Alias for payment_connector when a connector-specific payment path is required.",
+            },
+            limit: { type: "integer", minimum: 1, maximum: 25 },
+          },
+          required: [],
+        },
+      },
+    },
+    {
+      type: "function",
+      function: {
+        name: "customer_payment_profile",
+        description:
+          "Payment connector: summarize locally known customer payment history without exposing raw payment credentials.",
+        connector: connector(
+          "billing_customer_payment_profile",
+          "read",
+          "medium",
+          ["payment", "billing", "business_ops", "audit"],
+        ),
+        parameters: {
+          type: "object",
+          properties: {
+            customer_ref: { type: "string" },
+            customer_id: { type: "string" },
+            customer_email: { type: "string" },
+            call_sid: { type: "string" },
+            payment_connector: {
+              type: "string",
+              description: "Optional payment connector override, for example paypal, stripe, or square.",
             },
             connector: {
               type: "string",
@@ -561,10 +869,15 @@ function makeConnectorTools() {
           properties: {
             payment_intent_id: { type: "string" },
             charge_id: { type: "string" },
+            capture_id: { type: "string" },
+            order_id: { type: "string" },
+            payment_id: { type: "string" },
+            amount: { type: "number" },
+            currency: { type: "string" },
             reason: { type: "string" },
             payment_connector: {
               type: "string",
-              description: "Optional payment connector override, for example paypal or stripe.",
+              description: "Optional payment connector override, for example paypal, stripe, or square.",
             },
             connector: {
               type: "string",
@@ -573,6 +886,9 @@ function makeConnectorTools() {
             confirm_primary: { type: "boolean" },
             confirm_secondary: { type: "boolean" },
             confirm_write: { type: "boolean" },
+            dry_run: { type: "boolean" },
+            live_mode: { type: "boolean" },
+            idempotency_key: { type: "string" },
           },
           required: ["reason", "confirm_primary", "confirm_secondary", "confirm_write"],
         },
@@ -803,30 +1119,27 @@ function buildConnectorPackImplementations(options = {}) {
       ? options.getCurrentProvider
       : () => "twilio";
   const fetchFn = options.fetchFn;
-  let paypalPaymentService = null;
-  let stripePaymentService = null;
+  const emailService = options.emailService || null;
+  const crmContactSyncService = options.crmContactSyncService || null;
+  let paymentProviderSwitchboard = null;
 
-  const getPaypalPaymentService = () => {
-    if (!paypalPaymentService) {
-      paypalPaymentService = createPaypalPaymentService({
+  const getPaymentProviderSwitchboard = () => {
+    if (!paymentProviderSwitchboard) {
+      paymentProviderSwitchboard = createPaymentProviderSwitchboard({
+        callSid,
         db,
         fetchFn,
-        config: options.paypalConfig,
-        agentToolkitFactory: options.paypalAgentToolkitFactory,
+        getCallConfig,
+        managedInvoker: maybeInvokeManagedEndpoint,
+        hasPaymentScopedKey: () => Boolean(getScopedKey("payment")),
+        hasManagedEndpoint: () => Boolean(getManagedEndpoint("payment")),
+        paypalAgentToolkitFactory: options.paypalAgentToolkitFactory,
+        paypalConfig: options.paypalConfig,
+        squareConfig: options.squareConfig,
+        stripeConfig: options.stripeConfig,
       });
     }
-    return paypalPaymentService;
-  };
-
-  const getStripePaymentService = () => {
-    if (!stripePaymentService) {
-      stripePaymentService = createStripePaymentService({
-        db,
-        fetchFn,
-        config: options.stripeConfig,
-      });
-    }
-    return stripePaymentService;
+    return paymentProviderSwitchboard;
   };
 
   const logAudit = async (action, status, payload = {}) => {
@@ -909,6 +1222,17 @@ function buildConnectorPackImplementations(options = {}) {
     return String(envKeyMap[scope] || "").trim();
   };
 
+  const getManagedEndpoint = (scope) => {
+    const callConfig = getCallConfig() || {};
+    return (
+      (callConfig?.connector_endpoints &&
+        typeof callConfig.connector_endpoints === "object" &&
+        callConfig.connector_endpoints[scope]) ||
+      process.env[`CONNECTOR_${String(scope || "").toUpperCase()}_ENDPOINT`] ||
+      ""
+    );
+  };
+
   const assertTrustedDomains = (domains = []) => {
     const policy = getPolicy();
     const requested = Array.isArray(domains)
@@ -956,6 +1280,33 @@ function buildConnectorPackImplementations(options = {}) {
     return result;
   };
 
+  const buildConnectorIdempotencyKey = (action, args = {}) => {
+    const provided = normalizeText(args.idempotency_key || args.idempotencyKey, 180);
+    if (provided) {
+      return { key: provided, generated: false };
+    }
+    const digest = crypto
+      .createHash("sha256")
+      .update(
+        JSON.stringify({
+          call_sid: callSid || null,
+          action,
+          to: normalizeEmailAddress(args.to || args.email || args.recipient_email),
+          subject: normalizeText(args.subject, 180),
+          script_id: normalizeText(args.script_id || args.template_id, 120),
+          select_template: args.select_template === true,
+          call_intent: normalizeText(args.call_intent || args.intent, 120),
+          customer_status: normalizeText(args.customer_status, 120),
+          booking_state: normalizeText(args.booking_state, 120),
+          payment_state: normalizeText(args.payment_state || args.payment_status, 120),
+          call_outcome: normalizeText(args.call_outcome || args.outcome, 120),
+        }),
+      )
+      .digest("hex")
+      .slice(0, 24);
+    return { key: `connector_${action}_${digest}`, generated: true };
+  };
+
   const buildSourceRecord = (
     url,
     title,
@@ -974,12 +1325,7 @@ function buildConnectorPackImplementations(options = {}) {
   });
 
   const maybeInvokeManagedEndpoint = async (scope, action, payload = {}) => {
-    const callConfig = getCallConfig() || {};
-    const endpoint =
-      (callConfig?.connector_endpoints &&
-        typeof callConfig.connector_endpoints === "object" &&
-        callConfig.connector_endpoints[scope]) ||
-      process.env[`CONNECTOR_${String(scope || "").toUpperCase()}_ENDPOINT`];
+    const endpoint = getManagedEndpoint(scope);
     if (!endpoint || typeof fetchFn !== "function") {
       return null;
     }
@@ -1023,59 +1369,8 @@ function buildConnectorPackImplementations(options = {}) {
     }
   };
 
-  const getRequestedPaymentConnector = (args = {}) => {
-    const callConfig = getCallConfig() || {};
-    return normalizeText(
-      args.payment_connector ||
-        args.connector ||
-        callConfig.payment_connector ||
-        callConfig?.payment?.connector,
-      80,
-    ).toLowerCase();
-  };
-
-  const shouldUsePaypalConnector = (args = {}) => {
-    const requestedConnector = getRequestedPaymentConnector(args);
-    if (requestedConnector) {
-      return isPaypalConnectorName(requestedConnector);
-    }
-    return String(process.env.PAYPAL_CONNECTOR_ENABLED || "").toLowerCase() === "true";
-  };
-
   const maybeInvokePaypalConnector = async (action, args = {}) => {
-    if (!shouldUsePaypalConnector(args)) {
-      return null;
-    }
-    const result = await getPaypalPaymentService().execute(action, args, {
-      callSid,
-      callConfig: getCallConfig() || {},
-    });
-    if (result?.error) {
-      return { ok: false, data: result };
-    }
-    return { ok: true, data: result };
-  };
-
-  const shouldUseStripeConnector = (args = {}) => {
-    const requestedConnector = getRequestedPaymentConnector(args);
-    if (requestedConnector) {
-      return isStripeConnectorName(requestedConnector);
-    }
-    return String(process.env.STRIPE_CONNECTOR_ENABLED || "").toLowerCase() === "true";
-  };
-
-  const maybeInvokeStripeConnector = async (action, args = {}) => {
-    if (!shouldUseStripeConnector(args)) {
-      return null;
-    }
-    const result = await getStripePaymentService().execute(action, args, {
-      callSid,
-      callConfig: getCallConfig() || {},
-    });
-    if (result?.error) {
-      return { ok: false, data: result };
-    }
-    return { ok: true, data: result };
+    return getPaymentProviderSwitchboard().invokeProvider("paypal", action, args);
   };
 
   const requireScopedKey = (scope, mode = "read") => {
@@ -1180,6 +1475,102 @@ function buildConnectorPackImplementations(options = {}) {
       };
     }
     return { ok: true };
+  };
+
+  const hasExplicitPaymentConnector = (args = {}) => {
+    const callConfig = getCallConfig() || {};
+    return Boolean(
+      normalizeText(args.payment_connector || args.connector, 80) ||
+        normalizeText(callConfig.payment_connector || callConfig?.payment?.connector, 80),
+    );
+  };
+
+  const isPaymentDryRun = (args = {}) => {
+    const callConfig = getCallConfig() || {};
+    return (
+      isTruthyFlag(args.dry_run) ||
+      isTruthyFlag(callConfig.payment_dry_run) ||
+      isTruthyFlag(process.env.PAYMENT_CONNECTOR_DRY_RUN)
+    );
+  };
+
+  const isPaymentLiveMode = (args = {}) => {
+    const callConfig = getCallConfig() || {};
+    const environment = normalizeText(
+      args.payment_environment ||
+        callConfig.payment_environment ||
+        callConfig?.payment?.environment ||
+        "",
+      40,
+    ).toLowerCase();
+    return (
+      isTruthyFlag(args.live_mode) ||
+      isTruthyFlag(callConfig.payment_live_mode) ||
+      isTruthyFlag(process.env.PAYMENT_LIVE_MODE) ||
+      environment === "live" ||
+      environment === "production"
+    );
+  };
+
+  const buildPaymentIdempotencyKey = (action, args = {}) => {
+    const existing = normalizeText(args.idempotency_key || args.idempotencyKey, 180);
+    if (existing) return { key: existing, generated: false };
+    const basis = {
+      call_sid: callSid || "no-call",
+      action,
+      connector: getPaymentProviderSwitchboard().getRequestedConnector(args) || null,
+      amount: args.amount ?? null,
+      currency: normalizeText(args.currency, 12).toUpperCase() || null,
+      customer_ref:
+        normalizeText(args.customer_ref || args.customer_id || args.customer_email, 120) ||
+        null,
+      payment_intent_id:
+        normalizeText(args.payment_intent_id || args.charge_id || args.capture_id, 160) ||
+        null,
+      reason: normalizeText(args.reason, 80) || null,
+    };
+    const digest = crypto
+      .createHash("sha256")
+      .update(JSON.stringify(basis))
+      .digest("hex")
+      .slice(0, 24);
+    return { key: `vp_${normalizeText(action, 40)}_${digest}`, generated: true };
+  };
+
+  const preparePaymentWriteArgs = (action, args = {}) => {
+    if (!PAYMENT_WRITE_ACTIONS.has(action)) {
+      return { ok: true, args, dryRun: false, liveMode: false, idempotencyGenerated: false };
+    }
+    const dryRun = isPaymentDryRun(args);
+    const liveMode = isPaymentLiveMode(args) && !dryRun;
+    if (liveMode && !hasExplicitPaymentConnector(args)) {
+      return {
+        ok: false,
+        error: "payment_live_connector_required",
+        message:
+          "Live payment writes require an explicit payment_connector or connector selection.",
+      };
+    }
+    const switchboard = getPaymentProviderSwitchboard();
+    const policy = evaluatePaymentConnectorPolicy(action, args, {
+      callConfig: getCallConfig() || {},
+      requestedProvider: switchboard.getRequestedProvider(args),
+      requestedConnector: switchboard.getRequestedConnector(args),
+    });
+    if (!policy.ok) {
+      return policy;
+    }
+    const idempotency = buildPaymentIdempotencyKey(action, args);
+    return {
+      ok: true,
+      args: {
+        ...args,
+        idempotency_key: idempotency.key,
+      },
+      dryRun,
+      liveMode,
+      idempotencyGenerated: idempotency.generated,
+    };
   };
 
   const defaultDocs = [
@@ -1393,18 +1784,51 @@ function buildConnectorPackImplementations(options = {}) {
       const name = normalizeText(args.name, 80);
       if (!name) return { error: "invalid_name", message: "Lead name is required." };
       const managed = await maybeInvokeManagedEndpoint("business", "crm_create_lead", args);
-      const result =
-        managed?.ok === true
-          ? { status: "ok", connector_mode: "managed", ...managed.data }
-          : {
-              status: "ok",
-              connector_mode: "stub",
-              lead_id: createId("lead"),
-              created_at: new Date().toISOString(),
+      let result = managed?.ok === true
+        ? { status: "ok", connector_mode: "managed", ...managed.data }
+        : null;
+      if (!result && crmContactSyncService && typeof crmContactSyncService.upsertContact === "function") {
+        try {
+          const synced = await crmContactSyncService.upsertContact({
+            provider: args.provider || args.crm_provider || "stub",
+            contact: {
               name,
               email: normalizeText(args.email, 120) || null,
+              phone: normalizeText(args.phone, 80) || null,
               interest: normalizeText(args.interest, 120) || null,
-            };
+            },
+            metadata: {
+              connector: "crm_create_lead",
+              call_sid: callSid || null,
+            },
+          });
+          result = {
+            status: "ok",
+            connector_mode: "crm_service",
+            lead_id: synced.contact_id || null,
+            created_at: new Date().toISOString(),
+            name,
+            email: normalizeText(args.email, 120) || null,
+            interest: normalizeText(args.interest, 120) || null,
+          };
+        } catch (error) {
+          return blockedResult("crm_create_lead", {
+            error: normalizeText(error?.code || "crm_sync_failed", 80),
+            message: normalizeText(error?.message || "CRM contact sync failed.", 240),
+          });
+        }
+      }
+      if (!result) {
+        result = {
+          status: "ok",
+          connector_mode: "stub",
+          lead_id: createId("lead"),
+          created_at: new Date().toISOString(),
+          name,
+          email: normalizeText(args.email, 120) || null,
+          interest: normalizeText(args.interest, 120) || null,
+        };
+      }
       await logAudit("crm_create_lead", "ok", { lead_id: result.lead_id || null });
       return result;
     },
@@ -1432,6 +1856,150 @@ function buildConnectorPackImplementations(options = {}) {
               created_at: new Date().toISOString(),
             };
       await logAudit("ticket_create", "ok", { ticket_id: result.ticket_id || null });
+      return result;
+    },
+
+    email_send_followup: async (args = {}) => {
+      const confirmation = requireWriteConfirmation(args, "email_send_followup");
+      if (!confirmation.ok) return blockedResult("email_send_followup", confirmation);
+
+      const to = normalizeEmailAddress(args.to || args.email || args.recipient_email);
+      if (!isLikelyEmailAddress(to)) {
+        return blockedResult("email_send_followup", {
+          error: "invalid_email_recipient",
+          message: "Valid to email is required.",
+        });
+      }
+
+      const subject = normalizeText(args.subject, 200);
+      const scriptId = normalizeText(args.script_id || args.template_id, 120);
+      const text = normalizeText(args.text || args.body || args.message, 200000);
+      const html = normalizeText(args.html, 200000);
+      const templateContext = {
+        ...normalizeObject(args.template_context),
+        call_intent: normalizeText(args.call_intent || args.intent, 120),
+        customer_status: normalizeText(args.customer_status, 120),
+        booking_state: normalizeText(args.booking_state, 120),
+        payment_state: normalizeText(args.payment_state || args.payment_status, 120),
+        call_outcome: normalizeText(args.call_outcome || args.outcome, 120),
+        escalation_state: normalizeText(args.escalation_state || args.ticket_state, 120),
+        transcript_summary: normalizeText(args.transcript_summary, 500),
+      };
+      Object.keys(templateContext).forEach((key) => {
+        if (templateContext[key] === "") {
+          delete templateContext[key];
+        }
+      });
+      const shouldSelectTemplate =
+        args.select_template === true ||
+        args.auto_select_template === true ||
+        (!scriptId && !subject && !text && !html && Object.keys(templateContext).length > 0);
+      if (!scriptId && !shouldSelectTemplate && !subject) {
+        return blockedResult("email_send_followup", {
+          error: "invalid_email_subject",
+          message: "subject is required when no script_id/template_id is provided.",
+        });
+      }
+      if (!scriptId && !shouldSelectTemplate && !text && !html) {
+        return blockedResult("email_send_followup", {
+          error: "invalid_email_body",
+          message: "text or html is required when no script_id/template_id is provided.",
+        });
+      }
+
+      const idempotency = buildConnectorIdempotencyKey("email_send_followup", {
+        ...args,
+        to,
+        subject,
+        script_id: scriptId,
+      });
+      const metadata = {
+        ...normalizeObject(args.metadata),
+        connector: "sendgrid",
+        connector_action: "email_send_followup",
+        call_sid: callSid || null,
+        ...(Object.keys(templateContext).length ? { template_context: templateContext } : {}),
+      };
+      const emailPayload = {
+        to,
+        provider: "sendgrid",
+        variables: normalizeObject(args.variables),
+        metadata,
+        is_marketing: args.is_marketing === true,
+        ...(shouldSelectTemplate ? { select_template: true } : {}),
+        ...(Object.keys(templateContext).length ? { template_context: templateContext } : {}),
+        ...(normalizeText(args.from, 160) ? { from: normalizeText(args.from, 160) } : {}),
+        ...(subject ? { subject } : {}),
+        ...(text ? { text } : {}),
+        ...(html ? { html } : {}),
+        ...(scriptId ? { script_id: scriptId } : {}),
+        ...(normalizeText(args.send_at, 80) ? { send_at: normalizeText(args.send_at, 80) } : {}),
+        ...(normalizeText(args.tenant_id, 80) ? { tenant_id: normalizeText(args.tenant_id, 80) } : {}),
+      };
+
+      if (emailService && typeof emailService.enqueueEmail === "function") {
+        try {
+          const queued = await emailService.enqueueEmail(emailPayload, {
+            idempotencyKey: idempotency.key,
+          });
+          const result = {
+            status: "ok",
+            connector_mode: "sendgrid",
+            provider: "sendgrid",
+            queued: queued?.suppressed ? false : true,
+            suppressed: queued?.suppressed === true,
+            deduped: queued?.deduped === true,
+            message_id: queued?.message_id || null,
+            idempotency_key_present: true,
+            idempotency_key_generated: idempotency.generated,
+          };
+          await logAudit("email_send_followup", "ok", {
+            provider: "sendgrid",
+            message_id: result.message_id,
+            recipient_domain: getEmailDomain(to),
+            suppressed: result.suppressed,
+          });
+          return result;
+        } catch (error) {
+          return blockedResult("email_send_followup", {
+            error: normalizeText(error?.code || "sendgrid_enqueue_failed", 80),
+            message: normalizeText(error?.message || "SendGrid email enqueue failed.", 240),
+          });
+        }
+      }
+
+      if (getManagedEndpoint("business")) {
+        const scoped = requireScopedKey("business", "write");
+        if (!scoped.ok) return blockedResult("email_send_followup", scoped);
+      }
+      const managed = await maybeInvokeManagedEndpoint(
+        "business",
+        "email_send_followup",
+        emailPayload,
+      );
+      const result =
+        managed?.ok === true
+          ? {
+              status: "ok",
+              connector_mode: "managed",
+              provider: "sendgrid",
+              ...managed.data,
+            }
+          : {
+              status: "ok",
+              connector_mode: "stub",
+              provider: "sendgrid",
+              queued: true,
+              message_id: createId("email"),
+              idempotency_key_present: true,
+              idempotency_key_generated: idempotency.generated,
+              created_at: new Date().toISOString(),
+            };
+      await logAudit("email_send_followup", "ok", {
+        provider: "sendgrid",
+        message_id: result.message_id || null,
+        recipient_domain: getEmailDomain(to),
+      });
       return result;
     },
 
@@ -1484,15 +2052,53 @@ function buildConnectorPackImplementations(options = {}) {
       return result;
     },
 
+    payment_connector_health: async (args = {}) => {
+      const result = getPaymentProviderSwitchboard().getHealth(args);
+      await logAudit("payment_connector_health", "ok", {
+        readiness: result.readiness,
+        requested_provider: result.requested_provider || null,
+      });
+      return result;
+    },
+
+    payment_connector_policy_evaluate: async (args = {}) => {
+      const action = normalizeText(args.action, 120);
+      if (!action) {
+        return blockedResult("payment_connector_policy_evaluate", {
+          error: "missing_payment_policy_action",
+          message: "action is required.",
+        });
+      }
+      const switchboard = getPaymentProviderSwitchboard();
+      const result = evaluatePaymentConnectorPolicy(action, args, {
+        callConfig: getCallConfig() || {},
+        requestedProvider: switchboard.getRequestedProvider(args),
+        requestedConnector: switchboard.getRequestedConnector(args),
+      });
+      await logAudit("payment_connector_policy_evaluate", result.ok ? "ok" : "blocked", {
+        action,
+        provider: result.policy?.requested_provider || null,
+        error: result.error || null,
+      });
+      return {
+        status: result.ok ? "ok" : "blocked",
+        ...result,
+      };
+    },
+
     payment_link_generate: async (args = {}) => {
       const safe = ensurePaymentSafety(args);
       if (!safe.ok) return blockedResult("payment_link_generate", safe);
       const confirmation = requireWriteConfirmation(args, "payment_link_generate");
       if (!confirmation.ok) return blockedResult("payment_link_generate", confirmation);
-      const scoped = requireScopedKey("payment", "write");
-      if (!scoped.ok) return blockedResult("payment_link_generate", scoped);
       const paymentEnabled = ensurePaymentFeatureEnabled();
       if (!paymentEnabled.ok) return blockedResult("payment_link_generate", paymentEnabled);
+      const prepared = preparePaymentWriteArgs("payment_link_generate", args);
+      if (!prepared.ok) return blockedResult("payment_link_generate", prepared);
+      if (!prepared.dryRun) {
+        const scoped = requireScopedKey("payment", "write");
+        if (!scoped.ok) return blockedResult("payment_link_generate", scoped);
+      }
       const amount = Number(args.amount);
       if (!Number.isFinite(amount) || amount <= 0) {
         return blockedResult("payment_link_generate", {
@@ -1500,39 +2106,84 @@ function buildConnectorPackImplementations(options = {}) {
           message: "amount must be a positive number.",
         });
       }
-      const managed = await maybeInvokeManagedEndpoint("payment", "payment_link_generate", args);
-      const stripe =
-        managed?.ok === true
-          ? null
-          : await maybeInvokeStripeConnector("payment_link_generate", args);
-      if (stripe?.ok === false) {
-        return blockedResult("payment_link_generate", stripe.data);
+      const payment = await getPaymentProviderSwitchboard().execute(
+        "payment_link_generate",
+        prepared.args,
+        {
+          dryRun: prepared.dryRun,
+          stubBuilder: () => ({
+            payment_link_id: createId("plink"),
+            payment_url: `https://pay.example/checkout/${createId("p")}`,
+            amount: Number(amount.toFixed(2)),
+            currency: normalizeText(args.currency, 3).toUpperCase() || "USD",
+            expires_at: toIsoTimestamp(Date.now() + 2 * 3600 * 1000),
+            idempotency_key_present: true,
+          }),
+        },
+      );
+      if (payment?.ok === false) {
+        return blockedResult("payment_link_generate", payment.data);
       }
-      const paypal =
-        managed?.ok === true || stripe?.ok === true
-          ? null
-          : await maybeInvokePaypalConnector("payment_link_generate", args);
-      if (paypal?.ok === false) {
-        return blockedResult("payment_link_generate", paypal.data);
-      }
-      const result =
-        managed?.ok === true
-          ? { status: "ok", connector_mode: "managed", ...managed.data }
-          : stripe?.ok === true
-            ? { status: "ok", connector_mode: "stripe", ...stripe.data }
-          : paypal?.ok === true
-            ? { status: "ok", connector_mode: "paypal", ...paypal.data }
-          : {
-              status: "ok",
-              connector_mode: "stub",
-              payment_link_id: createId("plink"),
-              payment_url: `https://pay.example/checkout/${createId("p")}`,
-              amount: Number(amount.toFixed(2)),
-              currency: normalizeText(args.currency, 3).toUpperCase() || "USD",
-              expires_at: toIsoTimestamp(Date.now() + 2 * 3600 * 1000),
-            };
+      const result = payment.data;
       await logAudit("payment_link_generate", "ok", {
         payment_link_id: result.payment_link_id || null,
+        dry_run: prepared.dryRun,
+        live_mode: prepared.liveMode,
+        idempotency_key_present: true,
+        idempotency_key_generated: prepared.idempotencyGenerated,
+      });
+      return result;
+    },
+
+    payment_retry_link_generate: async (args = {}) => {
+      const safe = ensurePaymentSafety(args);
+      if (!safe.ok) return blockedResult("payment_retry_link_generate", safe);
+      const confirmation = requireWriteConfirmation(args, "payment_retry_link_generate");
+      if (!confirmation.ok) return blockedResult("payment_retry_link_generate", confirmation);
+      const paymentEnabled = ensurePaymentFeatureEnabled();
+      if (!paymentEnabled.ok) return blockedResult("payment_retry_link_generate", paymentEnabled);
+      const prepared = preparePaymentWriteArgs("payment_retry_link_generate", args);
+      if (!prepared.ok) return blockedResult("payment_retry_link_generate", prepared);
+      if (!prepared.dryRun) {
+        const scoped = requireScopedKey("payment", "write");
+        if (!scoped.ok) return blockedResult("payment_retry_link_generate", scoped);
+      }
+      const amount = Number(args.amount);
+      if (!Number.isFinite(amount) || amount <= 0) {
+        return blockedResult("payment_retry_link_generate", {
+          error: "invalid_amount",
+          message: "amount must be a positive number.",
+        });
+      }
+      const payment = await getPaymentProviderSwitchboard().execute(
+        "payment_retry_link_generate",
+        prepared.args,
+        {
+          dryRun: prepared.dryRun,
+          stubBuilder: () => ({
+            payment_link_id: createId("retry_plink"),
+            recovery_payment_link_id: createId("recovery"),
+            payment_url: `https://pay.example/retry/${createId("p")}`,
+            amount: Number(amount.toFixed(2)),
+            currency: normalizeText(args.currency, 3).toUpperCase() || "USD",
+            source_payment_intent_id: normalizeText(args.payment_intent_id, 120) || null,
+            source_checkout_session_id: normalizeText(args.checkout_session_id, 120) || null,
+            source_order_id: normalizeText(args.order_id, 120) || null,
+            expires_at: toIsoTimestamp(Date.now() + 2 * 3600 * 1000),
+            idempotency_key_present: true,
+          }),
+        },
+      );
+      if (payment?.ok === false) {
+        return blockedResult("payment_retry_link_generate", payment.data);
+      }
+      const result = payment.data;
+      await logAudit("payment_retry_link_generate", "ok", {
+        payment_link_id: result.payment_link_id || null,
+        dry_run: prepared.dryRun,
+        live_mode: prepared.liveMode,
+        idempotency_key_present: true,
+        idempotency_key_generated: prepared.idempotencyGenerated,
       });
       return result;
     },
@@ -1542,10 +2193,14 @@ function buildConnectorPackImplementations(options = {}) {
       if (!safe.ok) return blockedResult("invoice_create", safe);
       const confirmation = requireWriteConfirmation(args, "invoice_create");
       if (!confirmation.ok) return blockedResult("invoice_create", confirmation);
-      const scoped = requireScopedKey("payment", "write");
-      if (!scoped.ok) return blockedResult("invoice_create", scoped);
       const paymentEnabled = ensurePaymentFeatureEnabled();
       if (!paymentEnabled.ok) return blockedResult("invoice_create", paymentEnabled);
+      const prepared = preparePaymentWriteArgs("invoice_create", args);
+      if (!prepared.ok) return blockedResult("invoice_create", prepared);
+      if (!prepared.dryRun) {
+        const scoped = requireScopedKey("payment", "write");
+        if (!scoped.ok) return blockedResult("invoice_create", scoped);
+      }
       const amount = Number(args.amount);
       if (!Number.isFinite(amount) || amount <= 0) {
         return blockedResult("invoice_create", {
@@ -1553,87 +2208,118 @@ function buildConnectorPackImplementations(options = {}) {
           message: "amount must be a positive number.",
         });
       }
-      const managed = await maybeInvokeManagedEndpoint("payment", "invoice_create", args);
-      const stripe =
-        managed?.ok === true ? null : await maybeInvokeStripeConnector("invoice_create", args);
-      if (stripe?.ok === false) {
-        return blockedResult("invoice_create", stripe.data);
+      const payment = await getPaymentProviderSwitchboard().execute(
+        "invoice_create",
+        prepared.args,
+        {
+          dryRun: prepared.dryRun,
+          stubBuilder: () => ({
+            invoice_id: createId("inv"),
+            customer_ref: normalizeText(args.customer_ref, 80),
+            amount: Number(amount.toFixed(2)),
+            currency: normalizeText(args.currency, 3).toUpperCase() || "USD",
+            due_date: toIsoTimestamp(args.due_date || Date.now() + 3 * 24 * 3600 * 1000),
+            idempotency_key_present: true,
+          }),
+        },
+      );
+      if (payment?.ok === false) {
+        return blockedResult("invoice_create", payment.data);
       }
-      const paypal =
-        managed?.ok === true || stripe?.ok === true
-          ? null
-          : await maybeInvokePaypalConnector("invoice_create", args);
-      if (paypal?.ok === false) {
-        return blockedResult("invoice_create", paypal.data);
+      const result = payment.data;
+      await logAudit("invoice_create", "ok", {
+        invoice_id: result.invoice_id || null,
+        dry_run: prepared.dryRun,
+        live_mode: prepared.liveMode,
+        idempotency_key_present: true,
+        idempotency_key_generated: prepared.idempotencyGenerated,
+      });
+      return result;
+    },
+
+    invoice_reminder_send: async (args = {}) => {
+      const invoiceId = normalizeText(args.invoice_id, 160);
+      if (!invoiceId) {
+        return blockedResult("invoice_reminder_send", {
+          error: "invalid_invoice_id",
+          message: "invoice_id is required.",
+        });
       }
-      const result =
-        managed?.ok === true
-          ? { status: "ok", connector_mode: "managed", ...managed.data }
-          : stripe?.ok === true
-            ? { status: "ok", connector_mode: "stripe", ...stripe.data }
-          : paypal?.ok === true
-            ? { status: "ok", connector_mode: "paypal", ...paypal.data }
-          : {
-              status: "ok",
-              connector_mode: "stub",
-              invoice_id: createId("inv"),
-              customer_ref: normalizeText(args.customer_ref, 80),
-              amount: Number(amount.toFixed(2)),
-              currency: normalizeText(args.currency, 3).toUpperCase() || "USD",
-              due_date: toIsoTimestamp(args.due_date || Date.now() + 3 * 24 * 3600 * 1000),
-            };
-      await logAudit("invoice_create", "ok", { invoice_id: result.invoice_id || null });
+      const safe = ensurePaymentSafety(args);
+      if (!safe.ok) return blockedResult("invoice_reminder_send", safe);
+      const confirmation = requireWriteConfirmation(args, "invoice_reminder_send");
+      if (!confirmation.ok) return blockedResult("invoice_reminder_send", confirmation);
+      const paymentEnabled = ensurePaymentFeatureEnabled();
+      if (!paymentEnabled.ok) return blockedResult("invoice_reminder_send", paymentEnabled);
+      const prepared = preparePaymentWriteArgs("invoice_reminder_send", args);
+      if (!prepared.ok) return blockedResult("invoice_reminder_send", prepared);
+      if (!prepared.dryRun) {
+        const scoped = requireScopedKey("payment", "write");
+        if (!scoped.ok) return blockedResult("invoice_reminder_send", scoped);
+      }
+      const payment = await getPaymentProviderSwitchboard().execute(
+        "invoice_reminder_send",
+        prepared.args,
+        {
+          dryRun: prepared.dryRun,
+          stubBuilder: () => ({
+            invoice_id: invoiceId,
+            reminder_sent: true,
+            state: "sent",
+            sent_at: new Date().toISOString(),
+            idempotency_key_present: true,
+          }),
+        },
+      );
+      if (payment?.ok === false) {
+        return blockedResult("invoice_reminder_send", payment.data);
+      }
+      const result = payment.data;
+      await logAudit("invoice_reminder_send", "ok", {
+        invoice_id: result.invoice_id || invoiceId,
+        dry_run: prepared.dryRun,
+        live_mode: prepared.liveMode,
+        idempotency_key_present: true,
+        idempotency_key_generated: prepared.idempotencyGenerated,
+      });
       return result;
     },
 
     payment_intent_status: async (args = {}) => {
       const intentId = normalizeText(
-        args.payment_intent_id || args.order_id || args.payment_link_id || args.invoice_id,
+        args.payment_intent_id ||
+          args.payment_id ||
+          args.order_id ||
+          args.payment_link_id ||
+          args.invoice_id ||
+          args.checkout_session_id ||
+          args.refund_id,
         120,
       );
       if (!intentId) {
         return {
           error: "invalid_payment_intent_id",
-          message: "payment_intent_id, order_id, payment_link_id, or invoice_id is required.",
+          message:
+            "payment_intent_id, order_id, payment_link_id, invoice_id, checkout_session_id, or refund_id is required.",
         };
       }
-      const managed = await maybeInvokeManagedEndpoint("payment", "payment_intent_status", args);
-      const stripe =
-        managed?.ok === true
-          ? null
-          : await maybeInvokeStripeConnector("payment_intent_status", args);
-      if (stripe?.ok === false) {
-        await logAudit("payment_intent_status", "blocked", {
+      const payment = await getPaymentProviderSwitchboard().execute(
+        "payment_intent_status",
+        args,
+        {
+          stubBuilder: () => ({
+            payment_intent_id: intentId,
+            status_value: "requires_action",
+            updated_at: new Date().toISOString(),
+          }),
+        },
+      );
+      if (payment?.ok === false) {
+        return blockedResult("payment_intent_status", payment.data, {
           payment_intent_id: intentId,
-          error: stripe.data?.error || "stripe_error",
         });
-        return stripe.data;
       }
-      const paypal =
-        managed?.ok === true || stripe?.ok === true
-          ? null
-          : await maybeInvokePaypalConnector("payment_intent_status", args);
-      if (paypal?.ok === false) {
-        await logAudit("payment_intent_status", "blocked", {
-          payment_intent_id: intentId,
-          error: paypal.data?.error || "paypal_error",
-        });
-        return paypal.data;
-      }
-      const result =
-        managed?.ok === true
-          ? { status: "ok", connector_mode: "managed", ...managed.data }
-          : stripe?.ok === true
-            ? { status: "ok", connector_mode: "stripe", ...stripe.data }
-          : paypal?.ok === true
-            ? { status: "ok", connector_mode: "paypal", ...paypal.data }
-          : {
-              status: "ok",
-              connector_mode: "stub",
-              payment_intent_id: intentId,
-              status_value: "requires_action",
-              updated_at: new Date().toISOString(),
-            };
+      const result = payment.data;
       await logAudit("payment_intent_status", "ok", { payment_intent_id: intentId });
       return result;
     },
@@ -1641,9 +2327,11 @@ function buildConnectorPackImplementations(options = {}) {
     payment_session_history: async (args = {}) => {
       const lookupId = normalizeText(
         args.payment_intent_id ||
+          args.payment_id ||
           args.order_id ||
           args.payment_link_id ||
           args.invoice_id ||
+          args.checkout_session_id ||
           args.refund_id ||
           args.external_id,
         160,
@@ -1652,7 +2340,8 @@ function buildConnectorPackImplementations(options = {}) {
       if (!lookupId && !lookupCallSid) {
         return {
           error: "invalid_payment_session_lookup",
-          message: "payment_intent_id, order_id, invoice_id, refund_id, or call_sid is required.",
+          message:
+            "payment_intent_id, order_id, invoice_id, checkout_session_id, refund_id, or call_sid is required.",
         };
       }
 
@@ -1662,55 +2351,133 @@ function buildConnectorPackImplementations(options = {}) {
         call_sid: lookupCallSid || args.call_sid,
         limit: clampNumber(args.limit, 1, 25, 10),
       };
-      const managed = await maybeInvokeManagedEndpoint(
-        "payment",
+      const payment = await getPaymentProviderSwitchboard().execute(
         "payment_session_history",
         lookupArgs,
+        {
+          stubBuilder: () => ({
+            payment_intent_id: lookupId || null,
+            call_sid: lookupCallSid || null,
+            status_value: "UNKNOWN",
+            sessions: [],
+            events: [],
+            updated_at: new Date().toISOString(),
+          }),
+        },
       );
-      const stripe =
-        managed?.ok === true
-          ? null
-          : await maybeInvokeStripeConnector("payment_session_history", lookupArgs);
-      if (stripe?.ok === false) {
-        await logAudit("payment_session_history", "blocked", {
+      if (payment?.ok === false) {
+        return blockedResult("payment_session_history", payment.data, {
           payment_intent_id: lookupId || null,
           call_sid: lookupCallSid || null,
-          error: stripe.data?.error || "stripe_error",
         });
-        return stripe.data;
       }
-      const paypal =
-        managed?.ok === true || stripe?.ok === true
-          ? null
-          : await maybeInvokePaypalConnector("payment_session_history", lookupArgs);
-      if (paypal?.ok === false) {
-        await logAudit("payment_session_history", "blocked", {
-          payment_intent_id: lookupId || null,
-          call_sid: lookupCallSid || null,
-          error: paypal.data?.error || "paypal_error",
-        });
-        return paypal.data;
-      }
-      const result =
-        managed?.ok === true
-          ? { status: "ok", connector_mode: "managed", ...managed.data }
-          : stripe?.ok === true
-            ? { status: "ok", connector_mode: "stripe", ...stripe.data }
-          : paypal?.ok === true
-            ? { status: "ok", connector_mode: "paypal", ...paypal.data }
-          : {
-              status: "ok",
-              connector_mode: "stub",
-              payment_intent_id: lookupId || null,
-              call_sid: lookupCallSid || null,
-              status_value: "UNKNOWN",
-              sessions: [],
-              events: [],
-              updated_at: new Date().toISOString(),
-            };
+      const result = payment.data;
       await logAudit("payment_session_history", "ok", {
         payment_intent_id: lookupId || null,
         call_sid: lookupCallSid || null,
+      });
+      return result;
+    },
+
+    payment_failure_summary: async (args = {}) => {
+      const lookupId = normalizeText(
+        args.payment_intent_id ||
+          args.payment_id ||
+          args.order_id ||
+          args.payment_link_id ||
+          args.invoice_id ||
+          args.checkout_session_id ||
+          args.refund_id ||
+          args.external_id,
+        160,
+      );
+      const lookupCallSid = normalizeText(args.call_sid || callSid, 160);
+      if (!lookupId && !lookupCallSid) {
+        return {
+          error: "invalid_payment_failure_lookup",
+          message:
+            "payment_intent_id, payment_id, order_id, invoice_id, checkout_session_id, refund_id, or call_sid is required.",
+        };
+      }
+      const lookupArgs = {
+        ...args,
+        payment_intent_id: lookupId || args.payment_intent_id,
+        call_sid: lookupCallSid || args.call_sid,
+        limit: clampNumber(args.limit, 1, 25, 10),
+      };
+      const payment = await getPaymentProviderSwitchboard().execute(
+        "payment_failure_summary",
+        lookupArgs,
+        {
+          stubBuilder: () => ({
+            payment_intent_id: lookupId || null,
+            call_sid: lookupCallSid || null,
+            failed_attempts: 0,
+            latest_failure: null,
+            recommended_action: "none",
+            updated_at: new Date().toISOString(),
+          }),
+        },
+      );
+      if (payment?.ok === false) {
+        return blockedResult("payment_failure_summary", payment.data, {
+          payment_intent_id: lookupId || null,
+          call_sid: lookupCallSid || null,
+        });
+      }
+      const result = payment.data;
+      await logAudit("payment_failure_summary", "ok", {
+        payment_intent_id: lookupId || null,
+        call_sid: lookupCallSid || null,
+        failed_attempts: result.failed_attempts || 0,
+      });
+      return result;
+    },
+
+    customer_payment_profile: async (args = {}) => {
+      const customerRef = normalizeText(
+        args.customer_ref || args.customer_id || args.customer_email,
+        160,
+      );
+      const lookupCallSid = normalizeText(args.call_sid || callSid, 160);
+      if (!customerRef && !lookupCallSid) {
+        return {
+          error: "invalid_customer_payment_profile_lookup",
+          message: "customer_ref, customer_id, customer_email, or call_sid is required.",
+        };
+      }
+      const lookupArgs = {
+        ...args,
+        customer_ref: customerRef || args.customer_ref,
+        call_sid: lookupCallSid || args.call_sid,
+        limit: clampNumber(args.limit, 1, 25, 10),
+      };
+      const payment = await getPaymentProviderSwitchboard().execute(
+        "customer_payment_profile",
+        lookupArgs,
+        {
+          stubBuilder: () => ({
+            customer_ref: customerRef || null,
+            call_sid: lookupCallSid || null,
+            total_sessions: 0,
+            successful_payments: 0,
+            failed_payments: 0,
+            payment_methods: [],
+            updated_at: new Date().toISOString(),
+          }),
+        },
+      );
+      if (payment?.ok === false) {
+        return blockedResult("customer_payment_profile", payment.data, {
+          customer_ref: customerRef || null,
+          call_sid: lookupCallSid || null,
+        });
+      }
+      const result = payment.data;
+      await logAudit("customer_payment_profile", "ok", {
+        customer_ref: customerRef || null,
+        call_sid: lookupCallSid || null,
+        total_sessions: result.total_sessions || 0,
       });
       return result;
     },
@@ -1802,10 +2569,14 @@ function buildConnectorPackImplementations(options = {}) {
       }
       const confirmation = requireWriteConfirmation(args, "refund_request_initiate");
       if (!confirmation.ok) return blockedResult("refund_request_initiate", confirmation);
-      const scoped = requireScopedKey("payment", "write");
-      if (!scoped.ok) return blockedResult("refund_request_initiate", scoped);
       const paymentEnabled = ensurePaymentFeatureEnabled();
       if (!paymentEnabled.ok) return blockedResult("refund_request_initiate", paymentEnabled);
+      const prepared = preparePaymentWriteArgs("refund_request_initiate", args);
+      if (!prepared.ok) return blockedResult("refund_request_initiate", prepared);
+      if (!prepared.dryRun) {
+        const scoped = requireScopedKey("payment", "write");
+        if (!scoped.ok) return blockedResult("refund_request_initiate", scoped);
+      }
       const callConfig = getCallConfig() || {};
       if (callConfig?.risk_state?.hard_block === true) {
         return blockedResult("refund_request_initiate", {
@@ -1813,38 +2584,30 @@ function buildConnectorPackImplementations(options = {}) {
           message: "Refund initiation blocked due to high-risk combination.",
         });
       }
-      const managed = await maybeInvokeManagedEndpoint("payment", "refund_request_initiate", args);
-      const stripe =
-        managed?.ok === true
-          ? null
-          : await maybeInvokeStripeConnector("refund_request_initiate", args);
-      if (stripe?.ok === false) {
-        return blockedResult("refund_request_initiate", stripe.data);
+      const payment = await getPaymentProviderSwitchboard().execute(
+        "refund_request_initiate",
+        prepared.args,
+        {
+          dryRun: prepared.dryRun,
+          stubBuilder: () => ({
+            refund_request_id: createId("refund"),
+            payment_intent_id: normalizeText(args.payment_intent_id, 120),
+            state: "pending_review",
+            created_at: new Date().toISOString(),
+            idempotency_key_present: true,
+          }),
+        },
+      );
+      if (payment?.ok === false) {
+        return blockedResult("refund_request_initiate", payment.data);
       }
-      const paypal =
-        managed?.ok === true || stripe?.ok === true
-          ? null
-          : await maybeInvokePaypalConnector("refund_request_initiate", args);
-      if (paypal?.ok === false) {
-        return blockedResult("refund_request_initiate", paypal.data);
-      }
-      const result =
-        managed?.ok === true
-          ? { status: "ok", connector_mode: "managed", ...managed.data }
-          : stripe?.ok === true
-            ? { status: "ok", connector_mode: "stripe", ...stripe.data }
-          : paypal?.ok === true
-            ? { status: "ok", connector_mode: "paypal", ...paypal.data }
-          : {
-              status: "ok",
-              connector_mode: "stub",
-              refund_request_id: createId("refund"),
-              payment_intent_id: normalizeText(args.payment_intent_id, 120),
-              state: "pending_review",
-              created_at: new Date().toISOString(),
-            };
+      const result = payment.data;
       await logAudit("refund_request_initiate", "ok", {
         refund_request_id: result.refund_request_id || null,
+        dry_run: prepared.dryRun,
+        live_mode: prepared.liveMode,
+        idempotency_key_present: true,
+        idempotency_key_generated: prepared.idempotencyGenerated,
       });
       return result;
     },

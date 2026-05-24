@@ -68,6 +68,69 @@ function isValidCallDisposition(value) {
     return VALID_CALL_DISPOSITIONS.includes(normalizeCallDispositionForDb(value));
 }
 
+function parseJsonObjectForDb(value) {
+    if (!value) return {};
+    if (typeof value === 'object' && !Array.isArray(value)) return value;
+    if (typeof value !== 'string') return {};
+    try {
+        const parsed = JSON.parse(value);
+        return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+    } catch (_) {
+        return {};
+    }
+}
+
+function normalizeSquareLinkType(value) {
+    return String(value || '')
+        .trim()
+        .toLowerCase()
+        .replace(/[\s-]+/g, '_')
+        .slice(0, 80);
+}
+
+function addSquareSessionLink(links, related_type, related_id) {
+    const relatedType = normalizeSquareLinkType(related_type);
+    const relatedId = String(related_id || '').trim();
+    if (!relatedType || !relatedId) return;
+    links.push({ related_type: relatedType, related_id: relatedId.slice(0, 160) });
+}
+
+function collectSquarePaymentSessionLinks(external_id, payload = {}) {
+    const links = [];
+    const externalId = String(external_id || payload.external_id || '').trim();
+    const metadata = parseJsonObjectForDb(payload.metadata);
+    const relatedLinks = Array.isArray(payload.related_links) ? payload.related_links : [];
+
+    addSquareSessionLink(links, 'external_id', externalId);
+    if (String(payload.action || '').includes('payment_link')) {
+        addSquareSessionLink(links, 'payment_link', externalId);
+    }
+
+    addSquareSessionLink(links, 'payment_link', metadata.payment_link_id);
+    addSquareSessionLink(links, 'payment_link', metadata.checkout_session_id);
+    addSquareSessionLink(links, 'payment_link', metadata.square_payment_link_id);
+    addSquareSessionLink(links, 'order', metadata.order_id);
+    addSquareSessionLink(links, 'payment', metadata.payment_id);
+    addSquareSessionLink(links, 'payment', metadata.payment_intent_id);
+    addSquareSessionLink(links, 'payment', metadata.square_payment_id);
+    addSquareSessionLink(links, 'payment', metadata.square_resource_id);
+    addSquareSessionLink(links, 'refund', metadata.refund_id);
+    addSquareSessionLink(links, 'refund', metadata.square_refund_id);
+
+    relatedLinks.forEach((link) => {
+        if (!link || typeof link !== 'object') return;
+        addSquareSessionLink(links, link.related_type || link.type, link.related_id || link.id);
+    });
+
+    const seen = new Set();
+    return links.filter((link) => {
+        const key = `${link.related_type}:${link.related_id}`;
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+    });
+}
+
 function parseDispositionStateRow(row) {
     if (!row?.data) return null;
     try {
@@ -127,6 +190,7 @@ class EnhancedDatabase {
                     .then(() => this.createEnhancedTables())
                     .then(() => this.initializeSMSTables())
                     .then(() => this.initializeEmailTables())
+                    .then(() => this.initializePostCallAutomationTables())
                     .then(() => this.ensureEmailDlqColumns())
                     .then(() => this.ensureEmailQueueColumns())
                     .then(() => {
@@ -541,6 +605,44 @@ class EnhancedDatabase {
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )`,
 
+            // Durable Square connector state for checkout links, payments, orders, and refunds
+            `CREATE TABLE IF NOT EXISTS square_payment_sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                call_sid TEXT,
+                action TEXT NOT NULL,
+                external_id TEXT NOT NULL UNIQUE,
+                status TEXT,
+                amount TEXT,
+                currency TEXT,
+                approval_url TEXT,
+                idempotency_key TEXT,
+                metadata TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )`,
+
+            // Square webhook/event idempotency ledger
+            `CREATE TABLE IF NOT EXISTS square_payment_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                external_event_id TEXT NOT NULL UNIQUE,
+                event_type TEXT,
+                resource_id TEXT,
+                status TEXT,
+                payload TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )`,
+
+            // Indexed related Square IDs for payment link, order, payment, and refund correlation
+            `CREATE TABLE IF NOT EXISTS square_payment_session_links (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_external_id TEXT NOT NULL,
+                related_type TEXT NOT NULL,
+                related_id TEXT NOT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(related_type, related_id)
+            )`,
+
             // Durable provider webhook idempotency guard
             `CREATE TABLE IF NOT EXISTS provider_event_idempotency (
                 event_key TEXT PRIMARY KEY,
@@ -748,6 +850,13 @@ class EnhancedDatabase {
             'CREATE INDEX IF NOT EXISTS idx_stripe_payment_sessions_updated ON stripe_payment_sessions(updated_at)',
             'CREATE INDEX IF NOT EXISTS idx_stripe_payment_events_type ON stripe_payment_events(event_type)',
             'CREATE INDEX IF NOT EXISTS idx_stripe_payment_events_resource ON stripe_payment_events(resource_id)',
+            'CREATE INDEX IF NOT EXISTS idx_square_payment_sessions_call_sid ON square_payment_sessions(call_sid)',
+            'CREATE INDEX IF NOT EXISTS idx_square_payment_sessions_status ON square_payment_sessions(status)',
+            'CREATE INDEX IF NOT EXISTS idx_square_payment_sessions_updated ON square_payment_sessions(updated_at)',
+            'CREATE INDEX IF NOT EXISTS idx_square_payment_events_type ON square_payment_events(event_type)',
+            'CREATE INDEX IF NOT EXISTS idx_square_payment_events_resource ON square_payment_events(resource_id)',
+            'CREATE INDEX IF NOT EXISTS idx_square_payment_session_links_session ON square_payment_session_links(session_external_id)',
+            'CREATE INDEX IF NOT EXISTS idx_square_payment_session_links_related ON square_payment_session_links(related_id)',
             'CREATE INDEX IF NOT EXISTS idx_provider_event_idem_source ON provider_event_idempotency(source)',
             'CREATE INDEX IF NOT EXISTS idx_provider_event_idem_expires ON provider_event_idempotency(expires_at)',
             'CREATE INDEX IF NOT EXISTS idx_outbound_call_idem_provider ON outbound_call_idempotency(provider)',
@@ -2874,6 +2983,295 @@ class EnhancedDatabase {
         return new Promise((resolve, reject) => {
             const sql = `
                 INSERT OR IGNORE INTO stripe_payment_events (
+                    external_event_id, event_type, resource_id, status, payload
+                )
+                VALUES (?, ?, ?, ?, ?)
+            `;
+            this.db.run(
+                sql,
+                [
+                    externalEventId,
+                    payload.event_type || null,
+                    payload.resource_id || null,
+                    payload.status || null,
+                    payload.payload ? JSON.stringify(payload.payload) : null,
+                ],
+                function(err) {
+                    if (err) {
+                        reject(err);
+                    } else {
+                        resolve({ inserted: (this.changes || 0) > 0 });
+                    }
+                }
+            );
+        });
+    }
+
+    async upsertSquarePaymentSession(payload = {}) {
+        const externalId = String(payload.external_id || '').trim();
+        const action = String(payload.action || '').trim();
+        if (!externalId || !action) return 0;
+
+        const metadata =
+            payload.metadata && typeof payload.metadata === 'object'
+                ? JSON.stringify(payload.metadata)
+                : payload.metadata || null;
+
+        const changes = await new Promise((resolve, reject) => {
+            const sql = `
+                INSERT INTO square_payment_sessions (
+                    call_sid, action, external_id, status, amount, currency,
+                    approval_url, idempotency_key, metadata, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(external_id) DO UPDATE SET
+                    call_sid = COALESCE(excluded.call_sid, square_payment_sessions.call_sid),
+                    action = excluded.action,
+                    status = COALESCE(excluded.status, square_payment_sessions.status),
+                    amount = COALESCE(excluded.amount, square_payment_sessions.amount),
+                    currency = COALESCE(excluded.currency, square_payment_sessions.currency),
+                    approval_url = COALESCE(excluded.approval_url, square_payment_sessions.approval_url),
+                    idempotency_key = COALESCE(excluded.idempotency_key, square_payment_sessions.idempotency_key),
+                    metadata = COALESCE(excluded.metadata, square_payment_sessions.metadata),
+                    updated_at = CURRENT_TIMESTAMP
+            `;
+            this.db.run(
+                sql,
+                [
+                    payload.call_sid || null,
+                    action,
+                    externalId,
+                    payload.status || null,
+                    payload.amount != null ? String(payload.amount) : null,
+                    payload.currency || null,
+                    payload.approval_url || null,
+                    payload.idempotency_key || null,
+                    metadata,
+                ],
+                function(err) {
+                    if (err) {
+                        reject(err);
+                    } else {
+                        resolve(this.changes || 0);
+                    }
+                }
+            );
+        });
+        const links = collectSquarePaymentSessionLinks(externalId, payload);
+        await this.upsertSquarePaymentSessionLinks(externalId, links);
+        return changes;
+    }
+
+    async upsertSquarePaymentSessionLinks(session_external_id, links = []) {
+        const sessionExternalId = String(session_external_id || '').trim();
+        if (!sessionExternalId || !Array.isArray(links) || links.length === 0) return 0;
+        const normalizedLinks = collectSquarePaymentSessionLinks(sessionExternalId, {
+            related_links: links,
+        });
+        let totalChanges = 0;
+        for (const link of normalizedLinks) {
+            const changes = await new Promise((resolve, reject) => {
+                this.db.run(
+                    `INSERT INTO square_payment_session_links (
+                        session_external_id, related_type, related_id, updated_at
+                     )
+                     VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                     ON CONFLICT(related_type, related_id) DO UPDATE SET
+                        session_external_id = excluded.session_external_id,
+                        updated_at = CURRENT_TIMESTAMP`,
+                    [
+                        sessionExternalId,
+                        link.related_type,
+                        link.related_id,
+                    ],
+                    function(err) {
+                        if (err) {
+                            reject(err);
+                        } else {
+                            resolve(this.changes || 0);
+                        }
+                    }
+                );
+            });
+            totalChanges += changes;
+        }
+        return totalChanges;
+    }
+
+    async getSquarePaymentSession(external_id) {
+        const externalId = String(external_id || '').trim();
+        if (!externalId) return null;
+        return new Promise((resolve, reject) => {
+            this.db.get(
+                `SELECT *
+                 FROM square_payment_sessions
+                 WHERE external_id = ?
+                 LIMIT 1`,
+                [externalId],
+                (err, row) => {
+                    if (err) {
+                        reject(err);
+                    } else {
+                        resolve(row || null);
+                    }
+                }
+            );
+        });
+    }
+
+    async findSquarePaymentSessionByRelatedId(related_id) {
+        const relatedId = String(related_id || '').trim();
+        if (!relatedId) return null;
+        const directSession = await this.getSquarePaymentSession(relatedId);
+        if (directSession) return directSession;
+        return new Promise((resolve, reject) => {
+            this.db.get(
+                `SELECT s.*
+                 FROM square_payment_session_links l
+                 JOIN square_payment_sessions s
+                   ON s.external_id = l.session_external_id
+                 WHERE l.related_id = ?
+                 ORDER BY
+                    l.updated_at DESC,
+                    s.updated_at DESC,
+                    s.id DESC
+                 LIMIT 1`,
+                [relatedId],
+                (err, row) => {
+                    if (err) {
+                        reject(err);
+                    } else {
+                        resolve(row || null);
+                    }
+                }
+            );
+        });
+    }
+
+    async listSquarePaymentSessions(filters = {}) {
+        const externalId = String(filters.external_id || '').trim();
+        const callSid = String(filters.call_sid || '').trim();
+        const limit = Math.max(1, Math.min(25, Number(filters.limit) || 10));
+        if (!externalId && !callSid) return [];
+
+        const where = [];
+        const params = [];
+        if (externalId) {
+            where.push('external_id = ?');
+            params.push(externalId);
+        }
+        if (callSid) {
+            where.push('call_sid = ?');
+            params.push(callSid);
+        }
+        params.push(limit);
+
+        return new Promise((resolve, reject) => {
+            this.db.all(
+                `SELECT *
+                 FROM square_payment_sessions
+                 WHERE ${where.join(' OR ')}
+                 ORDER BY updated_at DESC, id DESC
+                 LIMIT ?`,
+                params,
+                (err, rows) => {
+                    if (err) {
+                        reject(err);
+                    } else {
+                        resolve(rows || []);
+                    }
+                }
+            );
+        });
+    }
+
+    async updateSquarePaymentSessionStatus(external_id, payload = {}) {
+        const externalId = String(external_id || '').trim();
+        if (!externalId) return 0;
+        const metadata =
+            payload.metadata && typeof payload.metadata === 'object'
+                ? JSON.stringify(payload.metadata)
+                : payload.metadata || null;
+        const changes = await new Promise((resolve, reject) => {
+            this.db.run(
+                `UPDATE square_payment_sessions
+                 SET status = COALESCE(?, status),
+                     amount = COALESCE(?, amount),
+                     currency = COALESCE(?, currency),
+                     metadata = COALESCE(?, metadata),
+                     updated_at = CURRENT_TIMESTAMP
+                 WHERE external_id = ?`,
+                [
+                    payload.status || null,
+                    payload.amount != null ? String(payload.amount) : null,
+                    payload.currency || null,
+                    metadata,
+                    externalId,
+                ],
+                function(err) {
+                    if (err) {
+                        reject(err);
+                    } else {
+                        resolve(this.changes || 0);
+                    }
+                }
+            );
+        });
+        if (changes > 0) {
+            const links = collectSquarePaymentSessionLinks(externalId, payload);
+            await this.upsertSquarePaymentSessionLinks(externalId, links);
+        }
+        return changes;
+    }
+
+    async listSquarePaymentEvents(filters = {}) {
+        const externalId = String(filters.external_id || '').trim();
+        const callSid = String(filters.call_sid || '').trim();
+        const limit = Math.max(1, Math.min(25, Number(filters.limit) || 10));
+        if (!externalId && !callSid) return [];
+
+        const eventIds = new Set();
+        if (externalId) eventIds.add(externalId);
+        if (callSid) {
+            const sessions = await this.listSquarePaymentSessions({
+                call_sid: callSid,
+                limit,
+            });
+            sessions.forEach((session) => {
+                if (session?.external_id) eventIds.add(session.external_id);
+            });
+        }
+        if (eventIds.size === 0) return [];
+
+        const placeholders = Array.from(eventIds).map(() => '?').join(', ');
+        const params = Array.from(eventIds);
+        params.push(limit);
+
+        return new Promise((resolve, reject) => {
+            this.db.all(
+                `SELECT *
+                 FROM square_payment_events
+                 WHERE resource_id IN (${placeholders})
+                 ORDER BY created_at DESC, id DESC
+                 LIMIT ?`,
+                params,
+                (err, rows) => {
+                    if (err) {
+                        reject(err);
+                    } else {
+                        resolve(rows || []);
+                    }
+                }
+            );
+        });
+    }
+
+    async recordSquarePaymentEvent(payload = {}) {
+        const externalEventId = String(payload.external_event_id || '').trim();
+        if (!externalEventId) return { inserted: false };
+        return new Promise((resolve, reject) => {
+            const sql = `
+                INSERT OR IGNORE INTO square_payment_events (
                     external_event_id, event_type, resource_id, status, payload
                 )
                 VALUES (?, ?, ?, ?, ?)
@@ -5720,6 +6118,117 @@ class EnhancedDatabase {
        });
    }
 
+   async initializePostCallAutomationTables() {
+       const statements = [
+           `CREATE TABLE IF NOT EXISTS post_call_automation_rules (
+               rule_id TEXT PRIMARY KEY,
+               name TEXT NOT NULL,
+               enabled INTEGER DEFAULT 1,
+               trigger_event TEXT NOT NULL,
+               conditions_json TEXT,
+               actions_json TEXT NOT NULL,
+               priority INTEGER DEFAULT 100,
+               created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+               updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+               last_run_at DATETIME
+           )`,
+           `CREATE TABLE IF NOT EXISTS post_call_automation_runs (
+               run_id TEXT PRIMARY KEY,
+               rule_id TEXT NOT NULL,
+               call_sid TEXT,
+               trigger_event TEXT NOT NULL,
+               status TEXT NOT NULL,
+               actions_json TEXT,
+               result_json TEXT,
+               error TEXT,
+               idempotency_key TEXT UNIQUE,
+               payload_json TEXT,
+               retry_of_run_id TEXT,
+               attempt INTEGER DEFAULT 1,
+               created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+               updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+               completed_at DATETIME
+           )`,
+           `CREATE TABLE IF NOT EXISTS crm_contact_sync_records (
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               provider TEXT NOT NULL,
+               local_contact_id TEXT,
+               external_contact_id TEXT,
+               email TEXT,
+               phone TEXT,
+               status TEXT,
+               payload_json TEXT,
+               created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+               updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+               UNIQUE(provider, local_contact_id)
+           )`,
+           `CREATE TABLE IF NOT EXISTS crm_activity_sync_events (
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               provider TEXT NOT NULL,
+               external_contact_id TEXT,
+               activity_id TEXT,
+               activity_type TEXT,
+               status TEXT,
+               payload_json TEXT,
+               created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+           )`,
+           'CREATE INDEX IF NOT EXISTS idx_post_call_rules_trigger_enabled ON post_call_automation_rules(trigger_event, enabled)',
+           'CREATE INDEX IF NOT EXISTS idx_post_call_rules_priority ON post_call_automation_rules(priority)',
+           'CREATE INDEX IF NOT EXISTS idx_post_call_runs_call_sid ON post_call_automation_runs(call_sid)',
+           'CREATE INDEX IF NOT EXISTS idx_post_call_runs_idempotency ON post_call_automation_runs(idempotency_key)',
+           'CREATE INDEX IF NOT EXISTS idx_crm_contact_sync_email ON crm_contact_sync_records(email)',
+           'CREATE INDEX IF NOT EXISTS idx_crm_activity_sync_contact ON crm_activity_sync_events(external_contact_id)',
+       ];
+       for (const stmt of statements) {
+           await new Promise((resolve, reject) => {
+               this.db.run(stmt, (err) => {
+                   if (err) reject(err);
+                   else resolve();
+               });
+           });
+       }
+       await this.ensurePostCallAutomationRunColumns();
+       console.log('✅ Post-call automation tables created successfully');
+   }
+
+   async ensurePostCallAutomationRunColumns() {
+       if (this.postCallAutomationRunColumnsEnsured) {
+           return;
+       }
+       const existing = await new Promise((resolve, reject) => {
+           this.db.all('PRAGMA table_info(post_call_automation_runs)', (err, rows) => {
+               if (err) {
+                   reject(err);
+               } else {
+                   resolve(rows || []);
+               }
+           });
+       });
+       const names = new Set(existing.map((row) => row.name));
+       const alterStatements = [];
+       if (!names.has('payload_json')) {
+           alterStatements.push('ALTER TABLE post_call_automation_runs ADD COLUMN payload_json TEXT');
+       }
+       if (!names.has('retry_of_run_id')) {
+           alterStatements.push('ALTER TABLE post_call_automation_runs ADD COLUMN retry_of_run_id TEXT');
+       }
+       if (!names.has('attempt')) {
+           alterStatements.push('ALTER TABLE post_call_automation_runs ADD COLUMN attempt INTEGER DEFAULT 1');
+       }
+       for (const stmt of alterStatements) {
+           await new Promise((resolve, reject) => {
+               this.db.run(stmt, (err) => {
+                   if (err) {
+                       reject(err);
+                   } else {
+                       resolve();
+                   }
+               });
+           });
+       }
+       this.postCallAutomationRunColumnsEnsured = true;
+   }
+
    async ensureEmailDlqColumns() {
        if (this.emailDlqColumnsEnsured) {
            return;
@@ -6554,6 +7063,327 @@ class EnhancedDatabase {
                    },
                );
            });
+       });
+   }
+
+   async upsertPostCallAutomationRule(rule = {}) {
+       return new Promise((resolve, reject) => {
+           const sql = `
+               INSERT INTO post_call_automation_rules (
+                   rule_id, name, enabled, trigger_event, conditions_json, actions_json, priority, created_at, updated_at
+               )
+               VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+               ON CONFLICT(rule_id) DO UPDATE SET
+                   name = excluded.name,
+                   enabled = excluded.enabled,
+                   trigger_event = excluded.trigger_event,
+                   conditions_json = excluded.conditions_json,
+                   actions_json = excluded.actions_json,
+                   priority = excluded.priority,
+                   updated_at = CURRENT_TIMESTAMP
+           `;
+           this.db.run(
+               sql,
+               [
+                   rule.rule_id,
+                   rule.name,
+                   rule.enabled === false || rule.enabled === 0 ? 0 : 1,
+                   rule.trigger_event,
+                   rule.conditions_json || '{}',
+                   rule.actions_json || '[]',
+                   Number.isFinite(Number(rule.priority)) ? Number(rule.priority) : 100,
+               ],
+               function (err) {
+                   if (err) {
+                       console.error('Error upserting post-call automation rule:', err);
+                       reject(err);
+                   } else {
+                       resolve(this.changes || 0);
+                   }
+               },
+           );
+       });
+   }
+
+   async getPostCallAutomationRule(ruleId) {
+       return new Promise((resolve, reject) => {
+           this.db.get(
+               'SELECT * FROM post_call_automation_rules WHERE rule_id = ?',
+               [ruleId],
+               (err, row) => {
+                   if (err) {
+                       console.error('Error fetching post-call automation rule:', err);
+                       reject(err);
+                   } else {
+                       resolve(row || null);
+                   }
+               },
+           );
+       });
+   }
+
+   async listPostCallAutomationRules(filters = {}) {
+       const where = [];
+       const params = [];
+       if (Object.prototype.hasOwnProperty.call(filters, 'enabled')) {
+           where.push('enabled = ?');
+           params.push(filters.enabled ? 1 : 0);
+       }
+       if (filters.trigger_event) {
+           where.push('trigger_event = ?');
+           params.push(filters.trigger_event);
+       }
+       const safeLimit = Number.isFinite(Number(filters.limit))
+           ? Math.max(1, Math.min(200, Math.floor(Number(filters.limit))))
+           : 100;
+       params.push(safeLimit);
+       const sql = `
+           SELECT * FROM post_call_automation_rules
+           ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
+           ORDER BY priority ASC, updated_at DESC
+           LIMIT ?
+       `;
+       return new Promise((resolve, reject) => {
+           this.db.all(sql, params, (err, rows) => {
+               if (err) {
+                   console.error('Error listing post-call automation rules:', err);
+                   reject(err);
+               } else {
+                   resolve(rows || []);
+               }
+           });
+       });
+   }
+
+   async deletePostCallAutomationRule(ruleId) {
+       return new Promise((resolve, reject) => {
+           this.db.run(
+               'DELETE FROM post_call_automation_rules WHERE rule_id = ?',
+               [ruleId],
+               function (err) {
+                   if (err) {
+                       console.error('Error deleting post-call automation rule:', err);
+                       reject(err);
+                   } else {
+                       resolve(this.changes || 0);
+                   }
+               },
+           );
+       });
+   }
+
+   async recordPostCallAutomationRun(run = {}) {
+       return new Promise((resolve, reject) => {
+           const sql = `
+               INSERT INTO post_call_automation_runs (
+                   run_id, rule_id, call_sid, trigger_event, status, actions_json, result_json, error, idempotency_key,
+                   payload_json, retry_of_run_id, attempt, created_at, updated_at, completed_at
+               )
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, ?)
+               ON CONFLICT(run_id) DO UPDATE SET
+                   status = excluded.status,
+                   actions_json = excluded.actions_json,
+                   result_json = excluded.result_json,
+                   error = excluded.error,
+                   payload_json = excluded.payload_json,
+                   retry_of_run_id = excluded.retry_of_run_id,
+                   attempt = excluded.attempt,
+                   updated_at = CURRENT_TIMESTAMP,
+                   completed_at = excluded.completed_at
+           `;
+           const completedAt = ['completed', 'failed'].includes(String(run.status || '').toLowerCase())
+               ? new Date().toISOString()
+               : null;
+           this.db.run(
+               sql,
+               [
+                   run.run_id,
+                   run.rule_id,
+                   run.call_sid || null,
+                   run.trigger_event,
+                   run.status,
+                   run.actions_json || null,
+                   run.result_json || null,
+                   run.error || null,
+                   run.idempotency_key || null,
+                   run.payload_json || null,
+                   run.retry_of_run_id || null,
+                   Number.isFinite(Number(run.attempt)) ? Math.max(1, Math.floor(Number(run.attempt))) : 1,
+                   completedAt,
+               ],
+               (err) => {
+                   if (err) {
+                       console.error('Error recording post-call automation run:', err);
+                       reject(err);
+                   } else {
+                       if (run.rule_id && run.status === 'completed') {
+                           this.db.run(
+                               'UPDATE post_call_automation_rules SET last_run_at = CURRENT_TIMESTAMP WHERE rule_id = ?',
+                               [run.rule_id],
+                               (updateErr) => {
+                                   if (updateErr) {
+                                       console.error('Error updating post-call automation rule last_run_at:', updateErr);
+                                       reject(updateErr);
+                                   } else {
+                                       resolve(true);
+                                   }
+                               },
+                           );
+                       } else {
+                           resolve(true);
+                       }
+                   }
+               },
+           );
+       });
+   }
+
+   async getPostCallAutomationRun(runId) {
+       if (!runId) return null;
+       return new Promise((resolve, reject) => {
+           this.db.get(
+               'SELECT * FROM post_call_automation_runs WHERE run_id = ?',
+               [runId],
+               (err, row) => {
+                   if (err) {
+                       console.error('Error fetching post-call automation run:', err);
+                       reject(err);
+                   } else {
+                       resolve(row || null);
+                   }
+               },
+           );
+       });
+   }
+
+   async listPostCallAutomationRuns(filters = {}) {
+       const where = [];
+       const params = [];
+       if (filters.call_sid) {
+           where.push('call_sid = ?');
+           params.push(filters.call_sid);
+       }
+       if (filters.rule_id) {
+           where.push('rule_id = ?');
+           params.push(filters.rule_id);
+       }
+       if (filters.status) {
+           where.push('status = ?');
+           params.push(String(filters.status).toLowerCase());
+       }
+       if (filters.trigger_event) {
+           where.push('trigger_event = ?');
+           params.push(filters.trigger_event);
+       }
+       if (filters.retry_of_run_id) {
+           where.push('retry_of_run_id = ?');
+           params.push(filters.retry_of_run_id);
+       }
+       const safeLimit = Number.isFinite(Number(filters.limit))
+           ? Math.max(1, Math.min(200, Math.floor(Number(filters.limit))))
+           : 100;
+       params.push(safeLimit);
+       const sql = `
+           SELECT * FROM post_call_automation_runs
+           ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
+           ORDER BY created_at DESC
+           LIMIT ?
+       `;
+       return new Promise((resolve, reject) => {
+           this.db.all(sql, params, (err, rows) => {
+               if (err) {
+                   console.error('Error listing post-call automation runs:', err);
+                   reject(err);
+               } else {
+                   resolve(rows || []);
+               }
+           });
+       });
+   }
+
+   async getPostCallAutomationRunByIdempotency(idempotencyKey) {
+       if (!idempotencyKey) return null;
+       return new Promise((resolve, reject) => {
+           this.db.get(
+               'SELECT * FROM post_call_automation_runs WHERE idempotency_key = ?',
+               [idempotencyKey],
+               (err, row) => {
+                   if (err) {
+                       console.error('Error fetching post-call automation idempotency record:', err);
+                       reject(err);
+                   } else {
+                       resolve(row || null);
+                   }
+               },
+           );
+       });
+   }
+
+   async upsertCrmContactSyncRecord(record = {}) {
+       return new Promise((resolve, reject) => {
+           const sql = `
+               INSERT INTO crm_contact_sync_records (
+                   provider, local_contact_id, external_contact_id, email, phone, status, payload_json, created_at, updated_at
+               )
+               VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+               ON CONFLICT(provider, local_contact_id) DO UPDATE SET
+                   external_contact_id = excluded.external_contact_id,
+                   email = excluded.email,
+                   phone = excluded.phone,
+                   status = excluded.status,
+                   payload_json = excluded.payload_json,
+                   updated_at = CURRENT_TIMESTAMP
+           `;
+           this.db.run(
+               sql,
+               [
+                   record.provider,
+                   record.local_contact_id,
+                   record.external_contact_id,
+                   record.email || null,
+                   record.phone || null,
+                   record.status || null,
+                   record.payload_json || null,
+               ],
+               function (err) {
+                   if (err) {
+                       console.error('Error upserting CRM contact sync record:', err);
+                       reject(err);
+                   } else {
+                       resolve(this.changes || 0);
+                   }
+               },
+           );
+       });
+   }
+
+   async recordCrmActivitySyncEvent(event = {}) {
+       return new Promise((resolve, reject) => {
+           const sql = `
+               INSERT INTO crm_activity_sync_events (
+                   provider, external_contact_id, activity_id, activity_type, status, payload_json
+               )
+               VALUES (?, ?, ?, ?, ?, ?)
+           `;
+           this.db.run(
+               sql,
+               [
+                   event.provider,
+                   event.external_contact_id || null,
+                   event.activity_id || null,
+                   event.activity_type || null,
+                   event.status || null,
+                   event.payload_json || null,
+               ],
+               function (err) {
+                   if (err) {
+                       console.error('Error recording CRM activity sync event:', err);
+                       reject(err);
+                   } else {
+                       resolve(this.lastID);
+                   }
+               },
+           );
        });
    }
 

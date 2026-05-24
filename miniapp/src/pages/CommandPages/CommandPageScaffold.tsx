@@ -8,7 +8,6 @@ import {
 
 import { Link } from '@/components/Link/Link.tsx';
 import { Page } from '@/components/Page.tsx';
-import { AdminPageIntro } from '@/components/admin-dashboard/AdminPageIntro';
 import {
   UiBadge,
   UiSurfaceState,
@@ -53,14 +52,23 @@ export function CommandPageLayout({
   return (
     <Page back={back}>
       <div className="va-dashboard va-command-page va-view-enter">
-        <AdminPageIntro
-          eyebrow={eyebrow}
-          title={title}
-          summary={summary}
-          meta={meta}
-          metaAriaLabel={metaAriaLabel}
-          note={note}
-        />
+        <header className="va-command-page-header">
+          <div className="va-command-page-heading">
+            <p className="va-command-page-eyebrow">{eyebrow}</p>
+            <h1 className="va-command-page-title">{title}</h1>
+            <div className="va-command-page-summary">{summary}</div>
+          </div>
+          {meta ? (
+            <div className="va-command-page-meta" aria-label={metaAriaLabel}>
+              {meta}
+            </div>
+          ) : null}
+          {note ? (
+            <div className="va-command-page-note">
+              {note}
+            </div>
+          ) : null}
+        </header>
         {pulse}
         {children}
       </div>

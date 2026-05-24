@@ -14,6 +14,8 @@ type TelegramButtonLifecycleControl = {
 type UseDashboardTelegramButtonsOptions = {
   settingsButtonSupported: boolean;
   toggleSettings: (next?: boolean, options?: { fallbackModule?: DashboardModule }) => void;
+  openOverflowMenu?: () => void;
+  closeOverflowMenu?: () => void;
   returnToHome: () => void;
   dialogState: DashboardDialogState | null;
   dismissDialog: (state: DashboardDialogState | null) => void;
@@ -22,6 +24,7 @@ type UseDashboardTelegramButtonsOptions = {
     impactStyle?: 'light' | 'medium' | 'heavy' | 'rigid' | 'soft',
   ) => void;
   settingsOpen: boolean;
+  overflowMenuOpen?: boolean;
   focusedWorkspaceMode: boolean;
   activeModule: DashboardModule;
 };
@@ -32,11 +35,14 @@ const backButtonLifecycleControl = backButton as unknown as TelegramButtonLifecy
 export function useDashboardTelegramButtons({
   settingsButtonSupported,
   toggleSettings,
+  openOverflowMenu,
+  closeOverflowMenu,
   returnToHome,
   dialogState,
   dismissDialog,
   triggerHaptic,
   settingsOpen,
+  overflowMenuOpen = false,
   focusedWorkspaceMode,
   activeModule,
 }: UseDashboardTelegramButtonsOptions): void {
@@ -63,14 +69,19 @@ export function useDashboardTelegramButtons({
       return undefined;
     }
     return settingsButton.onClick(() => {
+      if (openOverflowMenu) {
+        openOverflowMenu();
+        return;
+      }
       toggleSettings();
     });
-  }, [toggleSettings]);
+  }, [openOverflowMenu, toggleSettings]);
 
   useEffect(() => {
     if (
       Boolean(dialogState)
       || settingsOpen
+      || overflowMenuOpen
       || focusedWorkspaceMode
       || activeModule !== 'ops'
     ) {
@@ -78,7 +89,7 @@ export function useDashboardTelegramButtons({
       return;
     }
     backButtonLifecycleControl.hide?.ifAvailable?.();
-  }, [activeModule, dialogState, focusedWorkspaceMode, settingsOpen]);
+  }, [activeModule, dialogState, focusedWorkspaceMode, overflowMenuOpen, settingsOpen]);
 
   useEffect(() => {
     if (!backButton.onClick.isAvailable()) {
@@ -87,6 +98,11 @@ export function useDashboardTelegramButtons({
     return backButton.onClick(() => {
       if (dialogState) {
         dismissDialog(dialogState);
+        triggerHaptic('selection');
+        return;
+      }
+      if (overflowMenuOpen) {
+        closeOverflowMenu?.();
         triggerHaptic('selection');
         return;
       }
@@ -107,12 +123,13 @@ export function useDashboardTelegramButtons({
     });
   }, [
     activeModule,
+    closeOverflowMenu,
     dialogState,
     dismissDialog,
     focusedWorkspaceMode,
+    overflowMenuOpen,
     returnToHome,
     settingsOpen,
-    toggleSettings,
     triggerHaptic,
   ]);
 }

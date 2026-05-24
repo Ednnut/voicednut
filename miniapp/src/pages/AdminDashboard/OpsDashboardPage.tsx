@@ -13,6 +13,7 @@ import type {
 } from './types';
 import { useInvestigationAction } from './useInvestigationAction';
 import { selectOpsPageVm } from './vmSelectors';
+import { CommandCenterPanel } from './CommandCenterPanel';
 import { AdminPageIntro } from '@/components/admin-dashboard/AdminPageIntro';
 import { DashboardWorkflowContractCard } from '@/components/admin-dashboard/DashboardWorkflowContractCard';
 import {
@@ -294,6 +295,19 @@ export function OpsDashboardPage({ visible, vm }: OpsDashboardPageProps) {
           { label: 'Queue backlog', value: queueBacklogTotal },
           { label: 'Error budget', value: `${sloErrorBudgetPercent}%` },
         ]}
+      />
+
+      <CommandCenterPanel
+        busyAction={busyAction}
+        loading={loading}
+        invokeAction={invokeAction}
+        runAction={runAction}
+        formatTime={formatTime}
+        toText={toText}
+        toInt={toInt}
+        callLogs={callLogs}
+        emailJobs={emailJobs}
+        emailDlq={emailDlq}
       />
 
       {isInitialSyncing ? (

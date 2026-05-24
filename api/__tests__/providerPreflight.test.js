@@ -48,6 +48,26 @@ function createStripeConfig(stripeOverrides = {}) {
   };
 }
 
+function createSquareConfig(squareOverrides = {}) {
+  return {
+    server: {
+      hostname: "api.example.com",
+    },
+    payment: {
+      square: {
+        enabled: true,
+        environment: "sandbox",
+        accessToken: "square-token",
+        locationId: "L123",
+        webhookSignatureKey: "square-signature-key",
+        webhookUrl: "https://api.example.com/webhook/square",
+        returnUrl: "https://api.example.com/square/return",
+        ...squareOverrides,
+      },
+    },
+  };
+}
+
 function createAppWithPaypalWebhook() {
   const app = express();
   app.post("/webhook/paypal", (_req, res) => res.sendStatus(204));
@@ -57,6 +77,12 @@ function createAppWithPaypalWebhook() {
 function createAppWithStripeWebhook() {
   const app = express();
   app.post("/webhook/stripe", (_req, res) => res.sendStatus(204));
+  return app;
+}
+
+function createAppWithSquareWebhook() {
+  const app = express();
+  app.post("/webhook/square", (_req, res) => res.sendStatus(204));
   return app;
 }
 
@@ -208,6 +234,78 @@ describe("Stripe provider preflight", () => {
       requireReachability: false,
       guards: {
         stripe: false,
+      },
+    });
+
+    assert.equal(report.ok, false);
+    assert.equal(findCheck(report, "webhook_auth").status, CHECK_STATUS.FAIL);
+    assert.equal(findCheck(report, "required_routes").status, CHECK_STATUS.FAIL);
+  });
+});
+
+describe("Square provider preflight", () => {
+  it("registers Square as a payment-only preflight provider", () => {
+    assert.equal(isProviderSupported("payment", "square"), true);
+    assert.equal(isProviderSupported("call", "square"), false);
+    assert.equal(isProviderSupported("sms", "square"), false);
+  });
+
+  it("builds the Square webhook callback URL from SQUARE_WEBHOOK_URL", () => {
+    const callbacks = buildProviderCallbackUrls(
+      "square",
+      "payment",
+      createSquareConfig(),
+    );
+
+    assert.deepEqual(callbacks.urls, ["https://api.example.com/webhook/square"]);
+    assert.equal(callbacks.reason, null);
+  });
+
+  it("falls back to SERVER when Square webhook URL is not explicitly configured", () => {
+    const callbacks = buildProviderCallbackUrls(
+      "square",
+      "payment",
+      createSquareConfig({ webhookUrl: "" }),
+    );
+
+    assert.deepEqual(callbacks.urls, ["https://api.example.com/webhook/square"]);
+    assert.equal(callbacks.base_url, "https://api.example.com");
+    assert.equal(callbacks.reason, null);
+  });
+
+  it("passes offline readiness when Square credentials, webhook auth, and route are configured", async () => {
+    const report = await runProviderPreflight({
+      provider: "square",
+      channel: "payment",
+      mode: "manual",
+      config: createSquareConfig(),
+      app: createAppWithSquareWebhook(),
+      allowNetwork: false,
+      requireReachability: false,
+      guards: {
+        square: true,
+      },
+    });
+
+    assert.equal(report.ok, true);
+    assert.equal(findCheck(report, "credentials_auth").status, CHECK_STATUS.WARN);
+    assert.equal(findCheck(report, "webhook_auth").status, CHECK_STATUS.PASS);
+    assert.equal(findCheck(report, "callback_urls").status, CHECK_STATUS.PASS);
+    assert.equal(findCheck(report, "required_routes").status, CHECK_STATUS.PASS);
+    assert.equal(findCheck(report, "agent_toolkit_read_surface"), undefined);
+  });
+
+  it("fails when Square webhook signature configuration or route registration is missing", async () => {
+    const report = await runProviderPreflight({
+      provider: "square",
+      channel: "payment",
+      mode: "manual",
+      config: createSquareConfig({ webhookSignatureKey: "" }),
+      app: express(),
+      allowNetwork: false,
+      requireReachability: false,
+      guards: {
+        square: false,
       },
     });
 

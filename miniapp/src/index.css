@@ -40,33 +40,31 @@
   --app-ease-standard: cubic-bezier(0.2, 0.72, 0.14, 1);
 
   /* Color system */
-  --app-color-bg: #080e17;
-  --app-color-bg-elev-1: #0f1826;
-  --app-color-bg-elev-2: #162235;
-  --app-color-surface: #1d2a3f;
-  --app-color-surface-strong: #111a2a;
-  --app-color-border: rgba(158, 186, 232, 0.22);
-  --app-color-border-soft: rgba(158, 186, 232, 0.14);
-  --app-color-text: #ecf4ff;
-  --app-color-muted: #a7b7ce;
-  --app-color-primary: #3f93ff;
-  --app-color-primary-strong: #2f7adb;
-  --app-color-success: #49cda3;
-  --app-color-warning: #f5b95c;
-  --app-color-danger: #f07c9e;
-  --app-color-link: #7db5ff;
-  --app-focus-ring: 0 0 0 3px rgba(88, 163, 255, 0.22);
+  --app-color-bg: #101113;
+  --app-color-bg-elev-1: #15171b;
+  --app-color-bg-elev-2: #1b1d22;
+  --app-color-surface: #25272d;
+  --app-color-surface-strong: #2d3037;
+  --app-color-border: rgba(255, 255, 255, 0.1);
+  --app-color-border-soft: rgba(255, 255, 255, 0.07);
+  --app-color-text: #f4f5f7;
+  --app-color-muted: #9b9da5;
+  --app-color-primary: #3390ec;
+  --app-color-primary-strong: #2481dc;
+  --app-color-success: #54d66f;
+  --app-color-warning: #f4ba5f;
+  --app-color-danger: #ff5c5c;
+  --app-color-link: #56a8ff;
+  --app-focus-ring: 0 0 0 3px rgba(51, 144, 236, 0.26);
   --app-color-bg-telegram: var(--tg-theme-bg-color, var(--app-color-bg));
   --app-color-surface-telegram: var(--tg-theme-secondary-bg-color, var(--app-color-bg-elev-1));
   --app-color-card-telegram: var(--tg-theme-section-bg-color, var(--app-color-surface));
 
   --app-gradient-atmosphere:
-    radial-gradient(980px 400px at 100% -8%, rgba(73, 142, 255, 0.14), transparent 70%),
-    radial-gradient(880px 380px at -8% -2%, rgba(65, 214, 171, 0.09), transparent 66%),
-    linear-gradient(180deg, #0a121d 0%, #08101a 44%, #070d16 100%);
+    linear-gradient(180deg, #17191d 0%, #111214 42%, #0f1012 100%);
 
-  --app-shadow-soft: 0 10px 24px rgba(2, 7, 16, 0.34);
-  --app-shadow-float: 0 18px 42px rgba(0, 0, 0, 0.45);
+  --app-shadow-soft: 0 10px 24px rgba(0, 0, 0, 0.28);
+  --app-shadow-float: 0 20px 48px rgba(0, 0, 0, 0.46);
 }
 
 html,

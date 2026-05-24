@@ -25,6 +25,7 @@ type DashboardTopShellProps = {
   activeModuleLabel: string;
   activeModuleSubtitle: string;
   onOpenSettings: () => void;
+  onOpenOverflowMenu?: () => void;
   error: string;
   errorCode: string;
   refreshFailureDiagnostics: RefreshFailureDiagnostics | null;
@@ -65,6 +66,7 @@ export function DashboardTopShell({
   activeModuleLabel,
   activeModuleSubtitle,
   onOpenSettings,
+  onOpenOverflowMenu,
   error,
   errorCode,
   refreshFailureDiagnostics,
@@ -124,6 +126,7 @@ export function DashboardTopShell({
             loading={loading}
             compact
             onOpenSettings={onOpenSettings}
+            onOpenOverflowMenu={onOpenOverflowMenu}
           />
         ) : (
           <DashboardFocusedHeader
@@ -133,6 +136,7 @@ export function DashboardTopShell({
             userAvatarFallback={userAvatarFallback}
             loading={loading}
             onOpenSettings={onOpenSettings}
+            onOpenOverflowMenu={onOpenOverflowMenu}
           />
         )}
       </section>

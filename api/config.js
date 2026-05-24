@@ -865,6 +865,23 @@ const stripeTimeoutMs = Number(readEnv("STRIPE_TIMEOUT_MS") || "7000");
 const stripeWebhookToleranceSeconds = Number(
   readEnv("STRIPE_WEBHOOK_TOLERANCE_SECONDS") || "300",
 );
+const squareConnectorEnabled =
+  String(readEnv("SQUARE_CONNECTOR_ENABLED") || "false").toLowerCase() === "true";
+const squareEnvironmentRaw =
+  String(readEnv("SQUARE_ENVIRONMENT") || readEnv("SQUARE_ENV") || "sandbox")
+    .trim()
+    .toLowerCase();
+const squareEnvironment =
+  squareEnvironmentRaw === "live" || squareEnvironmentRaw === "production"
+    ? "production"
+    : "sandbox";
+const squareAccessToken = readEnv("SQUARE_ACCESS_TOKEN") || "";
+const squareLocationId = readEnv("SQUARE_LOCATION_ID") || "";
+const squareWebhookSignatureKey = readEnv("SQUARE_WEBHOOK_SIGNATURE_KEY") || "";
+const squareWebhookUrl = readEnv("SQUARE_WEBHOOK_URL") || "";
+const squareReturnUrl = readEnv("SQUARE_RETURN_URL") || "";
+const squareApiVersion = readEnv("SQUARE_API_VERSION") || "2026-05-20";
+const squareTimeoutMs = Number(readEnv("SQUARE_TIMEOUT_MS") || "7000");
 
 function loadPrivateKey(rawValue) {
   if (!rawValue) {
@@ -1070,6 +1087,20 @@ const sendgridBaseUrl = readEnv("SENDGRID_BASE_URL");
 const mailgunApiKey = readEnv("MAILGUN_API_KEY");
 const mailgunDomain = readEnv("MAILGUN_DOMAIN");
 const mailgunBaseUrl = readEnv("MAILGUN_BASE_URL");
+const crmProvider = (readEnv("CRM_PROVIDER") || "stub").toLowerCase();
+const crmRequestTimeoutMs = Number(readEnv("CRM_REQUEST_TIMEOUT_MS") || "15000");
+const hubspotApiKey = readEnv("HUBSPOT_API_KEY");
+const hubspotBaseUrl = readEnv("HUBSPOT_BASE_URL") || "https://api.hubapi.com";
+const airtableApiKey = readEnv("AIRTABLE_API_KEY");
+const airtableBaseId = readEnv("AIRTABLE_BASE_ID");
+const airtableContactsTable = readEnv("AIRTABLE_CONTACTS_TABLE") || "Contacts";
+const airtableActivitiesTable = readEnv("AIRTABLE_ACTIVITIES_TABLE") || "Activities";
+const airtableBaseUrl = readEnv("AIRTABLE_BASE_URL") || "https://api.airtable.com";
+const goHighLevelApiKey = readEnv("GOHIGHLEVEL_API_KEY") || readEnv("GHL_API_KEY");
+const goHighLevelLocationId = readEnv("GOHIGHLEVEL_LOCATION_ID") || readEnv("GHL_LOCATION_ID");
+const goHighLevelBaseUrl = readEnv("GOHIGHLEVEL_BASE_URL") || "https://services.leadconnectorhq.com";
+const salesforceAccessToken = readEnv("SALESFORCE_ACCESS_TOKEN");
+const salesforceInstanceUrl = readEnv("SALESFORCE_INSTANCE_URL");
 module.exports = {
   platform: {
     provider: callProvider,
@@ -1498,6 +1529,32 @@ module.exports = {
       baseUrl: mailgunBaseUrl,
     },
   },
+  crm: {
+    provider: crmProvider,
+    requestTimeoutMs: Number.isFinite(crmRequestTimeoutMs)
+      ? crmRequestTimeoutMs
+      : 15000,
+    hubspot: {
+      apiKey: hubspotApiKey,
+      baseUrl: hubspotBaseUrl,
+    },
+    airtable: {
+      apiKey: airtableApiKey,
+      baseId: airtableBaseId,
+      contactsTable: airtableContactsTable,
+      activitiesTable: airtableActivitiesTable,
+      baseUrl: airtableBaseUrl,
+    },
+    gohighlevel: {
+      apiKey: goHighLevelApiKey,
+      locationId: goHighLevelLocationId,
+      baseUrl: goHighLevelBaseUrl,
+    },
+    salesforce: {
+      accessToken: salesforceAccessToken,
+      instanceUrl: salesforceInstanceUrl,
+    },
+  },
   smsDefaults: {
     businessId: defaultSmsBusinessId,
   },
@@ -1792,6 +1849,20 @@ module.exports = {
       webhookToleranceSeconds: Number.isFinite(stripeWebhookToleranceSeconds)
         ? Math.max(30, Math.min(900, Math.floor(stripeWebhookToleranceSeconds)))
         : 300,
+    },
+    square: {
+      enabled: squareConnectorEnabled,
+      environment: squareEnvironment,
+      accessToken: String(squareAccessToken || "").trim(),
+      locationId: String(squareLocationId || "").trim(),
+      webhookSignatureKey: String(squareWebhookSignatureKey || "").trim(),
+      webhookUrl: String(squareWebhookUrl || "").trim(),
+      returnUrl: String(squareReturnUrl || "").trim(),
+      apiVersion: String(squareApiVersion || "2026-05-20").trim(),
+      defaultCurrency: paymentDefaultCurrency,
+      timeoutMs: Number.isFinite(squareTimeoutMs)
+        ? Math.max(1000, Math.min(30000, Math.floor(squareTimeoutMs)))
+        : 7000,
     },
   },
   webhook: {

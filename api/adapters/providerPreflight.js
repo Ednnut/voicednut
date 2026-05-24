@@ -11,6 +11,10 @@ const {
   DEFAULT_API_VERSION: STRIPE_DEFAULT_API_VERSION,
   createStripePaymentService,
 } = require("../services/stripePaymentService");
+const {
+  DEFAULT_API_VERSION: SQUARE_DEFAULT_API_VERSION,
+  createSquarePaymentService,
+} = require("../services/squarePaymentService");
 const { runWithTimeout } = require("../utils/asyncControl");
 
 const CHECK_STATUS = Object.freeze({
@@ -23,7 +27,7 @@ const CHECK_STATUS = Object.freeze({
 const SUPPORTED_PROVIDER_PREFLIGHT_CHANNELS = Object.freeze({
   call: Object.freeze(["twilio", "plivo", "vonage"]),
   sms: Object.freeze(["twilio", "plivo", "vonage"]),
-  payment: Object.freeze(["paypal", "stripe"]),
+  payment: Object.freeze(["paypal", "stripe", "square"]),
 });
 
 const REQUIRED_ROUTE_GROUPS = Object.freeze({
@@ -161,6 +165,15 @@ const REQUIRED_ROUTE_GROUPS = Object.freeze({
         label: "Stripe webhook route",
         anyOf: Object.freeze([
           Object.freeze({ method: "POST", path: "/webhook/stripe" }),
+        ]),
+      }),
+    ]),
+    square: Object.freeze([
+      Object.freeze({
+        id: "square_webhook",
+        label: "Square webhook route",
+        anyOf: Object.freeze([
+          Object.freeze({ method: "POST", path: "/webhook/square" }),
         ]),
       }),
     ]),
@@ -483,6 +496,35 @@ function buildStripeCallbackUrls(channel, config, options = {}) {
   };
 }
 
+function buildSquareCallbackUrls(channel, config, options = {}) {
+  const configuredWebhookUrl = String(config?.payment?.square?.webhookUrl || "").trim();
+  if (configuredWebhookUrl) {
+    return {
+      host: normalizeHost(configuredWebhookUrl),
+      base_url: "",
+      urls: [configuredWebhookUrl],
+      reason: null,
+    };
+  }
+
+  const host = normalizeHost(options.hostOverride || config?.server?.hostname);
+  if (!host) {
+    return {
+      host: "",
+      base_url: "",
+      urls: [],
+      reason: "Neither SQUARE_WEBHOOK_URL nor SERVER is configured for Square webhook callbacks",
+    };
+  }
+  const baseUrl = `https://${host}`;
+  return {
+    host,
+    base_url: baseUrl,
+    urls: [`${baseUrl}/webhook/square`],
+    reason: null,
+  };
+}
+
 function buildProviderCallbackUrls(provider, channel, config, options = {}) {
   const normalizedProvider = normalizeProvider(provider);
   if (normalizedProvider === "twilio") {
@@ -499,6 +541,9 @@ function buildProviderCallbackUrls(provider, channel, config, options = {}) {
   }
   if (normalizedProvider === "stripe") {
     return buildStripeCallbackUrls(channel, config, options);
+  }
+  if (normalizedProvider === "square") {
+    return buildSquareCallbackUrls(channel, config, options);
   }
   return {
     host: "",
@@ -863,6 +908,77 @@ async function runStripeCredentialCheck(channel, config, options = {}) {
   }
 }
 
+async function runSquareCredentialCheck(channel, config, options = {}) {
+  const squareConfig = config?.payment?.square || {};
+  const missing = [];
+  if (!squareConfig.accessToken) missing.push("SQUARE_ACCESS_TOKEN");
+  if (!squareConfig.locationId) missing.push("SQUARE_LOCATION_ID");
+
+  if (missing.length > 0) {
+    return {
+      status: CHECK_STATUS.FAIL,
+      reason: `Missing required credentials: ${missing.join(", ")}`,
+      suggestedFix: "Set required Square env vars and redeploy.",
+      details: { missing },
+    };
+  }
+
+  if (options.allowNetwork !== true) {
+    return {
+      status: CHECK_STATUS.WARN,
+      reason: "Network auth probe skipped (allowNetwork=false)",
+      suggestedFix: "Run live preflight with network checks enabled before promotion.",
+      details: {
+        environment: squareConfig.environment || "sandbox",
+        auth_probe: "skipped",
+        api_version: squareConfig.apiVersion || SQUARE_DEFAULT_API_VERSION,
+        channel: normalizeChannel(channel),
+      },
+    };
+  }
+
+  try {
+    const service = createSquarePaymentService({
+      config: {
+        ...squareConfig,
+        enabled: true,
+        timeoutMs: options.timeoutMs || squareConfig.timeoutMs,
+      },
+    });
+    await runWithTimeout(
+      service.request(
+        `/v2/locations/${encodeURIComponent(squareConfig.locationId)}`,
+      ),
+      {
+        timeoutMs: options.timeoutMs || squareConfig.timeoutMs,
+        label: "provider_preflight_square_auth_probe",
+        timeoutCode: "square_auth_probe_timeout",
+        logger: console,
+        meta: {
+          provider: "square",
+          scope: "provider_preflight",
+        },
+      },
+    );
+    return {
+      status: CHECK_STATUS.PASS,
+      details: {
+        environment: squareConfig.environment || "sandbox",
+        auth_probe: "location",
+        api_version: squareConfig.apiVersion || SQUARE_DEFAULT_API_VERSION,
+        channel: normalizeChannel(channel),
+      },
+    };
+  } catch (error) {
+    return {
+      status: CHECK_STATUS.FAIL,
+      reason: redactError(error),
+      suggestedFix:
+        "Confirm Square credentials, location ID, and API access are valid from this environment.",
+    };
+  }
+}
+
 function runWebhookAuthCheck(provider, channel, config, options = {}) {
   const normalizedProvider = normalizeProvider(provider);
   const normalizedChannel = normalizeChannel(channel);
@@ -1017,6 +1133,39 @@ function runWebhookAuthCheck(provider, channel, config, options = {}) {
       status: CHECK_STATUS.PASS,
       details: {
         validation_mode: "stripe_webhook_signature",
+        channel: normalizedChannel,
+      },
+    };
+  }
+
+  if (normalizedProvider === "square") {
+    if (!config?.payment?.square?.webhookSignatureKey) {
+      return {
+        status: CHECK_STATUS.FAIL,
+        reason: "SQUARE_WEBHOOK_SIGNATURE_KEY missing for webhook signature validation",
+        suggestedFix: "Set SQUARE_WEBHOOK_SIGNATURE_KEY for the configured Square webhook endpoint.",
+      };
+    }
+    if (!config?.payment?.square?.webhookUrl) {
+      return {
+        status: CHECK_STATUS.FAIL,
+        reason: "SQUARE_WEBHOOK_URL missing for Square webhook signature validation",
+        suggestedFix:
+          "Set SQUARE_WEBHOOK_URL to the exact public URL configured in the Square Developer Dashboard.",
+      };
+    }
+    if (options?.guards?.square !== true) {
+      return {
+        status: CHECK_STATUS.FAIL,
+        reason: "Square webhook signature guard is not wired",
+        suggestedFix:
+          "Ensure the Square webhook handler verifies the signature before state mutation.",
+      };
+    }
+    return {
+      status: CHECK_STATUS.PASS,
+      details: {
+        validation_mode: "square_webhook_signature",
         channel: normalizedChannel,
       },
     };
@@ -1237,6 +1386,12 @@ async function runProviderPreflight(options = {}) {
       }
       if (provider === "stripe") {
         return runStripeCredentialCheck(channel, config, {
+          allowNetwork: options.allowNetwork,
+          timeoutMs: options.timeoutMs,
+        });
+      }
+      if (provider === "square") {
+        return runSquareCredentialCheck(channel, config, {
           allowNetwork: options.allowNetwork,
           timeoutMs: options.timeoutMs,
         });

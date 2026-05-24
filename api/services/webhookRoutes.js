@@ -4,7 +4,9 @@ const {
   buildCanonicalSmsDeliveryEvent,
 } = require("../adapters/providerFlowPolicy");
 const { createPaypalPaymentService } = require("./paypalPaymentService");
+const { createSquarePaymentService } = require("./squarePaymentService");
 const { createStripePaymentService } = require("./stripePaymentService");
+const { maybeRunPaymentAutomation } = require("./postCallAutomationTriggers");
 
 const WEBHOOK_AUTH_POLICIES = Object.freeze({
   telegram: Object.freeze({
@@ -2679,6 +2681,12 @@ function createPaypalWebhookHandler(ctx = {}) {
       if (!result.ok) {
         return res.status(400).json(result);
       }
+      await maybeRunPaymentAutomation({
+        provider: "paypal",
+        result,
+        ctx,
+        logger: console,
+      });
       return res.status(200).json({
         status: "ok",
         ...result,
@@ -2733,6 +2741,12 @@ function createStripeWebhookHandler(ctx = {}) {
       if (!result.ok) {
         return res.status(400).json(result);
       }
+      await maybeRunPaymentAutomation({
+        provider: "stripe",
+        result,
+        ctx,
+        logger: console,
+      });
       return res.status(200).json({
         status: "ok",
         ...result,
@@ -2742,6 +2756,66 @@ function createStripeWebhookHandler(ctx = {}) {
       return res.status(500).json({
         error: "stripe_webhook_failed",
         message: "Unable to process Stripe webhook.",
+      });
+    }
+  };
+}
+
+function createSquareWebhookHandler(ctx = {}) {
+  const db = getDb(ctx);
+  const service =
+    ctx.squarePaymentService ||
+    createSquarePaymentService({
+      db,
+      config: ctx.config?.payment?.square,
+      fetchFn: ctx.fetchFn,
+    });
+
+  return async function handleSquareWebhook(req, res) {
+    try {
+      if (!service.isEnabled()) {
+        return res.status(404).json({
+          error: "square_disabled",
+          message: "Square connector is disabled.",
+        });
+      }
+
+      const rawBody =
+        typeof req.rawBody === "string"
+          ? req.rawBody
+          : Buffer.isBuffer(req.rawBody)
+            ? req.rawBody.toString("utf8")
+            : JSON.stringify(req.body || {});
+      const verification = await service.verifyWebhookSignature(
+        rawBody,
+        req.headers || {},
+      );
+      if (!verification.ok) {
+        console.warn("Square webhook verification failed:", {
+          error: verification.error,
+        });
+        return res.status(401).json(verification);
+      }
+
+      const result = await service.handleWebhookEvent(req.body || {});
+      if (!result.ok) {
+        return res.status(400).json(result);
+      }
+      await maybeRunPaymentAutomation({
+        provider: "square",
+        result,
+        ctx,
+        logger: console,
+      });
+      return res.status(200).json({
+        status: "ok",
+        ...result,
+      });
+    } catch (error) {
+      console.error("Square webhook handler error:", error);
+      return res.status(500).json({
+        error: "square_webhook_failed",
+        message: "Unable to process Square webhook.",
       });
     }
   };
@@ -2792,6 +2866,8 @@ function registerWebhookRoutes(app, ctx = {}) {
     ctx.handlePaypalWebhook || createPaypalWebhookHandler(ctx);
   const handleStripeWebhook =
     ctx.handleStripeWebhook || createStripeWebhookHandler(ctx);
+  const handleSquareWebhook =
+    ctx.handleSquareWebhook || createSquareWebhookHandler(ctx);
 
   app.get("/capture/secure", handleSecureCaptureView);
   app.post("/capture/secure", handleSecureCaptureSubmit);
@@ -2835,6 +2911,7 @@ function registerWebhookRoutes(app, ctx = {}) {
   app.post("/webhook/email", withWebhookAuth("email_events", handleEmailWebhook));
   app.post("/webhook/paypal", handlePaypalWebhook);
   app.post("/webhook/stripe", handleStripeWebhook);
+  app.post("/webhook/square", handleSquareWebhook);
   app.get("/webhook/email-unsubscribe", handleEmailUnsubscribeWebhook);
   app.post(
     "/webhook/twilio-gather",
@@ -2853,6 +2930,7 @@ module.exports = {
   createPlivoAnswerWebhookHandler,
   createPaypalWebhookHandler,
   createStripeWebhookHandler,
+  createSquareWebhookHandler,
   __testables: {
     WEBHOOK_AUTH_POLICIES,
     createWebhookAuthGuard,

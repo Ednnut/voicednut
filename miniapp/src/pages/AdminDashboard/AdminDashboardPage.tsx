@@ -12,6 +12,7 @@ import { DashboardShellFrame } from '@/components/admin-dashboard/DashboardShell
 import { DashboardSettingsStage } from '@/components/admin-dashboard/DashboardSettingsStage';
 import { DashboardTopShell } from '@/components/admin-dashboard/DashboardTopShell';
 import { DashboardViewStage } from '@/components/admin-dashboard/DashboardViewStage';
+import { DashboardOverflowMenu } from '@/components/admin-dashboard/DashboardChrome';
 import {
   asRecord,
   formatTime,
@@ -274,6 +275,7 @@ export function AdminDashboardPage() {
     () => readStoredModuleList(DASHBOARD_RECENT_MODULES_STORAGE_KEY).slice(0, DASHBOARD_RECENT_MODULE_LIMIT),
   );
   const [settingsOpen, setSettingsOpen] = useState<boolean>(false);
+  const [overflowMenuOpen, setOverflowMenuOpen] = useState<boolean>(false);
   const [pollingPaused, setPollingPaused] = useState<boolean>(false);
   const [smsRecipientsInput, setSmsRecipientsInput] = useState<string>('');
   const [smsMessageInput, setSmsMessageInput] = useState<string>('');
@@ -358,6 +360,9 @@ export function AdminDashboardPage() {
 
   const toggleSettings = useCallback((next?: boolean, options?: { fallbackModule?: DashboardModule }): void => {
     const target = typeof next === 'boolean' ? next : !settingsOpen;
+    if (target) {
+      setOverflowMenuOpen(false);
+    }
     setSettingsOpen((prev) => {
       if (!prev && target) {
         if (typeof document !== 'undefined') {
@@ -426,6 +431,7 @@ export function AdminDashboardPage() {
   }, [triggerHaptic]);
 
   const returnToHome = useCallback((): void => {
+    setOverflowMenuOpen(false);
     setSettingsOpen((prev) => {
       if (prev) {
         shouldRestoreFocusRef.current = true;
@@ -448,6 +454,20 @@ export function AdminDashboardPage() {
     setNotice,
     setNoticeTone,
   });
+
+  const closeOverflowMenu = useCallback((): void => {
+    setOverflowMenuOpen(false);
+  }, []);
+
+  const openOverflowMenu = useCallback((): void => {
+    setOverflowMenuOpen(true);
+    triggerHaptic('selection');
+  }, [triggerHaptic]);
+
+  const handleOverflowSettings = useCallback((): void => {
+    setOverflowMenuOpen(false);
+    toggleSettings(true);
+  }, [toggleSettings]);
 
   const { userLabel, userAvatarUrl, userAvatarFallback } = useMemo(() => {
     const pollSession = asRecord(pollPayload?.session);
@@ -598,11 +618,14 @@ export function AdminDashboardPage() {
   useDashboardTelegramButtons({
     settingsButtonSupported,
     toggleSettings,
+    openOverflowMenu,
+    closeOverflowMenu,
     returnToHome,
     dialogState,
     dismissDialog,
     triggerHaptic,
     settingsOpen,
+    overflowMenuOpen,
     focusedWorkspaceMode,
     activeModule,
   });
@@ -1033,6 +1056,50 @@ export function AdminDashboardPage() {
     clearActivityLog,
     pollFailureNotedRef,
   });
+
+  const handleShareMiniApp = useCallback(async (): Promise<void> => {
+    const shareUrl = typeof window !== 'undefined' ? window.location.href : '';
+    type MiniAppShareNavigator = Navigator & {
+      share?: (data: { title?: string; text?: string; url?: string }) => Promise<void>;
+    };
+
+    try {
+      triggerHaptic('selection');
+      const shareNavigator = typeof navigator !== 'undefined'
+        ? navigator as MiniAppShareNavigator
+        : null;
+      if (shareNavigator?.share && shareUrl) {
+        await shareNavigator.share({
+          title: 'Voicednut Mini App',
+          text: 'Open Voicednut Mini App admin.',
+          url: shareUrl,
+        });
+        setNoticeMessage('Mini App share sheet opened.');
+        return;
+      }
+      if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText && shareUrl) {
+        await navigator.clipboard.writeText(shareUrl);
+        setNoticeMessage('Mini App link copied to clipboard.');
+        return;
+      }
+      setNoticeMessage('Mini App link is ready to share from Telegram.');
+    } catch {
+      setNoticeMessage('Share was cancelled or blocked by the client.');
+    } finally {
+      setOverflowMenuOpen(false);
+    }
+  }, [setNoticeMessage, triggerHaptic]);
+
+  const handleOverflowRefresh = useCallback((): void => {
+    setOverflowMenuOpen(false);
+    void handleRefresh();
+  }, [handleRefresh]);
+
+  const handleOverflowCloseMiniApp = useCallback((): void => {
+    setOverflowMenuOpen(false);
+    handleCloseMiniApp();
+  }, [handleCloseMiniApp]);
+
   const handlePullReadyStateChange = useCallback((ready: boolean): void => {
     if (!ready) return;
     triggerHaptic('selection');
@@ -1504,6 +1571,7 @@ export function AdminDashboardPage() {
           activeModuleLabel={activeModuleLabel}
           activeModuleSubtitle={activeModuleMeta.subtitle}
           onOpenSettings={() => toggleSettings(true)}
+          onOpenOverflowMenu={openOverflowMenu}
           error={error}
           errorCode={errorCode}
           refreshFailureDiagnostics={refreshFailureDiagnostics}
@@ -1594,6 +1662,18 @@ export function AdminDashboardPage() {
         onTouchCancel={handleStageTouchCancel}
       />
       </DashboardShellFrame>
+      <DashboardOverflowMenu
+        open={overflowMenuOpen}
+        loading={loading}
+        closeDisabled={loading || busyAction.length > 0}
+        settingsStatusLabel={settingsStatusLabel}
+        featureFlagsCount={Object.keys(featureFlags).length || 'default'}
+        onClose={closeOverflowMenu}
+        onOpenSettings={handleOverflowSettings}
+        onRefreshDashboard={handleOverflowRefresh}
+        onShareMiniApp={handleShareMiniApp}
+        onCloseMiniApp={miniApp.close.isAvailable() ? handleOverflowCloseMiniApp : undefined}
+      />
       <DashboardActionDialog
         dialogState={dialogState}
         dialogInputValue={dialogInputValue}

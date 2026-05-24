@@ -103,6 +103,109 @@ const RETRYABLE_NETWORK_CODES = new Set([
   'EAI_AGAIN',
   'ECONNABORTED',
 ]);
+const TEMPLATE_SELECTABLE_LIFECYCLES = new Set(['approved', 'live']);
+const TEMPLATE_CONTEXT_FIELDS = [
+  'call_intent',
+  'intent',
+  'customer_status',
+  'booking_state',
+  'payment_state',
+  'payment_status',
+  'call_outcome',
+  'outcome',
+  'escalation_state',
+  'ticket_state',
+  'transcript_summary',
+  'transcript',
+];
+
+function normalizeLifecycleState(value) {
+  return String(value || '').trim().toLowerCase() || 'draft';
+}
+
+function parseTemplateRequiredVars(value) {
+  if (Array.isArray(value)) return value.map((entry) => String(entry || '').trim()).filter(Boolean);
+  if (!value) return [];
+  if (typeof value === 'string') {
+    const parsed = safeParseJson(value);
+    return Array.isArray(parsed)
+      ? parsed.map((entry) => String(entry || '').trim()).filter(Boolean)
+      : [];
+  }
+  return [];
+}
+
+function addSignalTokens(value, tokens) {
+  if (value === null || value === undefined) return;
+  if (Array.isArray(value)) {
+    value.forEach((entry) => addSignalTokens(entry, tokens));
+    return;
+  }
+  if (typeof value === 'object') {
+    Object.values(value).forEach((entry) => addSignalTokens(entry, tokens));
+    return;
+  }
+  String(value || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .split(/\s+/)
+    .filter((token) => token.length >= 3 && token.length <= 32)
+    .forEach((token) => tokens.add(token));
+}
+
+function buildTemplateContextTokens(context = {}) {
+  const tokens = new Set();
+  TEMPLATE_CONTEXT_FIELDS.forEach((field) => addSignalTokens(context[field], tokens));
+
+  const paymentState = String(
+    context.payment_state || context.payment_status || '',
+  ).toLowerCase();
+  if (['paid', 'succeeded', 'success', 'completed', 'complete'].includes(paymentState)) {
+    ['receipt', 'payment', 'paid', 'success'].forEach((token) => tokens.add(token));
+  }
+  if (['failed', 'declined', 'past_due', 'pastdue'].includes(paymentState)) {
+    ['payment', 'failed', 'retry'].forEach((token) => tokens.add(token));
+  }
+
+  const bookingState = String(context.booking_state || '').toLowerCase();
+  if (['missed', 'no_show', 'noshow'].includes(bookingState)) {
+    ['missed', 'appointment', 'booking', 'reschedule'].forEach((token) => tokens.add(token));
+  }
+  if (['booked', 'scheduled', 'confirmed'].includes(bookingState)) {
+    ['booking', 'appointment', 'confirmation'].forEach((token) => tokens.add(token));
+  }
+
+  const escalationState = String(
+    context.escalation_state || context.ticket_state || context.call_outcome || context.outcome || '',
+  ).toLowerCase();
+  if (['escalated', 'support', 'ticket', 'case'].some((token) => escalationState.includes(token))) {
+    ['support', 'case', 'ticket', 'summary', 'escalation'].forEach((token) => tokens.add(token));
+  }
+
+  return Array.from(tokens);
+}
+
+function normalizeTemplateSelectionContext(payload = {}) {
+  const context = {
+    ...(payload.context && typeof payload.context === 'object' ? payload.context : {}),
+    ...(payload.template_context && typeof payload.template_context === 'object'
+      ? payload.template_context
+      : {}),
+  };
+  TEMPLATE_CONTEXT_FIELDS.forEach((field) => {
+    if (payload[field] !== undefined && context[field] === undefined) {
+      context[field] = payload[field];
+    }
+  });
+  if (payload.metadata && typeof payload.metadata === 'object') {
+    TEMPLATE_CONTEXT_FIELDS.forEach((field) => {
+      if (payload.metadata[field] !== undefined && context[field] === undefined) {
+        context[field] = payload.metadata[field];
+      }
+    });
+  }
+  return context;
+}
 
 function isSqliteCorruptionError(error) {
   const code = String(error?.code || '').toUpperCase();
@@ -247,6 +350,65 @@ class SendGridAdapter extends ProviderAdapter {
       });
       const providerMessageId = response.headers?.['x-message-id'] || null;
       return { providerMessageId, response: response.data };
+    } catch (err) {
+      throw this.mapError(err);
+    }
+  }
+
+  async validateApiKey() {
+    if (!this.apiKey) {
+      throw new Error('SendGrid API key is not configured');
+    }
+    try {
+      const response = await runProviderRequestWithTimeout({
+        timeoutMs: this.requestTimeoutMs,
+        provider: this.providerName,
+        action: 'validate_api_key',
+        request: ({ signal, timeoutMs }) => axios.get(`${this.baseUrl}/user/profile`, {
+          timeout: timeoutMs,
+          signal,
+          headers: {
+            Authorization: `Bearer ${this.apiKey}`,
+          },
+        }),
+      });
+      return {
+        ok: true,
+        username: response.data?.username || null,
+        user_id: response.data?.user_id || response.data?.id || null,
+      };
+    } catch (err) {
+      throw this.mapError(err);
+    }
+  }
+
+  async listVerifiedSenders() {
+    if (!this.apiKey) {
+      throw new Error('SendGrid API key is not configured');
+    }
+    try {
+      const response = await runProviderRequestWithTimeout({
+        timeoutMs: this.requestTimeoutMs,
+        provider: this.providerName,
+        action: 'list_verified_senders',
+        request: ({ signal, timeoutMs }) => axios.get(`${this.baseUrl}/verified_senders`, {
+          timeout: timeoutMs,
+          signal,
+          headers: {
+            Authorization: `Bearer ${this.apiKey}`,
+          },
+        }),
+      });
+      const senders = Array.isArray(response.data?.results)
+        ? response.data.results
+        : Array.isArray(response.data)
+          ? response.data
+          : [];
+      return senders.map((sender) => ({
+        from_email: normalizeEmail(sender.from_email || sender.from?.email || sender.email),
+        verified: sender.verified === true || sender.valid === true,
+        nickname: sender.nickname || sender.name || null,
+      }));
     } catch (err) {
       throw this.mapError(err);
     }
@@ -522,24 +684,281 @@ class EmailService {
     };
   }
 
+  getTemplateRequiredVariables(template = {}) {
+    const required = new Set(parseTemplateRequiredVars(template.required_vars));
+    extractTemplateVariables(template.subject).forEach((key) => required.add(key));
+    extractTemplateVariables(template.html).forEach((key) => required.add(key));
+    extractTemplateVariables(template.text).forEach((key) => required.add(key));
+    return Array.from(required).filter(Boolean);
+  }
+
+  getAllowedTemplateIds(payload = {}) {
+    const raw =
+      payload.allowed_template_ids ||
+      payload.approved_templates ||
+      payload.template_ids ||
+      payload.script_ids ||
+      [];
+    const values = Array.isArray(raw) ? raw : [raw];
+    return new Set(values.map((entry) => String(entry || '').trim()).filter(Boolean));
+  }
+
+  findMissingTemplateVariables(template = {}, variables = {}) {
+    return this.getTemplateRequiredVariables(template).filter((key) => {
+      const value = getNestedValue(variables, key);
+      return value === undefined || value === null;
+    });
+  }
+
+  isTemplateSelectable(template = {}, { requireLive = false } = {}) {
+    const lifecycle = normalizeLifecycleState(template.lifecycle_state);
+    if (requireLive) return lifecycle === 'live';
+    return TEMPLATE_SELECTABLE_LIFECYCLES.has(lifecycle);
+  }
+
+  scoreTemplateForContext(template = {}, tokens = [], variables = {}) {
+    const lifecycle = normalizeLifecycleState(template.lifecycle_state);
+    const idText = String(template.template_id || '').toLowerCase();
+    const subjectText = String(template.subject || '').toLowerCase();
+    const bodyText = `${template.text || ''} ${template.html || ''}`.toLowerCase();
+    const matchedTokens = [];
+    let score = lifecycle === 'live' ? 25 : 10;
+
+    tokens.forEach((token) => {
+      const normalizedToken = String(token || '').toLowerCase();
+      if (!normalizedToken) return;
+      let tokenScore = 0;
+      if (idText.includes(normalizedToken)) tokenScore += 14;
+      if (subjectText.includes(normalizedToken)) tokenScore += 8;
+      if (bodyText.includes(normalizedToken)) tokenScore += 3;
+      if (tokenScore > 0) {
+        matchedTokens.push(normalizedToken);
+        score += tokenScore;
+      }
+    });
+
+    const missing = this.findMissingTemplateVariables(template, variables);
+    if (missing.length) {
+      score -= missing.length * 30;
+    }
+    return { score, matched_tokens: Array.from(new Set(matchedTokens)), missing_variables: missing };
+  }
+
+  shouldAutoSelectTemplate(payload = {}) {
+    if (payload.script_id || payload.template_id) return false;
+    if (payload.select_template === true || payload.auto_select_template === true) return true;
+    if (payload.subject || payload.html || payload.text) return false;
+    const context = normalizeTemplateSelectionContext(payload);
+    return buildTemplateContextTokens(context).length > 0;
+  }
+
+  async selectTemplateForContext(payload = {}) {
+    const context = normalizeTemplateSelectionContext(payload);
+    const tokens = buildTemplateContextTokens(context);
+    const variables = payload.variables || {};
+    const allowedTemplateIds = this.getAllowedTemplateIds(payload);
+    const requireLive = payload.require_live_template === true || payload.require_live_templates === true;
+    const allowMissingVariables = payload.allow_missing_template_vars === true;
+
+    if (!tokens.length && !allowedTemplateIds.size) {
+      return {
+        selected_template_id: null,
+        reason: 'no_selection_context',
+        context_tokens: tokens,
+        candidates: [],
+      };
+    }
+
+    const templates = typeof this.db?.listEmailTemplates === 'function'
+      ? await this.db.listEmailTemplates(200)
+      : [];
+    const candidates = templates
+      .filter((template) => this.isTemplateSelectable(template, { requireLive }))
+      .filter((template) => {
+        if (!allowedTemplateIds.size) return true;
+        return allowedTemplateIds.has(String(template.template_id || ''));
+      })
+      .map((template) => {
+        const scored = this.scoreTemplateForContext(template, tokens, variables);
+        return {
+          template_id: template.template_id,
+          lifecycle_state: normalizeLifecycleState(template.lifecycle_state),
+          subject: template.subject || '',
+          score: scored.score,
+          matched_tokens: scored.matched_tokens,
+          missing_variables: scored.missing_variables,
+        };
+      })
+      .filter((candidate) => allowMissingVariables || !candidate.missing_variables.length)
+      .filter((candidate) => allowedTemplateIds.size || candidate.matched_tokens.length > 0)
+      .sort((a, b) => b.score - a.score || a.template_id.localeCompare(b.template_id));
+
+    const selected = candidates[0] || null;
+    return {
+      selected_template_id: selected?.template_id || null,
+      template_id: selected?.template_id || null,
+      lifecycle_state: selected?.lifecycle_state || null,
+      score: selected?.score || 0,
+      matched_tokens: selected?.matched_tokens || [],
+      missing_variables: selected?.missing_variables || [],
+      context,
+      context_tokens: tokens,
+      candidates: candidates.slice(0, 5),
+      reason: selected ? 'matched' : 'no_matching_template',
+    };
+  }
+
+  async validateProviderHealth(payload = {}) {
+    const provider = this.resolveProvider(payload.provider || 'sendgrid');
+    const live = payload.live === true || String(payload.mode || '').toLowerCase() === 'live';
+    const requireLiveTemplates = payload.require_live_templates === true || payload.require_live_template === true;
+    const checks = [];
+    const addCheck = (name, status, details = {}) => {
+      checks.push({
+        name,
+        status,
+        ...details,
+      });
+    };
+
+    addCheck('provider_supported', 'pass', { provider });
+    const readiness = this.getProviderReadiness();
+    addCheck(`${provider}_credentials_configured`, readiness[provider] ? 'pass' : 'fail');
+
+    const from = normalizeEmail(payload.from || this.getDefaultFrom());
+    if (!isValidEmail(from)) {
+      addCheck('sender_identity', 'fail', { message: 'A valid sender email is required.' });
+    } else if (!this.isVerifiedSender(from)) {
+      addCheck('sender_identity', 'fail', {
+        from_domain: getDomain(from),
+        message: 'Sender domain is not in EMAIL_VERIFIED_DOMAINS.',
+      });
+    } else {
+      addCheck('sender_identity', 'pass', { from_domain: getDomain(from) });
+    }
+
+    const domains = this.getVerifiedDomains();
+    addCheck('domain_allowlist', domains.length ? 'pass' : 'warn', {
+      domains_configured: domains.length,
+      message: domains.length
+        ? undefined
+        : 'EMAIL_VERIFIED_DOMAINS is empty; local sender-domain checks are permissive.',
+    });
+
+    const templateIds = Array.from(this.getAllowedTemplateIds(payload));
+    if (!templateIds.length) {
+      addCheck('approved_templates', 'warn', {
+        message: 'No template ids supplied for approval validation.',
+      });
+    } else {
+      for (const templateId of templateIds) {
+        const template = await this.db.getEmailTemplate(templateId);
+        if (!template) {
+          addCheck('approved_template', 'fail', { template_id: templateId, message: 'Template not found.' });
+          continue;
+        }
+        const lifecycle = normalizeLifecycleState(template.lifecycle_state);
+        const selectable = this.isTemplateSelectable(template, { requireLive: requireLiveTemplates });
+        addCheck('approved_template', selectable ? 'pass' : 'fail', {
+          template_id: templateId,
+          lifecycle_state: lifecycle,
+          required_lifecycle: requireLiveTemplates ? 'live' : 'approved_or_live',
+        });
+      }
+    }
+
+    if (live && provider === 'sendgrid') {
+      const adapter = this.getAdapter(provider);
+      if (typeof adapter.validateApiKey === 'function') {
+        try {
+          const profile = await adapter.validateApiKey();
+          addCheck('sendgrid_api_key_live', 'pass', {
+            user_id: profile.user_id || null,
+            username: profile.username || null,
+          });
+        } catch (err) {
+          addCheck('sendgrid_api_key_live', 'fail', {
+            status: err.statusCode || null,
+            message: err.statusCode === 401
+              ? 'SendGrid rejected the API key.'
+              : previewForLog(err.message, 180),
+          });
+        }
+      }
+
+      if (isValidEmail(from) && typeof adapter.listVerifiedSenders === 'function') {
+        try {
+          const senders = await adapter.listVerifiedSenders();
+          const sender = senders.find((entry) => entry.from_email === from);
+          addCheck('sendgrid_sender_identity_live', sender?.verified ? 'pass' : 'fail', {
+            from_domain: getDomain(from),
+            sender_found: Boolean(sender),
+          });
+        } catch (err) {
+          addCheck('sendgrid_sender_identity_live', err.statusCode === 401 ? 'fail' : 'warn', {
+            status: err.statusCode || null,
+            message: err.statusCode === 401
+              ? 'SendGrid rejected the API key.'
+              : 'Unable to list SendGrid sender identities with the configured key.',
+          });
+        }
+      }
+    }
+
+    const ok = !checks.some((check) => check.status === 'fail');
+    return {
+      ok,
+      provider,
+      mode: live ? 'live' : 'dry_run',
+      dry_run: !live,
+      checked_at: new Date().toISOString(),
+      checks,
+    };
+  }
+
   async resolveTemplate(payload) {
-    if (payload.script_id) {
-      const template = await this.db.getEmailTemplate(payload.script_id);
+    const explicitTemplateId = payload.script_id || payload.template_id;
+    if (explicitTemplateId) {
+      const template = await this.db.getEmailTemplate(explicitTemplateId);
       if (!template) {
-        throw new Error(`Script ${payload.script_id} not found`);
+        throw new Error(`Script ${explicitTemplateId} not found`);
       }
       return {
         subject: template.subject || payload.subject || '',
         html: template.html || payload.html || '',
         text: template.text || payload.text || '',
-        script_id: payload.script_id
+        script_id: explicitTemplateId,
+        template_selection: null,
       };
+    }
+    if (this.shouldAutoSelectTemplate(payload)) {
+      const selection = await this.selectTemplateForContext(payload);
+      if (selection.selected_template_id) {
+        const template = await this.db.getEmailTemplate(selection.selected_template_id);
+        if (!template) {
+          const error = new Error(`Selected template ${selection.selected_template_id} not found`);
+          error.code = 'validation_error';
+          throw error;
+        }
+        return {
+          subject: template.subject || payload.subject || '',
+          html: template.html || payload.html || '',
+          text: template.text || payload.text || '',
+          script_id: selection.selected_template_id,
+          template_selection: selection,
+        };
+      }
+      const error = new Error('No approved email template matched selection context');
+      error.code = 'validation_error';
+      error.template_selection = selection;
+      throw error;
     }
     return {
       subject: payload.subject || '',
       html: payload.html || '',
       text: payload.text || '',
-      script_id: null
+      script_id: null,
+      template_selection: null,
     };
   }
 
@@ -611,6 +1030,7 @@ class EmailService {
       from,
       subject: rendered.subject,
       script_id: script.script_id,
+      template_selection: script.template_selection?.selected_template_id || null,
       variables,
       html: rendered.html,
       text: rendered.text,
@@ -651,6 +1071,14 @@ class EmailService {
     const status = suppressed ? 'suppressed' : 'queued';
     const messageId = `email_${crypto.randomUUID()}`;
     const metadata = { ...(payload.metadata || {}), is_marketing: !!payload.is_marketing };
+    if (script.template_selection) {
+      metadata.template_selection = {
+        selected_template_id: script.template_selection.selected_template_id,
+        reason: script.template_selection.reason,
+        score: script.template_selection.score,
+        matched_tokens: script.template_selection.matched_tokens || [],
+      };
+    }
 
     try {
       await this.db.saveEmailMessage({
@@ -1169,6 +1597,9 @@ class EmailService {
   }
 
   getSuppressionReasonFromProviderEvent(event = {}) {
+    if (event.suppression_reason) {
+      return String(event.suppression_reason || '').trim().toLowerCase();
+    }
     const type = this.normalizeStatus(event.type);
     if (type === 'bounced') return 'bounce';
     if (type === 'complained') return 'complaint';
@@ -1421,6 +1852,7 @@ class EmailService {
             type: event.type || null,
             provider: event.provider || null,
             reason: event.reason || null,
+            suppression_reason: event.suppression_reason || null,
             occurred_at: event.occurred_at || null,
           }),
         });
@@ -1433,7 +1865,7 @@ class EmailService {
       const statusMap = {
         delivered: { status: 'delivered', metric: 'delivered' },
         bounced: { status: 'bounced', metric: 'bounced', suppress: 'bounce' },
-        complained: { status: 'complained', metric: 'complained', suppress: 'complaint' },
+        complained: { status: 'complained', metric: 'complained' },
         failed: { status: 'failed', metric: 'failed' }
       };
       const statusInfo = statusMap[event.type];
@@ -1474,6 +1906,7 @@ class EmailService {
         const typeMap = {
           delivered: 'delivered',
           bounce: 'bounced',
+          blocked: 'failed',
           dropped: 'failed',
           spamreport: 'complained',
           unsubscribe: 'complained'
@@ -1488,7 +1921,15 @@ class EmailService {
           event_id: event.sg_event_id || event.event_id || null,
           type: mapped,
           provider: 'sendgrid',
-          reason: event.reason || event.response,
+          reason: event.reason || event.response || eventType,
+          suppression_reason:
+            eventType === 'bounce'
+              ? 'bounce'
+              : eventType === 'spamreport'
+                ? 'complaint'
+                : eventType === 'unsubscribe'
+                  ? 'unsubscribe'
+                  : null,
           occurred_at: Number.isFinite(timestampMs)
             ? new Date(timestampMs).toISOString()
             : null,
@@ -1548,7 +1989,14 @@ class EmailService {
       return { ok: false, missing };
     }
     const rendered = this.renderTemplate(script, variables);
-    return { ok: true, subject: rendered.subject, html: rendered.html, text: rendered.text };
+    return {
+      ok: true,
+      subject: rendered.subject,
+      html: rendered.html,
+      text: rendered.text,
+      script_id: script.script_id,
+      template_selection: script.template_selection || null,
+    };
   }
 }
 

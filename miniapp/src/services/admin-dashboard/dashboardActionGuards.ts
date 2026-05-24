@@ -126,6 +126,16 @@ function validateEmailTemplateUpdate(payload: Record<string, unknown>): string |
   return null;
 }
 
+function validateAutomationRunRetry(payload: Record<string, unknown>): string | null {
+  if (!isNonEmptyString(payload.run_id) && !isNonEmptyString(payload.runId) && !isNonEmptyString(payload.id)) {
+    return 'run_id is required';
+  }
+  if (payload.payload_overrides !== undefined && !isRecord(payload.payload_overrides)) {
+    return 'payload_overrides must be an object';
+  }
+  return null;
+}
+
 const ACTION_GUARDS: Record<string, (payload: Record<string, unknown>) => string | null> = {
   [DASHBOARD_ACTION_CONTRACTS.PROVIDER_SET]: validateProviderAction,
   [DASHBOARD_ACTION_CONTRACTS.PROVIDER_ROLLBACK]: validateProviderAction,
@@ -144,6 +154,7 @@ const ACTION_GUARDS: Record<string, (payload: Record<string, unknown>) => string
   [DASHBOARD_ACTION_CONTRACTS.SMSSCRIPT_UPDATE]: validateSmsScriptUpdate,
   [DASHBOARD_ACTION_CONTRACTS.EMAILTEMPLATE_CREATE]: validateEmailTemplateCreate,
   [DASHBOARD_ACTION_CONTRACTS.EMAILTEMPLATE_UPDATE]: validateEmailTemplateUpdate,
+  [DASHBOARD_ACTION_CONTRACTS.AUTOMATION_RUN_RETRY]: validateAutomationRunRetry,
 };
 
 const ACTION_ALIASES = DASHBOARD_ACTION_ALIAS_CONTRACTS;
@@ -424,6 +435,35 @@ const ACTION_POLICIES: Record<string, DashboardActionPolicy> = {
   [DASHBOARD_ACTION_CONTRACTS.EMAIL_PREVIEW]: {
     capability: 'email_bulk_manage',
     risk: 'safe',
+  },
+  [DASHBOARD_ACTION_CONTRACTS.EMAIL_PROVIDER_HEALTH]: {
+    capability: 'email_bulk_manage',
+    risk: 'safe',
+  },
+  [DASHBOARD_ACTION_CONTRACTS.CRM_HEALTH]: {
+    capability: 'provider_manage',
+    risk: 'safe',
+  },
+  [DASHBOARD_ACTION_CONTRACTS.AUTOMATION_RULES_LIST]: {
+    capability: 'dashboard_view',
+    risk: 'safe',
+  },
+  [DASHBOARD_ACTION_CONTRACTS.AUTOMATION_PREVIEW]: {
+    capability: 'dashboard_view',
+    risk: 'safe',
+  },
+  [DASHBOARD_ACTION_CONTRACTS.AUTOMATION_RUNS_LIST]: {
+    capability: 'dashboard_view',
+    risk: 'safe',
+  },
+  [DASHBOARD_ACTION_CONTRACTS.AUTOMATION_RUN_RETRY]: {
+    capability: 'provider_manage',
+    risk: 'danger',
+    confirmTitle: 'Confirm automation retry',
+    confirmTone: 'danger',
+    confirmConsequence: 'The selected post-call automation may send email, sync CRM data, or create a support task again.',
+    confirmIrreversible: false,
+    confirmLabel: 'Retry Automation',
   },
   [DASHBOARD_ACTION_CONTRACTS.USERS_LIST]: {
     capability: 'users_manage',

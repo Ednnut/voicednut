@@ -2290,7 +2290,28 @@
 
 .va-command-page {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: var(--app-space-3);
+  overflow-x: hidden;
+}
+
+.va-command-page > * {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.va-command-page h1,
+.va-command-page h2,
+.va-command-page h3,
+.va-command-page h4,
+.va-command-page h5,
+.va-command-page h6,
+.va-command-page p,
+.va-command-page span {
+  min-width: 0;
+  max-width: 100%;
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 
 .va-command-hero {
@@ -2299,14 +2320,7 @@
 }
 
 .va-command-hero::before {
-  content: '';
-  position: absolute;
-  inset: auto -42px -54px auto;
-  width: 168px;
-  height: 168px;
-  border-radius: 999px;
-  background: radial-gradient(circle, rgba(85, 214, 178, 0.12), transparent 68%);
-  pointer-events: none;
+  content: none;
 }
 
 .va-command-hero-top {
@@ -2327,12 +2341,12 @@
   align-items: center;
   justify-content: flex-end;
   min-width: 68px;
-  color: color-mix(in srgb, var(--tg-theme-hint-color, var(--va-muted)) 72%, white 28%);
+  color: var(--tg-theme-hint-color, var(--va-muted));
   font-size: 12px;
-  font-weight: 700;
-  letter-spacing: 0.04em;
+  font-weight: 650;
+  letter-spacing: 0;
   white-space: nowrap;
-  text-transform: uppercase;
+  text-transform: none;
 }
 
 .va-home-empty-panel {
@@ -4439,6 +4453,443 @@
 
 }
 
+.va-command-center {
+  display: grid;
+  gap: 16px;
+  overflow: hidden;
+  border-color: color-mix(in srgb, var(--va-card-border) 88%, transparent);
+  background: var(--va-card-bg);
+}
+
+.va-command-center .va-command-hero {
+  display: grid;
+  grid-template-columns: minmax(0, 1.1fr) minmax(260px, 0.9fr);
+  gap: 16px;
+  align-items: stretch;
+}
+
+.va-command-center .va-command-hero::before {
+  content: none;
+}
+
+.va-command-center .va-command-hero-copy {
+  display: grid;
+  align-content: center;
+  min-width: 0;
+}
+
+.va-command-center .va-command-hero-top {
+  display: flex;
+  gap: 14px;
+  align-items: flex-start;
+  min-width: 0;
+}
+
+.va-command-center .va-command-logo {
+  flex: 0 0 52px;
+  width: 52px;
+  height: 52px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 14px;
+  border: 1px solid color-mix(in srgb, var(--va-color-primary) 20%, var(--va-card-border));
+  color: color-mix(in srgb, var(--va-color-primary) 82%, var(--va-text));
+  font-weight: 800;
+  letter-spacing: 0;
+  background: color-mix(in srgb, var(--va-color-primary) 10%, var(--va-surface));
+  box-shadow: none;
+}
+
+.va-command-center .va-command-title-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  min-width: 0;
+}
+
+.va-command-center .va-command-title-row h3 {
+  min-width: 0;
+  margin: 0;
+  font-size: clamp(1.22rem, 3vw, 1.65rem);
+  line-height: 1.08;
+  letter-spacing: 0;
+  overflow-wrap: anywhere;
+}
+
+.va-command-center .va-command-hero-copy p,
+.va-command-center .va-command-panel p,
+.va-command-center .va-command-empty {
+  margin: 0;
+  color: var(--va-muted);
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.va-command-center .va-command-tabs {
+  display: flex;
+  gap: 8px;
+  overflow-x: auto;
+  padding-bottom: 2px;
+  scrollbar-width: none;
+}
+
+.va-command-center .va-command-tabs::-webkit-scrollbar {
+  display: none;
+}
+
+.va-command-center .va-command-tabs .va-btn {
+  flex: 0 0 auto;
+}
+
+.va-command-center .va-command-tabs .va-btn.is-active {
+  border-color: color-mix(in srgb, var(--va-color-primary) 28%, var(--va-card-border));
+  background: color-mix(in srgb, var(--va-color-primary) 8%, var(--va-surface));
+  color: var(--va-text);
+}
+
+.va-command-center .va-command-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.va-command-center .va-command-panel,
+.va-command-center .va-command-preview {
+  min-width: 0;
+  border: 1px solid color-mix(in srgb, var(--va-card-border) 82%, transparent);
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--va-surface) 88%, transparent);
+  box-shadow: none;
+}
+
+.va-command-center .va-command-panel {
+  display: grid;
+  gap: 12px;
+  align-content: start;
+  padding: 14px;
+}
+
+.va-command-center .va-command-panel-wide,
+.va-command-center .va-command-health-grid {
+  grid-column: 1 / -1;
+}
+
+.va-command-center .va-command-panel-head {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+  justify-content: space-between;
+  min-width: 0;
+}
+
+.va-command-center .va-command-panel-head > div {
+  min-width: 0;
+}
+
+.va-command-center .va-command-panel h4 {
+  margin: 0 0 4px;
+  font-size: 0.98rem;
+  line-height: 1.2;
+  letter-spacing: 0;
+  overflow-wrap: anywhere;
+}
+
+.va-command-center .va-command-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
+.va-command-center .va-command-list,
+.va-command-center .va-command-checks {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+
+.va-command-center .va-command-row,
+.va-command-center .va-command-timeline-row {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+  border: 1px solid color-mix(in srgb, var(--va-card-border) 64%, transparent);
+  border-radius: 10px;
+  background: transparent;
+}
+
+.va-command-center .va-command-row {
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  padding: 10px;
+}
+
+.va-command-center .va-command-row-main,
+.va-command-center .va-command-row-meta {
+  min-width: 0;
+}
+
+.va-command-center .va-command-row-main {
+  display: grid;
+  gap: 3px;
+}
+
+.va-command-center .va-command-row-main strong,
+.va-command-center .va-command-row-main span,
+.va-command-center .va-command-row-meta span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.va-command-center .va-command-row-main strong {
+  color: var(--va-text);
+  font-size: 0.91rem;
+  line-height: 1.22;
+}
+
+.va-command-center .va-command-row-main span,
+.va-command-center .va-command-row-meta span {
+  color: var(--va-muted);
+  font-size: 0.82rem;
+}
+
+.va-command-center .va-command-row-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  align-items: center;
+  justify-content: flex-end;
+}
+
+.va-command-center .va-command-health-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.va-command-center .va-command-field-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.va-command-center .va-command-preview {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: baseline;
+  padding: 12px;
+}
+
+.va-command-center .va-command-preview strong {
+  color: var(--va-text);
+  font-size: 1.15rem;
+  line-height: 1;
+}
+
+.va-command-center .va-command-preview span {
+  min-width: 0;
+  color: var(--va-muted);
+  overflow-wrap: anywhere;
+}
+
+.va-command-center .va-command-timeline {
+  display: grid;
+  gap: 9px;
+}
+
+.va-command-center .va-command-timeline-row {
+  grid-template-columns: 12px minmax(0, 1fr) auto;
+  align-items: center;
+  padding: 11px 12px;
+}
+
+.va-command-center .va-command-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 999px;
+  background: var(--va-color-primary);
+  box-shadow: none;
+}
+
+.va-command-center .va-command-empty {
+  padding: 2px 0;
+  font-size: 0.88rem;
+}
+
+.va-command-center .va-command-kpi {
+  align-content: stretch;
+}
+
+@media (max-width: 900px) {
+  .va-command-center .va-command-hero,
+  .va-command-center .va-command-grid,
+  .va-command-center .va-command-health-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 720px) {
+  .va-command-center {
+    gap: 13px;
+  }
+
+  .va-command-center .va-command-logo {
+    width: 46px;
+    height: 46px;
+    flex-basis: 46px;
+    border-radius: 13px;
+  }
+
+  .va-command-center .va-command-panel,
+  .va-command-center .va-command-preview {
+    border-radius: 14px;
+  }
+
+  .va-command-center .va-command-panel-head,
+  .va-command-center .va-command-row,
+  .va-command-center .va-command-timeline-row {
+    grid-template-columns: 1fr;
+  }
+
+  .va-command-center .va-command-panel-head,
+  .va-command-center .va-command-row-meta,
+  .va-command-center .va-command-actions {
+    align-items: flex-start;
+    justify-content: flex-start;
+  }
+
+  .va-command-center .va-command-field-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.va-dashboard {
+  background: var(--tg-theme-bg-color, var(--va-bg));
+}
+
+.va-title-card,
+.va-page-intro,
+.va-header,
+.va-focused-header,
+.va-settings-hero,
+.va-card:not(.va-command-center),
+.va-subcard,
+.va-disclosure,
+.va-native-list,
+.va-list li,
+.va-home-empty-panel,
+.va-home-session-strip,
+.va-home-focus-card,
+.va-home-task-card,
+.va-home-action-card,
+.va-home-action-summary,
+.va-home-action-summary-chip,
+.va-home-session-chip,
+.va-launcher-card,
+.va-launcher-card.is-locked,
+.va-launcher-palette,
+.va-launcher-palette-item,
+.va-launcher-palette-empty,
+.va-overview-metric-card,
+.va-shortcut-link {
+  border-color: color-mix(in srgb, var(--app-color-border-soft) 82%, transparent);
+  background: var(--tg-theme-secondary-bg-color, var(--va-surface));
+  box-shadow: none;
+  backdrop-filter: none;
+}
+
+.va-title-card::before,
+.va-page-intro::before,
+.va-header::before,
+.va-focused-header::before,
+.va-settings-hero::before,
+.va-launcher-card::before,
+.va-home-focus-card::before,
+.va-home-task-card::before,
+.va-home-action-card::before {
+  content: none;
+}
+
+.va-title-card-story,
+.va-title-card-stat,
+.va-hero,
+.va-home-focus-glyph,
+.va-home-task-glyph,
+.va-home-action-glyph,
+.va-launcher-glyph,
+.va-launcher-pin,
+.va-saved-query {
+  background: color-mix(in srgb, var(--tg-theme-secondary-bg-color, var(--va-surface)) 90%, transparent);
+  box-shadow: none;
+}
+
+.va-module-fallback,
+.va-health.is-healthy,
+.va-health.is-degraded,
+.va-blocked,
+.va-workspace-pulse.is-success .va-overview-metric-card,
+.va-workspace-pulse.is-warning .va-overview-metric-card,
+.va-workspace-pulse.is-error .va-overview-metric-card {
+  box-shadow: none;
+}
+
+.va-kicker,
+.va-card-eyebrow,
+.va-overview-metric-card span,
+.va-home-action-summary-label,
+.va-home-task-strip-label,
+.va-home-focus-eyebrow,
+.va-home-task-kicker,
+.va-home-action-kicker,
+.va-home-focus-action,
+.va-home-task-action,
+.va-launcher-summary,
+.va-launcher-palette-shortcut,
+.va-launcher-palette-item-action {
+  color: var(--tg-theme-hint-color, var(--va-muted));
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.va-overview-metric-card strong,
+.va-native-list-value,
+.va-home-action-rank {
+  color: var(--tg-theme-text-color, var(--va-text));
+}
+
+.va-home-action-card,
+.va-home-focus-card,
+.va-home-task-card,
+.va-launcher-card {
+  border-left-width: 1px;
+}
+
+.va-home-action-card:hover,
+.va-home-focus-card:hover,
+.va-home-task-card:hover,
+.va-launcher-card:hover,
+.va-shortcut-link:hover {
+  background: var(--tg-theme-secondary-bg-color, var(--va-surface));
+  transform: none;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .va-page-intro,
+  .va-section-block,
+  .va-status-rail .va-status-card,
+  .va-grid > .va-card,
+  .va-settings-group,
+  .va-home-focus-card,
+  .va-home-task-card,
+  .va-home-action-card,
+  .va-status-rail.is-busy .va-status-card {
+    animation: none;
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   .va-view-stage,
   .va-view-stage-content,
@@ -4455,5 +4906,1369 @@
   .va-pull-indicator-dot {
     animation: none;
     transition: none;
+  }
+}
+
+/* Transferly Slipcrafts-inspired operator theme: warm accent, light surfaces, quiet density. */
+.va-dashboard {
+  --va-bg: #f6f7f9;
+  --va-bg-soft: #eef1f5;
+  --va-surface: #ffffff;
+  --va-surface-strong: #fbfcfd;
+  --va-border: #e2e7ee;
+  --va-card-border: #e2e7ee;
+  --va-card-bg: #ffffff;
+  --va-text: #182230;
+  --va-muted: #687385;
+  --va-primary: #f8812d;
+  --va-primary-strong: #d95f13;
+  --va-color-primary: #f8812d;
+  --va-success: #1d9a6c;
+  --va-warning: #c87a16;
+  --va-danger: #cf3f4f;
+  --va-shadow: 0 1px 2px rgba(24, 34, 48, 0.06), 0 8px 22px rgba(24, 34, 48, 0.07);
+
+  color: var(--va-text);
+  font-family: 'Nunito', var(--app-font-body);
+  background:
+    linear-gradient(180deg, #ffffff 0%, var(--va-bg) 46%, #f3f5f8 100%);
+}
+
+.va-dashboard :is(h1, h2, h3, h4, strong, label) {
+  color: var(--va-text);
+  letter-spacing: 0;
+}
+
+.va-dashboard :is(p, span, small, li, dd, dt) {
+  letter-spacing: 0;
+}
+
+.va-title-card,
+.va-page-intro,
+.va-header,
+.va-focused-header,
+.va-settings-hero,
+.va-card,
+.va-subcard,
+.va-disclosure,
+.va-native-list,
+.va-list li,
+.va-home-empty-panel,
+.va-home-session-strip,
+.va-home-focus-card,
+.va-home-task-card,
+.va-home-action-card,
+.va-home-action-summary,
+.va-home-action-summary-chip,
+.va-home-session-chip,
+.va-launcher-card,
+.va-launcher-card.is-locked,
+.va-launcher-palette,
+.va-launcher-palette-item,
+.va-launcher-palette-empty,
+.va-overview-metric-card,
+.va-shortcut-link {
+  border-color: var(--va-border);
+  background: var(--va-surface);
+  box-shadow: var(--va-shadow);
+}
+
+.va-title-card,
+.va-page-intro,
+.va-header,
+.va-focused-header,
+.va-settings-hero {
+  border-radius: 18px;
+}
+
+.va-title-card::before,
+.va-page-intro::before,
+.va-header::before,
+.va-focused-header::before,
+.va-settings-hero::before,
+.va-header::after,
+.va-command-center .va-command-hero::before {
+  content: none;
+}
+
+.va-title-card-story,
+.va-title-card-stat,
+.va-hero,
+.va-home-focus-glyph,
+.va-home-task-glyph,
+.va-home-action-glyph,
+.va-launcher-glyph,
+.va-launcher-pin,
+.va-saved-query,
+.va-status-diagnostics,
+.va-module-nav {
+  border-color: var(--va-border);
+  background: #f8fafc;
+  box-shadow: none;
+}
+
+.va-title-card-eyebrow,
+.va-title-card-subtitle,
+.va-title-card-note,
+.va-title-card-stat-label,
+.va-page-intro-note,
+.va-muted,
+.va-card p,
+.va-card-eyebrow,
+.va-overview-metric-card span,
+.va-home-action-summary-label,
+.va-home-task-strip-label,
+.va-home-focus-eyebrow,
+.va-home-task-kicker,
+.va-home-action-kicker,
+.va-launcher-summary,
+.va-launcher-palette-shortcut,
+.va-launcher-palette-item-action,
+.va-status-line,
+.va-status-diagnostics-title,
+.va-status-diagnostics-item,
+.va-status-diagnostics-copy-feedback,
+.va-native-list-meta,
+.va-entity-meta,
+.va-entity-message,
+.va-disclosure-subtitle {
+  color: var(--va-muted);
+  text-transform: none;
+}
+
+.va-title-card-chip,
+.va-meta-chip,
+.va-pill,
+.va-chip {
+  border-radius: 999px;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.va-title-card-chip,
+.va-meta-chip {
+  border-color: #f4d6c0;
+  background: #fff2e8;
+  color: #9d4c12;
+}
+
+.va-btn,
+.va-header button:not(.va-profile-trigger),
+.va-card button,
+.va-chip {
+  min-height: 40px;
+  border-color: var(--va-border);
+  border-radius: 12px;
+  background: #ffffff;
+  color: var(--va-text);
+  box-shadow: none;
+}
+
+.va-btn:hover,
+.va-header button:not(.va-profile-trigger):hover,
+.va-card button:hover,
+.va-chip:hover {
+  border-color: #f4c29d;
+  background: #fff8f3;
+  transform: none;
+}
+
+.va-btn-primary {
+  border-color: var(--va-primary);
+  background: var(--va-primary);
+  color: #ffffff;
+}
+
+.va-btn-primary:hover {
+  border-color: var(--va-primary-strong);
+  background: var(--va-primary-strong);
+}
+
+.va-btn-secondary,
+.va-chip {
+  border-color: var(--va-border);
+  background: #ffffff;
+  color: var(--va-text);
+}
+
+.va-chip.is-active,
+.va-command-center .va-command-tabs .va-btn.is-active {
+  border-color: #f4c29d;
+  background: #fff0e4;
+  color: #a64b0c;
+}
+
+.va-input,
+.va-input:focus,
+.va-filter-grid .va-input,
+.va-inline-tools input[type='file'] {
+  border-color: var(--va-border);
+  background: #ffffff;
+  color: var(--va-text);
+  box-shadow: none;
+}
+
+.va-input:focus {
+  border-color: var(--va-primary);
+}
+
+.va-input::placeholder {
+  color: #98a2b3;
+}
+
+.va-pill-info {
+  background: #eef4ff;
+  color: #285b9f;
+}
+
+.va-pill-success {
+  background: #eaf8f1;
+  color: #147a54;
+}
+
+.va-pill-warning {
+  background: #fff6e8;
+  color: #9a5a0f;
+}
+
+.va-pill-error {
+  background: #fff0f1;
+  color: #ad2f3f;
+}
+
+.va-pill-neutral {
+  background: #eef1f5;
+  color: #475467;
+}
+
+.va-command-center {
+  gap: 18px;
+  padding: clamp(14px, 2.4vw, 20px);
+  border: 1px solid var(--va-border);
+  border-radius: 18px;
+  background: #ffffff;
+  box-shadow: var(--va-shadow);
+}
+
+.va-command-center .va-command-hero {
+  grid-template-columns: minmax(0, 1fr) minmax(240px, 0.74fr);
+  gap: 14px;
+  align-items: center;
+}
+
+.va-command-center .va-command-hero-top {
+  align-items: center;
+}
+
+.va-command-center .va-command-logo {
+  flex-basis: 48px;
+  width: 48px;
+  height: 48px;
+  border: 0;
+  border-radius: 16px;
+  background:
+    linear-gradient(135deg, #f8812d 0%, #f5a15d 100%);
+  color: #ffffff;
+  font-size: 0.93rem;
+  font-weight: 900;
+  box-shadow: inset 0 -10px 18px rgba(119, 51, 6, 0.18);
+}
+
+.va-command-center .va-command-title-row {
+  gap: 7px;
+}
+
+.va-command-center .va-command-title-row h3 {
+  font-size: clamp(1.16rem, 2.2vw, 1.42rem);
+  line-height: 1.12;
+}
+
+.va-command-center .va-command-hero-copy p,
+.va-command-center .va-command-panel p,
+.va-command-center .va-command-empty {
+  color: var(--va-muted);
+}
+
+.va-command-center .va-command-tabs {
+  gap: 6px;
+  padding: 4px;
+  border: 1px solid var(--va-border);
+  border-radius: 14px;
+  background: #f8fafc;
+}
+
+.va-command-center .va-command-tabs .va-btn {
+  min-height: 36px;
+  border-radius: 10px;
+}
+
+.va-command-center .va-command-grid {
+  gap: 10px;
+}
+
+.va-command-center .va-command-panel,
+.va-command-center .va-command-preview {
+  border-color: var(--va-border);
+  border-radius: 14px;
+  background: #fbfcfd;
+}
+
+.va-command-center .va-command-panel {
+  padding: 13px;
+}
+
+.va-command-center .va-command-panel-head {
+  gap: 10px;
+}
+
+.va-command-center .va-command-panel h4 {
+  font-size: 0.96rem;
+}
+
+.va-command-center .va-command-row,
+.va-command-center .va-command-timeline-row {
+  border-color: var(--va-border);
+  background: #ffffff;
+}
+
+.va-command-center .va-command-row-main strong {
+  color: var(--va-text);
+}
+
+.va-command-center .va-command-row-main span,
+.va-command-center .va-command-row-meta span,
+.va-command-center .va-command-preview span {
+  color: var(--va-muted);
+}
+
+.va-command-center .va-command-dot {
+  background: var(--va-primary);
+}
+
+.va-overview-metric-card {
+  border-radius: 14px;
+  background: #ffffff;
+}
+
+.va-dashboard .va-card.va-status-card,
+.va-dashboard .va-card.va-surface-state,
+.va-dashboard .va-card.va-workspace-pulse {
+  border-color: var(--va-border);
+  background: var(--va-surface);
+  color: var(--va-text);
+  box-shadow: var(--va-shadow);
+}
+
+.va-dashboard .va-state-panel,
+.va-dashboard .va-surface-state-panel {
+  border-color: var(--va-border);
+  background: #ffffff;
+  color: var(--va-text);
+  box-shadow: none;
+}
+
+.va-dashboard .va-state-panel-title {
+  color: var(--va-text);
+}
+
+.va-dashboard .va-state-panel p,
+.va-dashboard .va-state-panel-description {
+  color: var(--va-muted);
+}
+
+.va-dashboard .va-surface-state-eyebrow {
+  color: var(--va-muted);
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.va-dashboard .va-workspace-pulse-title {
+  color: var(--va-text);
+}
+
+.va-dashboard .va-workspace-pulse-description {
+  color: var(--va-muted);
+}
+
+.va-dashboard .va-workspace-pulse .va-overview-metric-card {
+  border-color: var(--va-border);
+  background: #ffffff;
+}
+
+.va-overview-metric-card strong,
+.va-native-list-value,
+.va-home-action-rank {
+  color: var(--va-text);
+}
+
+.va-dashboard :is(button, a, input, textarea, select):focus-visible {
+  outline: 2px solid var(--va-primary);
+  outline-offset: 2px;
+  box-shadow: none;
+}
+
+@media (max-width: 900px) {
+  .va-command-center .va-command-hero {
+    align-items: stretch;
+  }
+}
+
+@media (max-width: 720px) {
+  .va-dashboard {
+    padding-inline: 10px;
+  }
+
+  .va-command-center {
+    border-radius: 16px;
+    padding: 12px;
+  }
+
+  .va-command-center .va-command-logo {
+    flex-basis: 44px;
+    width: 44px;
+    height: 44px;
+    border-radius: 14px;
+  }
+
+  .va-command-center .va-command-tabs {
+    margin-inline: -2px;
+  }
+
+  .va-command-center .va-command-tabs .va-btn {
+    min-height: 34px;
+    padding-inline: 10px;
+  }
+}
+
+/* Telegram Mini App quiet mode. Uses Telegram theme tokens first, then the dark
+   Wallet/BotFather-style fallbacks used in local browser testing. */
+.va-dashboard {
+  --va-bg: var(--tg-theme-bg-color, #111214);
+  --va-surface: var(--tg-theme-secondary-bg-color, #1a1b1f);
+  --va-surface-raised: var(--tg-theme-section-bg-color, #25272d);
+  --va-surface-strong: #2c2e34;
+  --va-border: rgba(255, 255, 255, 0.09);
+  --va-border-strong: rgba(255, 255, 255, 0.14);
+  --va-text: var(--tg-theme-text-color, #f4f5f7);
+  --va-muted: var(--tg-theme-hint-color, #9b9da5);
+  --va-primary: var(--tg-theme-button-color, #3390ec);
+  --va-primary-text: var(--tg-theme-button-text-color, #ffffff);
+  --va-success: #54d66f;
+  --va-danger: #ff5c5c;
+  color: var(--va-text);
+  background: var(--app-gradient-atmosphere);
+  padding-top: max(10px, var(--tg-safe-area-inset-top, env(safe-area-inset-top, 0px)));
+  padding-bottom: calc(96px + var(--tg-safe-area-inset-bottom, env(safe-area-inset-bottom, 0px)));
+}
+
+.va-title-card::before,
+.va-title-card::after,
+.va-page-intro::before,
+.va-page-intro::after,
+.va-command-hero::before,
+.va-header::before,
+.va-header::after,
+.va-focused-header::before,
+.va-focused-header::after {
+  display: none;
+}
+
+.va-top-shell {
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.va-title-card,
+.va-header,
+.va-focused-header {
+  border: 1px solid var(--va-border);
+  border-radius: 28px;
+  background: var(--va-surface);
+  color: var(--va-text);
+  box-shadow: none;
+}
+
+.va-title-card {
+  padding: 14px;
+}
+
+.va-header,
+.va-focused-header {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 14px;
+}
+
+.va-telegram-topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 44px;
+}
+
+.va-telegram-topbar-left {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  gap: 10px;
+}
+
+.va-profile-trigger,
+.va-profile-trigger-sm,
+.va-overflow-trigger,
+.va-overflow-close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  border: 1px solid var(--va-border);
+  background: var(--va-surface-raised);
+  color: var(--va-text);
+  box-shadow: none;
+}
+
+.va-profile-trigger,
+.va-profile-trigger-sm {
+  width: 42px;
+  height: 42px;
+  padding: 0;
+  border-radius: 50%;
+}
+
+.va-telegram-app-title {
+  display: grid;
+  min-width: 0;
+  line-height: 1.15;
+}
+
+.va-telegram-app-title span {
+  overflow: hidden;
+  color: var(--va-text);
+  font-size: 0.98rem;
+  font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.va-telegram-app-title small {
+  overflow: hidden;
+  color: var(--va-muted);
+  font-size: 0.76rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.va-overflow-trigger,
+.va-overflow-close {
+  width: 38px;
+  height: 38px;
+  min-height: 38px;
+  padding: 0;
+  border-radius: 50%;
+}
+
+.va-overflow-dots {
+  display: block;
+  transform: translateY(-2px);
+  color: var(--va-muted);
+  font-weight: 900;
+  letter-spacing: 0;
+}
+
+.va-wallet-hero {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: end;
+  gap: 16px;
+  margin-top: 18px;
+  padding: 16px;
+  border: 1px solid var(--va-border);
+  border-radius: 24px;
+  background: var(--va-surface-raised);
+}
+
+.va-wallet-hero-copy {
+  display: grid;
+  min-width: 0;
+  gap: 8px;
+}
+
+.va-wallet-status-pill {
+  width: fit-content;
+  max-width: 100%;
+  padding: 5px 9px;
+  border: 1px solid var(--va-border);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--va-muted);
+  font-size: 0.75rem;
+  font-weight: 700;
+}
+
+.va-wallet-status-pill.is-success {
+  color: var(--va-success);
+}
+
+.va-wallet-status-pill.is-warning {
+  color: var(--app-color-warning);
+}
+
+.va-title-card-title {
+  margin: 0;
+  color: var(--va-text);
+  font-size: 2.3rem;
+  line-height: 0.96;
+  letter-spacing: 0;
+}
+
+.va-module-context-line {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  gap: 8px;
+  margin: 0;
+  color: var(--va-muted);
+}
+
+.va-module-context-line span:last-child {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.va-wallet-hero-glyph,
+.va-module-context-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  border-radius: 16px;
+  background: var(--va-primary);
+  color: var(--va-primary-text);
+  font-weight: 800;
+}
+
+.va-wallet-hero-glyph {
+  width: 58px;
+  height: 58px;
+  font-size: 1.35rem;
+}
+
+.va-module-context-icon {
+  width: 28px;
+  height: 28px;
+  font-size: 0.9rem;
+}
+
+.va-wallet-action-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 10px;
+}
+
+.va-wallet-action-card {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  gap: 10px;
+  padding: 11px;
+  border: 1px solid var(--va-border);
+  border-radius: 18px;
+  background: var(--va-surface-raised);
+}
+
+.va-wallet-action-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 34px;
+  width: 34px;
+  height: 34px;
+  border-radius: 12px;
+  background: rgba(51, 144, 236, 0.16);
+  color: var(--va-primary);
+  font-size: 0.75rem;
+  font-weight: 800;
+}
+
+.va-wallet-action-copy {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+  line-height: 1.15;
+}
+
+.va-wallet-action-copy small,
+.va-wallet-action-copy em {
+  overflow: hidden;
+  color: var(--va-muted);
+  font-size: 0.72rem;
+  font-style: normal;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.va-wallet-action-copy strong {
+  overflow: hidden;
+  color: var(--va-text);
+  font-size: 0.88rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.va-focused-header {
+  display: grid;
+  gap: 14px;
+}
+
+.va-focused-summary {
+  display: grid;
+  gap: 7px;
+  padding: 14px;
+  border: 1px solid var(--va-border);
+  border-radius: 22px;
+  background: var(--va-surface-raised);
+}
+
+.va-focused-summary .va-title-card-note {
+  margin: 0;
+  color: var(--va-muted);
+}
+
+.va-module-nav {
+  gap: 6px;
+  padding: 5px;
+  border: 1px solid var(--va-border);
+  border-radius: 999px;
+  background: var(--va-surface);
+  box-shadow: none;
+}
+
+.va-module-nav .va-btn {
+  min-height: 34px;
+  border: 0;
+  border-radius: 999px;
+  color: var(--va-muted);
+  background: transparent;
+}
+
+.va-module-nav .va-btn.is-active {
+  background: var(--va-surface-raised);
+  color: var(--va-text);
+  box-shadow: none;
+}
+
+.va-bottom-nav-wrap {
+  position: fixed;
+  right: 0;
+  bottom: max(12px, var(--tg-safe-area-inset-bottom, env(safe-area-inset-bottom, 0px)));
+  left: 0;
+  z-index: 35;
+  padding-inline: 12px;
+  pointer-events: none;
+}
+
+.va-bottom-nav {
+  display: flex;
+  max-width: 720px;
+  min-height: 58px;
+  margin: 0 auto;
+  padding: 7px;
+  overflow-x: auto;
+  border: 1px solid var(--va-border-strong);
+  border-radius: 28px;
+  background: rgba(39, 40, 45, 0.94);
+  box-shadow: 0 16px 38px rgba(0, 0, 0, 0.38);
+  pointer-events: auto;
+  scrollbar-width: none;
+}
+
+.va-bottom-nav::-webkit-scrollbar {
+  display: none;
+}
+
+.va-bottom-nav-item {
+  min-width: 78px;
+  min-height: 44px;
+  border: 0;
+  border-radius: 22px;
+  color: var(--va-muted);
+  background: transparent;
+  box-shadow: none;
+}
+
+.va-bottom-nav-item.is-active {
+  color: var(--va-text);
+  background: var(--va-surface-strong);
+}
+
+.va-bottom-nav-glyph {
+  color: inherit;
+}
+
+.va-command-page-header {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 12px;
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
+  margin-bottom: 12px;
+  padding: 16px;
+  border: 1px solid var(--va-border);
+  border-radius: 24px;
+  background: var(--va-surface);
+  color: var(--va-text);
+}
+
+.va-command-page-heading {
+  display: grid;
+  gap: 7px;
+}
+
+.va-command-page-eyebrow,
+.va-command-page-note,
+.va-command-page-summary {
+  margin: 0;
+  color: var(--va-muted);
+}
+
+.va-command-page-eyebrow {
+  font-size: 0.76rem;
+  font-weight: 700;
+}
+
+.va-command-page-title {
+  margin: 0;
+  color: var(--va-text);
+  font-size: 1.62rem;
+  line-height: 1.05;
+  letter-spacing: 0;
+}
+
+.va-command-page-summary {
+  font-size: 0.94rem;
+}
+
+.va-command-page-meta {
+  width: fit-content;
+}
+
+.va-command-page-note {
+  padding-top: 4px;
+  border-top: 1px solid var(--va-border);
+  font-size: 0.86rem;
+}
+
+.va-command-center,
+.va-command-center .va-command-hero,
+.va-command-center .va-command-panel,
+.va-command-center .va-command-preview,
+.va-dashboard .va-card.va-status-card,
+.va-dashboard .va-card.va-surface-state,
+.va-dashboard .va-card.va-workspace-pulse,
+.va-dashboard .va-state-panel,
+.va-dashboard .va-surface-state-panel,
+.va-dashboard .va-workspace-pulse .va-overview-metric-card,
+.va-overview-metric-card {
+  border-color: var(--va-border);
+  background: var(--va-surface);
+  color: var(--va-text);
+  box-shadow: none;
+}
+
+.va-command-center {
+  border-radius: 24px;
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.va-command-center .va-command-hero,
+.va-command-center .va-command-panel,
+.va-command-center .va-command-preview,
+.va-command-center .va-command-row,
+.va-command-center .va-command-timeline-row {
+  background: var(--va-surface-raised);
+}
+
+.va-command-center .va-command-tabs {
+  border-color: var(--va-border);
+  background: var(--va-surface-raised);
+}
+
+.va-command-center .va-command-tabs .va-btn {
+  color: var(--va-muted);
+}
+
+.va-command-center .va-command-tabs .va-btn.is-active {
+  background: var(--va-primary);
+  color: var(--va-primary-text);
+}
+
+.va-command-center .va-command-logo {
+  background: var(--va-primary);
+  color: var(--va-primary-text);
+  box-shadow: none;
+}
+
+.va-command-center .va-command-title-row h3,
+.va-command-center .va-command-panel h4,
+.va-command-center .va-command-preview strong,
+.va-command-center .va-command-row-main strong,
+.va-overview-metric-card strong,
+.va-native-list-value,
+.va-home-action-rank {
+  color: var(--va-text);
+}
+
+.va-command-center .va-command-hero-copy p,
+.va-command-center .va-command-panel p,
+.va-command-center .va-command-empty,
+.va-command-center .va-command-row-main span,
+.va-command-center .va-command-row-meta span,
+.va-command-center .va-command-preview span,
+.va-dashboard .va-state-panel p,
+.va-dashboard .va-state-panel-description,
+.va-dashboard .va-surface-state-eyebrow,
+.va-dashboard .va-workspace-pulse-description {
+  color: var(--va-muted);
+}
+
+.va-command-center .va-command-dot {
+  background: var(--va-primary);
+}
+
+.va-command-center .va-command-signal-strip {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+  min-width: 0;
+}
+
+.va-command-center .va-command-signal-strip-compact {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.va-command-center .va-command-signal,
+.va-command-center .va-command-customer-button,
+.va-command-center .va-command-link-card {
+  min-width: 0;
+  border: 1px solid var(--va-border);
+  border-radius: 14px;
+  background: var(--va-surface-raised);
+  color: var(--va-text);
+  box-shadow: none;
+}
+
+.va-command-center .va-command-signal {
+  display: grid;
+  gap: 4px;
+  padding: 10px 12px;
+}
+
+.va-command-center .va-command-signal span,
+.va-command-center .va-command-customer-button small,
+.va-command-center .va-command-link-card small,
+.va-command-center .va-command-native-list span {
+  min-width: 0;
+  color: var(--va-muted);
+  font-size: 0.76rem;
+  line-height: 1.25;
+  overflow-wrap: anywhere;
+}
+
+.va-command-center .va-command-signal strong,
+.va-command-center .va-command-customer-button strong,
+.va-command-center .va-command-link-card strong,
+.va-command-center .va-command-native-list strong,
+.va-command-center .va-command-template-score,
+.va-command-center .va-command-token {
+  min-width: 0;
+  color: var(--va-text);
+  letter-spacing: 0;
+  overflow-wrap: anywhere;
+}
+
+.va-command-center .va-command-signal strong {
+  font-size: 1rem;
+  line-height: 1.1;
+}
+
+.va-command-center .va-command-workspace {
+  display: grid;
+  grid-template-columns: minmax(220px, 0.72fr) minmax(0, 1.28fr);
+  gap: 12px;
+  min-width: 0;
+}
+
+.va-command-center .va-command-customer-list,
+.va-command-center .va-command-template-grid,
+.va-command-center .va-command-native-list,
+.va-command-center .va-command-link-grid {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+
+.va-command-center .va-command-template-grid {
+  grid-column: 1 / -1;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.va-command-center .va-command-customer-button,
+.va-command-center .va-command-link-card {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 11px;
+  text-align: left;
+}
+
+.va-command-center .va-command-customer-button {
+  cursor: pointer;
+}
+
+.va-command-center .va-command-customer-button span,
+.va-command-center .va-command-link-card span,
+.va-command-center .va-command-native-list div {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.va-command-center .va-command-customer-button.is-selected {
+  border-color: color-mix(in srgb, var(--va-primary) 54%, var(--va-border));
+  background: color-mix(in srgb, var(--va-primary) 10%, var(--va-surface-raised));
+}
+
+.va-command-center .va-command-template-score {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 38px;
+  height: 38px;
+  border: 1px solid var(--va-border);
+  border-radius: 50%;
+  background: color-mix(in srgb, var(--va-primary) 10%, var(--va-surface-raised));
+  font-size: 0.9rem;
+  font-weight: 800;
+}
+
+.va-command-center .va-command-native-list div {
+  padding: 10px 0;
+  border-bottom: 1px solid var(--va-border);
+}
+
+.va-command-center .va-command-native-list div:last-child {
+  border-bottom: 0;
+}
+
+.va-command-center .va-command-link-card {
+  cursor: pointer;
+}
+
+.va-command-center .va-command-token {
+  max-width: 150px;
+  padding: 5px 7px;
+  border: 1px solid var(--va-border);
+  border-radius: 8px;
+  background: var(--va-surface);
+  font-size: 0.72rem;
+  line-height: 1.2;
+  white-space: normal;
+}
+
+.va-command-center .va-btn,
+.va-command-center .va-card button:not(.va-command-customer-button):not(.va-command-link-card) {
+  border-color: var(--va-border);
+  background: var(--va-surface-raised);
+  color: var(--va-text);
+  box-shadow: none;
+}
+
+.va-command-center .va-btn:hover,
+.va-command-center .va-card button:not(.va-command-customer-button):not(.va-command-link-card):hover {
+  border-color: color-mix(in srgb, var(--va-primary) 32%, var(--va-border));
+  background: color-mix(in srgb, var(--va-primary) 7%, var(--va-surface-raised));
+  color: var(--va-text);
+  transform: none;
+}
+
+.va-command-center .va-btn-primary,
+.va-command-center .va-card button.va-btn-primary {
+  border-color: var(--va-primary);
+  background: var(--va-primary);
+  color: var(--va-primary-text);
+}
+
+.va-command-center .va-btn-primary:hover,
+.va-command-center .va-card button.va-btn-primary:hover {
+  border-color: color-mix(in srgb, var(--va-primary) 82%, black 18%);
+  background: color-mix(in srgb, var(--va-primary) 88%, black 12%);
+  color: var(--va-primary-text);
+}
+
+.va-command-center .va-btn:disabled,
+.va-command-center .va-card button:disabled {
+  color: color-mix(in srgb, var(--va-muted) 84%, var(--va-surface-raised) 16%);
+  opacity: 0.68;
+}
+
+.va-dashboard button.va-btn,
+.va-dashboard .va-card button:not(.va-profile-trigger),
+.va-dashboard .va-header button:not(.va-profile-trigger) {
+  border-color: var(--va-border);
+  background: var(--va-surface-raised);
+  color: var(--va-text);
+  box-shadow: none;
+}
+
+.va-dashboard button.va-btn:hover,
+.va-dashboard .va-card button:not(.va-profile-trigger):hover,
+.va-dashboard .va-header button:not(.va-profile-trigger):hover {
+  border-color: color-mix(in srgb, var(--va-primary) 34%, var(--va-border));
+  background: color-mix(in srgb, var(--va-primary) 8%, var(--va-surface-raised));
+  color: var(--va-text);
+  transform: none;
+}
+
+.va-dashboard button.va-btn-primary,
+.va-dashboard .va-card button.va-btn-primary {
+  border-color: var(--va-primary);
+  background: var(--va-primary);
+  color: var(--va-primary-text);
+}
+
+.va-dashboard button.va-btn-primary:hover,
+.va-dashboard .va-card button.va-btn-primary:hover {
+  border-color: color-mix(in srgb, var(--va-primary) 82%, black 18%);
+  background: color-mix(in srgb, var(--va-primary) 88%, black 12%);
+  color: var(--va-primary-text);
+}
+
+.va-dashboard button:disabled,
+.va-dashboard button.va-btn:disabled,
+.va-dashboard .va-card button:disabled {
+  color: color-mix(in srgb, var(--va-muted) 72%, var(--va-text) 28%);
+  opacity: 0.72;
+}
+
+@media (max-width: 900px) {
+  .va-command-center .va-command-workspace,
+  .va-command-center .va-command-template-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .va-command-center .va-command-signal-strip {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 520px) {
+  .va-command-center .va-command-hero {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 10px;
+  }
+
+  .va-command-center .va-command-hero-top {
+    display: grid;
+    grid-template-columns: 44px minmax(0, 1fr);
+    gap: 10px;
+    align-items: start;
+  }
+
+  .va-command-center .va-command-hero-copy > div,
+  .va-command-center .va-command-hero-top > div {
+    min-width: 0;
+  }
+
+  .va-command-center .va-command-title-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    gap: 5px;
+  }
+
+  .va-command-center .va-command-title-row h3 {
+    font-size: 1.05rem;
+    line-height: 1.12;
+    overflow-wrap: normal;
+    word-break: normal;
+  }
+
+  .va-command-center .va-command-kpi {
+    grid-template-columns: 1fr;
+  }
+
+  .va-command-center .va-command-signal-strip,
+  .va-command-center .va-command-signal-strip-compact,
+  .va-command-center .va-command-customer-button,
+  .va-command-center .va-command-link-card {
+    grid-template-columns: 1fr;
+  }
+
+  .va-command-center .va-command-token {
+    max-width: 100%;
+    width: fit-content;
+  }
+}
+
+.va-overflow-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 80;
+  border: 0;
+  background: rgba(0, 0, 0, 0.24);
+}
+
+.va-overflow-menu {
+  position: fixed;
+  top: calc(max(12px, var(--tg-safe-area-inset-top, env(safe-area-inset-top, 0px))) + 8px);
+  right: 12px;
+  z-index: 81;
+  width: min(300px, calc(100vw - 24px));
+  padding: 10px;
+  border: 1px solid var(--va-border-strong);
+  border-radius: 22px;
+  background: rgba(39, 40, 45, 0.98);
+  color: var(--va-text);
+  box-shadow: var(--app-shadow-float);
+}
+
+.va-overflow-menu-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 4px 2px 10px;
+}
+
+.va-overflow-menu-head span,
+.va-overflow-menu-meta {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.va-overflow-menu-head strong,
+.va-overflow-menu-meta strong {
+  color: var(--va-text);
+}
+
+.va-overflow-menu-head small,
+.va-overflow-menu-meta span {
+  color: var(--va-muted);
+  font-size: 0.76rem;
+}
+
+.va-overflow-menu-meta {
+  padding: 10px 12px;
+  border: 1px solid var(--va-border);
+  border-radius: 16px;
+  background: var(--va-surface-raised);
+}
+
+.va-overflow-menu-list {
+  display: grid;
+  gap: 5px;
+  margin-top: 8px;
+}
+
+.va-overflow-menu-row {
+  display: grid;
+  grid-template-columns: 34px minmax(0, 1fr);
+  align-items: center;
+  min-height: 46px;
+  justify-content: start;
+  gap: 10px;
+  padding: 6px 8px;
+  border: 0;
+  border-radius: 14px;
+  color: var(--va-text);
+  background: transparent;
+}
+
+.va-overflow-menu-row span {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.07);
+  color: var(--va-primary);
+  font-size: 0.78rem;
+  font-weight: 800;
+}
+
+.va-overflow-menu-row strong {
+  overflow: hidden;
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.va-overflow-menu-row:hover {
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.va-overflow-menu-row.is-danger {
+  color: var(--va-danger);
+}
+
+.va-overflow-menu-row.is-danger span {
+  color: var(--va-danger);
+}
+
+@media (max-width: 720px) {
+  .va-dashboard {
+    padding-inline: 10px;
+  }
+
+  .va-title-card,
+  .va-header,
+  .va-focused-header,
+  .va-command-page-header,
+  .va-command-center {
+    border-radius: 22px;
+  }
+
+  .va-wallet-hero {
+    grid-template-columns: 1fr;
+    gap: 12px;
+  }
+
+  .va-wallet-hero-glyph {
+    width: 48px;
+    height: 48px;
+  }
+
+  .va-title-card-title {
+    font-size: 1.82rem;
+  }
+
+  .va-command-page-title {
+    font-size: 1.38rem;
+  }
+
+  .va-wallet-action-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .va-module-context-line span:last-child {
+    white-space: normal;
+  }
+
+  .va-bottom-nav {
+    max-width: none;
+  }
+
+  .va-bottom-nav-item {
+    min-width: 72px;
   }
 }
