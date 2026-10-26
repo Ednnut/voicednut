@@ -56,6 +56,18 @@ npm run build
 
 Build artifacts are generated in `dist/`.
 
+## Validation
+
+```bash
+npm run validate:contracts
+npm run lint
+npm run build
+npm run test:e2e
+npm run test:a11y
+```
+
+`test:e2e` uses local fixtures and checks the dashboard at mobile, tablet, and desktop viewport sizes. `test:a11y` runs axe-core WCAG 2.1 A/AA checks against that fixture page; resolve reported violations instead of suppressing the audit. Browser checks require the Playwright browser binaries to be installed for the local environment.
+
 ## Vercel Deploy
 
 This folder includes `vercel.json` with Vite settings.

@@ -4,13 +4,16 @@ on:
   push:
     branches:
       - main
+  pull_request:
+    branches:
+      - main
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: deploy-main
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -25,14 +28,14 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 1
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
-          node-version: 20
+          node-version: 24
           cache: npm
           cache-dependency-path: miniapp/package-lock.json
 
@@ -42,20 +45,92 @@ jobs:
       - name: Validate Mini App contracts, lint, and build
         run: npm run validate:prod
 
+      - name: Install Chromium for Playwright
+        run: npx playwright install --with-deps chromium
+
+      - name: Run Mini App browser smoke tests
+        run: npm run test:e2e
+
+      - name: Run Mini App accessibility checks
+        run: npm run test:a11y
+
+  validate-api:
+    name: Validate API
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    defaults:
+      run:
+        working-directory: api
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 1
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: api/package-lock.json
+
+      - name: Install API dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Run API tests and offline provider checks
+        run: |
+          npm test
+          npm run validate:profiles
+          npm run parity:providers
+
+  validate-bot:
+    name: Validate Bot
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    defaults:
+      run:
+        working-directory: bot
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 1
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: bot/package-lock.json
+
+      - name: Install bot dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Run bot tests
+        run: npm test
+
   deploy:
     name: Deploy via SSH to EC2
     runs-on: ubuntu-latest
-    needs: validate-miniapp
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    needs:
+      - validate-miniapp
+      - validate-api
+      - validate-bot
     timeout-minutes: 25
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 1
 
       - name: Deploy using SSH
-        uses: appleboy/ssh-action@v0.1.6
+        uses: appleboy/ssh-action@4a03da89e5c43da56e502053be4bbcb293411883 # v0.1.6
         with:
           host: ${{ secrets.EC2_HOST }}
           username: ubuntu
@@ -68,12 +143,18 @@ jobs:
             set -euo pipefail
 
             export NVM_DIR="/home/ubuntu/.nvm"
-            if [ -s "$NVM_DIR/nvm.sh" ]; then
-              . "$NVM_DIR/nvm.sh"
-              nvm use 20 >/dev/null 2>&1 || nvm use default >/dev/null 2>&1 || true
+            if [ ! -s "$NVM_DIR/nvm.sh" ]; then
+              echo "nvm is required to select the supported Node.js 24 runtime" >&2
+              exit 1
             fi
+            . "$NVM_DIR/nvm.sh"
+            if ! nvm use 24; then
+              echo "Node.js 24 must be installed on the deployment host before deploying" >&2
+              exit 1
+            fi
+            node -e "if (Number(process.versions.node.split('.')[0]) !== 24) process.exit(1)"
 
-            for required_command in git node npm pm2; do
+            for required_command in git node npm pm2 curl grep; do
               if ! command -v "$required_command" >/dev/null 2>&1; then
                 echo "Missing required command: $required_command" >&2
                 exit 1
@@ -100,15 +181,19 @@ jobs:
 
             mkdir -p "$LOG_ROOT/api" "$LOG_ROOT/bot"
 
-            # Reset PM2 to a known-empty state without failing when nothing is running.
-            pm2 delete all || true
-            pm2 kill || true
-
             # Deploy API
             cd "$DEPLOY_ROOT/api"
             npm ci --omit=dev --no-audit --no-fund
             npm run parity:providers
             pm2 startOrRestart ecosystem.config.js --env production
+
+            # Wait for the API and SQLite health check before restarting the bot.
+            if ! curl --fail --silent --show-error --retry 10 --retry-delay 3 \
+              --retry-connrefused --max-time 5 http://127.0.0.1:1337/health \
+              | grep -q '"status":"healthy"'; then
+              echo "API health check failed after deployment" >&2
+              exit 1
+            fi
 
             # Deploy Bot
             cd "$DEPLOY_ROOT/bot"

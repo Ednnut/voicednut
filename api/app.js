@@ -88,11 +88,34 @@ const {
 } = require("./adapters/providerState");
 const {
   normalizeProviderName,
+  listProviderFlows,
   resolveProviderExecutionOrder,
   resolvePaymentExecutionMode,
   buildProviderCompatibilityReport,
   buildCanonicalCallStatusEvent,
 } = require("./adapters/providerFlowPolicy");
+const {
+  buildCallTemplateExecutionContext,
+} = require("./adapters/templateExecution");
+const { VoiceProviderRegistry } = require("./adapters/voiceProviderRegistry");
+const { previewCallETemplate } = require("./adapters/callETemplateAdapter");
+const { buildCallEDeploymentStatus, createCallEClientFromEnv } = require("./services/callEClient");
+const { parseAllowedDestinations } = require("./services/callEOutboundCallService");
+const { CallEReconciliationService, createCallEReconciliationHandler } = require("./services/callEReconciliationService");
+const {
+  containsCredentialLikeField,
+  fingerprintVapiTemplateMapping,
+  mapCallTemplateToVapiAssistant,
+} = require("./adapters/vapiTemplateAdapter");
+const { createVapiClientFromEnv } = require("./services/vapiClient");
+const { VapiTemplateSyncService } = require("./services/vapiTemplateSyncService");
+const { VapiOutboundCallService } = require("./services/vapiOutboundCallService");
+const { VapiCallControlService } = require("./services/vapiCallControlService");
+const { VapiCallReconciliationService } = require("./services/vapiCallReconciliationService");
+const { VapiCallCampaignService } = require("./services/vapiCallCampaignService");
+const { VapiWebCallService, isAllowedVapiWebOrigin } = require("./services/vapiWebCallService");
+const { VapiPhoneNumberService } = require("./services/vapiPhoneNumberService");
+const { VapiInboundPhoneNumberService } = require("./services/vapiInboundPhoneNumberService");
 const {
   runProviderPreflight,
   assertProviderPreflight,
@@ -3769,6 +3792,18 @@ function buildInboundCallConfig(callSid, payload = {}, options = {}) {
     effectivePrompt,
     effectiveFirstMessage,
   );
+  const inboundTemplateId = normalizeScriptId(
+    fallbackScript?.id || route.script_id,
+  );
+  const inboundTemplate =
+    fallbackScript || (Object.keys(route).length > 0 ? route : null);
+  const templateExecution = buildCallTemplateExecutionContext({
+    template: inboundTemplate,
+    templateId: inboundTemplateId,
+    templateVersion: fallbackScript?.version || route.script_version,
+    provider,
+    flow: inbound ? "inbound_voice" : "outbound_voice",
+  });
   const resolvedPurpose =
     String(route.purpose || "").trim() ||
     getProfilePurpose(conversationProfile);
@@ -3789,6 +3824,7 @@ function buildInboundCallConfig(callSid, payload = {}, options = {}) {
     customer_name: route.customer_name || null,
     provider,
     provider_metadata: null,
+    template_execution: templateExecution,
     business_context: route.business_context || functionSystem.context,
     function_count: functionSystem.functions.length,
     call_profile: route.call_profile || route.conversation_profile || null,
@@ -3952,7 +3988,10 @@ function ensureCallSetup(callSid, payload = {}, options = {}) {
     { callConfig, skipToolRefresh: true, source: "ensureCallSetup" },
   );
   queuePersistCallRuntimeState(callSid, {
-    snapshot: { source: "ensureCallSetup" },
+    snapshot: {
+      source: "ensureCallSetup",
+      template_execution: callConfig.template_execution || null,
+    },
   });
   return { callConfig, functionSystem, created: true };
 }
@@ -4003,6 +4042,7 @@ async function ensureCallRecord(
       script: callConfig.script || null,
       script_id: callConfig.script_id || null,
       script_version: callConfig.script_version || null,
+      template_execution: callConfig.template_execution || null,
       call_profile: callConfig.call_profile || null,
       conversation_profile_lock:
         callConfig.conversation_profile_lock ?? null,
@@ -4174,6 +4214,10 @@ async function hydrateCallConfigFromDb(callSid) {
     script_version: Number.isFinite(Number(state?.script_version))
       ? Math.max(1, Math.floor(Number(state.script_version)))
       : null,
+    template_execution:
+      state?.template_execution && typeof state.template_execution === "object"
+        ? state.template_execution
+        : null,
     emotion: state?.emotion || null,
     urgency: state?.urgency || null,
     technical_level: state?.technical_level || null,
@@ -6901,6 +6945,37 @@ function safeCompareSecret(provided, expected) {
   }
 }
 
+function requireValidVapiWebhook(req, res) {
+  const secret = String(process.env.VAPI_WEBHOOK_BEARER_TOKEN || "").trim();
+  if (!secret) {
+    res.status(503).json({ success: false, error: "Vapi webhook authentication is not configured" });
+    return false;
+  }
+  if (!safeCompareSecret(req.get("authorization"), `Bearer ${secret}`)) {
+    res.status(401).json({ success: false, error: "Vapi webhook authentication failed" });
+    return false;
+  }
+  return true;
+}
+
+function buildVapiWebhookServerConfiguration() {
+  const webhookUrl = String(process.env.VAPI_WEBHOOK_URL || "").trim();
+  const credentialId = String(process.env.VAPI_WEBHOOK_CREDENTIAL_ID || "").trim();
+  const secret = String(process.env.VAPI_WEBHOOK_BEARER_TOKEN || "").trim();
+  if (!webhookUrl || !credentialId || !secret) return null;
+  try {
+    const parsed = new URL(webhookUrl);
+    if (
+      parsed.protocol !== "https:" ||
+      parsed.pathname.replace(/\/+$/, "") !== "/webhook/vapi" ||
+      parsed.username || parsed.password || parsed.search || parsed.hash
+    ) return null;
+    return { url: parsed.toString(), credentialId };
+  } catch {
+    return null;
+  }
+}
+
 function verifyTelegramWebhookAuth(req) {
   const hmac = verifyHmacSignature(req);
   if (hmac.ok && !hmac.skipped) {
@@ -8316,6 +8391,79 @@ async function requireMiniAppSession(req, res, next) {
   }
 }
 
+app.get("/miniapp/vapi/web-assistants", requireMiniAppSession, async (req, res) => {
+  res.locals.miniAppRoute = "vapi_web_assistants";
+  if (await enforceMiniAppRateLimit(req, res, "bootstrap")) return;
+  if (!requireMiniAppCapability(req, res, "provider_manage")) return;
+  if (!isAllowedVapiWebOrigin(req.get("origin"), process.env.VAPI_WEB_ALLOWED_ORIGINS)) {
+    return res.status(403).json({ success: false, error: "This Mini App origin is not allowed", code: "vapi_web_origin_denied" });
+  }
+  if (String(process.env.VAPI_ENABLED || "false").trim().toLowerCase() !== "true") {
+    return res.status(503).json({ success: false, error: "Vapi web calling is disabled", code: "vapi_not_configured" });
+  }
+  try {
+    const assistants = await db.listVapiWebCallAssistants();
+    return res.json({
+      success: true,
+      assistants: assistants.map((row) => ({
+        mappingId: Number(row.id),
+        templateId: Number(row.template_id),
+        templateName: String(row.template_name || `Template ${row.template_id}`).slice(0, 160),
+        templateVersion: Number(row.template_version),
+      })),
+    });
+  } catch (error) {
+    console.error("miniapp_vapi_web_assistant_list_error", { code: "mapping_list_failed" });
+    return res.status(500).json({ success: false, error: "Unable to list Vapi web templates" });
+  }
+});
+
+app.post("/miniapp/vapi/web-calls", requireMiniAppSession, async (req, res) => {
+  res.locals.miniAppRoute = "vapi_web_calls";
+  if (await enforceMiniAppRateLimit(req, res, "action")) return;
+  if (!requireMiniAppCapability(req, res, "provider_manage")) return;
+  try {
+    if (!isAllowedVapiWebOrigin(req.get("origin"), process.env.VAPI_WEB_ALLOWED_ORIGINS)) {
+      return res.status(403).json({
+        success: false,
+        error: "This Mini App origin is not allowed for Vapi web calls",
+        code: "vapi_web_origin_denied",
+      });
+    }
+    const service = new VapiWebCallService({
+      client: createVapiClientFromEnv(),
+      db,
+      listEligibleAssistants: () => db.listVapiWebCallAssistants(),
+    });
+    const result = await service.createWebCall({
+      mappingId: req.body?.mappingId,
+      idempotencyKey: req.get("Idempotency-Key") || req.body?.idempotencyKey,
+    });
+    return res.json({ success: true, ...result });
+  } catch (error) {
+    const code = String(error?.code || "vapi_web_unavailable");
+    const status = code === "vapi_not_configured" || code === "vapi_web_unavailable"
+      ? 503
+      : ["vapi_web_mapping_invalid", "vapi_web_idempotency_key_required"].includes(code)
+        ? 400
+        : ["vapi_web_call_outcome_unknown", "vapi_web_idempotency_conflict"].includes(code)
+          ? 409
+        : code === "vapi_web_mapping_not_found"
+          ? 404
+          : code === "vapi_web_response_invalid"
+            ? 502
+            : 502;
+    console.error("miniapp_vapi_web_access_error", {
+      code: redactSensitiveLogValue(code),
+    });
+    return res.status(status).json({
+      success: false,
+      error: status === 502 ? "Vapi web calling is unavailable" : error.message,
+      code,
+    });
+  }
+});
+
 function requireMiniAppCapability(req, res, capability) {
   const session = req.miniAppSession || {};
   const caps = Array.isArray(session.caps) ? session.caps : [];
@@ -9391,6 +9539,12 @@ const bypassPathLimiter = rateLimit({
     60,
     Math.floor((config.server?.rateLimit?.max || 300) / 2),
   ),
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+const callEReconciliationLimiter = rateLimit({
+  windowMs: 60000,
+  max: 20,
   standardHeaders: true,
   legacyHeaders: false,
 });
@@ -12396,6 +12550,7 @@ const vonageCallMap = new Map();
 
 let plivoVoiceAdapter = null;
 let vonageVoiceAdapter = null;
+let voiceProviderRegistry = null;
 let vonageMappingReconcileTimer = null;
 
 function rememberPlivoCallMapping(callSid, plivoUuid, source = "unknown") {
@@ -13847,46 +14002,188 @@ function getPlivoVoiceAdapter() {
   return plivoVoiceAdapter;
 }
 
+function getVoiceProviderRegistry() {
+  if (voiceProviderRegistry) return voiceProviderRegistry;
+
+  const registry = new VoiceProviderRegistry();
+  registry.register("twilio", {
+    capabilities: listProviderFlows(PROVIDER_CHANNELS.CALL, "twilio"),
+    createOutboundCall: async ({ host, number }) => {
+      warnIfMachineDetectionDisabled("outbound-call");
+      const accountSid = config.twilio.accountSid;
+      const authToken = config.twilio.authToken;
+      const fromNumber = config.twilio.fromNumber;
+      if (!accountSid || !authToken || !fromNumber) {
+        throw new Error("Twilio credentials not configured");
+      }
+
+      const client = twilio(accountSid, authToken);
+      const callPayload = buildTwilioOutboundCallPayload({
+        host,
+        to: number,
+        from: fromNumber,
+        machineDetection: config.twilio?.machineDetection,
+        machineDetectionTimeout: config.twilio?.machineDetectionTimeout,
+      });
+      console.log(
+        `Twilio call URLs: twiml=${callPayload.url} statusCallback=${callPayload.statusCallback}`,
+      );
+      const providerTimeoutMs =
+        Number(config.callProvider?.requestTimeoutMs) ||
+        Number(config.outboundLimits?.handlerTimeoutMs) ||
+        30000;
+      const call = await runWithTimeout(
+        client.calls.create(callPayload),
+        providerTimeoutMs,
+        "twilio_outbound_call",
+        "call_provider_timeout",
+      );
+      return {
+        callId: call.sid,
+        providerCallId: call.sid,
+        status: call.status || "queued",
+      };
+    },
+    endCall: async ({ callId }) => {
+      const accountSid = config.twilio.accountSid;
+      const authToken = config.twilio.authToken;
+      if (!accountSid || !authToken) {
+        throw new Error("Twilio credentials not configured");
+      }
+      const client = twilio(accountSid, authToken);
+      await client.calls(callId).update({ status: "completed" });
+    },
+  });
+
+  registry.register("plivo", {
+    capabilities: listProviderFlows(PROVIDER_CHANNELS.CALL, "plivo"),
+    createOutboundCall: async ({ host, number, idempotencyKey }) => {
+      const plivoAdapter = getPlivoVoiceAdapter();
+      const callId = uuidv4();
+      const webhookReq = reqForHost(host);
+      const answerUrl = buildPlivoAnswerWebhookUrl(webhookReq, callId);
+      const eventUrl = buildPlivoEventWebhookUrl(webhookReq, callId);
+      if (!answerUrl) {
+        throw new Error(
+          "Plivo requires a public SERVER hostname or PLIVO_ANSWER_URL",
+        );
+      }
+      const response = await plivoAdapter.createOutboundCall({
+        to: number,
+        callSid: callId,
+        answerUrl,
+        eventUrl,
+      });
+      const plivoUuid = PlivoVoiceAdapter.extractPlivoCallUuid(response);
+      const metadata = {
+        plivo_uuid: plivoUuid || null,
+        plivo_request_uuid: response?.request_uuid || null,
+        answer_url: answerUrl || null,
+        event_url: eventUrl || null,
+        idempotency_key: idempotencyKey || null,
+      };
+      if (plivoUuid) rememberPlivoCallMapping(callId, plivoUuid, "outbound_create");
+      return {
+        callId,
+        providerCallId: plivoUuid,
+        status: response?.status || "queued",
+        metadata,
+      };
+    },
+    endCall: async ({ providerCallId }) => {
+      const callUuid = String(providerCallId || "").trim();
+      if (!callUuid) {
+        throw new Error(
+          "Plivo call UUID not available for hangup; ensure event webhook mapping is configured",
+        );
+      }
+      await getPlivoVoiceAdapter().hangupCall(callUuid);
+    },
+  });
+
+  registry.register("vonage", {
+    capabilities: listProviderFlows(PROVIDER_CHANNELS.CALL, "vonage", {
+      vonageDtmfWebhookEnabled: config.vonage?.dtmfWebhookEnabled === true,
+    }),
+    createOutboundCall: async ({ host, number, idempotencyKey }) => {
+      const vonageAdapter = getVonageVoiceAdapter();
+      const callId = uuidv4();
+      const webhookReq = reqForHost(host);
+      const answerUrl = buildVonageAnswerWebhookUrl(webhookReq, callId);
+      const eventUrl = buildVonageEventWebhookUrl(webhookReq, callId);
+      const wsUrl = host
+        ? buildVonageWebsocketUrl(webhookReq, callId, { direction: "outbound" })
+        : "";
+      const ncco = wsUrl
+        ? [
+            {
+              action: "connect",
+              endpoint: [
+                {
+                  type: "websocket",
+                  uri: wsUrl,
+                  "content-type": getVonageWebsocketContentType(),
+                },
+              ],
+            },
+          ]
+        : null;
+      if (!ncco && !answerUrl) {
+        throw new Error(
+          "Vonage requires a public SERVER hostname or VONAGE_ANSWER_URL",
+        );
+      }
+      const response = await vonageAdapter.createOutboundCall({
+        to: number,
+        callSid: callId,
+        answerUrl,
+        eventUrl,
+        ncco: ncco || undefined,
+      });
+      const vonageUuid = response?.uuid;
+      const metadata = {
+        vonage_uuid: vonageUuid || null,
+        answer_url: answerUrl || null,
+        event_url: eventUrl || null,
+        idempotency_key: idempotencyKey || null,
+      };
+      if (vonageUuid) rememberVonageCallMapping(callId, vonageUuid, "outbound_create");
+      return {
+        callId,
+        providerCallId: vonageUuid,
+        status: response?.status || "queued",
+        metadata,
+      };
+    },
+    endCall: async ({ providerCallId }) => {
+      const callUuid = String(providerCallId || "").trim();
+      if (!callUuid) {
+        throw new Error(
+          "Vonage call UUID not available for hangup; ensure event webhook mapping is configured",
+        );
+      }
+      await getVonageVoiceAdapter().hangupCall(callUuid);
+    },
+  });
+
+  voiceProviderRegistry = registry;
+  return registry;
+}
+
 async function endCallForProvider(callSid) {
   const callConfig = callConfigurations.get(callSid);
   const provider = callConfig?.provider || currentProvider;
-
-  if (provider === "twilio") {
-    const accountSid = config.twilio.accountSid;
-    const authToken = config.twilio.authToken;
-    if (!accountSid || !authToken) {
-      throw new Error("Twilio credentials not configured");
-    }
-    const client = twilio(accountSid, authToken);
-    await client.calls(callSid).update({ status: "completed" });
-    return;
-  }
-
+  let providerCallId = callSid;
   if (provider === "vonage") {
-    const callUuid = resolveVonageHangupUuid(callSid, callConfig);
-    if (!callUuid) {
-      throw new Error(
-        "Vonage call UUID not available for hangup; ensure event webhook mapping is configured",
-      );
-    }
-    const vonageAdapter = getVonageVoiceAdapter();
-    await vonageAdapter.hangupCall(callUuid);
-    return;
+    providerCallId = resolveVonageHangupUuid(callSid, callConfig);
+  } else if (provider === "plivo") {
+    providerCallId = resolvePlivoHangupUuid(callSid, callConfig);
   }
-
-  if (provider === "plivo") {
-    const callUuid = resolvePlivoHangupUuid(callSid, callConfig);
-    if (!callUuid) {
-      throw new Error(
-        "Plivo call UUID not available for hangup; ensure event webhook mapping is configured",
-      );
-    }
-    const plivoAdapter = getPlivoVoiceAdapter();
-    await plivoAdapter.hangupCall(callUuid);
-    return;
-  }
-
-  throw new Error(`Unsupported provider ${provider}`);
+  await getVoiceProviderRegistry().endCall(provider, {
+    callId: callSid,
+    providerCallId,
+    callConfig,
+  });
 }
 
 function estimateSpeechDurationMs(text = "") {
@@ -19187,6 +19484,9 @@ const MINI_APP_SUPPORTED_ACTIONS = Object.freeze([
   "callscript.promote_live",
   "callscript.review",
   "callscript.simulate",
+  "callscript.calle_preview",
+  "calle.status",
+  "calle.call.reconcile",
   "callscript.submit_review",
   "callscript.update",
   "dlq.call.list",
@@ -19851,6 +20151,43 @@ function buildMiniAppActionSpec(action, payload = {}) {
       method: "POST",
       path: `/api/call-scripts/${Math.trunc(scriptId)}/simulate`,
       body: { variables },
+    };
+  }
+
+  if (normalizedAction === "callscript.calle_preview") {
+    const scriptId = Number(input.id || input.script_id || input.scriptId);
+    if (!Number.isSafeInteger(scriptId) || scriptId <= 0) return { error: "Valid script id is required" };
+    return {
+      capability: "caller_flags_manage",
+      method: "POST",
+      path: `/api/call-scripts/${scriptId}/call-e-preview`,
+      body: {
+        phone: input.phone,
+        region: input.region,
+        locale: input.locale,
+        result_schema: input.result_schema,
+      },
+    };
+  }
+
+  if (normalizedAction === "calle.status") {
+    return {
+      capability: "caller_flags_manage",
+      method: "GET",
+      path: "/api/call-e/status",
+    };
+  }
+
+  if (normalizedAction === "calle.call.reconcile") {
+    const localCallId = String(input.local_call_id || input.localCallId || "").trim();
+    if (!/^call_e_[0-9a-f-]{36}$/i.test(localCallId)) {
+      return { error: "Valid VOICEDNUT CALL-E call ID is required" };
+    }
+    return {
+      capability: "caller_flags_manage",
+      method: "POST",
+      path: `/api/call-e/calls/${encodeURIComponent(localCallId)}/reconcile`,
+      body: {},
     };
   }
 
@@ -20920,6 +21257,8 @@ function buildMiniAppActionSpec(action, payload = {}) {
 
 const MINI_APP_READ_ONLY_POST_ACTIONS = new Set([
   "automation.preview",
+  "callscript.calle_preview",
+  "calle.call.reconcile",
   "callscript.simulate",
   "crm.health",
   "email.preview",
@@ -23014,6 +23353,585 @@ app.get("/api/call-scripts/:id", requireAdminToken, async (req, res) => {
   }
 });
 
+app.post("/api/call-scripts/:id/call-e-preview", requireAdminToken, async (req, res) => {
+  try {
+    const scriptId = Number(req.params.id);
+    if (!Number.isSafeInteger(scriptId) || scriptId <= 0) {
+      return res.status(400).json({ success: false, error: "Invalid script id" });
+    }
+    const template = normalizeScriptTemplateRecord(await db.getCallTemplateById(scriptId));
+    if (!template) return res.status(404).json({ success: false, error: "Script not found" });
+    const body = isPlainObject(req.body) ? req.body : {};
+    const preview = previewCallETemplate(template, {
+      phone: body.phone,
+      region: body.region,
+      locale: body.locale,
+      resultSchema: body.result_schema,
+    });
+    return res.json({ success: true, persisted: false, preview });
+  } catch (error) {
+    console.error("call_script_calle_preview_error", {
+      error: redactSensitiveLogValue(error.message || "preview_failed"),
+    });
+    return res.status(500).json({ success: false, error: "Failed to preview CALL-E template mapping" });
+  }
+});
+
+app.get("/api/call-e/status", requireAdminToken, (req, res) => {
+  return res.json({
+    success: true,
+    status: buildCallEDeploymentStatus(createCallEClientFromEnv(), {
+      destinationAllowlistReady: parseAllowedDestinations().size > 0,
+    }),
+  });
+});
+
+app.post(
+  "/api/call-e/calls/:localCallId/reconcile",
+  callEReconciliationLimiter,
+  requireAdminToken,
+  createCallEReconciliationHandler({
+    createService: () => new CallEReconciliationService({
+      client: createCallEClientFromEnv(),
+      db,
+      maxPages: 5,
+    }),
+  }),
+);
+
+app.post(
+  "/api/call-scripts/:id/vapi-preview",
+  requireAdminToken,
+  async (req, res) => {
+    try {
+      const scriptId = Number(req.params.id);
+      if (!Number.isSafeInteger(scriptId) || scriptId <= 0) {
+        return res.status(400).json({ success: false, error: "Invalid script id" });
+      }
+      const template = normalizeScriptTemplateRecord(
+        await db.getCallTemplateById(scriptId),
+      );
+      if (!template) {
+        return res.status(404).json({ success: false, error: "Script not found" });
+      }
+      const body = isPlainObject(req.body) ? req.body : {};
+      const vapiModel = isPlainObject(body.vapi_model) ? body.vapi_model : null;
+      const vapiVoice = isPlainObject(body.vapi_voice) ? body.vapi_voice : null;
+      if (containsCredentialLikeField(vapiModel) || containsCredentialLikeField(vapiVoice)) {
+        return res.status(400).json({
+          success: false,
+          error: "Vapi preview settings must not include credentials",
+        });
+      }
+      const preview = mapCallTemplateToVapiAssistant({
+        ...template,
+        configuration: {
+          vapi: {
+            ...(vapiModel ? { model: vapiModel } : {}),
+            ...(vapiVoice ? { voice: vapiVoice } : {}),
+          },
+        },
+      });
+      const configFingerprint = fingerprintVapiTemplateMapping(
+        template,
+        vapiModel,
+        vapiVoice,
+      );
+      await db.upsertVapiTemplateMapping({
+        template_id: scriptId,
+        template_version: template.version,
+        config_fingerprint: configFingerprint,
+        compatibility_status: preview.compatible ? "compatible" : "incompatible",
+        summary: {
+          mapped_fields: preview.mappedFields,
+          unsupported: preview.unsupported,
+          missing: preview.missing,
+        },
+      });
+      return res.json({
+        success: true,
+        persisted: true,
+        config_fingerprint: configFingerprint,
+        preview,
+      });
+    } catch (error) {
+      console.error("call_script_vapi_preview_error", {
+        error: redactSensitiveLogValue(error.message || "preview_failed"),
+      });
+      return res.status(500).json({
+        success: false,
+        error: "Failed to preview Vapi template mapping",
+      });
+    }
+  },
+);
+
+app.get(
+  "/api/call-scripts/:id/vapi-mappings",
+  requireAdminToken,
+  async (req, res) => {
+    try {
+      const scriptId = Number(req.params.id);
+      if (!Number.isSafeInteger(scriptId) || scriptId <= 0) {
+        return res.status(400).json({ success: false, error: "Invalid script id" });
+      }
+      const template = await db.getCallTemplateById(scriptId);
+      if (!template) {
+        return res.status(404).json({ success: false, error: "Script not found" });
+      }
+      const mappings = await db.listVapiTemplateMappings(scriptId);
+      return res.json({
+        success: true,
+        template_id: scriptId,
+        current_template_version: Number(template.version) || 1,
+        mappings,
+      });
+    } catch (error) {
+      console.error("call_script_vapi_mappings_error", {
+        error: redactSensitiveLogValue(error.message || "mapping_list_failed"),
+      });
+      return res.status(500).json({
+        success: false,
+        error: "Failed to load Vapi template mappings",
+      });
+    }
+  },
+);
+
+app.post(
+  "/api/call-scripts/:id/vapi-call",
+  requireAdminToken,
+  async (req, res) => {
+    const scriptId = Number(req.params.id);
+    if (!Number.isSafeInteger(scriptId) || scriptId <= 0) {
+      return res.status(400).json({ success: false, error: "Invalid script id" });
+    }
+    const body = isPlainObject(req.body) ? req.body : {};
+    const client = createVapiClientFromEnv();
+    try {
+      const service = new VapiOutboundCallService({
+        client,
+        getMapping: (mappingId) => db.getVapiTemplateMappingById(mappingId),
+        getTemplate: (templateId) => db.getCallTemplateById(templateId),
+      });
+      const result = await service.createOutboundCall({
+        templateId: scriptId,
+        mappingId: body.mapping_id,
+        phoneNumberId: body.phone_number_id,
+        number: body.number,
+        idempotencyKey: body.idempotency_key,
+      });
+      return res.status(result.idempotentReplay ? 200 : 201).json({ success: true, result });
+    } catch (error) {
+      const code = String(error?.code || "vapi_call_failed");
+      const status = code === "vapi_not_configured"
+        ? 503
+        : [
+          "vapi_mapping_required",
+          "vapi_phone_number_id_required",
+          "vapi_destination_invalid",
+          "vapi_mapping_template_mismatch",
+          "vapi_idempotency_key_required",
+        ].includes(code)
+          ? 400
+          : [
+            "vapi_mapping_not_found",
+            "vapi_mapping_not_ready",
+            "vapi_mapping_stale",
+            "vapi_template_unsupported",
+            "vapi_idempotency_conflict",
+            "vapi_previous_call_failed",
+            "vapi_call_outcome_unresolved",
+          ].includes(code)
+            ? 409
+            : 502;
+      console.error("vapi_outbound_call_error", {
+        code: redactSensitiveLogValue(code),
+        status: Number.isFinite(error?.status) ? error.status : null,
+      });
+      return res.status(status).json({
+        success: false,
+        error: status === 502 ? "Vapi outbound call failed" : error.message,
+        code,
+      });
+    }
+  },
+);
+
+app.get("/api/vapi/call-events", requireAdminToken, async (req, res) => {
+  try {
+    const rawTemplateId = req.query?.template_id;
+    const templateId = rawTemplateId === undefined ? null : Number(rawTemplateId);
+    if (templateId !== null && (!Number.isSafeInteger(templateId) || templateId <= 0)) {
+      return res.status(400).json({ success: false, error: "Invalid template_id" });
+    }
+    const providerCallId = String(req.query?.provider_call_id || "").trim();
+    if (providerCallId.length > 200) {
+      return res.status(400).json({ success: false, error: "provider_call_id is too long" });
+    }
+    const events = await db.listVapiCallEvents({
+      template_id: templateId,
+      provider_call_id: providerCallId,
+      limit: req.query?.limit,
+    });
+    return res.json({ success: true, events });
+  } catch (error) {
+    console.error("vapi_call_event_list_error", {
+      error: redactSensitiveLogValue(error.message || "event_list_failed"),
+    });
+    return res.status(500).json({ success: false, error: "Failed to list Vapi call events" });
+  }
+});
+
+app.post("/api/vapi/campaigns", requireAdminToken, async (req, res) => {
+  try {
+    const service = new VapiCallCampaignService({
+      db,
+      getTemplate: (templateId) => db.getCallTemplateById(templateId),
+      getMapping: (mappingId) => db.getVapiTemplateMappingById(mappingId),
+    });
+    const result = await service.createDraft({
+      ...(req.body && typeof req.body === "object" && !Array.isArray(req.body) ? req.body : {}),
+      idempotencyKey: req.get("Idempotency-Key") || req.body?.idempotencyKey || req.body?.idempotency_key,
+    });
+    return res.status(result.idempotentReplay ? 200 : 201).json({
+      success: true,
+      campaign: result.campaign,
+      idempotent_replay: result.idempotentReplay,
+    });
+  } catch (error) {
+    const code = String(error?.code || "vapi_campaign_create_failed");
+    const status = code === "vapi_campaign_invalid" || code === "vapi_campaign_idempotency_required"
+      ? 400
+      : code === "vapi_campaign_template_not_found"
+        ? 404
+        : [
+          "vapi_campaign_template_stale",
+          "vapi_campaign_mapping_not_ready",
+          "vapi_campaign_template_unsupported",
+          "vapi_campaign_idempotency_conflict",
+        ].includes(code)
+          ? 409
+          : code === "vapi_campaign_unavailable"
+            ? 503
+            : 500;
+    console.error("vapi_call_campaign_create_error", { code: redactSensitiveLogValue(code) });
+    return res.status(status).json({
+      success: false,
+      error: status === 500 ? "Failed to create Vapi campaign draft" : error.message,
+      code,
+    });
+  }
+});
+
+app.get("/api/vapi/campaigns", requireAdminToken, async (req, res) => {
+  const rawLimit = req.query?.limit;
+  const limit = rawLimit === undefined ? 50 : Number(rawLimit);
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
+    return res.status(400).json({ success: false, error: "limit must be between 1 and 100" });
+  }
+  try {
+    const campaigns = await db.listVapiCallCampaigns(limit);
+    return res.json({ success: true, campaigns });
+  } catch (error) {
+    console.error("vapi_call_campaign_list_error", { code: "campaign_list_failed" });
+    return res.status(500).json({ success: false, error: "Failed to list Vapi campaigns" });
+  }
+});
+
+app.get("/api/vapi/campaigns/:campaignId", requireAdminToken, async (req, res) => {
+  const campaignId = String(req.params.campaignId || "").trim();
+  if (!/^[0-9a-f-]{36}$/i.test(campaignId)) {
+    return res.status(400).json({ success: false, error: "Invalid campaign ID" });
+  }
+  try {
+    const campaign = await db.getVapiCallCampaign(campaignId);
+    if (!campaign) return res.status(404).json({ success: false, error: "Campaign not found" });
+    return res.json({ success: true, campaign });
+  } catch (error) {
+    console.error("vapi_call_campaign_lookup_error", { code: "campaign_lookup_failed" });
+    return res.status(500).json({ success: false, error: "Failed to load Vapi campaign" });
+  }
+});
+
+app.get("/api/vapi/phone-numbers", requireAdminToken, async (req, res) => {
+  try {
+    const result = await new VapiPhoneNumberService({ client: createVapiClientFromEnv() }).list({
+      page: req.query?.page,
+      limit: req.query?.limit,
+      search: req.query?.search,
+    });
+    return res.json({ success: true, ...result });
+  } catch (error) {
+    const code = String(error?.code || "vapi_phone_number_list_failed");
+    const status = code === "vapi_not_configured" ? 503
+      : code === "vapi_phone_number_query_invalid" ? 400
+        : code === "vapi_invalid_phone_number_list" ? 502
+          : 502;
+    console.error("vapi_phone_number_list_error", { code: redactSensitiveLogValue(code) });
+    return res.status(status).json({
+      success: false,
+      error: status === 502 ? "Failed to load Vapi phone numbers" : error.message,
+      code,
+    });
+  }
+});
+
+app.post("/api/vapi/phone-numbers/:phoneNumberId/configure-inbound", requireAdminToken, async (req, res) => {
+  try {
+    const service = new VapiInboundPhoneNumberService({
+      client: createVapiClientFromEnv(),
+      getInboundRoute: (phoneNumberId) => db.getVapiInboundAssistantByPhoneNumberId(phoneNumberId),
+      serverConfiguration: buildVapiWebhookServerConfiguration(),
+    });
+    const result = await service.configure(req.params.phoneNumberId);
+    return res.json({ success: true, result });
+  } catch (error) {
+    const code = String(error?.code || "vapi_phone_number_configuration_failed");
+    const status = code === "vapi_not_configured" || code === "vapi_webhook_configuration_invalid" ? 503
+      : code === "vapi_invalid_phone_number_id" ? 400
+        : ["vapi_phone_number_configuration_conflict", "vapi_phone_number_not_active", "vapi_inbound_route_missing"].includes(code) ? 409
+        : 502;
+    console.error("vapi_inbound_phone_number_configuration_error", { code: redactSensitiveLogValue(code) });
+    return res.status(status).json({
+      success: false,
+      error: status === 502 ? "Failed to configure Vapi inbound routing" : error.message,
+      code,
+    });
+  }
+});
+
+app.put("/api/vapi/inbound-routes/:phoneNumberId", requireAdminToken, async (req, res) => {
+  const phoneNumberId = String(req.params.phoneNumberId || "").trim();
+  const mappingId = Number(req.body?.mapping_id);
+  if (!/^[A-Za-z0-9_-]{1,200}$/.test(phoneNumberId)) {
+    return res.status(400).json({ success: false, error: "Invalid Vapi phone number ID" });
+  }
+  if (!Number.isSafeInteger(mappingId) || mappingId <= 0) {
+    return res.status(400).json({ success: false, error: "A valid mapping_id is required" });
+  }
+  try {
+    const route = await db.setVapiInboundAssistantRoute(phoneNumberId, mappingId);
+    return res.json({ success: true, route });
+  } catch (error) {
+    if (/current synced compatible mapping/.test(error?.message || "")) {
+      return res.status(409).json({ success: false, error: error.message });
+    }
+    console.error("vapi_inbound_route_save_error", {
+      code: redactSensitiveLogValue(error?.code || "route_save_failed"),
+    });
+    return res.status(500).json({ success: false, error: "Failed to save Vapi inbound route" });
+  }
+});
+
+app.delete("/api/vapi/inbound-routes/:phoneNumberId", requireAdminToken, async (req, res) => {
+  const phoneNumberId = String(req.params.phoneNumberId || "").trim();
+  if (!/^[A-Za-z0-9_-]{1,200}$/.test(phoneNumberId)) {
+    return res.status(400).json({ success: false, error: "Invalid Vapi phone number ID" });
+  }
+  try {
+    const result = await db.deleteVapiInboundAssistantRoute(phoneNumberId);
+    return res.json({ success: true, ...result });
+  } catch (error) {
+    return res.status(500).json({ success: false, error: "Failed to remove Vapi inbound route" });
+  }
+});
+
+app.get("/api/vapi/calls/:callId", requireAdminToken, async (req, res) => {
+  const providerCallId = String(req.params.callId || "").trim();
+  if (!providerCallId || providerCallId.length > 200) {
+    return res.status(400).json({ success: false, error: "Invalid Vapi call ID" });
+  }
+  try {
+    const call = await db.getVapiOutboundCallByProviderId(providerCallId);
+    if (!call) return res.status(404).json({ success: false, error: "Vapi call not found" });
+    const events = await db.listVapiCallEvents({ provider_call_id: providerCallId, limit: 100 });
+    return res.json({ success: true, call, events });
+  } catch (error) {
+    console.error("vapi_call_lookup_error", {
+      error: redactSensitiveLogValue(error.message || "call_lookup_failed"),
+    });
+    return res.status(500).json({ success: false, error: "Failed to load Vapi call" });
+  }
+});
+
+app.post("/api/vapi/calls/:callId/reconcile", requireAdminToken, async (req, res) => {
+  const providerCallId = String(req.params.callId || "").trim();
+  try {
+    const service = new VapiCallReconciliationService({
+      client: createVapiClientFromEnv(),
+      getLocalCall: (callId) => db.getVapiOutboundCallByProviderId(callId),
+      recordEvent: (event) => db.recordVapiCallEvent(event),
+    });
+    const result = await service.reconcile(providerCallId);
+    return res.json({ success: true, result });
+  } catch (error) {
+    const code = String(error?.code || "vapi_call_reconciliation_failed");
+    const status = code === "vapi_not_configured"
+      ? 503
+      : code === "vapi_call_not_found"
+        ? 404
+        : ["vapi_call_id_invalid", "vapi_call_snapshot_invalid"].includes(code)
+          ? 400
+          : code === "vapi_call_lookup_mismatch"
+            ? 409
+            : 502;
+    console.error("vapi_call_reconciliation_error", {
+      code: redactSensitiveLogValue(code),
+      status: Number.isFinite(error?.status) ? error.status : null,
+    });
+    return res.status(status).json({
+      success: false,
+      error: status === 502 ? "Vapi call reconciliation failed" : error.message,
+      code,
+    });
+  }
+});
+
+app.post("/api/vapi/calls/:callId/end", requireAdminToken, async (req, res) => {
+  const providerCallId = String(req.params.callId || "").trim();
+  try {
+    const service = new VapiCallControlService({
+      client: createVapiClientFromEnv(),
+      getLocalCall: async (callId) => {
+        const call = await db.getVapiOutboundCallByProviderId(callId);
+        return call?.provider === "vapi" ? call : null;
+      },
+      listEvents: (callId) => db.listVapiCallEvents({ provider_call_id: callId, limit: 100 }),
+    });
+    const result = await service.endCall(providerCallId);
+    return res.json({ success: true, result });
+  } catch (error) {
+    const code = String(error?.code || "vapi_call_control_failed");
+    const status = code === "vapi_not_configured"
+      ? 503
+      : code === "vapi_call_not_found"
+        ? 404
+        : ["vapi_call_not_active", "vapi_control_url_invalid", "vapi_call_lookup_mismatch"].includes(code)
+          ? 409
+          : code === "vapi_call_id_invalid"
+            ? 400
+            : 502;
+    console.error("vapi_call_end_error", {
+      code: redactSensitiveLogValue(code),
+      status: Number.isFinite(error?.status) ? error.status : null,
+    });
+    return res.status(status).json({
+      success: false,
+      error: status === 502 ? "Vapi call control failed" : error.message,
+      code,
+    });
+  }
+});
+
+app.post("/api/vapi/calls/:callId/transfer", requireAdminToken, async (req, res) => {
+  const providerCallId = String(req.params.callId || "").trim();
+  const body = isPlainObject(req.body) ? req.body : {};
+  try {
+    const service = new VapiCallControlService({
+      client: createVapiClientFromEnv(),
+      getLocalCall: async (callId) => {
+        const call = await db.getVapiOutboundCallByProviderId(callId);
+        return call?.provider === "vapi" ? call : null;
+      },
+      listEvents: (callId) => db.listVapiCallEvents({ provider_call_id: callId, limit: 100 }),
+    });
+    const result = await service.transferCall(providerCallId, body.destination, body.content);
+    return res.json({ success: true, result });
+  } catch (error) {
+    const code = String(error?.code || "vapi_call_transfer_failed");
+    const status = code === "vapi_not_configured"
+      ? 503
+      : code === "vapi_call_not_found"
+        ? 404
+        : [
+          "vapi_call_not_active",
+          "vapi_control_url_invalid",
+          "vapi_call_lookup_mismatch",
+        ].includes(code)
+          ? 409
+          : ["vapi_call_id_invalid", "vapi_transfer_destination_invalid", "vapi_transfer_content_invalid"].includes(code)
+            ? 400
+            : 502;
+    console.error("vapi_call_transfer_error", {
+      code: redactSensitiveLogValue(code),
+      status: Number.isFinite(error?.status) ? error.status : null,
+    });
+    return res.status(status).json({
+      success: false,
+      error: status === 502 ? "Vapi call transfer failed" : error.message,
+      code,
+    });
+  }
+});
+
+app.post(
+  "/api/call-scripts/:id/vapi-sync",
+  requireAdminToken,
+  async (req, res) => {
+    try {
+      const scriptId = Number(req.params.id);
+      if (!Number.isSafeInteger(scriptId) || scriptId <= 0) {
+        return res.status(400).json({ success: false, error: "Invalid script id" });
+      }
+      const template = normalizeScriptTemplateRecord(
+        await db.getCallTemplateById(scriptId),
+      );
+      if (!template) {
+        return res.status(404).json({ success: false, error: "Script not found" });
+      }
+      const body = isPlainObject(req.body) ? req.body : {};
+      const model = isPlainObject(body.vapi_model) ? body.vapi_model : null;
+      const voice = isPlainObject(body.vapi_voice) ? body.vapi_voice : null;
+      if (containsCredentialLikeField(model) || containsCredentialLikeField(voice)) {
+        return res.status(400).json({
+          success: false,
+          error: "Vapi sync settings must not include credentials",
+        });
+      }
+      const client = createVapiClientFromEnv();
+      if (!client.isConfigured()) {
+        return res.status(503).json({
+          success: false,
+          error: "Vapi synchronization is disabled or not configured",
+          code: "vapi_not_configured",
+        });
+      }
+      const result = await new VapiTemplateSyncService({ db, client }).syncTemplate(
+        template,
+        {
+          model,
+          voice,
+          serverConfiguration: buildVapiWebhookServerConfiguration(),
+        },
+      );
+      return res.json({ success: true, result });
+    } catch (error) {
+      const code = String(error?.code || "vapi_sync_failed");
+      const status =
+        code === "vapi_template_incompatible" ||
+        code === "vapi_sync_in_progress" ||
+        code === "vapi_assistant_mapping_mismatch" ||
+        code === "vapi_assistant_mapping_ambiguous" ||
+        code === "vapi_create_outcome_unresolved" ||
+        code === "vapi_assistant_list_truncated"
+          ? 409
+          : code === "vapi_not_configured"
+            ? 503
+            : 502;
+      console.error("call_script_vapi_sync_error", {
+        code: redactSensitiveLogValue(code),
+        status: Number.isFinite(error?.status) ? error.status : null,
+      });
+      return res.status(status).json({
+        success: false,
+        error: status === 502 ? "Vapi synchronization failed" : error.message,
+        code,
+      });
+    }
+  },
+);
+
 app.post("/api/call-scripts", requireAdminToken, async (req, res) => {
   const idempotency = await beginCallScriptMutationIdempotency(
     req,
@@ -24818,121 +25736,18 @@ async function placeOutboundCall(payload, hostOverride = null) {
         provider,
         attempt: providerIndex + 1,
       });
-      if (provider === "twilio") {
-        warnIfMachineDetectionDisabled("outbound-call");
-        const accountSid = config.twilio.accountSid;
-        const authToken = config.twilio.authToken;
-        const fromNumber = config.twilio.fromNumber;
-
-        if (!accountSid || !authToken || !fromNumber) {
-          throw new Error("Twilio credentials not configured");
-        }
-
-        const client = twilio(accountSid, authToken);
-        const callPayload = buildTwilioOutboundCallPayload({
+      const providerCall = await getVoiceProviderRegistry().createOutboundCall(
+        provider,
+        {
           host,
-          to: number,
-          from: fromNumber,
-          machineDetection: config.twilio?.machineDetection,
-          machineDetectionTimeout: config.twilio?.machineDetectionTimeout,
-        });
-        console.log(
-          `Twilio call URLs: twiml=${callPayload.url} statusCallback=${callPayload.statusCallback}`,
-        );
-        const providerTimeoutMs =
-          Number(config.callProvider?.requestTimeoutMs) ||
-          Number(config.outboundLimits?.handlerTimeoutMs) ||
-          30000;
-        const call = await runWithTimeout(
-          client.calls.create(callPayload),
-          providerTimeoutMs,
-          "twilio_outbound_call",
-          "call_provider_timeout",
-        );
-        callId = call.sid;
-        callStatus = call.status || "queued";
-      } else if (provider === "plivo") {
-        const plivoAdapter = getPlivoVoiceAdapter();
-        callId = uuidv4();
-        const webhookReq = reqForHost(host);
-        const answerUrl = buildPlivoAnswerWebhookUrl(webhookReq, callId);
-        const eventUrl = buildPlivoEventWebhookUrl(webhookReq, callId);
-        if (!answerUrl) {
-          throw new Error(
-            "Plivo requires a public SERVER hostname or PLIVO_ANSWER_URL",
-          );
-        }
-        const response = await plivoAdapter.createOutboundCall({
-          to: number,
-          callSid: callId,
-          answerUrl,
-          eventUrl,
-        });
-        const plivoUuid = PlivoVoiceAdapter.extractPlivoCallUuid(response);
-        providerMetadata = {
-          plivo_uuid: plivoUuid || null,
-          plivo_request_uuid: response?.request_uuid || null,
-          answer_url: answerUrl || null,
-          event_url: eventUrl || null,
-          idempotency_key: normalizedOutboundIdempotencyKey || null,
-        };
-        if (plivoUuid) {
-          rememberPlivoCallMapping(callId, plivoUuid, "outbound_create");
-        }
-        callStatus = response?.status || "queued";
-      } else if (provider === "vonage") {
-        const vonageAdapter = getVonageVoiceAdapter();
-        callId = uuidv4();
-        const webhookReq = reqForHost(host);
-        const answerUrl = buildVonageAnswerWebhookUrl(webhookReq, callId);
-        const eventUrl = buildVonageEventWebhookUrl(webhookReq, callId);
-
-        const wsUrl = host
-          ? buildVonageWebsocketUrl(webhookReq, callId, {
-              direction: "outbound",
-            })
-          : "";
-        const ncco = wsUrl
-          ? [
-              {
-                action: "connect",
-                endpoint: [
-                  {
-                    type: "websocket",
-                    uri: wsUrl,
-                    "content-type": getVonageWebsocketContentType(),
-                  },
-                ],
-              },
-            ]
-          : null;
-
-        if (!ncco && !answerUrl) {
-          throw new Error(
-            "Vonage requires a public SERVER hostname or VONAGE_ANSWER_URL",
-          );
-        }
-        const response = await vonageAdapter.createOutboundCall({
-          to: number,
-          callSid: callId,
-          answerUrl,
-          eventUrl,
-          ncco: ncco || undefined,
-        });
-        const vonageUuid = response?.uuid;
-        providerMetadata = {
-          vonage_uuid: vonageUuid || null,
-          answer_url: answerUrl || null,
-          event_url: eventUrl || null,
-          idempotency_key: normalizedOutboundIdempotencyKey || null,
-        };
-        if (vonageUuid) {
-          rememberVonageCallMapping(callId, vonageUuid, "outbound_create");
-        }
-        callStatus = response?.status || "queued";
-      } else {
-        throw new Error(`Unsupported provider ${provider}`);
-      }
+          number,
+          idempotencyKey: normalizedOutboundIdempotencyKey || null,
+          flow: keypadRequired ? "digit_capture" : "outbound_voice",
+        },
+      );
+      callId = providerCall.callId;
+      callStatus = providerCall.status;
+      providerMetadata = providerCall.metadata;
       await completeOutboundCallIdempotency(
         outboundIdempotencyContext,
         "completed",
@@ -25006,6 +25821,13 @@ async function placeOutboundCall(payload, hostOverride = null) {
   }
 
   const createdAt = new Date().toISOString();
+  const templateExecution = buildCallTemplateExecutionContext({
+    template: resolvedScriptTemplate,
+    templateId: normalizedScriptId,
+    templateVersion: resolvedScriptVersion,
+    provider: selectedProvider || currentProvider,
+    flow: keypadRequired ? "digit_capture" : "outbound_voice",
+  });
   const mergedPaymentInput = {
     payment_enabled: hasPayloadField("payment_enabled")
       ? payment_enabled
@@ -25102,6 +25924,7 @@ async function placeOutboundCall(payload, hostOverride = null) {
     customer_name: customer_name || null,
     provider: selectedProvider || currentProvider,
     provider_metadata: providerMetadata,
+    template_execution: templateExecution,
     outbound_idempotency_key: normalizedOutboundIdempotencyKey || null,
     business_context: functionSystem.context,
     function_count: functionSystem.functions.length,
@@ -25192,6 +26015,7 @@ async function placeOutboundCall(payload, hostOverride = null) {
   queuePersistCallRuntimeState(callId, {
     snapshot: {
       source: "placeOutboundCall",
+      template_execution: templateExecution,
       conversation_profile: conversationProfile,
       conversation_profile_source: profileSelection.conversation_profile_source,
       conversation_profile_confidence:
@@ -25232,6 +26056,7 @@ async function placeOutboundCall(payload, hostOverride = null) {
       script: script || null,
       script_id: normalizedScriptId || null,
       script_version: resolvedScriptVersion || null,
+      template_execution: templateExecution,
       first_message_version: callConfig.first_message_version || null,
       call_profile: callConfig.call_profile || null,
       conversation_profile_lock:
@@ -29763,6 +30588,12 @@ registerCallRoutes(app, {
   resolveHost,
   config,
   placeOutboundCall,
+  placeVapiOutboundCall: (input) => new VapiOutboundCallService({
+    client: createVapiClientFromEnv(),
+    db,
+    getMapping: (mappingId) => db.getVapiTemplateMappingById(mappingId),
+    getTemplate: (templateId) => db.getCallTemplateById(templateId),
+  }).createOutboundCall(input),
   scheduleCallJob,
   buildErrorDetails,
   getCurrentProvider: () => currentProvider,
@@ -29826,6 +30657,7 @@ registerWebhookRoutes(app, {
   fetchFn: fetch,
   handleTwilioGatherWebhook,
   requireValidTwilioSignature,
+  requireValidVapiWebhook,
   requireValidPlivoWebhook,
   requireValidEmailWebhook,
   requireValidVonageWebhook,

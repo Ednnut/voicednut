@@ -15,7 +15,7 @@ export function Page({ children, back = true }: PropsWithChildren<{
       backButton.show.ifAvailable();
       const off = backButton.onClick.isAvailable()
         ? backButton.onClick(() => {
-          navigate(-1);
+          void navigate(-1);
         })
         : undefined;
       return () => {

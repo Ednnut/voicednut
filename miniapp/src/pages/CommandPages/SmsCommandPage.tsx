@@ -698,7 +698,7 @@ function SmsCommandPageContent() {
     setActionError('');
     setCallbackResult('');
     setGuidedActionHint('');
-    navigate(path);
+    void navigate(path);
   };
 
   if (loading) {

@@ -70,6 +70,12 @@ function validateCallScriptIdPayload(payload: Record<string, unknown>): string |
   return null;
 }
 
+function validateCallEReconcilePayload(payload: Record<string, unknown>): string | null {
+  const localCallId = toText(payload.local_call_id || payload.localCallId, '').trim();
+  if (!/^call_e_[0-9a-f-]{36}$/i.test(localCallId)) return 'local_call_id must be a valid VOICEDNUT CALL-E call ID';
+  return null;
+}
+
 function validateCallerFlagsUpsert(payload: Record<string, unknown>): string | null {
   if (!isNonEmptyString(payload.phone_number) && !isNonEmptyString(payload.phoneNumber) && !isNonEmptyString(payload.phone)) {
     return 'phone_number is required';
@@ -149,6 +155,8 @@ const ACTION_GUARDS: Record<string, (payload: Record<string, unknown>) => string
   [DASHBOARD_ACTION_CONTRACTS.CALLSCRIPT_REVIEW]: validateCallScriptIdPayload,
   [DASHBOARD_ACTION_CONTRACTS.CALLSCRIPT_PROMOTE_LIVE]: validateCallScriptIdPayload,
   [DASHBOARD_ACTION_CONTRACTS.CALLSCRIPT_SIMULATE]: validateCallScriptIdPayload,
+  [DASHBOARD_ACTION_CONTRACTS.CALLSCRIPT_CALLE_PREVIEW]: validateCallScriptIdPayload,
+  [DASHBOARD_ACTION_CONTRACTS.CALLE_CALL_RECONCILE]: validateCallEReconcilePayload,
   [DASHBOARD_ACTION_CONTRACTS.CALLERFLAGS_UPSERT]: validateCallerFlagsUpsert,
   [DASHBOARD_ACTION_CONTRACTS.SMSSCRIPT_CREATE]: validateSmsScriptCreate,
   [DASHBOARD_ACTION_CONTRACTS.SMSSCRIPT_UPDATE]: validateSmsScriptUpdate,
@@ -313,6 +321,18 @@ const ACTION_POLICIES: Record<string, DashboardActionPolicy> = {
     confirmLabel: 'Promote Live',
   },
   [DASHBOARD_ACTION_CONTRACTS.CALLSCRIPT_SIMULATE]: {
+    capability: 'caller_flags_manage',
+    risk: 'safe',
+  },
+  [DASHBOARD_ACTION_CONTRACTS.CALLSCRIPT_CALLE_PREVIEW]: {
+    capability: 'caller_flags_manage',
+    risk: 'safe',
+  },
+  [DASHBOARD_ACTION_CONTRACTS.CALLE_STATUS]: {
+    capability: 'caller_flags_manage',
+    risk: 'safe',
+  },
+  [DASHBOARD_ACTION_CONTRACTS.CALLE_CALL_RECONCILE]: {
     capability: 'caller_flags_manage',
     risk: 'safe',
   },

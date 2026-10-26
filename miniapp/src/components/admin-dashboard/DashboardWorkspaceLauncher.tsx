@@ -536,7 +536,6 @@ export function DashboardWorkspaceLauncher({
                           <Link
                             to={page.routePath}
                             className="va-launcher-card"
-                            aria-label={`Open ${page.title}`}
                           >
                             {cardContent}
                           </Link>
@@ -634,7 +633,6 @@ export function DashboardWorkspaceLauncher({
                           isActive ? 'is-active' : '',
                           module.isAvailable ? '' : 'is-locked',
                         ].filter(Boolean).join(' ')}
-                        aria-label={module.isAvailable ? `Open ${module.label}` : `${module.label} is locked`}
                         aria-pressed={isActive}
                         aria-keyshortcuts={module.isAvailable && shortcutIndex > 0 ? `Alt+${shortcutIndex}` : undefined}
                         disabled={!module.isAvailable}
@@ -723,7 +721,6 @@ export function DashboardWorkspaceLauncher({
                       <Link
                         to={page.routePath}
                         className={cardClassName}
-                        aria-label={`Open ${page.title}`}
                       >
                         {cardContent}
                       </Link>

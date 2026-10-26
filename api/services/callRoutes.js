@@ -12,6 +12,85 @@ function createOutboundCallHandler(ctx = {}) {
 
   return async function handleOutboundCall(req, res) {
     try {
+      const requestedProvider = String(
+        req.body?.provider || req.body?.preferred_provider || req.body?.call_provider || "",
+      ).trim().toLowerCase();
+      if (requestedProvider === "vapi") {
+        const number = String(req.body?.number || "").trim();
+        const templateId = Number(req.body?.script_id);
+        const mappingId = Number(req.body?.mapping_id);
+        const phoneNumberId = String(req.body?.phone_number_id || "").trim();
+        const idempotencyKey = String(
+          req.body?.idempotency_key || req.headers?.["idempotency-key"] || req.headers?.["Idempotency-Key"] || "",
+        ).trim();
+        const validationError = (status, code, message) => sendApiError(
+          res, status, code, message, req.requestId || null,
+        );
+        if (!Number.isSafeInteger(templateId) || templateId <= 0 || !Number.isSafeInteger(mappingId) || mappingId <= 0) {
+          return validationError(400, "vapi_mapping_required", "script_id and mapping_id are required for Vapi calls");
+        }
+        if (!phoneNumberId || phoneNumberId.length > 200) {
+          return validationError(400, "vapi_phone_number_id_required", "phone_number_id is required for Vapi calls");
+        }
+        if (!/^\+[1-9]\d{1,14}$/.test(number)) {
+          return validationError(400, "vapi_destination_invalid", "Destination number must use E.164 format");
+        }
+        if (!/^[A-Za-z0-9._:-]{8,180}$/.test(idempotencyKey)) {
+          return validationError(400, "vapi_idempotency_key_required", "A valid idempotency key is required for Vapi calls");
+        }
+        try {
+          if (typeof ctx.placeVapiOutboundCall !== "function") {
+            const error = new Error("Vapi outbound calling is unavailable");
+            error.code = "vapi_not_configured";
+            throw error;
+          }
+          const result = await ctx.placeVapiOutboundCall({
+            templateId,
+            ...(req.body?.script_version !== undefined ? { templateVersion: req.body.script_version } : {}),
+            mappingId, phoneNumberId, number, idempotencyKey,
+          });
+          const providerCallId = String(result?.providerCallId || "").trim();
+          if (!providerCallId) {
+            const error = new Error("Vapi did not return a call ID");
+            error.code = "vapi_call_id_missing";
+            throw error;
+          }
+          return res.json({
+            success: true,
+            call_sid: providerCallId,
+            provider_call_id: providerCallId,
+            to: number,
+            status: result.status || "queued",
+            deduped: result.idempotentReplay === true,
+            provider: "vapi",
+            template_id: Number(result.templateId) || templateId,
+            template_version: Number(result.templateVersion) || null,
+            mapping_id: Number(result.mappingId) || mappingId,
+            business_context: null,
+            generated_functions: 0,
+            function_types: [],
+            enhanced_webhooks: true,
+          });
+        } catch (error) {
+          const code = String(error?.code || "vapi_call_failed");
+          const status = code === "vapi_not_configured" || code === "vapi_call_dependencies_missing" ? 503
+            : ["vapi_mapping_required", "vapi_phone_number_id_required", "vapi_destination_invalid", "vapi_idempotency_key_required"].includes(code) ? 400
+              : ["vapi_mapping_not_found", "vapi_mapping_not_ready", "vapi_mapping_stale", "vapi_template_unsupported", "vapi_mapping_template_mismatch", "vapi_idempotency_conflict", "vapi_previous_call_failed", "vapi_call_outcome_unresolved"].includes(code) ? 409
+                : 502;
+          console.error("vapi_outbound_call_route_error", {
+            code,
+            status: Number.isFinite(error?.status) ? error.status : null,
+          });
+          return sendApiError(
+            res,
+            status,
+            code,
+            status === 502 ? "Vapi outbound call failed" : error.message,
+            req.requestId || null,
+          );
+        }
+      }
+
       const number = String(req.body?.number || "").trim();
       const prompt = String(req.body?.prompt || "").trim();
       const firstMessage = String(req.body?.first_message || "").trim();

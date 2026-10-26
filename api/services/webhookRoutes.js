@@ -7,6 +7,7 @@ const { createPaypalPaymentService } = require("./paypalPaymentService");
 const { createSquarePaymentService } = require("./squarePaymentService");
 const { createStripePaymentService } = require("./stripePaymentService");
 const { maybeRunPaymentAutomation } = require("./postCallAutomationTriggers");
+const { VapiWebhookService } = require("./vapiWebhookService");
 
 const WEBHOOK_AUTH_POLICIES = Object.freeze({
   telegram: Object.freeze({
@@ -96,6 +97,12 @@ const WEBHOOK_AUTH_POLICIES = Object.freeze({
     label: "/webhook/email",
     verifier: "requireValidEmailWebhook",
   }),
+  vapi_events: Object.freeze({
+    id: "vapi_events",
+    label: "/webhook/vapi",
+    verifier: "requireValidVapiWebhook",
+    failClosed: true,
+  }),
 });
 
 function createWebhookAuthGuard(ctx = {}) {
@@ -115,6 +122,9 @@ function createWebhookAuthGuard(ctx = {}) {
           verifier: policy.verifier,
           request_id: req?.requestId || null,
         });
+        if (policy.failClosed) {
+          return res.status(503).json({ success: false, error: "Webhook authentication is unavailable" });
+        }
         return handler(req, res, next);
       }
       const label = req?.path || req?.originalUrl || policy.label;
@@ -1751,6 +1761,33 @@ function createVonageSmsDeliveryWebhookHandler(ctx = {}) {
   };
 }
 
+function createVapiWebhookHandler(ctx = {}) {
+  const service = new VapiWebhookService({ db: getDb(ctx) });
+  return async function handleVapiWebhook(req, res) {
+    try {
+      const result = await service.processEvent(req.body);
+      if (result?.toolCallResponse) {
+        return res.status(200).json({ results: result.results });
+      }
+      if (result?.assistantRequest) {
+        return res.status(200).json(result.assistantId
+          ? { assistantId: result.assistantId }
+          : { error: result.error });
+      }
+      return res.status(200).json({ success: true, ...result });
+    } catch (error) {
+      if (error?.code === "vapi_event_invalid" || error?.code === "vapi_tool_calls_invalid") {
+        return res.status(400).json({ success: false, error: "Invalid Vapi server event" });
+      }
+      console.error("vapi_server_event_persistence_error", {
+        code: error?.code || "vapi_event_persistence_failed",
+        request_id: req?.requestId || null,
+      });
+      return res.status(503).json({ success: false, error: "Vapi event persistence unavailable" });
+    }
+  };
+}
+
 function createEmailWebhookHandler(ctx = {}) {
   return async function handleEmailWebhook(req, res) {
     try {
@@ -2849,6 +2886,8 @@ function registerWebhookRoutes(app, ctx = {}) {
     createVonageSmsDeliveryWebhookHandler(ctx);
   const handleEmailWebhook =
     ctx.handleEmailWebhook || createEmailWebhookHandler(ctx);
+  const handleVapiWebhook =
+    ctx.handleVapiWebhook || createVapiWebhookHandler(ctx);
   const handleEmailUnsubscribeWebhook =
     ctx.handleEmailUnsubscribeWebhook ||
     createEmailUnsubscribeWebhookHandler(ctx);
@@ -2909,6 +2948,7 @@ function registerWebhookRoutes(app, ctx = {}) {
   app.get("/vd", withWebhookAuth("vonage_delivery", handleVonageSmsDeliveryWebhook));
   app.post("/vd", withWebhookAuth("vonage_delivery", handleVonageSmsDeliveryWebhook));
   app.post("/webhook/email", withWebhookAuth("email_events", handleEmailWebhook));
+  app.post("/webhook/vapi", withWebhookAuth("vapi_events", handleVapiWebhook));
   app.post("/webhook/paypal", handlePaypalWebhook);
   app.post("/webhook/stripe", handleStripeWebhook);
   app.post("/webhook/square", handleSquareWebhook);
@@ -2931,6 +2971,7 @@ module.exports = {
   createPaypalWebhookHandler,
   createStripeWebhookHandler,
   createSquareWebhookHandler,
+  createVapiWebhookHandler,
   __testables: {
     WEBHOOK_AUTH_POLICIES,
     createWebhookAuthGuard,
