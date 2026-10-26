@@ -100,11 +100,12 @@ const {
 const { VoiceProviderRegistry } = require("./adapters/voiceProviderRegistry");
 const { previewCallETemplate } = require("./adapters/callETemplateAdapter");
 const { buildCallEDeploymentStatus, createCallEClientFromEnv } = require("./services/callEClient");
-const { parseAllowedDestinations } = require("./services/callEOutboundCallService");
+const { parseAllowedDestinations, CallEOutboundCallService } = require("./services/callEOutboundCallService");
 const { CallEReconciliationService, createCallEReconciliationHandler } = require("./services/callEReconciliationService");
 const { CallEContactPolicyService } = require("./services/callEContactPolicyService");
 const { registerCallEContactPolicyRoutes } = require("./services/callEContactPolicyRoutes");
 const { CallEOperatorConfirmationService } = require("./services/callEOperatorConfirmationService");
+const { CallEDispatchService, approvedFingerprintFromEnv } = require("./services/callEDispatchService");
 const {
   containsCredentialLikeField,
   fingerprintVapiTemplateMapping,
@@ -19501,6 +19502,7 @@ const MINI_APP_SUPPORTED_ACTIONS = Object.freeze([
   "callscript.simulate",
   "callscript.calle_preview",
   "callscript.calle_confirm",
+  "callscript.calle_dispatch",
   "calle.status",
   "calle.call.reconcile",
   "callscript.submit_review",
@@ -19639,6 +19641,7 @@ const MINI_APP_DASHBOARD_MODULE_DEFINITIONS = [
       "callscript.simulate",
       "callscript.calle_preview",
       "callscript.calle_confirm",
+      "callscript.calle_dispatch",
     ],
     order: 4,
     enabled: true,
@@ -20189,6 +20192,24 @@ function buildMiniAppActionSpec(action, payload = {}) {
   }
 
   if (normalizedAction === "callscript.calle_confirm") {
+    const templateId = Number(input.template_id || input.id);
+    if (!Number.isSafeInteger(templateId) || templateId <= 0) return { error: "Valid script id is required" };
+    return {
+      capability: "caller_flags_manage",
+      method: "POST",
+      path: "/miniapp/action",
+      body: {
+        template_id: templateId,
+        destination: input.destination,
+        region: input.region,
+        locale: input.locale,
+        result_schema: input.result_schema,
+        preview_fingerprint: input.preview_fingerprint,
+      },
+    };
+  }
+
+  if (normalizedAction === "callscript.calle_dispatch") {
     const templateId = Number(input.template_id || input.id);
     if (!Number.isSafeInteger(templateId) || templateId <= 0) return { error: "Valid script id is required" };
     return {
@@ -22039,6 +22060,37 @@ app.post("/miniapp/action", requireMiniAppSession, async (req, res) => {
     }
   }
 
+  if (action === "callscript.calle_dispatch") {
+    try {
+      const client = createCallEClientFromEnv();
+      const result = await new CallEDispatchService({
+        db,
+        getTemplate: async (templateId) => normalizeScriptTemplateRecord(await db.getCallTemplateById(templateId)),
+        outbound: new CallEOutboundCallService({ client, db }),
+      }).dispatch({
+        ...spec.body,
+        idempotency_key: idempotencyKey,
+        recorded_by_telegram_id: String(req.miniAppSession?.telegram_id || "").trim(),
+      });
+      return res.status(result.idempotentReplay ? 200 : 201).json({
+        success: true,
+        action,
+        requested_action: actionResolution.requestedAction,
+        was_aliased: actionResolution.wasAliased,
+        data: result,
+        request_id: req.requestId || null,
+      });
+    } catch (error) {
+      return sendApiError(
+        res,
+        Number(error?.status) || 503,
+        String(error?.code || "call_e_dispatch_failed"),
+        error?.message || "CALL-E dispatch failed",
+        req.requestId || null,
+      );
+    }
+  }
+
   console.log("miniapp_action_request", {
     request_id: req.requestId || null,
     requested_action: actionResolution.requestedAction,
@@ -23447,6 +23499,9 @@ app.get("/api/call-e/status", requireAdminToken, (req, res) => {
     success: true,
     status: buildCallEDeploymentStatus(createCallEClientFromEnv(), {
       destinationAllowlistReady: parseAllowedDestinations().size > 0,
+      dispatchEnabled: String(process.env.CALLE_DISPATCH_ENABLED || "false").trim().toLowerCase() === "true",
+      pilotApprovalReady: Boolean(approvedFingerprintFromEnv()),
+      pilotReadinessReviewed: String(process.env.CALLE_PILOT_READINESS_REVIEWED || "false").trim().toLowerCase() === "true",
     }),
   });
 });

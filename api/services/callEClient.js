@@ -11,12 +11,9 @@ const KNOWN_NO_CALL_CODES = new Set([
   "result_schema_invalid",
 ]);
 const CALL_E_PILOT_DISPATCH_BLOCKERS = Object.freeze([
-  "dispatch_route_not_implemented",
-  "dispatch_tenant_authorization_not_wired",
-  "pilot_operator_confirmation_review_required",
-  "pilot_consent_evidence_not_reviewed",
-  "single_call_pilot_cap_not_connected_to_dispatch",
-  "concurrency_control_not_connected_to_dispatch",
+  "dispatch_kill_switch_disabled",
+  "exact_preview_pilot_approval_missing_or_expired",
+  "pilot_external_readiness_review_required",
 ]);
 
 class CallEApiError extends Error {
@@ -169,15 +166,26 @@ function createCallEClientFromEnv(options = {}) {
 
 function buildCallEDeploymentStatus(client, options = {}) {
   const integrationEnabled = client?.enabled === true;
+  const dispatchAvailable = options.dispatchEnabled === true && Boolean(client?.isConfigured?.()) &&
+    options.destinationAllowlistReady === true && options.pilotApprovalReady === true &&
+    options.pilotReadinessReviewed === true;
+  const blockers = [
+    ...(options.dispatchEnabled === true ? [] : ["dispatch_kill_switch_disabled"]),
+    ...(options.pilotApprovalReady === true ? [] : ["exact_preview_pilot_approval_missing_or_expired"]),
+    ...(options.pilotReadinessReviewed === true ? [] : ["pilot_external_readiness_review_required"]),
+  ];
   return {
     integrationEnabled,
     providerAccessReady: Boolean(client?.isConfigured?.()),
     destinationAllowlistReady: options.destinationAllowlistReady === true,
+    dispatchKillSwitchEnabled: options.dispatchEnabled === true,
+    pilotApprovalReady: options.pilotApprovalReady === true,
+    pilotReadinessReviewed: options.pilotReadinessReviewed === true,
     previewAvailable: true,
-    dispatchAvailable: false,
-    pilotReady: false,
-    dispatchBlocker: CALL_E_PILOT_DISPATCH_BLOCKERS[0],
-    dispatchBlockers: [...CALL_E_PILOT_DISPATCH_BLOCKERS],
+    dispatchAvailable,
+    pilotReady: dispatchAvailable,
+    dispatchBlocker: blockers[0] || null,
+    dispatchBlockers: blockers,
   };
 }
 

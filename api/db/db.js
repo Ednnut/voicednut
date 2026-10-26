@@ -4237,6 +4237,26 @@ class EnhancedDatabase {
         });
     }
 
+    async hasCallEOperatorConfirmation(input = {}) {
+        const businessId = String(input.business_id || '').trim();
+        const templateId = Number(input.template_id);
+        const templateVersion = Number(input.template_version);
+        const fingerprint = String(input.preview_fingerprint || '').trim().toLowerCase();
+        const telegramId = String(input.recorded_by_telegram_id || '').trim();
+        if (!/^[A-Za-z0-9._:-]{1,120}$/.test(businessId) || !Number.isSafeInteger(templateId) || templateId <= 0 ||
+            !Number.isSafeInteger(templateVersion) || templateVersion <= 0 || !/^[a-f0-9]{64}$/.test(fingerprint) ||
+            !/^\d{1,20}$/.test(telegramId)) return false;
+        return new Promise((resolve, reject) => {
+            this.db.get(
+                `SELECT 1 AS confirmed FROM call_e_operator_confirmation_events
+                 WHERE business_id = ? AND template_id = ? AND template_version = ?
+                   AND preview_fingerprint = ? AND recorded_by_telegram_id = ? LIMIT 1`,
+                [businessId, templateId, templateVersion, fingerprint, telegramId],
+                (error, row) => error ? reject(error) : resolve(Boolean(row)),
+            );
+        });
+    }
+
     async insertCallEContactPolicyEvent(event = {}) {
         const eventKey = String(event.eventKey || "").trim();
         const requestHash = String(event.requestHash || "").trim();

@@ -14,23 +14,23 @@ function jsonResponse(status, body) {
 }
 
 describe("CALL-E server client", () => {
-  it("reports deployment readiness without exposing secrets or implying dispatch exists", () => {
+  it("reports gated dispatch readiness without exposing secrets", () => {
     const disabled = buildCallEDeploymentStatus(new CallEClient({ apiKey: "private-test-key" }));
     assert.deepEqual(disabled, {
       integrationEnabled: false,
       providerAccessReady: false,
       destinationAllowlistReady: false,
+      dispatchKillSwitchEnabled: false,
+      pilotApprovalReady: false,
+      pilotReadinessReviewed: false,
       previewAvailable: true,
       dispatchAvailable: false,
       pilotReady: false,
-      dispatchBlocker: "dispatch_route_not_implemented",
+      dispatchBlocker: "dispatch_kill_switch_disabled",
       dispatchBlockers: [
-        "dispatch_route_not_implemented",
-        "dispatch_tenant_authorization_not_wired",
-        "pilot_operator_confirmation_review_required",
-        "pilot_consent_evidence_not_reviewed",
-        "single_call_pilot_cap_not_connected_to_dispatch",
-        "concurrency_control_not_connected_to_dispatch",
+        "dispatch_kill_switch_disabled",
+        "exact_preview_pilot_approval_missing_or_expired",
+        "pilot_external_readiness_review_required",
       ],
     });
     assert.equal(JSON.stringify(disabled).includes("private-test-key"), false);
@@ -45,7 +45,7 @@ describe("CALL-E server client", () => {
     assert.equal(configured.destinationAllowlistReady, true);
     assert.equal(configured.dispatchAvailable, false);
     assert.equal(configured.pilotReady, false);
-    assert.equal(configured.dispatchBlockers.length, 6);
+    assert.equal(configured.dispatchBlockers.length, 3);
     assert.equal("apiKey" in configured, false);
     assert.equal("baseUrl" in configured, false);
   });

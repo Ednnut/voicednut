@@ -61,12 +61,9 @@ function toRows(value: unknown): Array<Record<string, unknown>> {
 }
 
 const CALL_E_DISPATCH_BLOCKER_LABELS: Record<string, string> = {
-  dispatch_route_not_implemented: 'Authenticated dispatch route is not implemented',
-  dispatch_tenant_authorization_not_wired: 'Tenant authorization is not wired into CALL-E dispatch',
-  pilot_operator_confirmation_review_required: 'Pilot operator confirmation still needs review and approval',
-  pilot_consent_evidence_not_reviewed: 'Approved consent evidence is not yet recorded and reviewed for a pilot destination',
-  single_call_pilot_cap_not_connected_to_dispatch: 'The durable one call pilot cap is not connected to dispatch',
-  concurrency_control_not_connected_to_dispatch: 'The durable concurrency guard is not connected to dispatch',
+  dispatch_kill_switch_disabled: 'The independent dispatch kill switch is disabled',
+  exact_preview_pilot_approval_missing_or_expired: 'No current approval is configured for this exact preview',
+  pilot_external_readiness_review_required: 'Account, destination, consent, and recovery reviews have not been attested',
 };
 
 function toLifecycleTone(value: unknown): 'info' | 'success' | 'warning' | 'error' {
@@ -939,7 +936,7 @@ export function ScriptStudioPage({ visible, vm, initialLane = 'call' }: ScriptSt
                 subtitle="Check server configuration and rollout availability. This status request never contacts CALL-E."
                 tone={callEDeploymentStatus?.integrationEnabled === true ? 'info' : 'neutral'}
               >
-                <UiStatePanel compact tone="warning" title="Dispatch unavailable" description="VOICEDNUT has no CALL-E dispatch route. Configuration status does not enable or place calls." />
+                <UiStatePanel compact tone="warning" title="Dispatch gated" description="Dispatch requires both server switches, an unexpired approval for one exact preview, operator confirmation, consent, and an allowlisted destination." />
                 <UiButton
                   variant="secondary"
                   disabled={studioBusy.length > 0 || busyAction.length > 0}
@@ -955,6 +952,9 @@ export function ScriptStudioPage({ visible, vm, initialLane = 'call' }: ScriptSt
                 {callEDeploymentStatus ? (
                   <div aria-live="polite">
                     <p>Integration flag: <strong>{callEDeploymentStatus.integrationEnabled === true ? 'enabled' : 'disabled'}</strong></p>
+                    <p>Dispatch kill switch: <strong>{callEDeploymentStatus.dispatchKillSwitchEnabled === true ? 'enabled' : 'disabled'}</strong></p>
+                    <p>Exact-preview approval: <strong>{callEDeploymentStatus.pilotApprovalReady === true ? 'configured' : 'missing or expired'}</strong></p>
+                    <p>External pilot review: <strong>{callEDeploymentStatus.pilotReady === true ? 'complete' : 'incomplete'}</strong></p>
                     <p>Provider access readiness: <strong>{callEDeploymentStatus.providerAccessReady === true ? 'ready' : 'disabled or incomplete'}</strong></p>
                     <p>Destination allowlist: <strong>{callEDeploymentStatus.destinationAllowlistReady === true ? 'configured' : 'empty'}</strong></p>
                     <p>Local preview: <strong>{callEDeploymentStatus.previewAvailable === true ? 'available' : 'unavailable'}</strong></p>
@@ -1030,6 +1030,31 @@ export function ScriptStudioPage({ visible, vm, initialLane = 'call' }: ScriptSt
                       Confirm this preview
                     </UiButton>
                     {callEConfirmation ? <UiStatePanel compact tone="success" title="Operator confirmation recorded" description="The exact preview and operator were recorded. No call was placed." /> : null}
+                    {callEConfirmation ? (
+                      <UiButton
+                        variant="primary"
+                        disabled={studioBusy.length > 0 || busyAction.length > 0 || callEDeploymentStatus?.dispatchAvailable !== true || callEDeploymentStatus?.pilotReady !== true}
+                        onClick={() => {
+                          if (!window.confirm('This may place a real CALL-E call and incur charges. Continue only for the explicitly approved pilot destination.')) return;
+                          let resultSchema: unknown;
+                          try { resultSchema = JSON.parse(callEResultSchemaInput); }
+                          catch { setStudioError('Result schema must be valid JSON.'); return; }
+                          void (async () => {
+                            const data = await executeStudioAction(DASHBOARD_ACTION_CONTRACTS.CALLSCRIPT_CALLE_DISPATCH, {
+                              template_id: Number(selectedCallScriptId),
+                              destination: callEPhoneInput.trim(),
+                              region: asRecord(callEPreview.requestSummary).region,
+                              locale: asRecord(callEPreview.requestSummary).locale,
+                              result_schema: resultSchema,
+                              preview_fingerprint: callEPreview.fingerprint,
+                            });
+                            setCallELocalIdInput(toText(asRecord(data).localCallId, ''));
+                          })();
+                        }}
+                      >
+                        Place approved pilot call
+                      </UiButton>
+                    ) : null}
                   </div>
                 ) : null}
                 {callEPreview ? <pre aria-live="polite">{JSON.stringify(callEPreview, null, 2)}</pre> : null}
