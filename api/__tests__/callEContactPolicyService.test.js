@@ -62,6 +62,32 @@ describe("CALL-E contact consent and opt-out policy", () => {
     await assert.rejects(service.recordConsent(consent({ evidenceReference: "evidence:record:0002" })), (error) => error.code === "call_e_contact_policy_idempotency_conflict");
   });
 
+  it("keeps an append-only business-operator grant and revoke history", async () => {
+    await new Promise((resolve, reject) => db.db.run(
+      "INSERT INTO call_templates (name, business_id) VALUES (?, ?)",
+      ["Synthetic scoped template", "business_policy_001"],
+      (error) => error ? reject(error) : resolve(),
+    ));
+    assert.equal(await db.hasCallTemplateBusinessId("business_policy_001"), true);
+    assert.equal(await db.hasCallTemplateBusinessId("unknown_business"), false);
+    await db.grantCallEBusinessOperator({ business_id: "business_policy_001", telegram_id: "123456789", role: "policy_manager" });
+    assert.deepEqual(await db.getCallEBusinessOperator("business_policy_001", "123456789"), { role: "policy_manager" });
+    await db.grantCallEBusinessOperator({ business_id: "business_policy_001", telegram_id: "123456789", role: "call_operator" });
+    assert.deepEqual(await db.getCallEBusinessOperator("business_policy_001", "123456789"), { role: "call_operator" });
+    assert.equal(await db.revokeCallEBusinessOperator({ business_id: "business_policy_001", telegram_id: "123456789" }), true);
+    assert.equal(await db.getCallEBusinessOperator("business_policy_001", "123456789"), null);
+    const events = await new Promise((resolve, reject) => db.db.all(
+      "SELECT event_type, role, actor_type FROM call_e_business_operator_events ORDER BY id",
+      [],
+      (error, rows) => error ? reject(error) : resolve(rows),
+    ));
+    assert.deepEqual(events.map(({ event_type, role, actor_type }) => ({ event_type, role, actor_type })), [
+      { event_type: "access_granted", role: "policy_manager", actor_type: "admin_token" },
+      { event_type: "access_granted", role: "call_operator", actor_type: "admin_token" },
+      { event_type: "access_revoked", role: null, actor_type: "admin_token" },
+    ]);
+  });
+
   it("denies expired consent and keeps opt-out sticky after later consent evidence", async () => {
     await service.recordConsent(consent({
       businessId: "business_policy_expired",
@@ -123,5 +149,28 @@ describe("CALL-E contact consent and opt-out policy", () => {
       eligible: false,
       reason: "policy_storage_unavailable",
     });
+  });
+
+  it("stores the authenticated policy manager identity on an evidence event", async () => {
+    await service.recordConsent(consent({ recordedByTelegramId: "123456789" }));
+    const row = await new Promise((resolve, reject) => db.db.get(
+      "SELECT recorded_by_telegram_id FROM call_e_contact_policy_events WHERE event_key = ?",
+      ["consent:event:0001"],
+      (error, result) => error ? reject(error) : resolve(result),
+    ));
+    assert.equal(row.recorded_by_telegram_id, "123456789");
+  });
+
+  it("adds the actor column to an existing policy-event table during forward migration", async () => {
+    await new Promise((resolve, reject) => db.db.run(
+      "ALTER TABLE call_e_contact_policy_events DROP COLUMN recorded_by_telegram_id",
+      (error) => error ? reject(error) : resolve(),
+    ));
+    await db.ensureCallEContactPolicyColumns();
+    const columns = await new Promise((resolve, reject) => db.db.all(
+      "PRAGMA table_info(call_e_contact_policy_events)",
+      (error, rows) => error ? reject(error) : resolve(rows || []),
+    ));
+    assert.equal(columns.some(({ name }) => name === "recorded_by_telegram_id"), true);
   });
 });

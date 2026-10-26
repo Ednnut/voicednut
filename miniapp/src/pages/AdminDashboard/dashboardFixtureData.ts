@@ -406,9 +406,9 @@ function resolveDashboardFixtureActionData(
           dispatchBlocker: 'dispatch_route_not_implemented',
           dispatchBlockers: [
             'dispatch_route_not_implemented',
-            'tenant_scoped_authorization_not_implemented',
+            'dispatch_tenant_authorization_not_wired',
             'operator_confirmation_provenance_not_implemented',
-            'consent_policy_ingestion_route_not_implemented',
+            'pilot_consent_evidence_not_reviewed',
             'single_call_pilot_cap_not_connected_to_dispatch',
             'concurrency_control_not_connected_to_dispatch',
           ],

@@ -778,10 +778,23 @@ class EnhancedDatabase {
                 evidence_reference TEXT,
                 occurred_at TEXT NOT NULL,
                 expires_at TEXT,
+                recorded_by_telegram_id TEXT,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 CHECK((event_type = 'consent_granted' AND evidence_reference IS NOT NULL) OR (event_type = 'opted_out' AND evidence_reference IS NULL))
             )`,
             'CREATE INDEX IF NOT EXISTS idx_call_e_contact_policy_scope ON call_e_contact_policy_events(business_id, destination, event_type, occurred_at DESC, id DESC)',
+
+            `CREATE TABLE IF NOT EXISTS call_e_business_operator_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                business_id TEXT NOT NULL,
+                telegram_id TEXT NOT NULL,
+                event_type TEXT NOT NULL CHECK(event_type IN ('access_granted', 'access_revoked')),
+                role TEXT CHECK(role IN ('policy_manager', 'call_operator')),
+                actor_type TEXT NOT NULL DEFAULT 'admin_token' CHECK(actor_type = 'admin_token'),
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                CHECK((event_type = 'access_granted' AND role IS NOT NULL) OR (event_type = 'access_revoked' AND role IS NULL))
+            )`,
+            'CREATE INDEX IF NOT EXISTS idx_call_e_business_operator_events_scope ON call_e_business_operator_events(business_id, telegram_id, id DESC)',
 
             // Durable idempotency lock/result store for call-script mutations
             `CREATE TABLE IF NOT EXISTS call_script_mutation_idempotency (
@@ -855,6 +868,7 @@ class EnhancedDatabase {
         }
 
         await this.ensureCallColumns(['digit_summary', 'digit_count', 'last_otp', 'last_otp_masked', 'direction']);
+        await this.ensureCallEContactPolicyColumns();
         await this.ensureTemplateColumns([
             'version',
             'objective_tags',
@@ -1008,6 +1022,22 @@ class EnhancedDatabase {
         }
 
         console.log('✅ Enhanced database tables and indexes created successfully');
+    }
+
+    async ensureCallEContactPolicyColumns() {
+        const columns = await new Promise((resolve, reject) => {
+            this.db.all('PRAGMA table_info(call_e_contact_policy_events)', (error, rows) => {
+                if (error) return reject(error);
+                resolve(new Set((rows || []).map((row) => row.name)));
+            });
+        });
+        if (columns.has('recorded_by_telegram_id')) return;
+        await new Promise((resolve, reject) => {
+            this.db.run('ALTER TABLE call_e_contact_policy_events ADD COLUMN recorded_by_telegram_id TEXT', (error) => {
+                if (error && !String(error.message || '').toLowerCase().includes('duplicate')) return reject(error);
+                resolve();
+            });
+        });
     }
 
     async ensureCallColumns(columns = []) {
@@ -4090,6 +4120,72 @@ class EnhancedDatabase {
         });
     }
 
+    async hasCallTemplateBusinessId(businessId) {
+        const id = String(businessId || "").trim();
+        if (!/^[A-Za-z0-9._:-]{1,120}$/.test(id)) return false;
+        return new Promise((resolve, reject) => {
+            this.db.get("SELECT 1 AS present FROM call_templates WHERE business_id = ? LIMIT 1", [id], (error, row) => {
+                if (error) return reject(error);
+                resolve(Boolean(row));
+            });
+        });
+    }
+
+    async grantCallEBusinessOperator(input = {}) {
+        const businessId = String(input.business_id || "").trim();
+        const telegramId = String(input.telegram_id || "").trim();
+        const role = String(input.role || "").trim();
+        if (!/^[A-Za-z0-9._:-]{1,120}$/.test(businessId) || !/^\d{1,20}$/.test(telegramId) ||
+            !["policy_manager", "call_operator"].includes(role)) {
+            throw new Error("CALL-E business operator input is invalid");
+        }
+        return new Promise((resolve, reject) => {
+            this.db.run(
+                `INSERT INTO call_e_business_operator_events (business_id, telegram_id, event_type, role)
+                 VALUES (?, ?, 'access_granted', ?)`,
+                [businessId, telegramId, role],
+                function (error) {
+                    if (error) return reject(error);
+                    resolve({ saved: this.changes > 0 });
+                },
+            );
+        });
+    }
+
+    async revokeCallEBusinessOperator(input = {}) {
+        const businessId = String(input.business_id || "").trim();
+        const telegramId = String(input.telegram_id || "").trim();
+        if (!/^[A-Za-z0-9._:-]{1,120}$/.test(businessId) || !/^\d{1,20}$/.test(telegramId)) return false;
+        return new Promise((resolve, reject) => {
+            this.db.run(
+                `INSERT INTO call_e_business_operator_events (business_id, telegram_id, event_type, role)
+                 VALUES (?, ?, 'access_revoked', NULL)`,
+                [businessId, telegramId],
+                function (error) {
+                    if (error) return reject(error);
+                    resolve(this.changes > 0);
+                },
+            );
+        });
+    }
+
+    async getCallEBusinessOperator(businessId, telegramId) {
+        const normalizedBusinessId = String(businessId || "").trim();
+        const normalizedTelegramId = String(telegramId || "").trim();
+        if (!/^[A-Za-z0-9._:-]{1,120}$/.test(normalizedBusinessId) || !/^\d{1,20}$/.test(normalizedTelegramId)) return null;
+        return new Promise((resolve, reject) => {
+            this.db.get(
+                `SELECT event_type, role FROM call_e_business_operator_events
+                 WHERE business_id = ? AND telegram_id = ? ORDER BY id DESC LIMIT 1`,
+                [normalizedBusinessId, normalizedTelegramId],
+                (error, row) => {
+                    if (error) return reject(error);
+                    resolve(row?.event_type === "access_granted" ? { role: row.role } : null);
+                },
+            );
+        });
+    }
+
     async insertCallEContactPolicyEvent(event = {}) {
         const eventKey = String(event.eventKey || "").trim();
         const requestHash = String(event.requestHash || "").trim();
@@ -4100,6 +4196,7 @@ class EnhancedDatabase {
         const evidenceReference = event.evidenceReference == null ? null : String(event.evidenceReference).trim();
         const occurredAt = String(event.occurredAt || "").trim();
         const expiresAt = event.expiresAt == null ? null : String(event.expiresAt).trim();
+        const recordedBy = event.recordedByTelegramId == null ? null : String(event.recordedByTelegramId).trim();
         const allowedSources = eventType === "consent_granted"
             ? ["web_form", "written", "verbal", "other"]
             : ["recipient_request", "operator_report", "provider_report", "other"];
@@ -4109,6 +4206,7 @@ class EnhancedDatabase {
             !Number.isFinite(Date.parse(occurredAt)) || !/(?:Z|[+-]\d{2}:\d{2})$/i.test(occurredAt) ||
             (eventType === "consent_granted" && !/^[A-Za-z0-9._:-]{8,180}$/.test(evidenceReference || "")) ||
             (eventType === "opted_out" && evidenceReference !== null) ||
+            (recordedBy !== null && !/^\d{1,20}$/.test(recordedBy)) ||
             (expiresAt !== null && (!Number.isFinite(Date.parse(expiresAt)) || !/(?:Z|[+-]\d{2}:\d{2})$/i.test(expiresAt)))) {
             throw new Error("CALL-E contact policy event persistence input is invalid");
         }
@@ -4117,10 +4215,10 @@ class EnhancedDatabase {
             database.run(
                 `INSERT OR IGNORE INTO call_e_contact_policy_events (
                     event_key, request_hash, business_id, destination, event_type,
-                    source, evidence_reference, occurred_at, expires_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                    source, evidence_reference, occurred_at, expires_at, recorded_by_telegram_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
                 [eventKey, requestHash, businessId, destination, eventType,
-                    source, evidenceReference, occurredAt, expiresAt],
+                    source, evidenceReference, occurredAt, expiresAt, recordedBy],
                 function (insertError) {
                     if (insertError) return reject(insertError);
                     if (this.changes > 0) return resolve({ inserted: true, replay: false, conflict: false });

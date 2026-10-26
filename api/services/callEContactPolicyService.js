@@ -16,9 +16,11 @@ function normalizePolicyInput(input = {}, kind) {
   const eventKey = String(input.eventKey || input.event_key || "").trim();
   const source = String(input.source || "").trim().toLowerCase();
   const occurredAt = String(input.occurredAt || input.occurred_at || "").trim();
+  const recordedByTelegramId = String(input.recordedByTelegramId || "").trim() || null;
   if (!/^[A-Za-z0-9._:-]{1,120}$/.test(businessId) || !/^\+[1-9]\d{7,14}$/.test(destination) ||
       !/^[A-Za-z0-9._:-]{8,180}$/.test(eventKey) ||
-      !(kind === "consent" ? CONSENT_SOURCES : OPTOUT_SOURCES).has(source)) {
+      !(kind === "consent" ? CONSENT_SOURCES : OPTOUT_SOURCES).has(source) ||
+      (recordedByTelegramId !== null && !/^\d{1,20}$/.test(recordedByTelegramId))) {
     throw policyError("call_e_contact_policy_invalid", "CALL-E contact policy event is invalid");
   }
   const occurredMs = Date.parse(occurredAt);
@@ -54,6 +56,7 @@ function normalizePolicyInput(input = {}, kind) {
     expiresAt,
     evidenceReference,
     eventType: kind === "consent" ? "consent_granted" : "opted_out",
+    recordedByTelegramId,
   };
   normalized.requestHash = crypto.createHash("sha256").update(JSON.stringify(normalized)).digest("hex");
   return Object.freeze(normalized);

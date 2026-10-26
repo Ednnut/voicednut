@@ -102,6 +102,8 @@ const { previewCallETemplate } = require("./adapters/callETemplateAdapter");
 const { buildCallEDeploymentStatus, createCallEClientFromEnv } = require("./services/callEClient");
 const { parseAllowedDestinations } = require("./services/callEOutboundCallService");
 const { CallEReconciliationService, createCallEReconciliationHandler } = require("./services/callEReconciliationService");
+const { CallEContactPolicyService } = require("./services/callEContactPolicyService");
+const { registerCallEContactPolicyRoutes } = require("./services/callEContactPolicyRoutes");
 const {
   containsCredentialLikeField,
   fingerprintVapiTemplateMapping,
@@ -9545,6 +9547,18 @@ const bypassPathLimiter = rateLimit({
 const callEReconciliationLimiter = rateLimit({
   windowMs: 60000,
   max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+const callEPolicyAdminLimiter = rateLimit({
+  windowMs: 60000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+const callEPolicyWriteLimiter = rateLimit({
+  windowMs: 60000,
+  max: 10,
   standardHeaders: true,
   legacyHeaders: false,
 });
@@ -23384,6 +23398,21 @@ app.get("/api/call-e/status", requireAdminToken, (req, res) => {
       destinationAllowlistReady: parseAllowedDestinations().size > 0,
     }),
   });
+});
+
+registerCallEContactPolicyRoutes(app, {
+  db,
+  getTemplate: (templateId) => db.getCallTemplateById(templateId),
+  policyService: new CallEContactPolicyService({ db }),
+  requireAdminToken,
+  requireMiniAppSession,
+  requireMiniAppCapability,
+  policyAdminLimiter: callEPolicyAdminLimiter,
+  policyWriteLimiter: (req, res, next) => {
+    enforceMiniAppRateLimit(req, res, "action")
+      .then((limited) => { if (!limited) next(); })
+      .catch(next);
+  },
 });
 
 app.post(
