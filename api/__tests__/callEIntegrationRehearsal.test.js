@@ -5,6 +5,7 @@ const path = require("node:path");
 const Database = require("../db/db");
 const { previewCallETemplate } = require("../adapters/callETemplateAdapter");
 const { CallEOutboundCallService } = require("../services/callEOutboundCallService");
+const { CallEContactPolicyService } = require("../services/callEContactPolicyService");
 const { CallEReconciliationService } = require("../services/callEReconciliationService");
 
 describe("CALL-E offline integration rehearsal", () => {
@@ -27,6 +28,7 @@ describe("CALL-E offline integration rehearsal", () => {
     const template = {
       id: 44,
       version: 2,
+      business_id: "business_rehearsal_001",
       lifecycle_state: "live",
       prompt: "Ask whether the appointment reminder was received. Do not change the booking.",
       first_message: "Hello, I am calling with a brief appointment reminder.",
@@ -42,6 +44,21 @@ describe("CALL-E offline integration rehearsal", () => {
       required: ["received"],
       properties: { received: { type: "boolean" } },
     };
+    const contactPolicy = new CallEContactPolicyService({ db });
+    const consentAt = new Date().toISOString();
+    for (const [phone, eventKey] of [
+      ["+14155550123", "consent:rehearsal:0001"],
+      ["+14155550124", "consent:rehearsal:0002"],
+    ]) {
+      await contactPolicy.recordConsent({
+        businessId: template.business_id,
+        destination: phone,
+        eventKey,
+        source: "written",
+        evidenceReference: `evidence:${eventKey}`,
+        occurredAt: consentAt,
+      });
+    }
     const providerCallId = "call_rehearsal_123";
     let createRequests = 0;
     const client = {

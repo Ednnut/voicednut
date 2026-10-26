@@ -1,6 +1,7 @@
 const crypto = require("node:crypto");
 const { buildTask, previewCallETemplate, validateCallEResult } = require("../adapters/callETemplateAdapter");
 const { normalizeCallId } = require("./callEClient");
+const { CallEContactPolicyService } = require("./callEContactPolicyService");
 
 const CALL_E_IDEMPOTENCY_PREFIX = "voicednut:call-e:";
 const NO_CALL_CREATED_MARKER = "call_e_no_call_created";
@@ -94,6 +95,7 @@ class CallEOutboundCallService {
   constructor(options = {}) {
     this.client = options.client;
     this.db = options.db;
+    this.contactPolicy = options.contactPolicy || new CallEContactPolicyService({ db: this.db });
     this.allowedDestinations = parseAllowedDestinations(options.allowedDestinations);
   }
 
@@ -116,6 +118,7 @@ class CallEOutboundCallService {
         typeof this.db.getOutboundCallIdempotency !== "function" ||
         typeof this.db.completeOutboundCallIdempotency !== "function" ||
         typeof this.db.resetCallERejectedOutboundCall !== "function" ||
+        typeof this.db.getCallEContactPolicyEligibility !== "function" ||
         typeof this.db.reserveCallEPilotDispatch !== "function" ||
         typeof this.db.consumeCallEPilotDispatch !== "function" ||
         typeof this.db.releaseCallEPilotDispatch !== "function") {
@@ -138,6 +141,24 @@ class CallEOutboundCallService {
     const destination = String(input.phone || "").trim();
     if (!this.allowedDestinations.has(destination)) {
       throw callEError("call_e_destination_not_allowlisted", "CALL-E destination is not allowlisted", 403);
+    }
+    const businessId = String(template.business_id || template.businessId || "").trim();
+    if (!businessId) {
+      throw callEError("call_e_business_scope_required", "CALL-E execution requires a template business scope", 403);
+    }
+    const eligibility = await this.contactPolicy.checkEligibility({ businessId, destination });
+    if (eligibility?.eligible !== true) {
+      const policyErrors = {
+        opted_out: ["call_e_contact_opted_out", "CALL-E destination has opted out"],
+        consent_expired: ["call_e_consent_expired", "CALL-E consent evidence has expired"],
+        consent_not_effective: ["call_e_consent_not_effective", "CALL-E consent evidence is not effective yet"],
+        policy_storage_unavailable: ["call_e_contact_policy_unavailable", "CALL-E consent policy storage is unavailable"],
+      };
+      const [code, message] = policyErrors[eligibility?.reason] || [
+        "call_e_consent_required",
+        "Current CALL-E consent evidence is required for this business and destination",
+      ];
+      throw callEError(code, message, code === "call_e_contact_policy_unavailable" ? 503 : 403);
     }
     const idempotencyKeyForProvider = `${CALL_E_IDEMPOTENCY_PREFIX}${idempotencyKey}`;
     const requestHash = preview.fingerprint;

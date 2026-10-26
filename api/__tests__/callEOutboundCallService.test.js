@@ -9,6 +9,7 @@ const { CallEOutboundCallService, normalizeCallResource, parseAllowedDestination
 const template = {
   id: 27,
   version: 3,
+  business_id: "business_test_001",
   lifecycle_state: "live",
   prompt: "Confirm whether the appointment reminder was received. Do not change the booking.",
   first_message: "Hello, I am calling with a brief appointment reminder.",
@@ -92,6 +93,7 @@ function createMemoryDb() {
       pilotReservation = null;
       return true;
     },
+    async getCallEContactPolicyEligibility() { return { eligible: true, reason: null }; },
     async upsertCallEReconciliationRecord(payload) {
       reconciliationRows.set(payload.local_call_id, { ...payload });
       return { saved: true };
@@ -162,6 +164,39 @@ describe("CALL-E outbound call service", () => {
       return true;
     });
     assert.equal(creates, 0);
+    assert.equal(db.rows.size, 0);
+  });
+
+  it("requires business-scoped consent and rejects expired or opted-out destinations before reservation", async () => {
+    const db = createMemoryDb();
+    let creates = 0;
+    const service = new CallEOutboundCallService({
+      db,
+      allowedDestinations: ["+14155550123"],
+      client: { isConfigured: () => true, async createCall() { creates += 1; return callResponse(); } },
+    });
+    db.getCallEContactPolicyEligibility = async () => ({ eligible: false, reason: "consent_missing" });
+    await assert.rejects(service.createOutboundCall(createInput()), (error) => error.code === "call_e_consent_required");
+    db.getCallEContactPolicyEligibility = async () => ({ eligible: false, reason: "consent_expired" });
+    await assert.rejects(service.createOutboundCall(createInput()), (error) => error.code === "call_e_consent_expired");
+    db.getCallEContactPolicyEligibility = async () => ({ eligible: false, reason: "opted_out" });
+    await assert.rejects(service.createOutboundCall(createInput()), (error) => error.code === "call_e_contact_opted_out");
+    assert.equal(creates, 0);
+    assert.equal(db.rows.size, 0);
+    assert.equal(db.pilotReservation, null);
+  });
+
+  it("requires a business scope on the pinned template before checking consent", async () => {
+    const db = createMemoryDb();
+    const service = new CallEOutboundCallService({
+      db,
+      allowedDestinations: ["+14155550123"],
+      client: { isConfigured: () => true, async createCall() { throw new Error("must not submit"); } },
+    });
+    await assert.rejects(
+      service.createOutboundCall(createInput({ template: { ...template, business_id: null } })),
+      (error) => error.code === "call_e_business_scope_required",
+    );
     assert.equal(db.rows.size, 0);
   });
 

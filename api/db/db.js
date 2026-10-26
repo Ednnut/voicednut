@@ -766,6 +766,23 @@ class EnhancedDatabase {
                 updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )`,
 
+            // Consent/opt-out evidence is append-only and scoped to the template's business; destination is PII.
+            `CREATE TABLE IF NOT EXISTS call_e_contact_policy_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_key TEXT NOT NULL UNIQUE,
+                request_hash TEXT NOT NULL,
+                business_id TEXT NOT NULL,
+                destination TEXT NOT NULL,
+                event_type TEXT NOT NULL CHECK(event_type IN ('consent_granted', 'opted_out')),
+                source TEXT NOT NULL CHECK(source IN ('web_form', 'written', 'verbal', 'other', 'recipient_request', 'operator_report', 'provider_report')),
+                evidence_reference TEXT,
+                occurred_at TEXT NOT NULL,
+                expires_at TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                CHECK((event_type = 'consent_granted' AND evidence_reference IS NOT NULL) OR (event_type = 'opted_out' AND evidence_reference IS NULL))
+            )`,
+            'CREATE INDEX IF NOT EXISTS idx_call_e_contact_policy_scope ON call_e_contact_policy_events(business_id, destination, event_type, occurred_at DESC, id DESC)',
+
             // Durable idempotency lock/result store for call-script mutations
             `CREATE TABLE IF NOT EXISTS call_script_mutation_idempotency (
                 idempotency_key TEXT PRIMARY KEY,
@@ -4068,6 +4085,93 @@ class EnhancedDatabase {
                 (error, row) => {
                     if (error) return reject(error);
                     resolve(row ? { ...row } : null);
+                },
+            );
+        });
+    }
+
+    async insertCallEContactPolicyEvent(event = {}) {
+        const eventKey = String(event.eventKey || "").trim();
+        const requestHash = String(event.requestHash || "").trim();
+        const businessId = String(event.businessId || "").trim();
+        const destination = String(event.destination || "").trim();
+        const eventType = String(event.eventType || "").trim();
+        const source = String(event.source || "").trim();
+        const evidenceReference = event.evidenceReference == null ? null : String(event.evidenceReference).trim();
+        const occurredAt = String(event.occurredAt || "").trim();
+        const expiresAt = event.expiresAt == null ? null : String(event.expiresAt).trim();
+        const allowedSources = eventType === "consent_granted"
+            ? ["web_form", "written", "verbal", "other"]
+            : ["recipient_request", "operator_report", "provider_report", "other"];
+        if (!/^[A-Za-z0-9._:-]{8,180}$/.test(eventKey) || !/^[a-f0-9]{64}$/i.test(requestHash) ||
+            !/^[A-Za-z0-9._:-]{1,120}$/.test(businessId) || !/^\+[1-9]\d{7,14}$/.test(destination) ||
+            !["consent_granted", "opted_out"].includes(eventType) || !allowedSources.includes(source) ||
+            !Number.isFinite(Date.parse(occurredAt)) || !/(?:Z|[+-]\d{2}:\d{2})$/i.test(occurredAt) ||
+            (eventType === "consent_granted" && !/^[A-Za-z0-9._:-]{8,180}$/.test(evidenceReference || "")) ||
+            (eventType === "opted_out" && evidenceReference !== null) ||
+            (expiresAt !== null && (!Number.isFinite(Date.parse(expiresAt)) || !/(?:Z|[+-]\d{2}:\d{2})$/i.test(expiresAt)))) {
+            throw new Error("CALL-E contact policy event persistence input is invalid");
+        }
+        const database = this.db;
+        return new Promise((resolve, reject) => {
+            database.run(
+                `INSERT OR IGNORE INTO call_e_contact_policy_events (
+                    event_key, request_hash, business_id, destination, event_type,
+                    source, evidence_reference, occurred_at, expires_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                [eventKey, requestHash, businessId, destination, eventType,
+                    source, evidenceReference, occurredAt, expiresAt],
+                function (insertError) {
+                    if (insertError) return reject(insertError);
+                    if (this.changes > 0) return resolve({ inserted: true, replay: false, conflict: false });
+                    database.get(
+                        `SELECT request_hash FROM call_e_contact_policy_events WHERE event_key = ?`,
+                        [eventKey],
+                        (lookupError, row) => {
+                            if (lookupError) return reject(lookupError);
+                            if (!row) return resolve({ inserted: false, replay: false, conflict: true });
+                            const sameRequest = row.request_hash === requestHash;
+                            resolve({ inserted: false, replay: sameRequest, conflict: !sameRequest });
+                        },
+                    );
+                },
+            );
+        });
+    }
+
+    async getCallEContactPolicyEligibility(input = {}) {
+        const businessId = String(input.business_id || "").trim();
+        const destination = String(input.destination || "").trim();
+        if (!/^[A-Za-z0-9._:-]{1,120}$/.test(businessId) || !/^\+[1-9]\d{7,14}$/.test(destination)) {
+            return { eligible: false, reason: "scope_or_destination_invalid" };
+        }
+        return new Promise((resolve, reject) => {
+            this.db.get(
+                `SELECT
+                    EXISTS(
+                        SELECT 1 FROM call_e_contact_policy_events
+                        WHERE business_id = ? AND destination = ? AND event_type = 'opted_out'
+                    ) AS opted_out,
+                    (SELECT occurred_at FROM call_e_contact_policy_events
+                     WHERE business_id = ? AND destination = ? AND event_type = 'consent_granted'
+                     ORDER BY occurred_at DESC, id DESC LIMIT 1) AS latest_consent_at,
+                    (SELECT expires_at FROM call_e_contact_policy_events
+                     WHERE business_id = ? AND destination = ? AND event_type = 'consent_granted'
+                     ORDER BY occurred_at DESC, id DESC LIMIT 1) AS latest_consent_expiry,
+                    EXISTS(
+                        SELECT 1 FROM call_e_contact_policy_events
+                        WHERE business_id = ? AND destination = ? AND event_type = 'consent_granted'
+                    ) AS has_consent`,
+                [businessId, destination, businessId, destination, businessId, destination, businessId, destination],
+                (error, row) => {
+                    if (error) return reject(error);
+                    if (Number(row?.opted_out) === 1) return resolve({ eligible: false, reason: "opted_out" });
+                    if (Number(row?.has_consent) !== 1) return resolve({ eligible: false, reason: "consent_missing" });
+                    if (Date.parse(row.latest_consent_at) > Date.now()) return resolve({ eligible: false, reason: "consent_not_effective" });
+                    if (row.latest_consent_expiry && Date.parse(row.latest_consent_expiry) <= Date.now()) {
+                        return resolve({ eligible: false, reason: "consent_expired" });
+                    }
+                    resolve({ eligible: true, reason: null });
                 },
             );
         });

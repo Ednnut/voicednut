@@ -64,7 +64,7 @@ const CALL_E_DISPATCH_BLOCKER_LABELS: Record<string, string> = {
   dispatch_route_not_implemented: 'Authenticated dispatch route is not implemented',
   tenant_scoped_authorization_not_implemented: 'Tenant scoped authorization is not implemented',
   operator_confirmation_provenance_not_implemented: 'Operator confirmation provenance is not implemented',
-  consent_and_opt_out_controls_not_implemented: 'Consent and opt out controls are not implemented',
+  consent_policy_ingestion_route_not_implemented: 'Business scoped consent and opt out evidence ingestion is not implemented',
   single_call_pilot_cap_not_connected_to_dispatch: 'The durable one call pilot cap is not connected to dispatch',
   concurrency_control_not_connected_to_dispatch: 'The durable concurrency guard is not connected to dispatch',
 };
