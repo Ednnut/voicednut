@@ -6,6 +6,7 @@ const MAX_PAGES_PER_RUN = 5;
 const MAX_SEEN_EVENT_IDS = 500;
 const MAX_EVENT_ID_LENGTH = 200;
 const MAX_CURSOR_LENGTH = 512;
+const OPERATOR_ROLES = new Set(["policy_manager", "call_operator"]);
 
 function callEReconciliationError(code, message) {
   const error = new Error(message);
@@ -180,6 +181,24 @@ class CallEReconciliationService {
       eventsHaveMore: events.hasMore,
       updatedAt: new Date().toISOString(),
     });
+  }
+
+  async reconcileLocalCallForOperator(localCallId, telegramId) {
+    const localId = String(localCallId || "").trim();
+    const actorId = String(telegramId || "").trim();
+    if (!/^call_e_[0-9a-f-]{36}$/i.test(localId) || !/^\d{1,20}$/.test(actorId) ||
+        typeof this.db?.getCallEReconciliationRecord !== "function" ||
+        typeof this.db?.getCallEBusinessOperator !== "function") {
+      throw callEReconciliationError("call_e_call_not_found", "CALL-E call was not found");
+    }
+    const record = await this.db.getCallEReconciliationRecord(localId);
+    const businessId = String(record?.business_id || "").trim();
+    if (!businessId) throw callEReconciliationError("call_e_call_not_found", "CALL-E call was not found");
+    const membership = await this.db.getCallEBusinessOperator(businessId, actorId);
+    if (!OPERATOR_ROLES.has(membership?.role)) {
+      throw callEReconciliationError("call_e_call_not_found", "CALL-E call was not found");
+    }
+    return this.reconcileLocalCall(localId);
   }
 }
 

@@ -167,6 +167,7 @@ class CallEOutboundCallService {
       await this.db.upsertCallEReconciliationRecord({
         local_call_id: localId,
         provider_call_id: accepted?.providerCallId || null,
+        business_id: businessId,
         template_id: Number(template.id ?? template.template_id),
         template_version: Number(template.version ?? template.template_version),
         request_hash: requestHash,

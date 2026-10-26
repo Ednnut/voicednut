@@ -20243,8 +20243,8 @@ function buildMiniAppActionSpec(action, payload = {}) {
     return {
       capability: "caller_flags_manage",
       method: "POST",
-      path: `/api/call-e/calls/${encodeURIComponent(localCallId)}/reconcile`,
-      body: {},
+      path: "/miniapp/action",
+      body: { local_call_id: localCallId },
     };
   }
 
@@ -22086,6 +22086,38 @@ app.post("/miniapp/action", requireMiniAppSession, async (req, res) => {
         Number(error?.status) || 503,
         String(error?.code || "call_e_dispatch_failed"),
         error?.message || "CALL-E dispatch failed",
+        req.requestId || null,
+      );
+    }
+  }
+
+  if (action === "calle.call.reconcile") {
+    try {
+      const result = await new CallEReconciliationService({
+        client: createCallEClientFromEnv(),
+        db,
+      }).reconcileLocalCallForOperator(
+        spec.body.local_call_id,
+        String(req.miniAppSession?.telegram_id || "").trim(),
+      );
+      return res.json({
+        success: true,
+        action,
+        requested_action: actionResolution.requestedAction,
+        was_aliased: actionResolution.wasAliased,
+        data: { result },
+        request_id: req.requestId || null,
+      });
+    } catch (error) {
+      const code = String(error?.code || "call_e_reconciliation_failed");
+      const status = code === "call_e_call_not_found" ? 404
+        : code === "call_e_not_configured" || code === "call_e_reconciliation_storage_unavailable" ? 503
+          : code === "call_e_result_invalid" ? 409 : 502;
+      return sendApiError(
+        res,
+        status,
+        code,
+        status === 502 ? "CALL-E reconciliation failed" : error?.message || "CALL-E reconciliation failed",
         req.requestId || null,
       );
     }

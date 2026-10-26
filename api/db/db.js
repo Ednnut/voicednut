@@ -742,6 +742,7 @@ class EnhancedDatabase {
             `CREATE TABLE IF NOT EXISTS call_e_reconciliation (
                 local_call_id TEXT PRIMARY KEY,
                 provider_call_id TEXT UNIQUE,
+                business_id TEXT,
                 template_id INTEGER NOT NULL,
                 template_version INTEGER NOT NULL,
                 request_hash TEXT NOT NULL,
@@ -882,6 +883,7 @@ class EnhancedDatabase {
 
         await this.ensureCallColumns(['digit_summary', 'digit_count', 'last_otp', 'last_otp_masked', 'direction']);
         await this.ensureCallEContactPolicyColumns();
+        await this.ensureCallEReconciliationBusinessColumn();
         await this.ensureTemplateColumns([
             'version',
             'objective_tags',
@@ -1047,6 +1049,22 @@ class EnhancedDatabase {
         if (columns.has('recorded_by_telegram_id')) return;
         await new Promise((resolve, reject) => {
             this.db.run('ALTER TABLE call_e_contact_policy_events ADD COLUMN recorded_by_telegram_id TEXT', (error) => {
+                if (error && !String(error.message || '').toLowerCase().includes('duplicate')) return reject(error);
+                resolve();
+            });
+        });
+    }
+
+    async ensureCallEReconciliationBusinessColumn() {
+        const columns = await new Promise((resolve, reject) => {
+            this.db.all('PRAGMA table_info(call_e_reconciliation)', (error, rows) => {
+                if (error) return reject(error);
+                resolve(new Set((rows || []).map((row) => row.name)));
+            });
+        });
+        if (columns.has('business_id')) return;
+        await new Promise((resolve, reject) => {
+            this.db.run('ALTER TABLE call_e_reconciliation ADD COLUMN business_id TEXT', (error) => {
                 if (error && !String(error.message || '').toLowerCase().includes('duplicate')) return reject(error);
                 resolve();
             });
@@ -4372,12 +4390,15 @@ class EnhancedDatabase {
     async upsertCallEReconciliationRecord(payload = {}) {
         const localCallId = String(payload.local_call_id || '').trim();
         const providerCallId = String(payload.provider_call_id || '').trim() || null;
+        const rawBusinessId = String(payload.business_id || '').trim();
+        const businessId = rawBusinessId || null;
         const templateId = Number(payload.template_id);
         const templateVersion = Number(payload.template_version);
         const requestHash = String(payload.request_hash || '').trim();
         const schema = payload.result_schema;
         if (!/^call_e_[0-9a-f-]{36}$/i.test(localCallId) ||
             (providerCallId && !/^call_[A-Za-z0-9_-]{1,190}$/.test(providerCallId)) ||
+            (businessId !== null && !/^[A-Za-z0-9._:-]{1,120}$/.test(businessId)) ||
             !Number.isSafeInteger(templateId) || templateId <= 0 ||
             !Number.isSafeInteger(templateVersion) || templateVersion <= 0 ||
             !/^[a-f0-9]{64}$/i.test(requestHash) || !schema || typeof schema !== 'object' || Array.isArray(schema)) {
@@ -4388,12 +4409,13 @@ class EnhancedDatabase {
         return new Promise((resolve, reject) => {
             this.db.run(
                 `INSERT INTO call_e_reconciliation (
-                    local_call_id, provider_call_id, template_id, template_version,
+                    local_call_id, provider_call_id, business_id, template_id, template_version,
                     request_hash, result_schema_json, execution_status, call_outcome,
                     result_status, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                 ON CONFLICT(local_call_id) DO UPDATE SET
                     provider_call_id = COALESCE(excluded.provider_call_id, call_e_reconciliation.provider_call_id),
+                    business_id = excluded.business_id,
                     template_id = excluded.template_id,
                     template_version = excluded.template_version,
                     request_hash = excluded.request_hash,
@@ -4402,7 +4424,7 @@ class EnhancedDatabase {
                     call_outcome = COALESCE(excluded.call_outcome, call_e_reconciliation.call_outcome),
                     result_status = COALESCE(excluded.result_status, call_e_reconciliation.result_status),
                     updated_at = CURRENT_TIMESTAMP`,
-                [localCallId, providerCallId, templateId, templateVersion, requestHash, schemaJson,
+                [localCallId, providerCallId, businessId, templateId, templateVersion, requestHash, schemaJson,
                     payload.execution_status || null, payload.call_outcome || null, payload.result_status || null],
                 function (err) { if (err) return reject(err); resolve({ saved: this.changes > 0 }); },
             );
