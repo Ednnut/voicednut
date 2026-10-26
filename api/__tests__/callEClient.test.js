@@ -22,7 +22,16 @@ describe("CALL-E server client", () => {
       destinationAllowlistReady: false,
       previewAvailable: true,
       dispatchAvailable: false,
+      pilotReady: false,
       dispatchBlocker: "dispatch_route_not_implemented",
+      dispatchBlockers: [
+        "dispatch_route_not_implemented",
+        "tenant_scoped_authorization_not_implemented",
+        "operator_confirmation_provenance_not_implemented",
+        "consent_and_opt_out_controls_not_implemented",
+        "single_call_pilot_cap_not_implemented",
+        "concurrency_control_not_implemented",
+      ],
     });
     assert.equal(JSON.stringify(disabled).includes("private-test-key"), false);
 
@@ -35,6 +44,8 @@ describe("CALL-E server client", () => {
     assert.equal(configured.providerAccessReady, true);
     assert.equal(configured.destinationAllowlistReady, true);
     assert.equal(configured.dispatchAvailable, false);
+    assert.equal(configured.pilotReady, false);
+    assert.equal(configured.dispatchBlockers.length, 6);
     assert.equal("apiKey" in configured, false);
     assert.equal("baseUrl" in configured, false);
   });

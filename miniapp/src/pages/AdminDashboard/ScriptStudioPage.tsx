@@ -60,6 +60,15 @@ function toRows(value: unknown): Array<Record<string, unknown>> {
   return value.map((entry) => asRecord(entry));
 }
 
+const CALL_E_DISPATCH_BLOCKER_LABELS: Record<string, string> = {
+  dispatch_route_not_implemented: 'Authenticated dispatch route is not implemented',
+  tenant_scoped_authorization_not_implemented: 'Tenant scoped authorization is not implemented',
+  operator_confirmation_provenance_not_implemented: 'Operator confirmation provenance is not implemented',
+  consent_and_opt_out_controls_not_implemented: 'Consent and opt out controls are not implemented',
+  single_call_pilot_cap_not_implemented: 'One call pilot cap is not implemented',
+  concurrency_control_not_implemented: 'Dispatch concurrency control is not implemented',
+};
+
 function toLifecycleTone(value: unknown): 'info' | 'success' | 'warning' | 'error' {
   const normalized = typeof value === 'string'
     ? value.trim().toLowerCase()
@@ -944,6 +953,16 @@ export function ScriptStudioPage({ visible, vm, initialLane = 'call' }: ScriptSt
                     <p>Destination allowlist: <strong>{callEDeploymentStatus.destinationAllowlistReady === true ? 'configured' : 'empty'}</strong></p>
                     <p>Local preview: <strong>{callEDeploymentStatus.previewAvailable === true ? 'available' : 'unavailable'}</strong></p>
                     <p>Call dispatch: <strong>{callEDeploymentStatus.dispatchAvailable === true ? 'available' : 'unavailable'}</strong></p>
+                    <p>Pilot readiness: <strong>{callEDeploymentStatus.pilotReady === true ? 'ready' : 'blocked'}</strong></p>
+                    {Array.isArray(callEDeploymentStatus.dispatchBlockers) ? (
+                      <ul aria-label="CALL-E dispatch blockers">
+                        {callEDeploymentStatus.dispatchBlockers
+                          .filter((blocker): blocker is string => typeof blocker === 'string')
+                          .map((blocker) => (
+                            <li key={blocker}>{CALL_E_DISPATCH_BLOCKER_LABELS[blocker] || 'Additional dispatch requirement is incomplete'}</li>
+                          ))}
+                      </ul>
+                    ) : null}
                   </div>
                 ) : (
                   <UiStatePanel compact tone="info" title="Deployment status not loaded" description="Refresh availability to inspect the server-side flag and configuration state." />

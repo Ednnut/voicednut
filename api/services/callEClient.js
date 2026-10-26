@@ -10,6 +10,14 @@ const KNOWN_NO_CALL_CODES = new Set([
   "unsupported_language",
   "result_schema_invalid",
 ]);
+const CALL_E_PILOT_DISPATCH_BLOCKERS = Object.freeze([
+  "dispatch_route_not_implemented",
+  "tenant_scoped_authorization_not_implemented",
+  "operator_confirmation_provenance_not_implemented",
+  "consent_and_opt_out_controls_not_implemented",
+  "single_call_pilot_cap_not_implemented",
+  "concurrency_control_not_implemented",
+]);
 
 class CallEApiError extends Error {
   constructor(message, details = {}) {
@@ -167,7 +175,9 @@ function buildCallEDeploymentStatus(client, options = {}) {
     destinationAllowlistReady: options.destinationAllowlistReady === true,
     previewAvailable: true,
     dispatchAvailable: false,
-    dispatchBlocker: "dispatch_route_not_implemented",
+    pilotReady: false,
+    dispatchBlocker: CALL_E_PILOT_DISPATCH_BLOCKERS[0],
+    dispatchBlockers: [...CALL_E_PILOT_DISPATCH_BLOCKERS],
   };
 }
 
@@ -176,6 +186,7 @@ module.exports = {
   CALL_E_TEST_BASE_URL,
   CallEApiError,
   CallEClient,
+  CALL_E_PILOT_DISPATCH_BLOCKERS,
   buildCallEDeploymentStatus,
   createCallEClientFromEnv,
   isAllowedBaseUrl,

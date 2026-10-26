@@ -51,6 +51,12 @@ test('exposes CALL-E status lookup only after a local call ID is supplied', asyn
     await expect(page.getByText('Provider access readiness:')).toContainText('disabled or incomplete');
     await expect(page.getByText('Destination allowlist:')).toContainText('empty');
     await expect(page.getByText('Call dispatch:')).toContainText('unavailable');
+    await expect(page.getByText('Pilot readiness:')).toContainText('blocked');
+    const dispatchBlockers = page.getByRole('list', { name: 'CALL-E dispatch blockers' });
+    await expect(dispatchBlockers.getByRole('listitem')).toHaveCount(6);
+    await expect(dispatchBlockers).toContainText('Tenant scoped authorization is not implemented');
+    await expect(dispatchBlockers).toContainText('Consent and opt out controls are not implemented');
+    await expect(dispatchBlockers).toContainText('One call pilot cap is not implemented');
     const previewDisclosure = page.locator('details.va-disclosure').filter({ hasText: 'CALL-E compatibility preview' });
     await previewDisclosure.evaluate((element) => { (element as HTMLDetailsElement).open = true; });
     await expect(page.getByLabel('Destination in E.164 format')).toBeVisible();
