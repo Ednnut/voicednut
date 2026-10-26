@@ -43,3 +43,11 @@ The dependency install initially skipped sqlite3's native install script, so the
 ## Boundary and outstanding verification
 
 This phase does not create provider mappings or migrate template records. The runtime database and deployment export were not available, so live template compatibility and production mappings remain unassessed. AWS-related call execution remains outside the current registry operations because this path did not establish an AWS outbound/termination adapter contract. These are inputs for later provider expansion, not grounds to infer compatibility.
+
+## Follow-up — operation and result contract
+
+The voice registry now reports operation support separately from provider flow capabilities. Outbound creation remains required; active-call termination is optional and is surfaced through `getDescriptor`/`supportsOperation`. Attempting an unavailable operation returns a typed `provider_operation_unsupported` error marked `not_submitted`.
+
+Successful create results preserve the existing `provider`, `callId`, `providerCallId`, `status`, and `metadata` fields, and add `channel`, `operation`, `submissionState`, and `canonicalStatus`. The original normalized provider status stays available for compatibility while `canonicalStatus` uses the existing provider status map. The error normalizer emits a safe common shape and defaults submission state to `unknown`; adapters must explicitly classify `not_submitted` or `rejected`. It does not infer retry safety from a timeout, HTTP status, or error text.
+
+This is a contract foundation only. It does not change provider selection, retries, or failover, and it does not yet move Vapi or CALL-E into the voice registry. CALL-E task planning/confirmation and its Calls API lifecycle need a dedicated adapter shape rather than being modeled as ordinary call creation and termination.

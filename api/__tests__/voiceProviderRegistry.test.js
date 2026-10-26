@@ -20,19 +20,29 @@ describe("VoiceProviderRegistry", () => {
     assert.deepStrictEqual(registry.getCapabilities("example"), ["outbound_voice"]);
     assert.deepStrictEqual(result, {
       provider: "example",
+      channel: "call",
+      operation: "outbound_call.create",
+      submissionState: "accepted",
       callId: "local-123",
       status: "in-progress",
+      canonicalStatus: "in-progress",
       providerCallId: "remote-456",
       metadata: { resource: "remote-456" },
     });
     assert.deepStrictEqual(await registry.endCall("example", {}), { ended: true });
   });
 
-  it("requires adapters to implement create and end operations", () => {
-    assert.throws(
-      () => new VoiceProviderRegistry().register("broken", { createOutboundCall() {} }),
-      /must implement endCall/,
-    );
+  it("reports optional operations instead of requiring termination support", () => {
+    const registry = new VoiceProviderRegistry().register("create-only", { createOutboundCall() {} });
+    assert.deepStrictEqual(registry.getDescriptor("create-only"), {
+      provider: "create-only",
+      channel: "call",
+      capabilities: [],
+      operations: {
+        "outbound_call.create": true,
+        "call.active_terminate": false,
+      },
+    });
   });
 
   it("rejects unknown providers and malformed create results", async () => {
