@@ -394,6 +394,17 @@ function resolveDashboardFixtureActionData(
 ): Record<string, unknown> {
   const requestedCallSid = toText(payload.call_sid, '').trim() || 'CA_FIXTURE_CALL_001';
   switch (action) {
+    case DASHBOARD_ACTION_CONTRACTS.CALLE_STATUS:
+      return {
+        status: {
+          integrationEnabled: false,
+          providerAccessReady: false,
+          destinationAllowlistReady: false,
+          previewAvailable: true,
+          dispatchAvailable: false,
+          dispatchBlocker: 'dispatch_route_not_implemented',
+        },
+      };
     case DASHBOARD_ACTION_CONTRACTS.CALLSCRIPT_LIST:
       return {
         scripts: [

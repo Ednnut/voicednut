@@ -19,6 +19,9 @@
   "keywords": [],
   "author": "Tunde Ednut",
   "license": "MIT",
+  "engines": {
+    "node": ">=24 <25"
+  },
   "dependencies": {
     "@deepgram/sdk": "^3.3.4",
     "@paypal/agent-toolkit": "^1.8.0",

@@ -15,7 +15,16 @@ export function DashboardShellFrame({
 }: DashboardShellFrameProps): JSX.Element {
   return (
     <main className="va-dashboard" aria-busy={loading}>
-      <a className="va-skip-link" href="#va-view-stage-root">Skip to active content</a>
+      <a
+        className="va-skip-link"
+        href="#va-view-stage-root"
+        onClick={(event) => {
+          event.preventDefault();
+          document.getElementById('va-view-stage-root')?.focus();
+        }}
+      >
+        Skip to active content
+      </a>
       <p className="va-sr-only" role="status" aria-live="polite" aria-atomic="true">
         {settingsOpen
           ? 'Settings panel active.'

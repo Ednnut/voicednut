@@ -3,6 +3,7 @@ import type { DashboardVm, ProviderMatrixRow } from './types';
 import { selectProviderPageVm } from './vmSelectors';
 import { AdminPageIntro } from '@/components/admin-dashboard/AdminPageIntro';
 import { LoadingTelemetryCard } from '@/components/admin-dashboard/DashboardStateCards';
+import { VapiWebCallPanel } from './VapiWebCallPanel';
 import {
   UiActionBar,
   UiBadge,
@@ -368,6 +369,7 @@ export function ProviderControlPage({ visible, vm }: ProviderControlPageProps) {
         {renderProviderSection('call')}
         {renderProviderSection('sms')}
         {renderProviderSection('email')}
+        <VapiWebCallPanel />
       </section>
     </>
   );

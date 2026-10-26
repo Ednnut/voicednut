@@ -383,7 +383,7 @@ export function AdminDashboardPage() {
     triggerHaptic('selection');
     if (target) {
       if (location.pathname !== DASHBOARD_STATIC_ROUTE_CONTRACTS.SETTINGS) {
-        navigate(DASHBOARD_STATIC_ROUTE_CONTRACTS.SETTINGS);
+        void navigate(DASHBOARD_STATIC_ROUTE_CONTRACTS.SETTINGS);
       }
       return;
     }
@@ -392,7 +392,7 @@ export function AdminDashboardPage() {
       ? moduleRoutePath(fallbackModule)
       : DASHBOARD_STATIC_ROUTE_CONTRACTS.ROOT;
     if (location.pathname !== fallbackPath) {
-      navigate(fallbackPath);
+      void navigate(fallbackPath);
     }
   }, [
     activeModule,
@@ -416,7 +416,7 @@ export function AdminDashboardPage() {
       .slice(0, DASHBOARD_RECENT_MODULE_LIMIT));
     const targetPath = moduleRoutePath(moduleId);
     if (location.pathname !== targetPath) {
-      navigate(targetPath);
+      void navigate(targetPath);
     }
   }, [location.pathname, navigate, triggerHaptic]);
 
@@ -440,7 +440,7 @@ export function AdminDashboardPage() {
     });
     setActiveModule('ops');
     if (location.pathname !== DASHBOARD_STATIC_ROUTE_CONTRACTS.ROOT) {
-      navigate(DASHBOARD_STATIC_ROUTE_CONTRACTS.ROOT);
+      void navigate(DASHBOARD_STATIC_ROUTE_CONTRACTS.ROOT);
     }
   }, [location.pathname, navigate]);
 
@@ -1671,7 +1671,7 @@ export function AdminDashboardPage() {
         onClose={closeOverflowMenu}
         onOpenSettings={handleOverflowSettings}
         onRefreshDashboard={handleOverflowRefresh}
-        onShareMiniApp={handleShareMiniApp}
+        onShareMiniApp={() => { void handleShareMiniApp(); }}
         onCloseMiniApp={miniApp.close.isAvailable() ? handleOverflowCloseMiniApp : undefined}
       />
       <DashboardActionDialog

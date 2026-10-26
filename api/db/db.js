@@ -366,6 +366,79 @@ class EnhancedDatabase {
                 FOREIGN KEY(template_id) REFERENCES call_templates(id) ON DELETE CASCADE
             )`,
 
+            // Auditable local mapping state for call-template compatibility with Vapi.
+            `CREATE TABLE IF NOT EXISTS vapi_template_mappings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                template_id INTEGER NOT NULL,
+                template_version INTEGER NOT NULL,
+                config_fingerprint TEXT NOT NULL,
+                compatibility_status TEXT NOT NULL CHECK(compatibility_status IN ('compatible', 'incompatible')),
+                mapping_status TEXT NOT NULL DEFAULT 'previewed' CHECK(mapping_status IN ('previewed', 'provisioned', 'stale')),
+                sync_status TEXT NOT NULL DEFAULT 'not_synced' CHECK(sync_status IN ('not_synced', 'syncing', 'synced', 'unknown', 'failed')),
+                vapi_assistant_id TEXT,
+                vapi_assistant_version TEXT,
+                summary_json TEXT NOT NULL,
+                reviewed_by TEXT,
+                last_sync_started_at DATETIME,
+                last_synced_at DATETIME,
+                last_sync_error TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(template_id, template_version, config_fingerprint)
+            )`,
+
+            `CREATE TABLE IF NOT EXISTS vapi_inbound_routes (
+                phone_number_id TEXT PRIMARY KEY,
+                mapping_id INTEGER NOT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(mapping_id) REFERENCES vapi_template_mappings(id) ON DELETE CASCADE
+            )`,
+
+            `CREATE TABLE IF NOT EXISTS vapi_call_campaigns (
+                campaign_id TEXT PRIMARY KEY,
+                idempotency_key TEXT NOT NULL UNIQUE,
+                request_hash TEXT NOT NULL,
+                name TEXT NOT NULL,
+                provider TEXT NOT NULL CHECK(provider = 'vapi'),
+                template_id INTEGER NOT NULL,
+                template_version INTEGER NOT NULL,
+                mapping_id INTEGER NOT NULL,
+                phone_number_id TEXT NOT NULL,
+                time_zone TEXT NOT NULL,
+                calling_window_start TEXT NOT NULL,
+                calling_window_end TEXT NOT NULL,
+                calling_days_json TEXT NOT NULL,
+                scheduled_start_at TEXT,
+                max_concurrency INTEGER NOT NULL DEFAULT 1 CHECK(max_concurrency BETWEEN 1 AND 20),
+                max_retries INTEGER NOT NULL DEFAULT 0 CHECK(max_retries BETWEEN 0 AND 3),
+                retry_delay_minutes INTEGER NOT NULL DEFAULT 0 CHECK(retry_delay_minutes BETWEEN 0 AND 1440),
+                status TEXT NOT NULL DEFAULT 'draft' CHECK(status = 'draft'),
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(template_id) REFERENCES call_templates(id) ON DELETE RESTRICT,
+                FOREIGN KEY(mapping_id) REFERENCES vapi_template_mappings(id) ON DELETE RESTRICT
+            )`,
+            'CREATE INDEX IF NOT EXISTS idx_vapi_call_campaigns_created ON vapi_call_campaigns(created_at DESC, campaign_id)',
+
+            // Sanitized Vapi lifecycle events for call correlation and operations.
+            `CREATE TABLE IF NOT EXISTS vapi_call_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_key TEXT NOT NULL UNIQUE,
+                provider_call_id TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                provider_status TEXT,
+                destination_type TEXT,
+                ended_reason TEXT,
+                duration_seconds INTEGER,
+                assistant_id TEXT,
+                template_id INTEGER,
+                template_version INTEGER,
+                config_fingerprint TEXT,
+                event_timestamp TEXT,
+                received_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )`,
+
             // Enhanced webhook notifications table with delivery metrics
             `CREATE TABLE IF NOT EXISTS webhook_notifications (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -665,6 +738,25 @@ class EnhancedDatabase {
                 updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )`,
 
+            // CALL-E normalized lifecycle and durable event cursor; deliberately excludes phone, transcript, result, and raw event payloads.
+            `CREATE TABLE IF NOT EXISTS call_e_reconciliation (
+                local_call_id TEXT PRIMARY KEY,
+                provider_call_id TEXT UNIQUE,
+                template_id INTEGER NOT NULL,
+                template_version INTEGER NOT NULL,
+                request_hash TEXT NOT NULL,
+                result_schema_json TEXT NOT NULL,
+                execution_status TEXT,
+                call_outcome TEXT,
+                result_status TEXT,
+                error_code TEXT,
+                event_cursor TEXT,
+                last_event_id TEXT,
+                seen_event_ids_json TEXT NOT NULL DEFAULT '[]',
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )`,
+
             // Durable idempotency lock/result store for call-script mutations
             `CREATE TABLE IF NOT EXISTS call_script_mutation_idempotency (
                 idempotency_key TEXT PRIMARY KEY,
@@ -767,6 +859,7 @@ class EnhancedDatabase {
         ]);
         await this.ensureNotificationColumns(['last_attempt_at', 'next_attempt_at']);
         await this.ensureCallQualityReportColumns(['profile']);
+        await this.ensureVapiCallEventColumns(['destination_type']);
 
         // Create comprehensive indexes for optimal performance
         const indexes = [
@@ -802,6 +895,9 @@ class EnhancedDatabase {
             'CREATE INDEX IF NOT EXISTS idx_call_templates_name ON call_templates(name)',
             'CREATE INDEX IF NOT EXISTS idx_call_templates_lifecycle_state ON call_templates(lifecycle_state)',
             'CREATE INDEX IF NOT EXISTS idx_call_template_versions_template_version ON call_template_versions(template_id, version)',
+            'CREATE INDEX IF NOT EXISTS idx_vapi_template_mappings_template ON vapi_template_mappings(template_id, template_version, updated_at)',
+            'CREATE INDEX IF NOT EXISTS idx_vapi_call_events_call ON vapi_call_events(provider_call_id, received_at)',
+            'CREATE INDEX IF NOT EXISTS idx_vapi_call_events_template ON vapi_call_events(template_id, template_version, received_at)',
             
             // Notification indexes
             'CREATE INDEX IF NOT EXISTS idx_notifications_status ON webhook_notifications(status)',
@@ -930,6 +1026,26 @@ class EnhancedDatabase {
             } else if (column === 'direction') {
                 await addColumn('direction', 'TEXT');
             }
+        }
+    }
+
+    async ensureVapiCallEventColumns(columns = []) {
+        if (!columns.length) return;
+        const existing = await new Promise((resolve, reject) => {
+            this.db.all('PRAGMA table_info(vapi_call_events)', (err, rows) => {
+                if (err) return reject(err);
+                resolve(rows || []);
+            });
+        });
+        const existingNames = new Set(existing.map((row) => row.name));
+        for (const column of columns) {
+            if (column !== 'destination_type' || existingNames.has(column)) continue;
+            await new Promise((resolve, reject) => {
+                this.db.run('ALTER TABLE vapi_call_events ADD COLUMN destination_type TEXT', (err) => {
+                    if (err && !String(err.message || '').toLowerCase().includes('duplicate')) return reject(err);
+                    resolve();
+                });
+            });
         }
     }
 
@@ -1677,6 +1793,428 @@ class EnhancedDatabase {
                     resolve(row || null);
                 }
             });
+        });
+    }
+
+    async upsertVapiTemplateMapping(mapping = {}) {
+        const templateId = Number(mapping.template_id);
+        const templateVersion = Number(mapping.template_version);
+        const fingerprint = String(mapping.config_fingerprint || "").trim();
+        const compatibilityStatus = String(mapping.compatibility_status || "")
+            .trim()
+            .toLowerCase();
+        const summary = mapping.summary && typeof mapping.summary === "object"
+            ? mapping.summary
+            : {};
+        if (!Number.isSafeInteger(templateId) || templateId <= 0) {
+            throw new Error("Vapi template mapping requires a valid template ID");
+        }
+        if (!Number.isSafeInteger(templateVersion) || templateVersion <= 0) {
+            throw new Error("Vapi template mapping requires a valid template version");
+        }
+        if (!/^[a-f0-9]{64}$/i.test(fingerprint)) {
+            throw new Error("Vapi template mapping requires a SHA-256 fingerprint");
+        }
+        if (!["compatible", "incompatible"].includes(compatibilityStatus)) {
+            throw new Error("Vapi template mapping compatibility status is invalid");
+        }
+        return new Promise((resolve, reject) => {
+            const sql = `
+                INSERT INTO vapi_template_mappings (
+                    template_id, template_version, config_fingerprint,
+                    compatibility_status, mapping_status, summary_json, reviewed_by,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, 'previewed', ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                ON CONFLICT(template_id, template_version, config_fingerprint) DO UPDATE SET
+                    compatibility_status = excluded.compatibility_status,
+                    summary_json = excluded.summary_json,
+                    reviewed_by = excluded.reviewed_by,
+                    updated_at = CURRENT_TIMESTAMP
+            `;
+            this.db.run(sql, [
+                templateId,
+                templateVersion,
+                fingerprint,
+                compatibilityStatus,
+                JSON.stringify(summary),
+                String(mapping.reviewed_by || "").trim() || null,
+            ], function (err) {
+                if (err) return reject(err);
+                resolve(this.lastID || null);
+            });
+        });
+    }
+
+    async listVapiTemplateMappings(templateId) {
+        const normalizedId = Number(templateId);
+        if (!Number.isSafeInteger(normalizedId) || normalizedId <= 0) {
+            throw new Error("A valid template ID is required");
+        }
+        return new Promise((resolve, reject) => {
+            this.db.all(
+                `SELECT id, template_id, template_version, config_fingerprint,
+                        compatibility_status, mapping_status, sync_status,
+                        vapi_assistant_id, vapi_assistant_version, summary_json,
+                        reviewed_by, last_sync_started_at, last_synced_at,
+                        last_sync_error, created_at, updated_at
+                 FROM vapi_template_mappings WHERE template_id = ? ORDER BY updated_at DESC, id DESC`,
+                [normalizedId],
+                (err, rows) => {
+                    if (err) return reject(err);
+                    resolve((rows || []).map((row) => {
+                        let summary = {};
+                        try { summary = JSON.parse(row.summary_json || "{}"); } catch (_) {}
+                        return { ...row, summary };
+                    }));
+                },
+            );
+        });
+    }
+
+    async getVapiTemplateMappingById(mappingId) {
+        const normalizedId = Number(mappingId);
+        if (!Number.isSafeInteger(normalizedId) || normalizedId <= 0) {
+            throw new Error("A valid Vapi template mapping ID is required");
+        }
+        return new Promise((resolve, reject) => {
+            this.db.get(
+                `SELECT id, template_id, template_version, config_fingerprint,
+                        compatibility_status, mapping_status, sync_status,
+                        vapi_assistant_id, vapi_assistant_version, summary_json,
+                        reviewed_by, last_synced_at, last_sync_error
+                 FROM vapi_template_mappings WHERE id = ?`,
+                [normalizedId],
+                (err, row) => {
+                    if (err) return reject(err);
+                    if (!row) return resolve(null);
+                    let summary = {};
+                    try { summary = JSON.parse(row.summary_json || "{}"); } catch (_) {}
+                    resolve({ ...row, summary });
+                },
+            );
+        });
+    }
+
+    async getVapiCallCampaignByIdempotencyKey(idempotencyKey) {
+        const key = String(idempotencyKey || '').trim();
+        if (!key) return null;
+        return new Promise((resolve, reject) => {
+            this.db.get(
+                `SELECT * FROM vapi_call_campaigns WHERE idempotency_key = ? LIMIT 1`,
+                [key],
+                (err, row) => {
+                    if (err) return reject(err);
+                    resolve(row ? { ...this.normalizeVapiCallCampaignRow(row), request_hash: row.request_hash } : null);
+                },
+            );
+        });
+    }
+
+    async getVapiCallCampaign(campaignId) {
+        const id = String(campaignId || '').trim();
+        if (!/^[0-9a-f-]{36}$/i.test(id)) return null;
+        return new Promise((resolve, reject) => {
+            this.db.get(
+                `SELECT * FROM vapi_call_campaigns WHERE campaign_id = ? LIMIT 1`,
+                [id],
+                (err, row) => {
+                    if (err) return reject(err);
+                    resolve(row ? this.normalizeVapiCallCampaignRow(row) : null);
+                },
+            );
+        });
+    }
+
+    async listVapiCallCampaigns(limit = 50) {
+        const boundedLimit = Math.max(1, Math.min(100, Math.floor(Number(limit) || 50)));
+        return new Promise((resolve, reject) => {
+            this.db.all(
+                `SELECT * FROM vapi_call_campaigns ORDER BY created_at DESC, campaign_id DESC LIMIT ?`,
+                [boundedLimit],
+                (err, rows) => {
+                    if (err) return reject(err);
+                    resolve((rows || []).map((row) => this.normalizeVapiCallCampaignRow(row)));
+                },
+            );
+        });
+    }
+
+    normalizeVapiCallCampaignRow(row) {
+        let callingDays = [];
+        try {
+            const parsed = JSON.parse(row.calling_days_json || '[]');
+            if (Array.isArray(parsed)) callingDays = parsed.filter((day) => Number.isInteger(day) && day >= 1 && day <= 7);
+        } catch (_) {}
+        return {
+            campaign_id: row.campaign_id,
+            name: row.name,
+            provider: row.provider,
+            template_id: Number(row.template_id),
+            template_version: Number(row.template_version),
+            mapping_id: Number(row.mapping_id),
+            phone_number_id: row.phone_number_id,
+            time_zone: row.time_zone,
+            calling_window_start: row.calling_window_start,
+            calling_window_end: row.calling_window_end,
+            calling_days: callingDays,
+            scheduled_start_at: row.scheduled_start_at || null,
+            max_concurrency: Number(row.max_concurrency),
+            max_retries: Number(row.max_retries),
+            retry_delay_minutes: Number(row.retry_delay_minutes),
+            status: row.status,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+        };
+    }
+
+    async insertVapiCallCampaign(campaign = {}) {
+        return new Promise((resolve, reject) => {
+            this.db.run(
+                `INSERT OR IGNORE INTO vapi_call_campaigns (
+                    campaign_id, idempotency_key, request_hash, name, provider,
+                    template_id, template_version, mapping_id, phone_number_id,
+                    time_zone, calling_window_start, calling_window_end, calling_days_json,
+                    scheduled_start_at, max_concurrency, max_retries, retry_delay_minutes, status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft')`,
+                [
+                    campaign.campaign_id, campaign.idempotency_key, campaign.request_hash,
+                    campaign.name, campaign.provider, campaign.template_id, campaign.template_version,
+                    campaign.mapping_id, campaign.phone_number_id, campaign.time_zone,
+                    campaign.calling_window_start, campaign.calling_window_end,
+                    campaign.calling_days_json, campaign.scheduled_start_at,
+                    campaign.max_concurrency, campaign.max_retries, campaign.retry_delay_minutes,
+                ],
+                function (err) {
+                    if (err) return reject(err);
+                    resolve((this.changes || 0) > 0);
+                },
+            );
+        });
+    }
+
+    async listVapiWebCallAssistants() {
+        return new Promise((resolve, reject) => {
+            this.db.all(
+                `SELECT m.id, m.template_id, m.template_version, m.vapi_assistant_id,
+                        t.name AS template_name
+                 FROM vapi_template_mappings m
+                 JOIN call_templates t
+                   ON t.id = m.template_id
+                  AND t.version = m.template_version
+                 WHERE m.compatibility_status = 'compatible'
+                   AND m.mapping_status = 'provisioned'
+                   AND m.sync_status = 'synced'
+                   AND m.vapi_assistant_id IS NOT NULL
+                   AND m.vapi_assistant_id <> ''
+                   AND t.lifecycle_state = 'live'
+                   AND m.id = (
+                       SELECT current_mapping.id
+                       FROM vapi_template_mappings current_mapping
+                       WHERE current_mapping.template_id = m.template_id
+                         AND current_mapping.template_version = m.template_version
+                       ORDER BY current_mapping.updated_at DESC, current_mapping.id DESC
+                       LIMIT 1
+                   )
+                 ORDER BY t.name COLLATE NOCASE, m.template_id, m.id DESC`,
+                [],
+                (err, rows) => {
+                    if (err) return reject(err);
+                    resolve(rows || []);
+                },
+            );
+        });
+    }
+
+    async setVapiInboundAssistantRoute(phoneNumberId, mappingId) {
+        const phoneId = String(phoneNumberId || "").trim();
+        const normalizedMappingId = Number(mappingId);
+        if (!/^[A-Za-z0-9_-]{1,200}$/.test(phoneId)) throw new Error("A valid Vapi phone number ID is required");
+        if (!Number.isSafeInteger(normalizedMappingId) || normalizedMappingId <= 0) throw new Error("A valid Vapi mapping ID is required");
+        const eligible = await new Promise((resolve, reject) => {
+            this.db.get(
+                `SELECT m.id FROM vapi_template_mappings m
+                 JOIN call_templates t ON t.id = m.template_id AND t.version = m.template_version
+                 WHERE m.id = ? AND m.compatibility_status = 'compatible'
+                   AND m.mapping_status = 'provisioned' AND m.sync_status = 'synced'
+                   AND m.vapi_assistant_id IS NOT NULL AND m.vapi_assistant_id <> ''`,
+                [normalizedMappingId],
+                (err, row) => err ? reject(err) : resolve(row || null),
+            );
+        });
+        if (!eligible) throw new Error("Vapi inbound route requires a current synced compatible mapping");
+        return new Promise((resolve, reject) => {
+            this.db.run(
+                `INSERT INTO vapi_inbound_routes (phone_number_id, mapping_id, created_at, updated_at)
+                 VALUES (?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                 ON CONFLICT(phone_number_id) DO UPDATE SET mapping_id = excluded.mapping_id, updated_at = CURRENT_TIMESTAMP`,
+                [phoneId, normalizedMappingId],
+                (err) => err ? reject(err) : resolve({ phone_number_id: phoneId, mapping_id: normalizedMappingId }),
+            );
+        });
+    }
+
+    async getVapiInboundAssistantByPhoneNumberId(phoneNumberId) {
+        const phoneId = String(phoneNumberId || "").trim();
+        if (!/^[A-Za-z0-9_-]{1,200}$/.test(phoneId)) return null;
+        return new Promise((resolve, reject) => {
+            this.db.get(
+                `SELECT m.vapi_assistant_id
+                 FROM vapi_inbound_routes r
+                 JOIN vapi_template_mappings m ON m.id = r.mapping_id
+                 JOIN call_templates t ON t.id = m.template_id AND t.version = m.template_version
+                 WHERE r.phone_number_id = ? AND m.compatibility_status = 'compatible'
+                   AND m.mapping_status = 'provisioned' AND m.sync_status = 'synced'
+                   AND m.vapi_assistant_id IS NOT NULL AND m.vapi_assistant_id <> ''`,
+                [phoneId],
+                (err, row) => err ? reject(err) : resolve(row || null),
+            );
+        });
+    }
+
+    async deleteVapiInboundAssistantRoute(phoneNumberId) {
+        const phoneId = String(phoneNumberId || "").trim();
+        if (!/^[A-Za-z0-9_-]{1,200}$/.test(phoneId)) throw new Error("A valid Vapi phone number ID is required");
+        return new Promise((resolve, reject) => {
+            this.db.run("DELETE FROM vapi_inbound_routes WHERE phone_number_id = ?", [phoneId], function (err) {
+                if (err) return reject(err);
+                resolve({ deleted: this.changes > 0 });
+            });
+        });
+    }
+
+    async claimVapiTemplateSync(templateId, templateVersion, fingerprint) {
+        const params = [Number(templateId), Number(templateVersion), String(fingerprint || "")];
+        return new Promise((resolve, reject) => {
+            this.db.run(
+                `UPDATE vapi_template_mappings
+                 SET sync_status = 'syncing', last_sync_started_at = CURRENT_TIMESTAMP,
+                     last_sync_error = NULL, updated_at = CURRENT_TIMESTAMP
+                 WHERE template_id = ? AND template_version = ? AND config_fingerprint = ?
+                   AND compatibility_status = 'compatible'
+                   AND (sync_status <> 'syncing' OR last_sync_started_at < datetime('now', '-10 minutes'))`,
+                params,
+                function (err) {
+                    if (err) return reject(err);
+                    resolve(this.changes === 1);
+                },
+            );
+        });
+    }
+
+    async completeVapiTemplateSync(mapping = {}) {
+        return new Promise((resolve, reject) => {
+            this.db.run(
+                `UPDATE vapi_template_mappings
+                 SET sync_status = 'synced', mapping_status = 'provisioned',
+                     vapi_assistant_id = ?, vapi_assistant_version = ?,
+                     last_synced_at = CURRENT_TIMESTAMP, last_sync_error = NULL,
+                     updated_at = CURRENT_TIMESTAMP
+                 WHERE template_id = ? AND template_version = ? AND config_fingerprint = ?`,
+                [
+                    String(mapping.vapi_assistant_id || "").trim(),
+                    String(mapping.vapi_assistant_version || "").trim() || null,
+                    Number(mapping.template_id),
+                    Number(mapping.template_version),
+                    String(mapping.config_fingerprint || ""),
+                ],
+                function (err) {
+                    if (err) return reject(err);
+                    resolve(this.changes === 1);
+                },
+            );
+        });
+    }
+
+    async failVapiTemplateSync(mapping = {}) {
+        const status = ["unknown", "failed"].includes(String(mapping.sync_status || ""))
+            ? String(mapping.sync_status)
+            : "failed";
+        return new Promise((resolve, reject) => {
+            this.db.run(
+                `UPDATE vapi_template_mappings
+                 SET sync_status = ?, last_sync_error = ?, updated_at = CURRENT_TIMESTAMP
+                 WHERE template_id = ? AND template_version = ? AND config_fingerprint = ?`,
+                [
+                    status,
+                    String(mapping.error_code || "vapi_sync_failed").slice(0, 100),
+                    Number(mapping.template_id),
+                    Number(mapping.template_version),
+                    String(mapping.config_fingerprint || ""),
+                ],
+                function (err) {
+                    if (err) return reject(err);
+                    resolve(this.changes === 1);
+                },
+            );
+        });
+    }
+
+    async recordVapiCallEvent(event = {}) {
+        const eventKey = String(event.event_key || "").trim();
+        const providerCallId = String(event.provider_call_id || "").trim();
+        const eventType = String(event.event_type || "").trim();
+        if (!eventKey || !providerCallId || !eventType) {
+            throw new Error("Vapi call event requires event key, call ID, and event type");
+        }
+        return new Promise((resolve, reject) => {
+            this.db.run(
+                `INSERT OR IGNORE INTO vapi_call_events (
+                    event_key, provider_call_id, event_type, provider_status, destination_type,
+                    ended_reason, duration_seconds, assistant_id, template_id,
+                    template_version, config_fingerprint, event_timestamp
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                [
+                    eventKey,
+                    providerCallId,
+                    eventType,
+                    event.provider_status || null,
+                    ["number", "sip", "assistant"].includes(String(event.destination_type || "").toLowerCase())
+                        ? String(event.destination_type).toLowerCase()
+                        : null,
+                    event.ended_reason || null,
+                    Number.isFinite(Number(event.duration_seconds)) ? Math.max(0, Math.floor(Number(event.duration_seconds))) : null,
+                    event.assistant_id || null,
+                    Number.isSafeInteger(Number(event.template_id)) && Number(event.template_id) > 0 ? Number(event.template_id) : null,
+                    Number.isSafeInteger(Number(event.template_version)) && Number(event.template_version) > 0 ? Number(event.template_version) : null,
+                    event.config_fingerprint || null,
+                    event.event_timestamp || null,
+                ],
+                function (err) {
+                    if (err) return reject(err);
+                    resolve({ inserted: this.changes > 0 });
+                },
+            );
+        });
+    }
+
+    async listVapiCallEvents(filters = {}) {
+        const templateId = Number(filters.template_id);
+        const callId = String(filters.provider_call_id || "").trim();
+        const limit = Math.max(1, Math.min(500, Math.floor(Number(filters.limit) || 100)));
+        const clauses = [];
+        const params = [];
+        if (Number.isSafeInteger(templateId) && templateId > 0) {
+            clauses.push("template_id = ?");
+            params.push(templateId);
+        }
+        if (callId) {
+            clauses.push("provider_call_id = ?");
+            params.push(callId);
+        }
+        const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
+        params.push(limit);
+        return new Promise((resolve, reject) => {
+            this.db.all(
+                `SELECT id, provider_call_id, event_type, provider_status, destination_type,
+                        ended_reason, duration_seconds, assistant_id, template_id,
+                        template_version, config_fingerprint, event_timestamp, received_at
+                 FROM vapi_call_events ${where} ORDER BY received_at DESC, id DESC LIMIT ?`,
+                params,
+                (err, rows) => {
+                    if (err) return reject(err);
+                    resolve(rows || []);
+                },
+            );
         });
     }
 
@@ -3429,6 +3967,163 @@ class EnhancedDatabase {
         });
     }
 
+    async reserveCallEOutboundCall(payload = {}) {
+        const idempotencyKey = String(payload.idempotency_key || "").trim();
+        const requestHash = String(payload.request_hash || "").trim();
+        const localCallId = String(payload.local_call_id || "").trim();
+        if (!idempotencyKey || !/^[a-f0-9]{64}$/i.test(requestHash) || !/^call_e_[0-9a-f-]{36}$/i.test(localCallId)) {
+            throw new Error("CALL-E call reservation is invalid");
+        }
+        return new Promise((resolve, reject) => {
+            this.db.run(
+                `INSERT OR IGNORE INTO outbound_call_idempotency (
+                    idempotency_key, provider, request_hash, status, response_payload, updated_at
+                ) VALUES (?, 'call_e', ?, 'pending', ?, CURRENT_TIMESTAMP)`,
+                [idempotencyKey, requestHash, JSON.stringify({ localCallId })],
+                function (err) {
+                    if (err) return reject(err);
+                    resolve({ reserved: (this.changes || 0) > 0 });
+                },
+            );
+        });
+    }
+
+    async resetCallERejectedOutboundCall(payload = {}) {
+        const idempotencyKey = String(payload.idempotency_key || "").trim();
+        const requestHash = String(payload.request_hash || "").trim();
+        const localCallId = String(payload.local_call_id || "").trim();
+        if (!idempotencyKey || !/^[a-f0-9]{64}$/i.test(requestHash) || !/^call_e_[0-9a-f-]{36}$/i.test(localCallId)) {
+            throw new Error("CALL-E rejected-call reset is invalid");
+        }
+        return new Promise((resolve, reject) => {
+            this.db.run(
+                `UPDATE outbound_call_idempotency
+                 SET request_hash = ?, call_sid = NULL, status = 'pending',
+                     response_payload = ?, error_message = NULL, updated_at = CURRENT_TIMESTAMP
+                 WHERE idempotency_key = ? AND provider = 'call_e'
+                   AND status = 'failed' AND error_message = 'call_e_no_call_created'`,
+                [requestHash, JSON.stringify({ localCallId }), idempotencyKey],
+                function (err) {
+                    if (err) return reject(err);
+                    resolve({ reset: (this.changes || 0) > 0 });
+                },
+            );
+        });
+    }
+
+    async upsertCallEReconciliationRecord(payload = {}) {
+        const localCallId = String(payload.local_call_id || '').trim();
+        const providerCallId = String(payload.provider_call_id || '').trim() || null;
+        const templateId = Number(payload.template_id);
+        const templateVersion = Number(payload.template_version);
+        const requestHash = String(payload.request_hash || '').trim();
+        const schema = payload.result_schema;
+        if (!/^call_e_[0-9a-f-]{36}$/i.test(localCallId) ||
+            (providerCallId && !/^call_[A-Za-z0-9_-]{1,190}$/.test(providerCallId)) ||
+            !Number.isSafeInteger(templateId) || templateId <= 0 ||
+            !Number.isSafeInteger(templateVersion) || templateVersion <= 0 ||
+            !/^[a-f0-9]{64}$/i.test(requestHash) || !schema || typeof schema !== 'object' || Array.isArray(schema)) {
+            throw new Error('CALL-E reconciliation record is invalid');
+        }
+        const schemaJson = JSON.stringify(schema);
+        if (schemaJson.length > 16000) throw new Error('CALL-E result schema is too large');
+        return new Promise((resolve, reject) => {
+            this.db.run(
+                `INSERT INTO call_e_reconciliation (
+                    local_call_id, provider_call_id, template_id, template_version,
+                    request_hash, result_schema_json, execution_status, call_outcome,
+                    result_status, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(local_call_id) DO UPDATE SET
+                    provider_call_id = COALESCE(excluded.provider_call_id, call_e_reconciliation.provider_call_id),
+                    template_id = excluded.template_id,
+                    template_version = excluded.template_version,
+                    request_hash = excluded.request_hash,
+                    result_schema_json = excluded.result_schema_json,
+                    execution_status = COALESCE(excluded.execution_status, call_e_reconciliation.execution_status),
+                    call_outcome = COALESCE(excluded.call_outcome, call_e_reconciliation.call_outcome),
+                    result_status = COALESCE(excluded.result_status, call_e_reconciliation.result_status),
+                    updated_at = CURRENT_TIMESTAMP`,
+                [localCallId, providerCallId, templateId, templateVersion, requestHash, schemaJson,
+                    payload.execution_status || null, payload.call_outcome || null, payload.result_status || null],
+                function (err) { if (err) return reject(err); resolve({ saved: this.changes > 0 }); },
+            );
+        });
+    }
+
+    async getCallEReconciliationRecord(localCallId) {
+        const id = String(localCallId || '').trim();
+        if (!/^call_e_[0-9a-f-]{36}$/i.test(id)) return null;
+        return new Promise((resolve, reject) => {
+            this.db.get('SELECT * FROM call_e_reconciliation WHERE local_call_id = ?', [id], (err, row) => {
+                if (err) return reject(err);
+                if (!row) return resolve(null);
+                let resultSchema = null;
+                let seenEventIds = [];
+                try { resultSchema = JSON.parse(row.result_schema_json || 'null'); } catch (_) {}
+                try { seenEventIds = JSON.parse(row.seen_event_ids_json || '[]'); } catch (_) {}
+                resolve({ ...row, result_schema: resultSchema, seen_event_ids: Array.isArray(seenEventIds) ? seenEventIds : [] });
+            });
+        });
+    }
+
+    async getCallEReconciliationState(providerCallId) {
+        const id = String(providerCallId || '').trim();
+        if (!/^call_[A-Za-z0-9_-]{1,190}$/.test(id)) return null;
+        return new Promise((resolve, reject) => {
+            this.db.get(
+                `SELECT event_cursor, last_event_id, seen_event_ids_json FROM call_e_reconciliation WHERE provider_call_id = ?`,
+                [id],
+                (err, row) => {
+                    if (err) return reject(err);
+                    if (!row) return resolve(null);
+                    let seenEventIds = [];
+                    try { seenEventIds = JSON.parse(row.seen_event_ids_json || '[]'); } catch (_) {}
+                    resolve({ nextCursor: row.event_cursor || null, lastEventId: row.last_event_id || null, seenEventIds: Array.isArray(seenEventIds) ? seenEventIds : [] });
+                },
+            );
+        });
+    }
+
+    async saveCallEReconciliationState(providerCallId, state = {}) {
+        const id = String(providerCallId || '').trim();
+        const cursor = state.nextCursor == null ? null : String(state.nextCursor);
+        const lastEventId = state.lastEventId == null ? null : String(state.lastEventId);
+        const seen = Array.isArray(state.seenEventIds) ? state.seenEventIds : [];
+        if (!/^call_[A-Za-z0-9_-]{1,190}$/.test(id) ||
+            (cursor && cursor.length > 512) || (lastEventId && lastEventId.length > 200) || seen.length > 500 ||
+            seen.some((eventId) => typeof eventId !== 'string' || eventId.length > 200)) {
+            throw new Error('CALL-E reconciliation cursor is invalid');
+        }
+        return new Promise((resolve, reject) => {
+            this.db.run(
+                `UPDATE call_e_reconciliation SET event_cursor = ?, last_event_id = ?, seen_event_ids_json = ?, updated_at = CURRENT_TIMESTAMP WHERE provider_call_id = ?`,
+                [cursor, lastEventId, JSON.stringify(seen), id],
+                function (err) { if (err) return reject(err); resolve({ saved: this.changes > 0 }); },
+            );
+        });
+    }
+
+    async updateCallEReconciliationSnapshot(localCallId, snapshot = {}) {
+        const id = String(localCallId || '').trim();
+        if (!/^call_e_[0-9a-f-]{36}$/i.test(id)) throw new Error('CALL-E local call ID is invalid');
+        const allowedStatus = new Set(['queued', 'in_progress', 'completed', 'failed', 'canceled']);
+        const allowedOutcome = new Set(['completed', 'no_answer', 'busy', 'declined']);
+        const allowedResultStatus = new Set(['pending', 'available', 'unavailable', 'not_applicable']);
+        if (!allowedStatus.has(snapshot.execution_status) ||
+            !(snapshot.call_outcome == null || allowedOutcome.has(snapshot.call_outcome)) ||
+            !allowedResultStatus.has(snapshot.result_status)) throw new Error('CALL-E lifecycle snapshot is invalid');
+        const errorCode = typeof snapshot.error_code === 'string' && /^[a-z][a-z0-9_]{0,79}$/.test(snapshot.error_code)
+            ? snapshot.error_code : null;
+        return new Promise((resolve, reject) => {
+            this.db.run(
+                `UPDATE call_e_reconciliation SET execution_status = ?, call_outcome = ?, result_status = ?, error_code = ?, updated_at = CURRENT_TIMESTAMP WHERE local_call_id = ?`,
+                [snapshot.execution_status, snapshot.call_outcome || null, snapshot.result_status, errorCode, id],
+                function (err) { if (err) return reject(err); resolve({ saved: this.changes > 0 }); },
+            );
+        });
+    }
+
     async getOutboundCallIdempotency(idempotency_key) {
         const key = String(idempotency_key || '').trim();
         if (!key) return null;
@@ -3446,6 +4141,36 @@ class EnhancedDatabase {
                     resolve(row || null);
                 }
             });
+        });
+    }
+
+    async getVapiOutboundCallByProviderId(providerCallId) {
+        const callId = String(providerCallId || "").trim();
+        if (!callId || callId.length > 200) return null;
+        return new Promise((resolve, reject) => {
+            this.db.get(
+                `SELECT provider, status, call_sid, request_hash, response_payload, created_at, updated_at
+                 FROM outbound_call_idempotency
+                 WHERE provider IN ('vapi', 'vapi_web') AND call_sid = ? AND status = 'completed'
+                 ORDER BY updated_at DESC LIMIT 1`,
+                [callId],
+                (err, row) => {
+                    if (err) return reject(err);
+                    if (!row) return resolve(null);
+                    let result = {};
+                    try { result = JSON.parse(row.response_payload || "{}"); } catch (_) {}
+                    resolve({
+                        provider: row.provider,
+                        provider_call_id: row.call_sid,
+                        status: row.status,
+                        template_id: Number(result.templateId) || null,
+                        template_version: Number(result.templateVersion) || null,
+                        mapping_id: Number(result.mappingId) || null,
+                        created_at: row.created_at,
+                        updated_at: row.updated_at,
+                    });
+                },
+            );
         });
     }
 

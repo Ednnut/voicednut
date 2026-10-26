@@ -631,7 +631,7 @@ function EmailCommandPageContent() {
   const openGuidedEmailRoute = (path: string): void => {
     setActionError('');
     setCallbackResult('');
-    navigate(path);
+    void navigate(path);
   };
 
   if (loading) {

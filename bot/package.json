@@ -7,7 +7,7 @@
     "start": "node .",
     "dev": "nodemon .",
     "setup": "node setup-env.js",
-    "test": "echo \"No tests configured\""
+    "test": "node --test __tests__/*.test.js"
   },
   "dependencies": {
     "@grammyjs/conversations": "^1.2.0",
@@ -23,7 +23,7 @@
     "nodemon": "^3.0.2"
   },
   "engines": {
-    "node": ">=16.0.0"
+    "node": ">=24 <25"
   },
   "keywords": [
     "telegram-bot",

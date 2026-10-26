@@ -249,7 +249,6 @@ export function DashboardModuleNav({
           className={activeModuleId === module.id ? 'is-active' : ''}
           aria-pressed={activeModuleId === module.id}
           aria-current={activeModuleId === module.id ? 'page' : undefined}
-          aria-label={`Open ${module.label} module`}
           aria-keyshortcuts={`Alt+${index + 1}`}
           aria-controls="va-view-stage-root"
           onClick={() => onSelectModule(module.id)}
@@ -403,7 +402,6 @@ export function DashboardBottomNav({
             variant="plain"
             className={`va-bottom-nav-item ${activeModuleId === module.id ? 'is-active' : ''}`}
             aria-current={activeModuleId === module.id ? 'page' : undefined}
-            aria-label={`Open ${module.label} module`}
             aria-keyshortcuts={`Alt+${index + 1}`}
             aria-controls="va-view-stage-root"
             onClick={() => onSelectModule(module.id)}

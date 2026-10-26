@@ -2855,6 +2855,14 @@
   line-height: 1.35;
 }
 
+.va-field-label {
+  display: block;
+  margin-top: 12px;
+  color: var(--tg-theme-hint-color, color-mix(in srgb, var(--va-muted) 82%, white 18%));
+  font-size: var(--app-text-label);
+  font-weight: 650;
+}
+
 .va-textarea {
   min-height: 92px;
   resize: vertical;

@@ -173,7 +173,7 @@ export function MailerPage({ visible, vm }: MailerPageProps) {
             ? mailerDomainHealthDetail
             : 'Audience, content, and deliverability controls are ready for the next send.';
   const openMailerLinkedWorkspace = (moduleId: MailerLinkedWorkspace) => {
-    navigate(moduleRoutePath(moduleId));
+    void navigate(moduleRoutePath(moduleId));
   };
 
   return (

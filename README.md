@@ -375,30 +375,13 @@ cd bot && npm run dev
 
 ### Production Deployment
 
-#### Using PM2
+#### EC2 and PM2
 
-```bash
-npm install -g pm2
+Production deployment is defined in `.github/workflows/main.yml` and uses the API and bot PM2 ecosystem files. CI validates on Node.js 24. The deploy workflow now requires nvm and Node.js 24 on the EC2 host and stops before checkout if the runtime is missing. The host runtime and PM2 process interpreter still need an authorized operator to verify before deployment. See [the Codex toolkit and deployment readiness notes](docs/codex-toolkit.md).
 
-# Start services
-cd api && pm2 start npm --name "voice-api" -- start
-cd bot && pm2 start npm --name "voice-bot" -- start
+#### Docker
 
-# Save configuration
-pm2 save && pm2 startup
-```
-
-#### Using Docker
-
-```dockerfile
-FROM node:16-alpine
-WORKDIR /app
-COPY package*.json ./
-RUN npm install
-COPY . .
-EXPOSE 3000
-CMD ["npm", "start"]
-```
+The repository does not currently define a supported Docker image or Compose deployment. The API and bot are separate packages, and SQLite data requires persistent storage and a tested backup/restore plan. Do not use a generic single-package Dockerfile for production.
 
 ## 🎯 Usage Examples
 

@@ -158,6 +158,15 @@ export function ScriptStudioPage({ visible, vm, initialLane = 'call' }: ScriptSt
   const [callerFlagPhoneInput, setCallerFlagPhoneInput] = useState<string>('');
   const [callerFlagStatusInput, setCallerFlagStatusInput] = useState<string>('blocked');
   const [callerFlagNoteInput, setCallerFlagNoteInput] = useState<string>('');
+  const [callEPhoneInput, setCallEPhoneInput] = useState<string>('');
+  const [callEResultSchemaInput, setCallEResultSchemaInput] = useState<string>(JSON.stringify({
+    type: 'object', additionalProperties: false, required: ['outcome'],
+    properties: { outcome: { type: 'string', description: 'Verified call outcome' } },
+  }, null, 2));
+  const [callEDeploymentStatus, setCallEDeploymentStatus] = useState<Record<string, unknown> | null>(null);
+  const [callEPreview, setCallEPreview] = useState<Record<string, unknown> | null>(null);
+  const [callELocalIdInput, setCallELocalIdInput] = useState<string>('');
+  const [callEReconciliation, setCallEReconciliation] = useState<Record<string, unknown> | null>(null);
   const [personaBuiltin, setPersonaBuiltin] = useState<Array<Record<string, unknown>>>([]);
   const [personaCustom, setPersonaCustom] = useState<Array<Record<string, unknown>>>([]);
 
@@ -910,6 +919,115 @@ export function ScriptStudioPage({ visible, vm, initialLane = 'call' }: ScriptSt
                   Promote Live
                 </UiButton>
               </div>
+              <UiDisclosure
+                title="CALL-E deployment status"
+                subtitle="Check server configuration and rollout availability. This status request never contacts CALL-E."
+                tone={callEDeploymentStatus?.integrationEnabled === true ? 'info' : 'neutral'}
+              >
+                <UiStatePanel compact tone="warning" title="Dispatch unavailable" description="VOICEDNUT has no CALL-E dispatch route. Configuration status does not enable or place calls." />
+                <UiButton
+                  variant="secondary"
+                  disabled={studioBusy.length > 0 || busyAction.length > 0}
+                  onClick={() => {
+                    void (async () => {
+                      const data = await executeStudioAction(DASHBOARD_ACTION_CONTRACTS.CALLE_STATUS, {});
+                      setCallEDeploymentStatus(asRecord(data.status));
+                    })();
+                  }}
+                >
+                  Refresh CALL-E availability
+                </UiButton>
+                {callEDeploymentStatus ? (
+                  <div aria-live="polite">
+                    <p>Integration flag: <strong>{callEDeploymentStatus.integrationEnabled === true ? 'enabled' : 'disabled'}</strong></p>
+                    <p>Provider access readiness: <strong>{callEDeploymentStatus.providerAccessReady === true ? 'ready' : 'disabled or incomplete'}</strong></p>
+                    <p>Destination allowlist: <strong>{callEDeploymentStatus.destinationAllowlistReady === true ? 'configured' : 'empty'}</strong></p>
+                    <p>Local preview: <strong>{callEDeploymentStatus.previewAvailable === true ? 'available' : 'unavailable'}</strong></p>
+                    <p>Call dispatch: <strong>{callEDeploymentStatus.dispatchAvailable === true ? 'available' : 'unavailable'}</strong></p>
+                  </div>
+                ) : (
+                  <UiStatePanel compact tone="info" title="Deployment status not loaded" description="Refresh availability to inspect the server-side flag and configuration state." />
+                )}
+              </UiDisclosure>
+              <UiDisclosure
+                title="CALL-E compatibility preview"
+                subtitle="Build a no-call Calls V2 preview for this saved template version. The destination is masked in the result."
+                tone={callEPreview ? 'info' : 'neutral'}
+              >
+                <UiStatePanel compact tone="warning" title="Preview only" description="This action never places a call. Live CALL-E execution remains disabled until template, account, and policy reviews are complete." />
+                <label className="va-field-label" htmlFor="call-e-preview-phone">Destination in E.164 format</label>
+                <UiInput id="call-e-preview-phone" type="tel" autoComplete="off" placeholder="+15551234567" value={callEPhoneInput} onChange={(event) => setCallEPhoneInput(event.target.value)} />
+                <label className="va-field-label" htmlFor="call-e-preview-schema">Flat scalar result schema (JSON)</label>
+                <UiTextarea id="call-e-preview-schema" value={callEResultSchemaInput} onChange={(event) => setCallEResultSchemaInput(event.target.value)} rows={7} />
+                <UiButton
+                  variant="secondary"
+                  disabled={studioBusy.length > 0 || busyAction.length > 0 || !callEPhoneInput.trim()}
+                  onClick={() => {
+                    let resultSchema: unknown;
+                    try { resultSchema = JSON.parse(callEResultSchemaInput); }
+                    catch { setStudioError('Result schema must be valid JSON.'); setCallEPreview(null); return; }
+                    void (async () => {
+                      const data = await executeStudioAction('callscript.calle_preview', {
+                        id: selectedCallScriptId,
+                        phone: callEPhoneInput.trim(),
+                        result_schema: resultSchema,
+                      });
+                      setCallEPreview(asRecord(data.preview));
+                    })();
+                  }}
+                >
+                  Preview CALL-E mapping
+                </UiButton>
+                {callEPreview ? <pre aria-live="polite">{JSON.stringify(callEPreview, null, 2)}</pre> : null}
+              </UiDisclosure>
+              <UiDisclosure
+                title="CALL-E call status"
+                subtitle="Refresh lifecycle and event metadata for a locally recorded CALL-E call. This never creates or cancels a call."
+                tone={callEReconciliation ? 'info' : 'neutral'}
+              >
+                <label className="va-field-label" htmlFor="call-e-local-id">VOICEDNUT local Call ID</label>
+                <UiInput
+                  id="call-e-local-id"
+                  autoComplete="off"
+                  placeholder="call_e_…"
+                  value={callELocalIdInput}
+                  onChange={(event) => {
+                    setCallELocalIdInput(event.target.value);
+                    setCallEReconciliation(null);
+                  }}
+                />
+                <UiButton
+                  variant="secondary"
+                  disabled={studioBusy.length > 0 || busyAction.length > 0 || !/^call_e_[0-9a-f-]{36}$/i.test(callELocalIdInput.trim())}
+                  onClick={() => {
+                    void (async () => {
+                      const data = await executeStudioAction(DASHBOARD_ACTION_CONTRACTS.CALLE_CALL_RECONCILE, {
+                        local_call_id: callELocalIdInput.trim(),
+                      });
+                      setCallEReconciliation(asRecord(data.result));
+                    })();
+                  }}
+                >
+                  Refresh CALL-E status
+                </UiButton>
+                {callEReconciliation ? (
+                  <div aria-live="polite">
+                    <p>
+                      Execution: <strong>{toText(callEReconciliation.executionStatus, 'unknown')}</strong>
+                      {' · '}Outcome: <strong>{toText(callEReconciliation.callOutcome, 'unknown')}</strong>
+                      {' · '}Result: <strong>{toText(callEReconciliation.resultStatus, 'unknown')}</strong>
+                    </p>
+                    <p className="va-muted">Structured result available: {callEReconciliation.resultAvailable === true ? 'yes' : 'no'}. Transcript and result content are not shown here.</p>
+                    <pre>{JSON.stringify(toRows(callEReconciliation.events).map((item) => ({
+                      id: item.id,
+                      type: item.type,
+                      createdAt: item.createdAt,
+                    })), null, 2)}</pre>
+                  </div>
+                ) : (
+                  <UiStatePanel compact tone="info" title="No status snapshot loaded" description="Enter a local Call ID to fetch normalized state when CALL-E is enabled and the record exists." />
+                )}
+              </UiDisclosure>
               <UiDisclosure
                 title="Simulation preview"
                 subtitle="Use test variables and inspect the resolved output before promoting a script."

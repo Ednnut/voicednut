@@ -42,7 +42,7 @@ export function useDashboardModuleRouteGuards({
     if (visibleModules.length === 0) {
       if (!routeAccessReady) return;
       if (locationPathname !== DASHBOARD_STATIC_ROUTE_CONTRACTS.ROOT) {
-        navigate(DASHBOARD_STATIC_ROUTE_CONTRACTS.ROOT, { replace: true });
+        void navigate(DASHBOARD_STATIC_ROUTE_CONTRACTS.ROOT, { replace: true });
       }
       return;
     }
@@ -50,7 +50,7 @@ export function useDashboardModuleRouteGuards({
     const visibleModuleIds = visibleModules.map((module) => module.id);
     const fallbackPath = resolveWorkspaceRouteFallbackPath(workspaceRoute, visibleModuleIds);
     if (locationPathname !== fallbackPath) {
-      navigate(fallbackPath, { replace: true });
+      void navigate(fallbackPath, { replace: true });
     }
   }, [
     locationPathname,
