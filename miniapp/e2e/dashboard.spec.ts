@@ -55,6 +55,7 @@ test('exposes CALL-E status lookup only after a local call ID is supplied', asyn
     const dispatchBlockers = page.getByRole('list', { name: 'CALL-E dispatch blockers' });
     await expect(dispatchBlockers.getByRole('listitem')).toHaveCount(6);
     await expect(dispatchBlockers).toContainText('Tenant authorization is not wired into CALL-E dispatch');
+    await expect(dispatchBlockers).toContainText('Pilot operator confirmation still needs review and approval');
     await expect(dispatchBlockers).toContainText('Approved consent evidence is not yet recorded and reviewed for a pilot destination');
     await expect(dispatchBlockers).toContainText('The durable one call pilot cap is not connected to dispatch');
     await expect(dispatchBlockers).toContainText('The durable concurrency guard is not connected to dispatch');

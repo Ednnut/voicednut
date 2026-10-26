@@ -522,6 +522,7 @@ export const DASHBOARD_MODULE_WORKFLOW_DETAIL_CONTRACTS: Record<
     confirmationRules: [
       'Draft save, review, and promote-live actions remain explicit operator actions.',
       'Simulation stays a bounded non-mutating verification path.',
+      'CALL-E preview confirmation records the exact reviewed fingerprint and never places a call.',
     ],
     executionActions: [
       'callscript.list',
@@ -530,6 +531,7 @@ export const DASHBOARD_MODULE_WORKFLOW_DETAIL_CONTRACTS: Record<
       'callscript.review',
       'callscript.promote_live',
       'callscript.simulate',
+      'callscript.calle_confirm',
       'persona.list',
       'callerflags.list',
       'callerflags.upsert',
@@ -1128,6 +1130,7 @@ export const DASHBOARD_ACTION_CONTRACTS = {
   CALLSCRIPT_PROMOTE_LIVE: 'callscript.promote_live',
   CALLSCRIPT_SIMULATE: 'callscript.simulate',
   CALLSCRIPT_CALLE_PREVIEW: 'callscript.calle_preview',
+  CALLSCRIPT_CALLE_CONFIRM: 'callscript.calle_confirm',
   CALLE_STATUS: 'calle.status',
   CALLE_CALL_RECONCILE: 'calle.call.reconcile',
   DLQ_CALL_REPLAY: 'dlq.call.replay',
@@ -1281,6 +1284,7 @@ export const DASHBOARD_MODULE_ACTION_CONTRACTS = {
     DASHBOARD_ACTION_CONTRACTS.CALLSCRIPT_PROMOTE_LIVE,
     DASHBOARD_ACTION_CONTRACTS.CALLSCRIPT_SIMULATE,
     DASHBOARD_ACTION_CONTRACTS.CALLSCRIPT_CALLE_PREVIEW,
+    DASHBOARD_ACTION_CONTRACTS.CALLSCRIPT_CALLE_CONFIRM,
     DASHBOARD_ACTION_CONTRACTS.CALLE_STATUS,
     DASHBOARD_ACTION_CONTRACTS.CALLE_CALL_RECONCILE,
   ],
@@ -1398,6 +1402,7 @@ function assertMiniAppParityContracts(): void {
     DASHBOARD_ACTION_CONTRACTS.CALLSCRIPT_PROMOTE_LIVE,
     DASHBOARD_ACTION_CONTRACTS.CALLSCRIPT_SIMULATE,
     DASHBOARD_ACTION_CONTRACTS.CALLSCRIPT_CALLE_PREVIEW,
+    DASHBOARD_ACTION_CONTRACTS.CALLSCRIPT_CALLE_CONFIRM,
     DASHBOARD_ACTION_CONTRACTS.CALLE_STATUS,
     DASHBOARD_ACTION_CONTRACTS.CALLE_CALL_RECONCILE,
   ] as const;

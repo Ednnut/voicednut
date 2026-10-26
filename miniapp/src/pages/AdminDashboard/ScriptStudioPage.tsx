@@ -63,7 +63,7 @@ function toRows(value: unknown): Array<Record<string, unknown>> {
 const CALL_E_DISPATCH_BLOCKER_LABELS: Record<string, string> = {
   dispatch_route_not_implemented: 'Authenticated dispatch route is not implemented',
   dispatch_tenant_authorization_not_wired: 'Tenant authorization is not wired into CALL-E dispatch',
-  operator_confirmation_provenance_not_implemented: 'Operator confirmation provenance is not implemented',
+  pilot_operator_confirmation_review_required: 'Pilot operator confirmation still needs review and approval',
   pilot_consent_evidence_not_reviewed: 'Approved consent evidence is not yet recorded and reviewed for a pilot destination',
   single_call_pilot_cap_not_connected_to_dispatch: 'The durable one call pilot cap is not connected to dispatch',
   concurrency_control_not_connected_to_dispatch: 'The durable concurrency guard is not connected to dispatch',
@@ -174,6 +174,7 @@ export function ScriptStudioPage({ visible, vm, initialLane = 'call' }: ScriptSt
   }, null, 2));
   const [callEDeploymentStatus, setCallEDeploymentStatus] = useState<Record<string, unknown> | null>(null);
   const [callEPreview, setCallEPreview] = useState<Record<string, unknown> | null>(null);
+  const [callEConfirmation, setCallEConfirmation] = useState<Record<string, unknown> | null>(null);
   const [callELocalIdInput, setCallELocalIdInput] = useState<string>('');
   const [callEReconciliation, setCallEReconciliation] = useState<Record<string, unknown> | null>(null);
   const [personaBuiltin, setPersonaBuiltin] = useState<Array<Record<string, unknown>>>([]);
@@ -185,6 +186,11 @@ export function ScriptStudioPage({ visible, vm, initialLane = 'call' }: ScriptSt
   const selectedEmailTemplate = useMemo(() => (
     emailTemplates.find((template) => toText(template.template_id, '') === selectedEmailTemplateId) || null
   ), [emailTemplates, selectedEmailTemplateId, toText]);
+
+  useEffect(() => {
+    setCallEPreview(null);
+    setCallEConfirmation(null);
+  }, [selectedCallScriptId]);
 
   useEffect(() => {
     if (!selectedSmsScript) return;
@@ -975,9 +981,9 @@ export function ScriptStudioPage({ visible, vm, initialLane = 'call' }: ScriptSt
               >
                 <UiStatePanel compact tone="warning" title="Preview only" description="This action never places a call. Live CALL-E execution remains disabled until template, account, and policy reviews are complete." />
                 <label className="va-field-label" htmlFor="call-e-preview-phone">Destination in E.164 format</label>
-                <UiInput id="call-e-preview-phone" type="tel" autoComplete="off" placeholder="+15551234567" value={callEPhoneInput} onChange={(event) => setCallEPhoneInput(event.target.value)} />
+                <UiInput id="call-e-preview-phone" type="tel" autoComplete="off" placeholder="+15551234567" value={callEPhoneInput} onChange={(event) => { setCallEPhoneInput(event.target.value); setCallEPreview(null); setCallEConfirmation(null); }} />
                 <label className="va-field-label" htmlFor="call-e-preview-schema">Flat scalar result schema (JSON)</label>
-                <UiTextarea id="call-e-preview-schema" value={callEResultSchemaInput} onChange={(event) => setCallEResultSchemaInput(event.target.value)} rows={7} />
+                <UiTextarea id="call-e-preview-schema" value={callEResultSchemaInput} onChange={(event) => { setCallEResultSchemaInput(event.target.value); setCallEPreview(null); setCallEConfirmation(null); }} rows={7} />
                 <UiButton
                   variant="secondary"
                   disabled={studioBusy.length > 0 || busyAction.length > 0 || !callEPhoneInput.trim()}
@@ -992,11 +998,40 @@ export function ScriptStudioPage({ visible, vm, initialLane = 'call' }: ScriptSt
                         result_schema: resultSchema,
                       });
                       setCallEPreview(asRecord(data.preview));
+                      setCallEConfirmation(null);
                     })();
                   }}
                 >
                   Preview CALL-E mapping
                 </UiButton>
+                {callEPreview?.compatible === true && typeof callEPreview.fingerprint === 'string' && String(selectedCallScriptLifecycleState).toLowerCase() === 'live' ? (
+                  <div>
+                    <p className="va-muted">Preview destination: {toText(asRecord(callEPreview.requestSummary).phoneMasked, 'masked in preview')} · Version: {toText(asRecord(callEPreview.source).templateVersion, 'unknown')}</p>
+                    <UiButton
+                      variant="secondary"
+                      disabled={studioBusy.length > 0 || busyAction.length > 0 || !selectedCallScriptId || Boolean(callEConfirmation)}
+                      onClick={() => {
+                        let resultSchema: unknown;
+                        try { resultSchema = JSON.parse(callEResultSchemaInput); }
+                        catch { setStudioError('Result schema must be valid JSON.'); return; }
+                        void (async () => {
+                          const data = await executeStudioAction(DASHBOARD_ACTION_CONTRACTS.CALLSCRIPT_CALLE_CONFIRM, {
+                            template_id: Number(selectedCallScriptId),
+                            destination: callEPhoneInput.trim(),
+                            region: asRecord(callEPreview.requestSummary).region,
+                            locale: asRecord(callEPreview.requestSummary).locale,
+                            result_schema: resultSchema,
+                            preview_fingerprint: callEPreview.fingerprint,
+                          });
+                          setCallEConfirmation(asRecord(data).confirmed === true ? asRecord(data) : null);
+                        })();
+                      }}
+                    >
+                      Confirm this preview
+                    </UiButton>
+                    {callEConfirmation ? <UiStatePanel compact tone="success" title="Operator confirmation recorded" description="The exact preview and operator were recorded. No call was placed." /> : null}
+                  </div>
+                ) : null}
                 {callEPreview ? <pre aria-live="polite">{JSON.stringify(callEPreview, null, 2)}</pre> : null}
               </UiDisclosure>
               <UiDisclosure

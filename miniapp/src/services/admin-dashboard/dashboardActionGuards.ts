@@ -156,6 +156,13 @@ const ACTION_GUARDS: Record<string, (payload: Record<string, unknown>) => string
   [DASHBOARD_ACTION_CONTRACTS.CALLSCRIPT_PROMOTE_LIVE]: validateCallScriptIdPayload,
   [DASHBOARD_ACTION_CONTRACTS.CALLSCRIPT_SIMULATE]: validateCallScriptIdPayload,
   [DASHBOARD_ACTION_CONTRACTS.CALLSCRIPT_CALLE_PREVIEW]: validateCallScriptIdPayload,
+  [DASHBOARD_ACTION_CONTRACTS.CALLSCRIPT_CALLE_CONFIRM]: (payload) => {
+    if (!Number.isSafeInteger(Number(payload.template_id)) || Number(payload.template_id) <= 0) return 'template_id is required';
+    if (!isNonEmptyString(payload.destination) || !/^\+[1-9]\d{7,14}$/.test(payload.destination.trim())) return 'destination must be E.164';
+    if (!isNonEmptyString(payload.preview_fingerprint) || !/^[a-f0-9]{64}$/i.test(payload.preview_fingerprint)) return 'preview_fingerprint is required';
+    if (!isRecord(payload.result_schema)) return 'result_schema must be an object';
+    return null;
+  },
   [DASHBOARD_ACTION_CONTRACTS.CALLE_CALL_RECONCILE]: validateCallEReconcilePayload,
   [DASHBOARD_ACTION_CONTRACTS.CALLERFLAGS_UPSERT]: validateCallerFlagsUpsert,
   [DASHBOARD_ACTION_CONTRACTS.SMSSCRIPT_CREATE]: validateSmsScriptCreate,
@@ -327,6 +334,14 @@ const ACTION_POLICIES: Record<string, DashboardActionPolicy> = {
   [DASHBOARD_ACTION_CONTRACTS.CALLSCRIPT_CALLE_PREVIEW]: {
     capability: 'caller_flags_manage',
     risk: 'safe',
+  },
+  [DASHBOARD_ACTION_CONTRACTS.CALLSCRIPT_CALLE_CONFIRM]: {
+    capability: 'caller_flags_manage',
+    risk: 'caution',
+    confirmTitle: 'Record CALL-E operator confirmation',
+    confirmTone: 'warning',
+    confirmConsequence: 'This records your confirmation of the exact preview. It will not place a call.',
+    confirmLabel: 'Record Confirmation',
   },
   [DASHBOARD_ACTION_CONTRACTS.CALLE_STATUS]: {
     capability: 'caller_flags_manage',

@@ -796,6 +796,19 @@ class EnhancedDatabase {
             )`,
             'CREATE INDEX IF NOT EXISTS idx_call_e_business_operator_events_scope ON call_e_business_operator_events(business_id, telegram_id, id DESC)',
 
+            `CREATE TABLE IF NOT EXISTS call_e_operator_confirmation_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                confirmation_key TEXT NOT NULL UNIQUE,
+                request_hash TEXT NOT NULL,
+                business_id TEXT NOT NULL,
+                template_id INTEGER NOT NULL,
+                template_version INTEGER NOT NULL,
+                preview_fingerprint TEXT NOT NULL,
+                recorded_by_telegram_id TEXT NOT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )`,
+            'CREATE INDEX IF NOT EXISTS idx_call_e_operator_confirmation_scope ON call_e_operator_confirmation_events(business_id, template_id, id DESC)',
+
             // Durable idempotency lock/result store for call-script mutations
             `CREATE TABLE IF NOT EXISTS call_script_mutation_idempotency (
                 idempotency_key TEXT PRIMARY KEY,
@@ -4181,6 +4194,44 @@ class EnhancedDatabase {
                 (error, row) => {
                     if (error) return reject(error);
                     resolve(row?.event_type === "access_granted" ? { role: row.role } : null);
+                },
+            );
+        });
+    }
+
+    async recordCallEOperatorConfirmation(input = {}) {
+        const confirmationKey = String(input.confirmation_key || '').trim();
+        const requestHash = String(input.request_hash || '').trim();
+        const businessId = String(input.business_id || '').trim();
+        const templateId = Number(input.template_id);
+        const templateVersion = Number(input.template_version);
+        const fingerprint = String(input.preview_fingerprint || '').trim();
+        const telegramId = String(input.recorded_by_telegram_id || '').trim();
+        if (!/^[A-Za-z0-9._:-]{8,180}$/.test(confirmationKey) || !/^[a-f0-9]{64}$/.test(requestHash) ||
+            !/^[A-Za-z0-9._:-]{1,120}$/.test(businessId) || !Number.isSafeInteger(templateId) || templateId <= 0 ||
+            !Number.isSafeInteger(templateVersion) || templateVersion <= 0 || !/^[a-f0-9]{64}$/.test(fingerprint) ||
+            !/^\d{1,20}$/.test(telegramId)) {
+            throw new Error('CALL-E operator confirmation persistence input is invalid');
+        }
+        const database = this.db;
+        return new Promise((resolve, reject) => {
+            database.run(
+                `INSERT OR IGNORE INTO call_e_operator_confirmation_events (
+                    confirmation_key, request_hash, business_id, template_id, template_version,
+                    preview_fingerprint, recorded_by_telegram_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+                [confirmationKey, requestHash, businessId, templateId, templateVersion, fingerprint, telegramId],
+                function (error) {
+                    if (error) return reject(error);
+                    if (this.changes > 0) return resolve({ recorded: true, replay: false, conflict: false });
+                    database.get(
+                        'SELECT request_hash FROM call_e_operator_confirmation_events WHERE confirmation_key = ?',
+                        [confirmationKey],
+                        (lookupError, row) => {
+                            if (lookupError) return reject(lookupError);
+                            resolve({ recorded: false, replay: row?.request_hash === requestHash, conflict: row?.request_hash !== requestHash });
+                        },
+                    );
                 },
             );
         });

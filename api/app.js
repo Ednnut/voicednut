@@ -104,6 +104,7 @@ const { parseAllowedDestinations } = require("./services/callEOutboundCallServic
 const { CallEReconciliationService, createCallEReconciliationHandler } = require("./services/callEReconciliationService");
 const { CallEContactPolicyService } = require("./services/callEContactPolicyService");
 const { registerCallEContactPolicyRoutes } = require("./services/callEContactPolicyRoutes");
+const { CallEOperatorConfirmationService } = require("./services/callEOperatorConfirmationService");
 const {
   containsCredentialLikeField,
   fingerprintVapiTemplateMapping,
@@ -19499,6 +19500,7 @@ const MINI_APP_SUPPORTED_ACTIONS = Object.freeze([
   "callscript.review",
   "callscript.simulate",
   "callscript.calle_preview",
+  "callscript.calle_confirm",
   "calle.status",
   "calle.call.reconcile",
   "callscript.submit_review",
@@ -19635,6 +19637,8 @@ const MINI_APP_DASHBOARD_MODULE_DEFINITIONS = [
       "callscript.review",
       "callscript.promote_live",
       "callscript.simulate",
+      "callscript.calle_preview",
+      "callscript.calle_confirm",
     ],
     order: 4,
     enabled: true,
@@ -20180,6 +20184,24 @@ function buildMiniAppActionSpec(action, payload = {}) {
         region: input.region,
         locale: input.locale,
         result_schema: input.result_schema,
+      },
+    };
+  }
+
+  if (normalizedAction === "callscript.calle_confirm") {
+    const templateId = Number(input.template_id || input.id);
+    if (!Number.isSafeInteger(templateId) || templateId <= 0) return { error: "Valid script id is required" };
+    return {
+      capability: "caller_flags_manage",
+      method: "POST",
+      path: "/miniapp/action",
+      body: {
+        template_id: templateId,
+        destination: input.destination,
+        region: input.region,
+        locale: input.locale,
+        result_schema: input.result_schema,
+        preview_fingerprint: input.preview_fingerprint,
       },
     };
   }
@@ -21986,6 +22008,35 @@ app.post("/miniapp/action", requireMiniAppSession, async (req, res) => {
   }
   if (!requireMiniAppCapability(req, res, spec.capability)) {
     return;
+  }
+
+  if (action === "callscript.calle_confirm") {
+    try {
+      const result = await new CallEOperatorConfirmationService({
+        db,
+        getTemplate: async (templateId) => normalizeScriptTemplateRecord(await db.getCallTemplateById(templateId)),
+      }).confirm({
+        ...spec.body,
+        confirmation_key: idempotencyKey,
+        recorded_by_telegram_id: String(req.miniAppSession?.telegram_id || "").trim(),
+      });
+      return res.status(result.idempotentReplay ? 200 : 201).json({
+        success: true,
+        action,
+        requested_action: actionResolution.requestedAction,
+        was_aliased: actionResolution.wasAliased,
+        data: result,
+        request_id: req.requestId || null,
+      });
+    } catch (error) {
+      return sendApiError(
+        res,
+        Number(error?.status) || 503,
+        String(error?.code || "call_e_confirmation_unavailable"),
+        error?.message || "CALL-E confirmation failed",
+        req.requestId || null,
+      );
+    }
   }
 
   console.log("miniapp_action_request", {
