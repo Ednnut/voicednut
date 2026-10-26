@@ -115,7 +115,10 @@ class CallEOutboundCallService {
     if (!this.db || typeof this.db.reserveCallEOutboundCall !== "function" ||
         typeof this.db.getOutboundCallIdempotency !== "function" ||
         typeof this.db.completeOutboundCallIdempotency !== "function" ||
-        typeof this.db.resetCallERejectedOutboundCall !== "function") {
+        typeof this.db.resetCallERejectedOutboundCall !== "function" ||
+        typeof this.db.reserveCallEPilotDispatch !== "function" ||
+        typeof this.db.consumeCallEPilotDispatch !== "function" ||
+        typeof this.db.releaseCallEPilotDispatch !== "function") {
       throw callEError("call_e_dependencies_missing", "CALL-E idempotency storage is unavailable", 503);
     }
 
@@ -160,6 +163,25 @@ class CallEOutboundCallService {
       return replay;
     };
     const existing = await this.db.getOutboundCallIdempotency(idempotencyKeyForProvider);
+    let existingReplay = null;
+    if (existing) {
+      const existingResolution = resolveReplay(existing, requestHash);
+      existingReplay = existingResolution.replay || null;
+    }
+    const pilotSlot = await this.db.reserveCallEPilotDispatch({ reservation_key: idempotencyKeyForProvider });
+    if (!pilotSlot?.reserved) {
+      if (pilotSlot?.reason === "pilot_cap_reached") {
+        throw callEError("call_e_pilot_cap_reached", "The single-call CALL-E pilot cap has already been reserved", 409);
+      }
+      throw callEError("call_e_pilot_guard_unavailable", "CALL-E pilot dispatch guard is unavailable", 503);
+    }
+    if (existingReplay) {
+      const consumed = await this.db.consumeCallEPilotDispatch({ reservation_key: idempotencyKeyForProvider });
+      if (!consumed) {
+        throw callEError("call_e_pilot_guard_unavailable", "CALL-E replay exists but the pilot cap state could not be confirmed", 503);
+      }
+      return repairReplayRecord(existingReplay);
+    }
     let localCallId = null;
 
     if (existing) {
@@ -243,18 +265,29 @@ class CallEOutboundCallService {
       call = await this.client.createCall(request, idempotencyKeyForProvider);
     } catch (error) {
       const noCallCreated = error?.noCallCreated === true;
-      await this.db.completeOutboundCallIdempotency({
-        idempotency_key: idempotencyKeyForProvider,
-        provider: "call_e",
-        request_hash: requestHash,
-        status: noCallCreated ? "failed" : "pending",
-        response_payload: { localCallId, requestFingerprint: requestHash },
-        error_message: noCallCreated ? NO_CALL_CREATED_MARKER : "call_e_outcome_unknown",
-      });
+      try {
+        await this.db.completeOutboundCallIdempotency({
+          idempotency_key: idempotencyKeyForProvider,
+          provider: "call_e",
+          request_hash: requestHash,
+          status: noCallCreated ? "failed" : "pending",
+          response_payload: { localCallId, requestFingerprint: requestHash },
+          error_message: noCallCreated ? NO_CALL_CREATED_MARKER : "call_e_outcome_unknown",
+        });
+      } finally {
+        if (noCallCreated) {
+          await this.db.releaseCallEPilotDispatch({ reservation_key: idempotencyKeyForProvider });
+        }
+      }
       if (noCallCreated) {
         throw callEError(String(error?.code || "call_e_request_rejected"), "CALL-E rejected the request before creating a Call", error?.status || 422);
       }
       throw callEError("call_e_call_outcome_unknown", "CALL-E acceptance is uncertain; retry only with the same request and idempotency key", 409);
+    }
+
+    const pilotSlotConsumed = await this.db.consumeCallEPilotDispatch({ reservation_key: idempotencyKeyForProvider });
+    if (!pilotSlotConsumed) {
+      throw callEError("call_e_call_outcome_unknown", "CALL-E accepted a request but the pilot cap state could not be confirmed; reconcile before retrying", 409);
     }
 
     let normalized;

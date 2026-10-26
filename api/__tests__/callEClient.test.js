@@ -29,8 +29,8 @@ describe("CALL-E server client", () => {
         "tenant_scoped_authorization_not_implemented",
         "operator_confirmation_provenance_not_implemented",
         "consent_and_opt_out_controls_not_implemented",
-        "single_call_pilot_cap_not_implemented",
-        "concurrency_control_not_implemented",
+        "single_call_pilot_cap_not_connected_to_dispatch",
+        "concurrency_control_not_connected_to_dispatch",
       ],
     });
     assert.equal(JSON.stringify(disabled).includes("private-test-key"), false);

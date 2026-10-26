@@ -45,9 +45,11 @@ const callResponse = (id = "call_test_123", resultStatus = "pending") => ({
 function createMemoryDb() {
   const rows = new Map();
   const reconciliationRows = new Map();
+  let pilotReservation = null;
   return {
     rows,
     reconciliationRows,
+    get pilotReservation() { return pilotReservation ? { ...pilotReservation } : null; },
     async getOutboundCallIdempotency(key) { return rows.get(key) ? { ...rows.get(key) } : null; },
     async reserveCallEOutboundCall(payload) {
       if (rows.has(payload.idempotency_key)) return { reserved: false };
@@ -69,6 +71,26 @@ function createMemoryDb() {
       row.response_payload = JSON.stringify({ localCallId: payload.local_call_id });
       row.error_message = null;
       return { reset: true };
+    },
+    async reserveCallEPilotDispatch(payload) {
+      if (!pilotReservation) {
+        pilotReservation = { reservation_key: payload.reservation_key, state: "reserved" };
+        return { reserved: true, replay: false, state: "reserved" };
+      }
+      if (pilotReservation.reservation_key !== payload.reservation_key) {
+        return { reserved: false, reason: "pilot_cap_reached" };
+      }
+      return { reserved: true, replay: true, state: pilotReservation.state };
+    },
+    async consumeCallEPilotDispatch(payload) {
+      if (pilotReservation?.reservation_key !== payload.reservation_key) return false;
+      pilotReservation.state = "consumed";
+      return true;
+    },
+    async releaseCallEPilotDispatch(payload) {
+      if (pilotReservation?.reservation_key !== payload.reservation_key || pilotReservation.state !== "reserved") return false;
+      pilotReservation = null;
+      return true;
     },
     async upsertCallEReconciliationRecord(payload) {
       reconciliationRows.set(payload.local_call_id, { ...payload });
@@ -179,6 +201,56 @@ describe("CALL-E outbound call service", () => {
     assert.equal(saved.includes("reminder_received"), false);
     assert.equal(saved.includes("+14155550123"), false);
     assert.equal(saved.includes("private synthetic transcript"), false);
+  });
+
+  it("enforces a single lifetime pilot call while allowing its exact idempotent replay", async () => {
+    const db = createMemoryDb();
+    let creates = 0;
+    const service = new CallEOutboundCallService({
+      db,
+      allowedDestinations: ["+14155550123", "+14155550124"],
+      client: { isConfigured: () => true, async createCall() { creates += 1; return callResponse(); } },
+    });
+    const first = await service.createOutboundCall(createInput());
+    const replay = await service.createOutboundCall(createInput());
+    assert.equal(replay.idempotentReplay, true);
+    assert.equal(replay.localCallId, first.localCallId);
+    await assert.rejects(
+      service.createOutboundCall(createInput({ phone: "+14155550124", idempotencyKey: "reminder:test:0002" })),
+      (error) => error.code === "call_e_pilot_cap_reached" && error.status === 409,
+    );
+    assert.equal(creates, 1);
+    assert.equal(db.pilotReservation.state, "consumed");
+  });
+
+  it("claims the pilot cap when replaying an accepted idempotency row created before the guard", async () => {
+    const db = createMemoryDb();
+    const input = createInput();
+    const idempotencyKey = "voicednut:call-e:reminder:test:0001";
+    const localCallId = "call_e_123e4567-e89b-12d3-a456-426614174000";
+    db.rows.set(idempotencyKey, {
+      idempotency_key: idempotencyKey,
+      provider: "call_e",
+      request_hash: input.confirmedFingerprint,
+      status: "completed",
+      call_sid: "call_test_123",
+      response_payload: JSON.stringify({ localCallId, providerCallId: "call_test_123", status: "queued" }),
+      error_message: null,
+    });
+    let creates = 0;
+    const service = new CallEOutboundCallService({
+      db,
+      allowedDestinations: ["+14155550123", "+14155550124"],
+      client: { isConfigured: () => true, async createCall() { creates += 1; return callResponse(); } },
+    });
+    const replay = await service.createOutboundCall(input);
+    assert.equal(replay.idempotentReplay, true);
+    assert.equal(db.pilotReservation.state, "consumed");
+    await assert.rejects(
+      service.createOutboundCall(createInput({ phone: "+14155550124", idempotencyKey: "reminder:test:0002" })),
+      (error) => error.code === "call_e_pilot_cap_reached",
+    );
+    assert.equal(creates, 0);
   });
 
   it("repairs a missing reconciliation link from an accepted idempotent replay", async () => {
@@ -372,5 +444,39 @@ describe("CALL-E idempotency persistence reuses the existing outbound ledger", (
     assert.equal(row.request_hash, "b".repeat(64));
     assert.equal(row.status, "pending");
     assert.equal(row.error_message, null);
+  });
+
+  it("atomically grants one CALL-E pilot slot across competing idempotency keys", async () => {
+    const keys = [
+      "voicednut:call-e:pilot:attempt:0001",
+      "voicednut:call-e:pilot:attempt:0002",
+    ];
+    const claims = await Promise.all(keys.map((reservation_key) => db.reserveCallEPilotDispatch({ reservation_key })));
+    assert.equal(claims.filter((claim) => claim.reserved).length, 1);
+    const winnerIndex = claims.findIndex((claim) => claim.reserved);
+    const winner = keys[winnerIndex];
+    const loser = keys[1 - winnerIndex];
+    assert.equal((await db.reserveCallEPilotDispatch({ reservation_key: winner })).reserved, true);
+    assert.deepEqual(await db.reserveCallEPilotDispatch({ reservation_key: loser }), {
+      reserved: false,
+      reason: "pilot_cap_reached",
+    });
+    assert.equal(await db.consumeCallEPilotDispatch({ reservation_key: winner }), true);
+    assert.equal(await db.releaseCallEPilotDispatch({ reservation_key: winner }), false);
+    assert.equal((await db.reserveCallEPilotDispatch({ reservation_key: loser })).reserved, false);
+    const state = await db.getCallEPilotDispatchState();
+    assert.equal(state.state, "consumed");
+    assert.equal(typeof state.created_at, "string");
+    assert.equal(typeof state.updated_at, "string");
+  });
+
+  it("releases the lifetime pilot slot only for a confirmed no-call outcome", async () => {
+    const first = "voicednut:call-e:pilot:attempt:0001";
+    const next = "voicednut:call-e:pilot:attempt:0002";
+    assert.equal((await db.reserveCallEPilotDispatch({ reservation_key: first })).reserved, true);
+    assert.equal(await db.releaseCallEPilotDispatch({ reservation_key: first }), true);
+    assert.equal((await db.reserveCallEPilotDispatch({ reservation_key: next })).reserved, true);
+    assert.equal(await db.consumeCallEPilotDispatch({ reservation_key: next }), true);
+    assert.equal(await db.releaseCallEPilotDispatch({ reservation_key: next }), false);
   });
 });

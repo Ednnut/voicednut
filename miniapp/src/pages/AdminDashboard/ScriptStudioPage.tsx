@@ -65,8 +65,8 @@ const CALL_E_DISPATCH_BLOCKER_LABELS: Record<string, string> = {
   tenant_scoped_authorization_not_implemented: 'Tenant scoped authorization is not implemented',
   operator_confirmation_provenance_not_implemented: 'Operator confirmation provenance is not implemented',
   consent_and_opt_out_controls_not_implemented: 'Consent and opt out controls are not implemented',
-  single_call_pilot_cap_not_implemented: 'One call pilot cap is not implemented',
-  concurrency_control_not_implemented: 'Dispatch concurrency control is not implemented',
+  single_call_pilot_cap_not_connected_to_dispatch: 'The durable one call pilot cap is not connected to dispatch',
+  concurrency_control_not_connected_to_dispatch: 'The durable concurrency guard is not connected to dispatch',
 };
 
 function toLifecycleTone(value: unknown): 'info' | 'success' | 'warning' | 'error' {

@@ -757,6 +757,15 @@ class EnhancedDatabase {
                 updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )`,
 
+            // One lifetime CALL-E pilot slot. A different request key cannot replace a reserved or accepted call.
+            `CREATE TABLE IF NOT EXISTS call_e_pilot_dispatch_guard (
+                singleton_id INTEGER PRIMARY KEY CHECK(singleton_id = 1),
+                reservation_key TEXT NOT NULL UNIQUE,
+                state TEXT NOT NULL CHECK(state IN ('reserved', 'consumed')),
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )`,
+
             // Durable idempotency lock/result store for call-script mutations
             `CREATE TABLE IF NOT EXISTS call_script_mutation_idempotency (
                 idempotency_key TEXT PRIMARY KEY,
@@ -3983,6 +3992,82 @@ class EnhancedDatabase {
                 function (err) {
                     if (err) return reject(err);
                     resolve({ reserved: (this.changes || 0) > 0 });
+                },
+            );
+        });
+    }
+
+    async reserveCallEPilotDispatch(payload = {}) {
+        const reservationKey = String(payload.reservation_key || "").trim();
+        if (!/^voicednut:call-e:[A-Za-z0-9._:-]{8,180}$/.test(reservationKey)) {
+            throw new Error("CALL-E pilot reservation key is invalid");
+        }
+        return new Promise((resolve, reject) => {
+            this.db.run(
+                `INSERT OR IGNORE INTO call_e_pilot_dispatch_guard (
+                    singleton_id, reservation_key, state, updated_at
+                ) VALUES (1, ?, 'reserved', CURRENT_TIMESTAMP)`,
+                [reservationKey],
+                (insertError) => {
+                    if (insertError) return reject(insertError);
+                    this.db.get(
+                        `SELECT reservation_key, state FROM call_e_pilot_dispatch_guard WHERE singleton_id = 1`,
+                        [],
+                        (selectError, row) => {
+                            if (selectError) return reject(selectError);
+                            if (!row) return resolve({ reserved: false, reason: "pilot_guard_unavailable" });
+                            if (row.reservation_key !== reservationKey) {
+                                return resolve({ reserved: false, reason: "pilot_cap_reached" });
+                            }
+                            resolve({ reserved: true, replay: true, state: row.state });
+                        },
+                    );
+                },
+            );
+        });
+    }
+
+    async consumeCallEPilotDispatch(payload = {}) {
+        const reservationKey = String(payload.reservation_key || "").trim();
+        if (!/^voicednut:call-e:[A-Za-z0-9._:-]{8,180}$/.test(reservationKey)) return false;
+        return new Promise((resolve, reject) => {
+            this.db.run(
+                `UPDATE call_e_pilot_dispatch_guard
+                 SET state = 'consumed', updated_at = CURRENT_TIMESTAMP
+                 WHERE singleton_id = 1 AND reservation_key = ? AND state IN ('reserved', 'consumed')`,
+                [reservationKey],
+                function (error) {
+                    if (error) return reject(error);
+                    resolve((this.changes || 0) > 0);
+                },
+            );
+        });
+    }
+
+    async releaseCallEPilotDispatch(payload = {}) {
+        const reservationKey = String(payload.reservation_key || "").trim();
+        if (!/^voicednut:call-e:[A-Za-z0-9._:-]{8,180}$/.test(reservationKey)) return false;
+        return new Promise((resolve, reject) => {
+            this.db.run(
+                `DELETE FROM call_e_pilot_dispatch_guard
+                 WHERE singleton_id = 1 AND reservation_key = ? AND state = 'reserved'`,
+                [reservationKey],
+                function (error) {
+                    if (error) return reject(error);
+                    resolve((this.changes || 0) > 0);
+                },
+            );
+        });
+    }
+
+    async getCallEPilotDispatchState() {
+        return new Promise((resolve, reject) => {
+            this.db.get(
+                `SELECT state, created_at, updated_at FROM call_e_pilot_dispatch_guard WHERE singleton_id = 1`,
+                [],
+                (error, row) => {
+                    if (error) return reject(error);
+                    resolve(row ? { ...row } : null);
                 },
             );
         });

@@ -85,7 +85,7 @@ describe("CALL-E offline integration rehearsal", () => {
         };
       },
     };
-    const outbound = new CallEOutboundCallService({ db, client, allowedDestinations: ["+14155550123"] });
+    const outbound = new CallEOutboundCallService({ db, client, allowedDestinations: ["+14155550123", "+14155550124"] });
     const request = {
       template,
       phone: "+14155550123",
@@ -96,6 +96,16 @@ describe("CALL-E offline integration rehearsal", () => {
     const accepted = await outbound.createOutboundCall(request);
     const replay = await outbound.createOutboundCall(request);
     assert.equal(replay.idempotentReplay, true);
+    assert.equal(createRequests, 1);
+    await assert.rejects(outbound.createOutboundCall({
+      ...request,
+      phone: "+14155550124",
+      idempotencyKey: "offline:rehearsal:0002",
+      confirmedFingerprint: previewCallETemplate(template, {
+        phone: "+14155550124",
+        resultSchema,
+      }).fingerprint,
+    }), (error) => error.code === "call_e_pilot_cap_reached");
     assert.equal(createRequests, 1);
 
     const reconciliation = new CallEReconciliationService({ db, client });
