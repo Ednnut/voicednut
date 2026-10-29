@@ -184,6 +184,8 @@ export interface CallScriptRow {
   description?: unknown;
   prompt?: unknown;
   first_message?: unknown;
+  voice_model?: unknown;
+  agent_config?: unknown;
   default_profile?: unknown;
   objective_tags?: unknown;
   flow_type?: unknown;
@@ -419,7 +421,7 @@ export interface DashboardVm {
   setScriptFirstMessageInput: StringStateSetter;
   scriptObjectiveTagsInput: string;
   setScriptObjectiveTagsInput: StringStateSetter;
-  saveCallScriptDraft: () => Promise<void>;
+  saveCallScriptDraft: (agentConfig?: Record<string, unknown> | null, voiceModel?: string | null) => Promise<void>;
   submitCallScriptForReview: () => Promise<void>;
   scriptReviewNoteInput: string;
   setScriptReviewNoteInput: StringStateSetter;

@@ -5,6 +5,8 @@
   "main": "app.js",
   "scripts": {
     "test": "mocha \"__tests__/**/*.test.js\"",
+    "lint": "eslint . --quiet",
+    "test:watch": "mocha --watch \"__tests__/**/*.test.js\"",
     "validate:profiles": "node scripts/validate-profile-packs.js --strict",
     "scaffold:profile": "node scripts/scaffold-profile-pack.js",
     "parity:providers": "node scripts/provider-smoke.js",

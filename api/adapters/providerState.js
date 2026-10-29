@@ -7,7 +7,7 @@ const PROVIDER_CHANNELS = Object.freeze({
 });
 
 const SUPPORTED_PROVIDERS = Object.freeze({
-  [PROVIDER_CHANNELS.CALL]: Object.freeze(["twilio", "plivo", "vonage"]),
+  [PROVIDER_CHANNELS.CALL]: Object.freeze(["twilio", "plivo", "vonage", "call_e"]),
   [PROVIDER_CHANNELS.SMS]: Object.freeze(["twilio", "plivo", "vonage"]),
   [PROVIDER_CHANNELS.EMAIL]: Object.freeze(["sendgrid", "mailgun"]),
 });
@@ -46,7 +46,11 @@ function normalizeProvider(channel, value) {
 
 function resolveInitialProvider(channel) {
   if (channel === PROVIDER_CHANNELS.CALL) {
-    return normalizeProvider(channel, config.platform?.provider || "twilio");
+    const provider = normalizeProvider(channel, config.platform?.provider || "twilio");
+    if (provider === "call_e" && !isCallESelectionReady(config.callE)) {
+      throw new Error("CALL-E cannot be selected until it is enabled, configured, allowlisted, and pilot-approved");
+    }
+    return provider;
   }
   if (channel === PROVIDER_CHANNELS.SMS) {
     return normalizeProvider(
@@ -55,6 +59,19 @@ function resolveInitialProvider(channel) {
     );
   }
   return normalizeProvider(channel, config.email?.provider || "sendgrid");
+}
+
+function isCallESelectionReady(settings = {}) {
+  const fingerprint = String(settings.pilotApprovalFingerprint || "").trim().toLowerCase();
+  const reference = String(settings.pilotApprovalReference || "").trim();
+  const expiresAt = String(settings.pilotApprovalExpiresAt || "").trim();
+  const baseUrl = String(settings.baseUrl || "").replace(/\/+$/, "");
+  return settings.enabled === true && settings.dispatchEnabled === true && Boolean(String(settings.apiKey || "").trim()) &&
+    ["https://api.heycall-e.com", "https://test-api.heycall-e.com"].includes(baseUrl) &&
+    Array.isArray(settings.allowedDestinations) && settings.allowedDestinations.some((value) => /^\+[1-9]\d{7,14}$/.test(String(value))) &&
+    /^[a-f0-9]{64}$/.test(fingerprint) && /^[A-Za-z0-9._:-]{8,180}$/.test(reference) &&
+    /(?:Z|[+-]\d{2}:\d{2})$/i.test(expiresAt) && Number.isFinite(Date.parse(expiresAt)) &&
+    Date.parse(expiresAt) > Date.now() && settings.pilotReadinessReviewed === true;
 }
 
 const activeProviders = {
@@ -78,6 +95,9 @@ function getStoredProvider(channel) {
 function setActiveProvider(channel, provider) {
   const normalizedChannel = normalizeChannel(channel);
   const normalizedProvider = normalizeProvider(normalizedChannel, provider);
+  if (normalizedChannel === PROVIDER_CHANNELS.CALL && normalizedProvider === "call_e" && !isCallESelectionReady(config.callE)) {
+    throw new Error("CALL-E cannot be selected until it is enabled, configured, allowlisted, and pilot-approved");
+  }
   const changed = activeProviders[normalizedChannel] !== normalizedProvider;
   activeProviders[normalizedChannel] = normalizedProvider;
   return {
@@ -90,6 +110,9 @@ function setActiveProvider(channel, provider) {
 function setStoredProvider(channel, provider) {
   const normalizedChannel = normalizeChannel(channel);
   const normalizedProvider = normalizeProvider(normalizedChannel, provider);
+  if (normalizedChannel === PROVIDER_CHANNELS.CALL && normalizedProvider === "call_e" && !isCallESelectionReady(config.callE)) {
+    throw new Error("CALL-E cannot be stored as the selected provider until its pilot gates are ready");
+  }
   const changed = storedProviders[normalizedChannel] !== normalizedProvider;
   storedProviders[normalizedChannel] = normalizedProvider;
   return {
@@ -171,4 +194,5 @@ module.exports = {
   setStoredCallProvider,
   setStoredSmsProvider,
   setStoredEmailProvider,
+  isCallESelectionReady,
 };

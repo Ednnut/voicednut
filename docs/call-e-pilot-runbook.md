@@ -18,6 +18,14 @@ Do not schedule or submit a pilot until every item below has an owner and record
 
 Previewing a template in the Mini App is a no-call check. The Script Designer status lookup and admin reconciliation endpoint only read existing records and do not create a call. Do not treat either as proof that an account, destination, or live dispatch path is ready.
 
+## Webhook contract and trust boundary
+
+The current CALL-E Calls V2 webhook is an unsigned terminal notification. `CALL-E-Event-Id` must match the event envelope's `id`, but this is only a consistency check; CALL-E does not send a signature or signing secret for this contract. The receiver uses the event only to locate a locally linked call, then reads the current snapshot through the authenticated CALL-E API before updating normalized status. It stores only the event/call identifiers and event type, not the submitted webhook payload. Duplicate delivery is acknowledged after reconciliation has completed; pending or unavailable reconciliation is not acknowledged as processed.
+
+Do not use the webhook payload itself to trigger customer-data writes, payments, follow-up calls, or other consequential actions. Such actions require separate authorization and a fresh authoritative read. Keep the receiver behind the app's 10 MiB request-body limit and rate limit, and monitor delivery failures. If CALL-E changes its signature contract, verify the new official contract before changing receiver authentication.
+
+See the current [CALL-E Webhooks guide](https://docs.heycall-e.com/webhooks) and [Calls API](https://docs.heycall-e.com/api-reference/calls). The webhook delivers the final result snapshot once `result_status` is no longer pending and may retry the same event up to six times; this is not the legacy signed-webhook contract.
+
 ## Pilot envelope after all gates pass
 
 - Use the CALL-E test host and a test-compatible key. Keep credentials in the approved runtime secret store; do not place them in Mini App configuration, fixtures, or logs.
@@ -26,6 +34,7 @@ Previewing a template in the Mini App is a no-call check. The Script Designer st
 - Persist the exact immutable request fingerprint and idempotency key before dispatch. After timeout or uncertain acceptance, reconcile or replay only the identical request with that key.
 - Show the masked destination, template/version, task purpose, result fields, and possible charges in the operator confirmation. Changing any input requires a new preview and authorization.
 - Review status, outcome, and result readiness separately. Do not infer success from `status=completed`. Keep provider result/transcript review access limited and do not make downstream business writes from a model result without existing policy and human approval.
+- The Mini App's explicit CALL-E content review action fetches transcript turns and structured results only for a current operator of the call's business. The response is bounded, omitted content is reported, and the provider content is not persisted locally or written to ordinary logs. Treat displayed content as sensitive and use it only for the approved review.
 - Confirm current region and billing details from [CALL-E regions and languages](https://docs.heycall-e.com/guides/regions-and-languages), [Calls API](https://docs.heycall-e.com/api-reference/calls), and [Billing](https://docs.heycall-e.com/billing) before the approved run.
 
 ## Run sequence

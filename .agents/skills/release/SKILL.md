@@ -1,6 +1,6 @@
 ---
 name: release
-description: Perform final VOICEDNUT release readiness, risk, compatibility, verification, and rollback review.
+description: Perform final VOICEDNUT release readiness, risk, compatibility, verification, and rollback review before merge or deploy; also the go/no-go owner for provider pilots (CALL-E NO-GO gates), flag/env changes, migrations in a release, and production-facing documentation accuracy checks.
 ---
 
 ## Workflow

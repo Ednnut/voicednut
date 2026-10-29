@@ -99,6 +99,138 @@ describe("CALL-E event reconciliation", () => {
     assert.equal(storedSnapshots[0].snapshot.result_status, "available");
     await assert.rejects(service.reconcileLocalCall("call_e_123e4567-e89b-12d3-a456-426614174001"), (error) => error.code === "call_e_call_not_found");
   });
+
+  it("cancels only a business-scoped operator call through the task cancellation capability", async () => {
+    const localCallId = "call_e_123e4567-e89b-12d3-a456-426614174000";
+    const resultSchema = { type: "object", additionalProperties: false, required: [], properties: {} };
+    const snapshots = [];
+    const cancelRequests = [];
+    const db = {
+      async getCallEReconciliationRecord(id) {
+        return id === localCallId ? {
+          business_id: "business_1",
+          provider_call_id: callId,
+          result_schema: resultSchema,
+        } : null;
+      },
+      async getCallEBusinessOperator(businessId, telegramId) {
+        return businessId === "business_1" && telegramId === "12345" ? { role: "call_operator" } : null;
+      },
+      async updateCallEReconciliationSnapshot(id, snapshot) { snapshots.push({ id, snapshot }); },
+    };
+    const service = new CallEReconciliationService({
+      db,
+      client: { isConfigured: () => true },
+      cancelTaskCall: async (request) => {
+        cancelRequests.push(request);
+        return {
+          id: request.providerCallId,
+          object: "call",
+          status: "canceled",
+          call_outcome: null,
+          result_status: "not_applicable",
+          result: null,
+          error: null,
+          transcript: [],
+        };
+      },
+    });
+
+    const result = await service.cancelLocalCallForOperator(localCallId, "12345");
+    assert.equal(result.executionStatus, "canceled");
+    assert.equal(result.resultStatus, "not_applicable");
+    assert.equal("transcript" in result, false);
+    assert.deepEqual(cancelRequests, [{ providerCallId: callId }]);
+    assert.equal(snapshots[0].id, localCallId);
+    assert.equal(snapshots[0].snapshot.execution_status, "canceled");
+    await assert.rejects(service.cancelLocalCallForOperator(localCallId, "99999"), (error) => error.code === "call_e_call_not_found");
+    assert.equal(cancelRequests.length, 1);
+  });
+
+  it("returns bounded transcript and schema-validated result only to a current business operator", async () => {
+    const localCallId = "call_e_123e4567-e89b-12d3-a456-426614174000";
+    const resultSchema = { type: "object", additionalProperties: false, required: ["outcome"], properties: { outcome: { type: "string" } } };
+    let providerReads = 0;
+    const db = {
+      async getCallEReconciliationRecord(id) {
+        return id === localCallId ? { business_id: "business_1", provider_call_id: callId, result_schema: resultSchema } : null;
+      },
+      async getCallEBusinessOperator(businessId, telegramId) {
+        return businessId === "business_1" && telegramId === "12345" ? { role: "call_operator" } : null;
+      },
+    };
+    const service = new CallEReconciliationService({
+      db,
+      client: { isConfigured: () => true },
+      providerRegistry: {
+        async getCall(provider, request) {
+          providerReads += 1;
+          assert.equal(provider, "call_e");
+          assert.equal(request.providerCallId, callId);
+          return {
+            id: callId,
+            object: "call",
+            status: "completed",
+            call_outcome: "completed",
+            result_status: "available",
+            result: { outcome: "confirmed" },
+            transcript: [{ offset_seconds: 1.5, speaker: "user", text: "private transcript" }],
+            error: null,
+          };
+        },
+      },
+    });
+
+    await assert.rejects(service.reviewLocalCallForOperator(localCallId, "99999"), (error) => error.code === "call_e_call_not_found");
+    assert.equal(providerReads, 0);
+    const review = await service.reviewLocalCallForOperator(localCallId, "12345");
+    assert.deepEqual(review.result, { outcome: "confirmed" });
+    assert.deepEqual(review.transcript, [{ offsetSeconds: 1.5, speaker: "user", text: "private transcript" }]);
+    assert.equal(review.executionStatus, "completed");
+    assert.equal("providerCallId" in review, false);
+  });
+
+  it("caps private review payloads without returning partial structured results", async () => {
+    const localCallId = "call_e_123e4567-e89b-12d3-a456-426614174000";
+    const db = {
+      async getCallEReconciliationRecord() {
+        return {
+          business_id: "business_1",
+          provider_call_id: callId,
+          result_schema: { type: "object", additionalProperties: false, required: ["note"], properties: { note: { type: "string" } } },
+        };
+      },
+      async getCallEBusinessOperator() { return { role: "policy_manager" }; },
+    };
+    const service = new CallEReconciliationService({
+      db,
+      client: { isConfigured: () => true },
+      providerRegistry: {
+        async getCall() {
+          return {
+            id: callId,
+            object: "call",
+            status: "completed",
+            call_outcome: "completed",
+            result_status: "available",
+            result: { note: "r".repeat(25000) },
+            transcript: Array.from({ length: 205 }, (_, index) => ({
+              offset_seconds: index,
+              speaker: "user",
+              text: "t".repeat(1400),
+            })),
+            error: null,
+          };
+        },
+      },
+    });
+    const review = await service.reviewLocalCallForOperator(localCallId, "12345");
+    assert.equal(review.result, null);
+    assert.equal(review.resultOmittedForSize, true);
+    assert.equal(review.transcriptTruncated, true);
+    assert.ok(review.transcript.length <= 200);
+    assert.ok(review.transcript.reduce((total, turn) => total + turn.text.length, 0) <= 30000);
+  });
 });
 
 describe("CALL-E additive reconciliation persistence", () => {

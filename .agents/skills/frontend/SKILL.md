@@ -1,6 +1,6 @@
 ---
 name: frontend
-description: Create or safely refactor VOICEDNUT Mini App pages, features, components, data flows, or responsive behavior.
+description: Create or safely refactor VOICEDNUT Mini App (miniapp/) pages, React 18 + TypeScript + Vite features, Telegram UI components, routing, admin dashboard and Script Studio flows, API data fetching/action-bridge calls, contracts and payload guards, or responsive behavior.
 ---
 
 ## Workflow

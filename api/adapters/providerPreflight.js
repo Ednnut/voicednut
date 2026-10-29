@@ -16,6 +16,7 @@ const {
   createSquarePaymentService,
 } = require("../services/squarePaymentService");
 const { runWithTimeout } = require("../utils/asyncControl");
+const { isCallESelectionReady } = require("./providerState");
 
 const CHECK_STATUS = Object.freeze({
   PASS: "pass",
@@ -25,13 +26,20 @@ const CHECK_STATUS = Object.freeze({
 });
 
 const SUPPORTED_PROVIDER_PREFLIGHT_CHANNELS = Object.freeze({
-  call: Object.freeze(["twilio", "plivo", "vonage"]),
+  call: Object.freeze(["twilio", "plivo", "vonage", "call_e"]),
   sms: Object.freeze(["twilio", "plivo", "vonage"]),
   payment: Object.freeze(["paypal", "stripe", "square"]),
 });
 
 const REQUIRED_ROUTE_GROUPS = Object.freeze({
   call: Object.freeze({
+    call_e: Object.freeze([
+      Object.freeze({
+        id: "call_e_terminal_webhook",
+        label: "CALL-E terminal result webhook route",
+        anyOf: Object.freeze([Object.freeze({ method: "POST", path: "/api/webhooks/call-e" })]),
+      }),
+    ]),
     twilio: Object.freeze([
       Object.freeze({
         id: "twilio_incoming",
@@ -527,6 +535,15 @@ function buildSquareCallbackUrls(channel, config, options = {}) {
 
 function buildProviderCallbackUrls(provider, channel, config, options = {}) {
   const normalizedProvider = normalizeProvider(provider);
+  if (normalizedProvider === "call_e") {
+    const webhookUrl = String(config?.callE?.webhookUrl || "").trim();
+    return {
+      host: "",
+      base_url: "",
+      urls: webhookUrl ? [webhookUrl] : [],
+      reason: null,
+    };
+  }
   if (normalizedProvider === "twilio") {
     return buildTwilioCallbackUrls(channel, config, options);
   }
@@ -779,6 +796,37 @@ async function runPlivoCredentialCheck(channel, config) {
   };
 }
 
+function runCallECredentialCheck(config) {
+  const settings = config?.callE || {};
+  const missing = [];
+  if (settings.enabled !== true) missing.push("CALLE_ENABLED=true");
+  if (settings.dispatchEnabled !== true) missing.push("CALLE_DISPATCH_ENABLED=true");
+  if (!String(settings.apiKey || "").trim()) missing.push("CALLE_API_KEY");
+  const baseUrl = String(settings.baseUrl || "").replace(/\/$/, "");
+  if (!["https://api.heycall-e.com", "https://test-api.heycall-e.com"].includes(baseUrl)) {
+    missing.push("CALLE_BASE_URL (official production or test host)");
+  }
+  const destinations = Array.isArray(settings.allowedDestinations) ? settings.allowedDestinations : [];
+  if (!destinations.some((value) => /^\+[1-9]\d{7,14}$/.test(String(value).trim()))) {
+    missing.push("CALLE_ALLOWED_DESTINATIONS (at least one E.164 number)");
+  }
+  if (settings.pilotReadinessReviewed !== true) missing.push("CALLE_PILOT_READINESS_REVIEWED=true");
+  if (!isCallESelectionReady(settings)) missing.push("current exact-preview pilot approval");
+  if (missing.length) {
+    const uniqueMissing = [...new Set(missing)];
+    return {
+      status: CHECK_STATUS.FAIL,
+      reason: `CALL-E is not ready for selection: ${uniqueMissing.join(", ")}`,
+      suggestedFix: "Complete the server-side CALL-E pilot gates; preflight did not contact CALL-E.",
+      details: { missing: uniqueMissing, network_probe: "not_performed" },
+    };
+  }
+  return {
+    status: CHECK_STATUS.PASS,
+    details: { configuration: "valid", network_probe: "not_performed", dispatch_mode: "single_target_task" },
+  };
+}
+
 async function runPaypalCredentialCheck(channel, config, options = {}) {
   const paypalConfig = config?.payment?.paypal || {};
   const missing = [];
@@ -982,6 +1030,23 @@ async function runSquareCredentialCheck(channel, config, options = {}) {
 function runWebhookAuthCheck(provider, channel, config, options = {}) {
   const normalizedProvider = normalizeProvider(provider);
   const normalizedChannel = normalizeChannel(channel);
+  if (normalizedProvider === "call_e") {
+    if (options?.guards?.call_e !== true) {
+      return {
+        status: CHECK_STATUS.FAIL,
+        reason: "CALL-E unsigned webhook handling is not wired",
+        suggestedFix: "Verify events through the authenticated Calls API before trusting state.",
+      };
+    }
+    return {
+      status: CHECK_STATUS.PASS,
+      details: {
+        validation_mode: "unsigned_notification_authenticated_read_required",
+        event_id_header_is_not_a_signature: true,
+        channel: normalizedChannel,
+      },
+    };
+  }
   if (normalizedProvider === "twilio") {
     const mode = String(config?.twilio?.webhookValidation || "warn").toLowerCase();
     if (mode === "off") {
@@ -1182,6 +1247,32 @@ async function runCallbackUrlCheck(provider, channel, config, options = {}) {
     hostOverride: options.hostOverride,
   });
 
+  if (normalizeProvider(provider) === "call_e" && callbacks.urls.length === 0) {
+    return {
+      status: CHECK_STATUS.WARN,
+      reason: "CALL-E webhook_url is optional; use authenticated reconciliation when no webhook is configured.",
+      details: { delivery_mode: "bounded_reconciliation" },
+    };
+  }
+
+  if (normalizeProvider(provider) === "call_e") {
+    const invalidWebhookUrls = callbacks.urls.filter((value) => {
+      try {
+        const parsed = new URL(value);
+        return parsed.protocol !== "https:" || !parsed.hostname || parsed.username || parsed.password || parsed.search || parsed.hash;
+      } catch {
+        return true;
+      }
+    });
+    if (invalidWebhookUrls.length) {
+      return {
+        status: CHECK_STATUS.FAIL,
+        reason: "CALLE_WEBHOOK_URL must be a public HTTPS URL without credentials, query parameters, or a fragment.",
+        suggestedFix: "Configure the fixed CALL-E webhook URL or leave it unset to use reconciliation.",
+      };
+    }
+  }
+
   if (callbacks.reason && callbacks.urls.length === 0) {
     return {
       status: CHECK_STATUS.FAIL,
@@ -1371,6 +1462,9 @@ async function runProviderPreflight(options = {}) {
       }
       if (provider === "plivo") {
         return runPlivoCredentialCheck(channel, config);
+      }
+      if (provider === "call_e") {
+        return runCallECredentialCheck(config);
       }
       if (provider === "vonage") {
         return runVonageCredentialCheck(channel, config, {

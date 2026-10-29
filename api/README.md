@@ -231,6 +231,8 @@ Operational email controls:
 
 ## Post-Call Automation and CRM Sync
 
+Automation run results include an ordered `steps` audit with pending, running, completed, or failed states, persisted in the existing run record. A retry skips previously completed steps. Manual retry is limited to failed email steps using the same per-step idempotency key; an interrupted running step or a failed CRM/ticket action is treated as ambiguous and requires operator review before replay. Older runs without a step audit are blocked from retry when they contain actions that may not be safe to replay.
+
 Post-call automation rules can now be seeded with the default payment receipt, missed-booking follow-up, and escalation case summary workflows. Runs store the original payload so failed automations can be inspected and retried safely.
 
 Manual API controls:
@@ -242,8 +244,16 @@ Manual API controls:
 - `POST /post-call/automation/run` evaluates and executes matching rules.
 - `GET /post-call/automation/runs` lists stored runs by `call_sid`, `rule_id`, `status`, `trigger_event`, or `retry_of_run_id`.
 - `POST /post-call/automation/runs/:run_id/retry` retries a failed run with stable action idempotency.
+- `GET /post-call/workflows` lists versioned workflow definitions (admin token required).
+- `GET /post-call/workflows/:workflow_id/versions` lists all versions for a workflow (admin token required).
+- `POST /post-call/workflows` stores a validated draft as the next immutable version (admin token required).
+- `POST /post-call/workflows/:workflow_id/versions/:version/approve` approves a draft version (admin token required).
 - `POST /crm/contact-sync` syncs a contact plus post-call note.
 - `POST /crm/contact-sync/health` checks whether the configured CRM provider can run in native mode.
+
+Workflow definitions use schema version 1 and are stored separately from currently executing automation rules. Branches must form an acyclic, reachable graph; wait steps are bounded to a 30-day total; action types are restricted to the existing email, CRM sync, and ticket actions; credential-shaped fields are rejected. Approval records review state only: approved definitions are not published or executed by this API.
+
+These endpoints use the repository's shared admin-token authorization. Approval records the `admin_token` principal label, not an individual admin identity, and definitions are not tenant-scoped; retain them as internal admin-only controls until identity and tenant ownership are available.
 
 CRM provider environment:
 

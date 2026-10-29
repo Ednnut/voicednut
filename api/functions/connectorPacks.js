@@ -2041,7 +2041,6 @@ function buildConnectorPackImplementations(options = {}) {
         managed?.ok === true
           ? { status: "ok", connector_mode: "managed", ...managed.data }
           : {
-              status: "ok",
               connector_mode: "stub",
               order_id: orderId,
               status: "in_transit",

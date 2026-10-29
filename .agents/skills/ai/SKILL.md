@@ -1,6 +1,6 @@
 ---
 name: ai
-description: Design or improve VOICEDNUT AI agents, prompts, tools, routing, memory, workforce behavior, evaluations, or safety controls.
+description: Design or improve VOICEDNUT AI features — voice-agent templates and prompts, Deepgram/Vapi model configs, agent routing and workforce behavior, post-call automation and QA services, tool policies, memory boundaries, offline evaluations, and AI safety/refusal controls.
 ---
 
 ## Workflow

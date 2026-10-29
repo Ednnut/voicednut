@@ -355,6 +355,40 @@ describe("CALL-E outbound call service", () => {
     assert.equal(recovered.providerCallId, "call_test_123");
   });
 
+  it("pins the configured webhook URL into same-key create recovery", async () => {
+    const db = createMemoryDb();
+    const requests = [];
+    const env = { CALLE_WEBHOOK_URL: "https://voice.example.test/api/webhooks/call-e" };
+    const client = {
+      isConfigured: () => true,
+      async createCall(request, key) {
+        requests.push({ request, key });
+        if (requests.length === 1) throw Object.assign(new Error("timeout"), { code: "call_e_timeout" });
+        return callResponse();
+      },
+    };
+    const service = new CallEOutboundCallService({ client, db, env, allowedDestinations: ["+14155550123"] });
+    await assert.rejects(service.createOutboundCall(createInput()), (error) => error.code === "call_e_call_outcome_unknown");
+    const pendingPayload = JSON.stringify([...db.rows.values()][0].response_payload);
+    assert.equal(pendingPayload.includes("webhookUrl"), true);
+    env.CALLE_WEBHOOK_URL = "https://voice.example.test/new-webhook-path";
+    await service.createOutboundCall(createInput());
+    assert.equal(requests[0].request.webhook_url, "https://voice.example.test/api/webhooks/call-e");
+    assert.deepEqual(requests[0].request, requests[1].request);
+  });
+
+  it("rejects unsafe configured webhook URLs before reserving a call", async () => {
+    const db = createMemoryDb();
+    const service = new CallEOutboundCallService({
+      db,
+      env: { CALLE_WEBHOOK_URL: "http://voice.example.test/webhook" },
+      allowedDestinations: ["+14155550123"],
+      client: { isConfigured: () => true, async createCall() { throw new Error("must not call provider"); } },
+    });
+    await assert.rejects(service.createOutboundCall(createInput()), (error) => error.code === "call_e_webhook_url_invalid");
+    assert.equal(db.rows.size, 0);
+  });
+
   it("allows a corrected request with the same key only after explicit pre-acceptance rejection", async () => {
     const db = createMemoryDb();
     const calls = [];

@@ -935,7 +935,7 @@ class EnhancedWebhookService {
           this.clearNoResponseTimer(call_sid);
           break;
 
-        case 'completed':
+        case 'completed': {
           callTiming.completed = new Date();
           this.clearNoResponseTimer(call_sid);
 
@@ -971,6 +971,7 @@ class EnhancedWebhookService {
             console.error('Failed to append digit summary:', error);
           }
           break;
+        }
         case 'voicemail':
           this.clearNoResponseTimer(call_sid);
           message = this.buildStatusBubble('voicemail', victimName, {
@@ -994,6 +995,7 @@ class EnhancedWebhookService {
 
         case 'no-answer':
         case 'no_answer':
+          {
           message = this.buildStatusBubble('no-answer', victimName, { voicemailDetected });
           this.clearNoResponseTimer(call_sid);
 
@@ -1027,6 +1029,7 @@ class EnhancedWebhookService {
 
           console.log(`📞 No-answer notification: ${message}`);
           break;
+          }
 
         case 'failed':
           message = this.buildStatusBubble('failed', victimName, { errorMsg: additionalData.error || additionalData.error_message });
@@ -1299,12 +1302,14 @@ class EnhancedWebhookService {
           success = await this.sendCallStatusUpdate(call_sid, 'in-progress', telegram_chat_id, { status_source: 'provider' });
           break;
         case 'call_completed':
+          {
           const callDetails = await this.db.getCall(call_sid);
           success = await this.sendCallStatusUpdate(call_sid, 'completed', telegram_chat_id, { 
             duration: callDetails?.duration,
             status_source: 'provider'
           });
           break;
+          }
         case 'call_recap':
           // Deprecated: recap options should not be pushed in status notifications
           success = true;
@@ -1318,17 +1323,20 @@ class EnhancedWebhookService {
           break;
         }
         case 'call_failed':
+          {
           const failedCall = await this.db.getCall(call_sid);
           success = await this.sendCallStatusUpdate(call_sid, 'failed', telegram_chat_id, { 
             error_message: failedCall?.error_message,
             status_source: 'provider'
           });
           break;
+          }
         case 'call_busy':
           success = await this.sendCallStatusUpdate(call_sid, 'busy', telegram_chat_id, { status_source: 'provider' });
           break;
         case 'call_no_answer':
         case 'call_no-answer':
+          {
           const noAnswerCall = await this.db.getCall(call_sid);
           success = await this.sendCallStatusUpdate(call_sid, 'no-answer', telegram_chat_id, {
             ring_duration: noAnswerCall?.ring_duration,
@@ -1337,6 +1345,7 @@ class EnhancedWebhookService {
             status_source: 'provider'
           });
           break;
+          }
         case 'call_voicemail': {
           const voicemailCall = await this.db.getCall(call_sid);
           success = await this.sendCallStatusUpdate(call_sid, 'no-answer', telegram_chat_id, {

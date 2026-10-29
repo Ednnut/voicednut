@@ -36,6 +36,10 @@ const PROVIDER_FLOW_REGISTRY = Object.freeze({
         "voice_stream",
       ]),
     }),
+    call_e: Object.freeze({
+      label: "CALL-E Task Calls",
+      flows: Object.freeze(["outbound_task"]),
+    }),
   }),
   [PROVIDER_CHANNELS.SMS]: Object.freeze({
     twilio: Object.freeze({
@@ -124,6 +128,13 @@ const CALL_STATUS_MAP = Object.freeze({
     canceled: "canceled",
     cancelled: "canceled",
     rejected: "canceled",
+  }),
+  call_e: Object.freeze({
+    queued: "queued",
+    in_progress: "in-progress",
+    completed: "completed",
+    failed: "failed",
+    canceled: "canceled",
   }),
 });
 
@@ -268,7 +279,7 @@ function resolveProviderExecutionOrder(options = {}) {
       });
       return;
     }
-    if (failoverEnabled && typeof isProviderDegraded === "function") {
+    if (typeof isProviderDegraded === "function") {
       const degradedState = isProviderDegraded(provider) === true;
       if (degradedState) {
         degraded.push({ provider, score, index });
@@ -287,7 +298,7 @@ function resolveProviderExecutionOrder(options = {}) {
     return Number(left?.index || 0) - Number(right?.index || 0);
   };
 
-  healthy.sort(sortByScoreThenOrder);
+  if (failoverEnabled) healthy.sort(sortByScoreThenOrder);
   degraded.sort(sortByScoreThenOrder);
 
   const healthyProviders = healthy.map((entry) => entry.provider);
@@ -299,9 +310,14 @@ function resolveProviderExecutionOrder(options = {}) {
     providerScores[entry.provider] = entry.score;
   });
 
-  const attemptOrder = healthyProviders.length > 0
-    ? [...healthyProviders, ...degradedProviders]
-    : [...degradedProviders];
+  // An open circuit is excluded from routing until its cooldown transitions it
+  // to half-open. A degraded provider is diagnostic state, not a fallback tier.
+  const preferred = normalizeProviderName(preferredProvider);
+  const attemptOrder = failoverEnabled
+    ? healthyProviders
+    : healthyProviders.includes(preferred)
+      ? [preferred]
+      : [];
 
   return {
     channel: normalizedChannel,
@@ -407,6 +423,13 @@ function toCanonicalCallStatus(provider, status) {
   const normalizedStatus = normalizeCallStatusValue(status);
   const providerMap = CALL_STATUS_MAP[normalizedProvider] || {};
   return providerMap[normalizedStatus] || normalizedStatus || null;
+}
+
+function classifyProviderSubmissionState(statusCode) {
+  const status = Number(statusCode);
+  return Number.isInteger(status) && status >= 400 && status < 500 && status !== 408
+    ? "rejected"
+    : "unknown";
 }
 
 function notificationTypeForCallStatus(status) {
@@ -742,6 +765,7 @@ module.exports = {
   resolveProviderExecutionOrder,
   resolvePaymentExecutionMode,
   toCanonicalCallStatus,
+  classifyProviderSubmissionState,
   notificationTypeForCallStatus,
   buildCanonicalCallStatusEvent,
   normalizeSmsStatus,

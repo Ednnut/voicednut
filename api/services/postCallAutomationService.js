@@ -247,6 +247,11 @@ function buildIdempotencyKey(ruleId, payload = {}, triggerEvent) {
   return `postcall:${ruleId}:${triggerEvent}:${source}`;
 }
 
+function safeAutomationErrorCode(error) {
+  const code = String(error?.code || "").trim().toLowerCase();
+  return /^[a-z][a-z0-9_]{0,79}$/.test(code) ? code : "action_failed";
+}
+
 class PostCallAutomationService {
   constructor(options = {}) {
     this.db = options.db || null;
@@ -449,6 +454,13 @@ class PostCallAutomationService {
       error.code = "conflict";
       throw error;
     }
+    const originalResult = safeObject(originalRun.result);
+    const originalSteps = safeArray(originalResult.steps);
+    if (originalSteps.some((step) => step?.status === "running")) {
+      const error = new Error("A workflow step may have completed before interruption; inspect the run before retrying");
+      error.code = "conflict";
+      throw error;
+    }
     if (!this.db || typeof this.db.getPostCallAutomationRule !== "function") {
       const error = new Error("Post-call automation rule persistence is not available");
       error.code = "service_unavailable";
@@ -459,6 +471,31 @@ class PostCallAutomationService {
       const error = new Error("Post-call automation rule for retry was not found");
       error.code = "not_found";
       throw error;
+    }
+    const actionSnapshot = safeArray(originalRun.actions);
+    const retryActions = actionSnapshot.length ? actionSnapshot : rule.actions;
+    const failedSteps = originalSteps.filter((step) => step?.status === "failed");
+    const unsafeFailedStep = failedSteps.find((step) => {
+      const action = retryActions[Number(step.index)];
+      return !["send_email", "email"].includes(action?.type);
+    });
+    if (unsafeFailedStep) {
+      const error = new Error("The failed workflow step is not safe to replay automatically; review its external outcome first");
+      error.code = "conflict";
+      throw error;
+    }
+    if (!originalSteps.length && retryActions.some((action) => !["send_email", "email"].includes(action?.type))) {
+      const error = new Error("This run has no step audit and contains actions that may not be safe to replay; review its external outcome first");
+      error.code = "conflict";
+      throw error;
+    }
+    const completedStepResults = {};
+    for (const step of originalSteps) {
+      if (step?.status !== "completed") continue;
+      const index = Number(step.index);
+      if (Number.isSafeInteger(index) && index >= 0) {
+        completedStepResults[index] = originalResult.actions?.[index] ?? null;
+      }
     }
     const payload = {
       ...safeObject(originalRun.payload),
@@ -472,11 +509,12 @@ class PostCallAutomationService {
       normalizeText(originalRun.idempotency_key, 240).replace(/:retry:.+$/i, "");
     const retrySuffix = crypto.randomBytes(4).toString("hex");
     const retryRunKey = `${baseIdempotencyKey || `postcall:${rule.rule_id}:${triggerEvent}:${originalRun.run_id}`}:retry:${Date.now()}:${retrySuffix}`;
-    const run = await this.runRule(rule, payload, context, triggerEvent, {
+    const run = await this.runRule({ ...rule, actions: retryActions }, payload, context, triggerEvent, {
       retryOfRunId: originalRun.run_id,
       attempt: Number(originalRun.attempt || 1) + 1,
       baseIdempotencyKey,
       runIdempotencyKey: retryRunKey,
+      completedStepResults,
     });
     return {
       retried: true,
@@ -511,6 +549,16 @@ class PostCallAutomationService {
     const serializedActions = JSON.stringify(rule.actions || []);
     const serializedPayload = JSON.stringify(payload || {});
     const attempt = Number.isFinite(Number(options.attempt)) ? Number(options.attempt) : 1;
+    const actionResults = new Array(rule.actions.length);
+    const stepAudit = rule.actions.map((action, index) => ({
+      index,
+      type: action.type,
+      status: "pending",
+    }));
+    const currentResult = () => ({
+      actions: actionResults,
+      steps: stepAudit.map((step) => ({ ...step })),
+    });
     await this.recordRun({
       run_id: runId,
       rule_id: rule.rule_id,
@@ -518,7 +566,7 @@ class PostCallAutomationService {
       trigger_event: triggerEvent,
       status: "running",
       actions_json: serializedActions,
-      result_json: null,
+      result_json: JSON.stringify(currentResult()),
       error: null,
       idempotency_key: idempotencyKey || null,
       payload_json: serializedPayload,
@@ -526,20 +574,98 @@ class PostCallAutomationService {
       attempt,
     });
     try {
-      const actionResults = [];
       for (let index = 0; index < rule.actions.length; index += 1) {
-        actionResults.push(
-          await this.executeAction(
+        const action = rule.actions[index];
+        const priorResult = options.completedStepResults?.[index];
+        if (Object.prototype.hasOwnProperty.call(options.completedStepResults || {}, index)) {
+          actionResults[index] = priorResult;
+          stepAudit[index] = {
+            index,
+            type: action.type,
+            status: "skipped_completed",
+            source_run_id: options.retryOfRunId,
+            completed_at: new Date().toISOString(),
+          };
+          await this.recordRun({
+            run_id: runId,
+            rule_id: rule.rule_id,
+            call_sid: callSid,
+            trigger_event: triggerEvent,
+            status: "running",
+            actions_json: serializedActions,
+            result_json: JSON.stringify(currentResult()),
+            error: null,
+            idempotency_key: idempotencyKey || null,
+            payload_json: serializedPayload,
+            retry_of_run_id: options.retryOfRunId || null,
+            attempt,
+          });
+          continue;
+        }
+        const startedAt = new Date().toISOString();
+        stepAudit[index] = {
+          index,
+          type: action.type,
+          status: "running",
+          started_at: startedAt,
+        };
+        await this.recordRun({
+          run_id: runId,
+          rule_id: rule.rule_id,
+          call_sid: callSid,
+          trigger_event: triggerEvent,
+          status: "running",
+          actions_json: serializedActions,
+          result_json: JSON.stringify(currentResult()),
+          error: null,
+          idempotency_key: idempotencyKey || null,
+          payload_json: serializedPayload,
+          retry_of_run_id: options.retryOfRunId || null,
+          attempt,
+        });
+        try {
+          actionResults[index] = await this.executeAction(
             rule.actions[index],
             payload,
             context,
             runId,
             index,
             baseIdempotencyKey || idempotencyKey || `postcall:${runId}`,
-          ),
-        );
+          );
+          stepAudit[index] = {
+            index,
+            type: action.type,
+            status: "completed",
+            started_at: startedAt,
+            completed_at: new Date().toISOString(),
+          };
+        } catch (error) {
+          stepAudit[index] = {
+            index,
+            type: action.type,
+            status: "failed",
+            started_at: startedAt,
+            completed_at: new Date().toISOString(),
+            error_code: safeAutomationErrorCode(error),
+          };
+          throw error;
+        }
+        await this.recordRun({
+          run_id: runId,
+          rule_id: rule.rule_id,
+          call_sid: callSid,
+          trigger_event: triggerEvent,
+          status: "running",
+          actions_json: serializedActions,
+          result_json: JSON.stringify(currentResult()),
+          error: null,
+          idempotency_key: idempotencyKey || null,
+          payload_json: serializedPayload,
+          retry_of_run_id: options.retryOfRunId || null,
+          attempt,
+        });
       }
-      const result = { actions: actionResults };
+      const result = currentResult();
       await this.recordRun({
         run_id: runId,
         rule_id: rule.rule_id,
@@ -569,7 +695,7 @@ class PostCallAutomationService {
         trigger_event: triggerEvent,
         status: "failed",
         actions_json: serializedActions,
-        result_json: null,
+        result_json: JSON.stringify(currentResult()),
         error: normalizeText(error?.message || "automation_run_failed", 1000),
         idempotency_key: idempotencyKey || null,
         payload_json: serializedPayload,

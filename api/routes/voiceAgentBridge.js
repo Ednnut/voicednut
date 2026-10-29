@@ -152,25 +152,46 @@ function buildManagedVoiceAgentSettings(options = {}) {
   const outputEncoding = normalizeText(options?.audio?.output?.encoding, "mulaw");
   const outputSampleRate = toFiniteNumber(options?.audio?.output?.sample_rate, 8000);
   const outputContainer = normalizeText(options?.audio?.output?.container, "none");
-  const listenModel = normalizeText(options?.agent?.listen?.provider?.model, "nova-2");
+  const listenProviderOptions = options?.agent?.listen?.provider || {};
+  const listenModel = normalizeText(listenProviderOptions.model, "nova-2");
+  const isFluxListenModel = listenModel.startsWith("flux-");
+  const listenLanguage = normalizeText(
+    options?.agent?.language?.type || options?.agent?.language,
+    "en",
+  ).toLowerCase();
   const listenSmartFormat =
-    options?.agent?.listen?.provider?.smart_format !== undefined
-      ? options.agent.listen.provider.smart_format === true
+    listenProviderOptions.smart_format !== undefined
+      ? listenProviderOptions.smart_format === true
       : true;
-  const listenKeyterms = Array.isArray(options?.agent?.listen?.provider?.keyterms)
-    ? options.agent.listen.provider.keyterms
+  const listenKeyterms = Array.isArray(listenProviderOptions.keyterms)
+    ? listenProviderOptions.keyterms
         .map((entry) => normalizeText(entry))
         .filter(Boolean)
         .slice(0, 24)
     : [];
+  const listenProvider = {
+    type: "deepgram",
+    model: listenModel,
+    ...(isFluxListenModel
+      ? { version: "v2" }
+      : listenProviderOptions.version
+        ? { version: normalizeText(listenProviderOptions.version) }
+        : {}),
+    ...(!isFluxListenModel ? { language: listenLanguage, smart_format: listenSmartFormat } : {}),
+    ...(isFluxListenModel && listenModel === "flux-general-multi"
+      ? {
+          language_hints: Array.isArray(listenProviderOptions.language_hints)
+            ? listenProviderOptions.language_hints.map((value) => normalizeText(value)).filter(Boolean).slice(0, 10)
+            : [listenLanguage],
+        }
+      : {}),
+    ...(listenKeyterms.length > 0 ? { keyterms: listenKeyterms } : {}),
+  };
   const speakModel = normalizeText(
     options?.agent?.speak?.provider?.model,
     "aura-2-andromeda-en",
   );
-  const language = normalizeText(
-    options?.agent?.language?.type || options?.agent?.language,
-    "en",
-  );
+  const language = listenLanguage;
 
   const settings = {
     audio: {
@@ -187,12 +208,7 @@ function buildManagedVoiceAgentSettings(options = {}) {
     agent: {
       language,
       listen: {
-        provider: {
-          type: "deepgram",
-          model: listenModel,
-          smart_format: listenSmartFormat,
-          ...(listenKeyterms.length > 0 ? { keyterms: listenKeyterms } : {}),
-        },
+        provider: listenProvider,
       },
       speak: {
         provider: {

@@ -68,6 +68,24 @@ function createSquareConfig(squareOverrides = {}) {
   };
 }
 
+function createCallEConfig(callEOverrides = {}) {
+  return {
+    callE: {
+      enabled: true,
+      dispatchEnabled: true,
+      apiKey: "secret-test-value",
+      baseUrl: "https://test-api.heycall-e.com",
+      allowedDestinations: ["+14155550100"],
+      pilotApprovalFingerprint: "a".repeat(64),
+      pilotApprovalReference: "approval:test-001",
+      pilotApprovalExpiresAt: "2999-01-01T00:00:00Z",
+      pilotReadinessReviewed: true,
+      webhookUrl: "",
+      ...callEOverrides,
+    },
+  };
+}
+
 function createAppWithPaypalWebhook() {
   const app = express();
   app.post("/webhook/paypal", (_req, res) => res.sendStatus(204));
@@ -83,6 +101,12 @@ function createAppWithStripeWebhook() {
 function createAppWithSquareWebhook() {
   const app = express();
   app.post("/webhook/square", (_req, res) => res.sendStatus(204));
+  return app;
+}
+
+function createAppWithCallEWebhook() {
+  const app = express();
+  app.post("/api/webhooks/call-e", (_req, res) => res.sendStatus(204));
   return app;
 }
 
@@ -179,6 +203,51 @@ describe("PayPal provider preflight", () => {
       "list_invoices",
     ]);
     assert.ok(toolkitCheck.details.blocked_tools.includes("create_order"));
+  });
+});
+
+describe("CALL-E provider preflight", () => {
+  it("registers CALL-E for task-based calls only", () => {
+    assert.equal(isProviderSupported("call", "call_e"), true);
+    assert.equal(isProviderSupported("sms", "call_e"), false);
+    assert.deepEqual(buildProviderCallbackUrls("call_e", "call", createCallEConfig()).urls, []);
+  });
+
+  it("passes local readiness without contacting CALL-E and flags unsigned webhooks", async () => {
+    const report = await runProviderPreflight({
+      provider: "call_e",
+      channel: "call",
+      mode: "manual",
+      config: createCallEConfig(),
+      app: createAppWithCallEWebhook(),
+      allowNetwork: false,
+      requireReachability: false,
+      guards: { call_e: true },
+    });
+
+    assert.equal(report.ok, true);
+    assert.equal(findCheck(report, "credentials_auth").status, CHECK_STATUS.PASS);
+    assert.equal(findCheck(report, "webhook_auth").details.event_id_header_is_not_a_signature, true);
+    assert.equal(findCheck(report, "callback_urls").status, CHECK_STATUS.WARN);
+    assert.equal(findCheck(report, "required_routes").status, CHECK_STATUS.PASS);
+    assert.equal(JSON.stringify(report).includes("secret-test-value"), false);
+  });
+
+  it("rejects disabled or unconfigured CALL-E without a provider request", async () => {
+    const report = await runProviderPreflight({
+      provider: "call_e",
+      channel: "call",
+      mode: "manual",
+      config: createCallEConfig({ enabled: false, apiKey: "" }),
+      app: createAppWithCallEWebhook(),
+      allowNetwork: false,
+      requireReachability: false,
+      guards: { call_e: true },
+    });
+
+    assert.equal(report.ok, false);
+    assert.equal(findCheck(report, "credentials_auth").status, CHECK_STATUS.FAIL);
+    assert.equal(JSON.stringify(report).includes("secret-test-value"), false);
   });
 });
 

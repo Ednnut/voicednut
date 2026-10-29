@@ -1,6 +1,6 @@
 ---
 name: architecture
-description: Review or change VOICEDNUT package boundaries, provider abstractions, shared contracts, or broad refactors.
+description: Review or change VOICEDNUT package boundaries, provider abstractions, shared contracts, module seams out of api/app.js, or broad refactors; use for ADR-style decisions and before any cross-package or multi-file structural change. For the mechanical execution of an agreed structural change use `refactor`.
 ---
 
 Trace the relevant request, data, and failure flow across API, bot, Mini App, database, and provider adapters. Inspect callers, tests, manifests, and existing abstractions before proposing a new pattern.

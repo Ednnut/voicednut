@@ -3,6 +3,7 @@ import { useMemo, useState } from 'react';
 import { buildModuleRequestState } from './moduleRequestState';
 import type { CallLogRow, DashboardVm } from './types';
 import { useInvestigationAction } from './useInvestigationAction';
+import { CallEOperationsPanel } from './CallEOperationsPanel';
 import { selectOpsPageVm } from './vmSelectors';
 import { AdminPageIntro } from '@/components/admin-dashboard/AdminPageIntro';
 import { DASHBOARD_ACTION_CONTRACTS } from '@/contracts/miniappParityContracts';
@@ -157,6 +158,13 @@ export function CallLogExplorerPage({ visible, vm }: CallLogExplorerPageProps) {
           { label: 'Details', value: hasDetails ? 'Loaded' : activeSid ? 'Pending' : 'Not selected' },
           { label: 'Events', value: hasEvents ? 'Loaded' : activeSid ? 'Pending' : 'Not selected' },
         ]}
+      />
+
+      <CallEOperationsPanel
+        runAction={runInvestigationAction}
+        busy={controlsBusy}
+        error={investigationError}
+        formatTime={formatTime}
       />
 
       {(loading && rows.length === 0 && callLogs.length === 0) || error || controlsBusy ? (

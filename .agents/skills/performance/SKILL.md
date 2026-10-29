@@ -1,6 +1,6 @@
 ---
 name: performance
-description: Investigate measurable Mini App, API, database, network, or runtime performance problems and regressions.
+description: Investigate measurable VOICEDNUT performance problems and regressions — Mini App load/render/bundle size, api/app.js request latency and event-loop blocking, SQLite query plans and index gaps (sqlite3 CLI available), provider/network fanout, timeouts, memory, or PM2 runtime behavior. Requires a baseline measurement before and after any change.
 ---
 
 ## Workflow

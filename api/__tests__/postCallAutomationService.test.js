@@ -116,6 +116,12 @@ describe("PostCallAutomationService", () => {
     assert.equal(emails[0].payload.template_context.payment_state, "paid");
     assert.equal(crmSyncs.length, 1);
     assert.equal(crmSyncs[0].provider, "hubspot");
+    const persistedRun = Array.from(db.runs.values()).find((run) => run.status === "completed");
+    const persistedResult = JSON.parse(persistedRun.result_json);
+    assert.deepEqual(persistedResult.steps.map(({ index, type, status }) => ({ index, type, status })), [
+      { index: 0, type: "send_email", status: "completed" },
+      { index: 1, type: "crm_sync", status: "completed" },
+    ]);
   });
 
   it("deduplicates repeated automation runs for the same rule and call", async () => {
@@ -211,5 +217,91 @@ describe("PostCallAutomationService", () => {
     assert.equal(retry.run.deduped, false);
     assert.equal(emailIdempotencyKeys.length, 2);
     assert.equal(emailIdempotencyKeys[0], emailIdempotencyKeys[1]);
+  });
+
+  it("persists step progress and skips completed email steps when a later email step retries", async () => {
+    const db = createAutomationDb([
+      {
+        rule_id: "multi_step_email",
+        name: "Multi-step email follow-up",
+        enabled: 1,
+        trigger_event: "post_call_completed",
+        conditions_json: JSON.stringify({ call_outcome: "complete" }),
+        actions_json: JSON.stringify([{ type: "send_email" }, { type: "send_email" }]),
+        priority: 10,
+      },
+    ]);
+    const attempts = [];
+    const service = new PostCallAutomationService({
+      db,
+      emailService: {
+        enqueueEmail: async (_payload, options) => {
+          attempts.push(options.idempotencyKey);
+          if (attempts.length === 2) throw new Error("temporary email provider error");
+          return { message_id: `email_${attempts.length}` };
+        },
+      },
+    });
+    const payload = {
+      trigger_event: "post_call_completed",
+      call_sid: "CA_MULTI_STEP",
+      call_outcome: "complete",
+      customer: { email: "ada@example.com" },
+    };
+
+    await assert.rejects(() => service.evaluateAndRun(payload), /temporary email provider error/);
+    const original = Array.from(db.runs.values()).find((run) => run.status === "failed");
+    assert.deepEqual(JSON.parse(original.result_json).steps.map((step) => step.status), ["completed", "failed"]);
+
+    const retried = await service.retryRun(original.run_id);
+    assert.equal(retried.run.status, "completed");
+    assert.deepEqual(retried.run.result.steps.map((step) => step.status), ["skipped_completed", "completed"]);
+    assert.equal(attempts.length, 3);
+    assert.equal(attempts[1], attempts[2]);
+  });
+
+  it("blocks retry of a step with an interrupted or non-idempotent outcome", async () => {
+    const db = createAutomationDb([
+      {
+        rule_id: "unsafe_step_retry",
+        name: "Ticket workflow",
+        enabled: 1,
+        trigger_event: "post_call_completed",
+        conditions_json: JSON.stringify({}),
+        actions_json: JSON.stringify([{ type: "create_ticket" }]),
+        priority: 10,
+      },
+    ]);
+    const service = new PostCallAutomationService({ db });
+    db.runs.set("run_interrupted", {
+      run_id: "run_interrupted",
+      rule_id: "unsafe_step_retry",
+      trigger_event: "post_call_completed",
+      status: "running",
+      actions: [{ type: "create_ticket" }],
+      payload: { call_sid: "CA_INTERRUPTED" },
+      result: { actions: [], steps: [{ index: 0, type: "create_ticket", status: "running" }] },
+      attempt: 1,
+    });
+
+    await assert.rejects(
+      () => service.retryRun("run_interrupted", { force: true }),
+      (error) => error.code === "conflict" && /may have completed before interruption/.test(error.message),
+    );
+
+    db.runs.set("run_ticket_failed", {
+      run_id: "run_ticket_failed",
+      rule_id: "unsafe_step_retry",
+      trigger_event: "post_call_completed",
+      status: "failed",
+      actions: [{ type: "create_ticket" }],
+      payload: { call_sid: "CA_TICKET_FAILED" },
+      result: { actions: [], steps: [{ index: 0, type: "create_ticket", status: "failed" }] },
+      attempt: 1,
+    });
+    await assert.rejects(
+      () => service.retryRun("run_ticket_failed"),
+      (error) => error.code === "conflict" && /not safe to replay automatically/.test(error.message),
+    );
   });
 });

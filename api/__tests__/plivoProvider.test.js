@@ -91,6 +91,51 @@ describe("Plivo provider integration", () => {
     });
   });
 
+  it("does not retry an ambiguous outbound submission and marks it unknown", async () => {
+    const requests = [];
+    const adapter = new PlivoVoiceAdapter({
+      authId: "auth-id",
+      authToken: "auth-token",
+      voice: {
+        fromNumber: "+15555550100",
+        retryAttempts: 3,
+        createRetryAttempts: 3,
+      },
+      fetch: async (url, options) => {
+        requests.push({ url, options });
+        return { ok: false, status: 503, text: async () => "temporary provider failure" };
+      },
+    }, { info: () => {}, warn: () => {} });
+
+    await assert.rejects(adapter.createOutboundCall({
+      to: "+15555550123",
+      callSid: "internal-call-sid",
+      answerUrl: "https://api.example.com/plivo/answer",
+    }), (error) => {
+      assert.equal(error.providerSubmissionState, "unknown");
+      return true;
+    });
+    assert.equal(requests.length, 1);
+  });
+
+  it("marks a definitive Plivo client rejection separately from an ambiguous failure", async () => {
+    const adapter = new PlivoVoiceAdapter({
+      authId: "auth-id",
+      authToken: "auth-token",
+      voice: { fromNumber: "+15555550100" },
+      fetch: async () => ({ ok: false, status: 422, text: async () => "invalid request" }),
+    }, { info: () => {}, warn: () => {} });
+
+    await assert.rejects(adapter.createOutboundCall({
+      to: "+15555550123",
+      callSid: "internal-call-sid",
+      answerUrl: "https://api.example.com/plivo/answer",
+    }), (error) => {
+      assert.equal(error.providerSubmissionState, "rejected");
+      return true;
+    });
+  });
+
   it("returns Plivo Stream XML for outbound answer callbacks", async () => {
     const handler = createPlivoAnswerWebhookHandler({
       requireValidPlivoWebhook: () => true,

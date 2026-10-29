@@ -400,9 +400,6 @@ const vonageVoiceRequestTimeoutMs = Number(
 const vonageVoiceRetryAttempts = Number(
   readEnv("VONAGE_VOICE_RETRY_ATTEMPTS") || "1",
 );
-const vonageVoiceCreateRetryAttempts = Number(
-  readEnv("VONAGE_VOICE_CREATE_RETRY_ATTEMPTS") || "0",
-);
 const vonageVoiceRetryBaseMs = Number(
   readEnv("VONAGE_VOICE_RETRY_BASE_MS") || "250",
 );
@@ -432,9 +429,6 @@ const plivoVoiceRequestTimeoutMs = Number(
 const plivoVoiceRetryAttempts = Number(
   readEnv("PLIVO_VOICE_RETRY_ATTEMPTS") || "1",
 );
-const plivoVoiceCreateRetryAttempts = Number(
-  readEnv("PLIVO_VOICE_CREATE_RETRY_ATTEMPTS") || "0",
-);
 const plivoVoiceRetryBaseMs = Number(
   readEnv("PLIVO_VOICE_RETRY_BASE_MS") || "250",
 );
@@ -462,6 +456,19 @@ const telegramWebhookValidation = telegramWebhookValidationModes.has(
     ? "strict"
     : "warn";
 const callProvider = ensure("CALL_PROVIDER", "twilio").toLowerCase();
+const callE = {
+  enabled: readBooleanEnv("CALLE_ENABLED", false),
+  dispatchEnabled: readBooleanEnv("CALLE_DISPATCH_ENABLED", false),
+  apiKey: readEnv("CALLE_API_KEY") || "",
+  baseUrl: readEnv("CALLE_BASE_URL") || "https://api.heycall-e.com",
+  apiTimeoutMs: Number(readEnv("CALLE_API_TIMEOUT_MS") || "10000"),
+  allowedDestinations: parseList(readEnv("CALLE_ALLOWED_DESTINATIONS")),
+  webhookUrl: readEnv("CALLE_WEBHOOK_URL") || "",
+  pilotApprovalFingerprint: readEnv("CALLE_PILOT_APPROVED_FINGERPRINT") || "",
+  pilotApprovalReference: readEnv("CALLE_PILOT_APPROVAL_REFERENCE") || "",
+  pilotApprovalExpiresAt: readEnv("CALLE_PILOT_APPROVAL_EXPIRES_AT") || "",
+  pilotReadinessReviewed: readBooleanEnv("CALLE_PILOT_READINESS_REVIEWED", false),
+};
 const apiSecret = readEnv("API_SECRET");
 const adminApiToken = apiSecret || readEnv("ADMIN_API_TOKEN");
 const complianceModeRaw = (
@@ -1105,6 +1112,7 @@ module.exports = {
   platform: {
     provider: callProvider,
   },
+  callE,
   twilio: {
     accountSid: ensure("TWILIO_ACCOUNT_SID"),
     authToken: ensure("TWILIO_AUTH_TOKEN"),
@@ -1142,11 +1150,6 @@ module.exports = {
         Number.isFinite(plivoVoiceRetryAttempts) && plivoVoiceRetryAttempts >= 0
           ? Math.floor(plivoVoiceRetryAttempts)
           : 1,
-      createRetryAttempts:
-        Number.isFinite(plivoVoiceCreateRetryAttempts) &&
-        plivoVoiceCreateRetryAttempts >= 0
-          ? Math.floor(plivoVoiceCreateRetryAttempts)
-          : 0,
       retryBaseMs:
         Number.isFinite(plivoVoiceRetryBaseMs) && plivoVoiceRetryBaseMs >= 0
           ? Math.floor(plivoVoiceRetryBaseMs)
@@ -1191,10 +1194,6 @@ module.exports = {
         Number.isFinite(vonageVoiceRetryAttempts) && vonageVoiceRetryAttempts >= 0
           ? Math.floor(vonageVoiceRetryAttempts)
           : 1,
-      createRetryAttempts:
-        Number.isFinite(vonageVoiceCreateRetryAttempts) && vonageVoiceCreateRetryAttempts >= 0
-          ? Math.floor(vonageVoiceCreateRetryAttempts)
-          : 0,
       retryBaseMs:
         Number.isFinite(vonageVoiceRetryBaseMs) && vonageVoiceRetryBaseMs >= 0
           ? Math.floor(vonageVoiceRetryBaseMs)

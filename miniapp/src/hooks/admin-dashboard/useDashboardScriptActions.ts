@@ -47,7 +47,7 @@ type UseDashboardCallScriptActionsOptions = {
 
 type UseDashboardCallScriptActionsResult = {
   refreshCallScriptsModule: () => Promise<void>;
-  saveCallScriptDraft: () => Promise<void>;
+  saveCallScriptDraft: (agentConfig?: Record<string, unknown> | null, voiceModel?: string | null) => Promise<void>;
   submitCallScriptForReview: () => Promise<void>;
   reviewCallScript: (decision: 'approve' | 'reject') => Promise<void>;
   promoteCallScriptLive: () => Promise<void>;
@@ -93,7 +93,7 @@ export function useDashboardCallScriptActions({
     }
   }, [invokeAction, pushActivity, scriptFlowFilter, setCallScriptsSnapshot, setError]);
 
-  const saveCallScriptDraft = useCallback(async (): Promise<void> => {
+  const saveCallScriptDraft = useCallback(async (agentConfig?: Record<string, unknown> | null, voiceModel?: string | null): Promise<void> => {
     if (selectedCallScriptId <= 0) {
       setError('Select a script before saving draft changes.');
       return;
@@ -106,6 +106,8 @@ export function useDashboardCallScriptActions({
       prompt: scriptPromptInput,
       first_message: scriptFirstMessageInput,
       objective_tags: scriptObjectiveTagsInput,
+      ...(agentConfig === undefined ? {} : { agent_config: agentConfig }),
+      ...(voiceModel === undefined ? {} : { voice_model: voiceModel }),
     };
     await runAction(
       DASHBOARD_ACTION_CONTRACTS.CALLSCRIPT_UPDATE,

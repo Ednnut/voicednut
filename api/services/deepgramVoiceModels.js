@@ -42,6 +42,13 @@ const CURATED_DEEPGRAM_VOICE_MODELS = Object.freeze([
     priority: 90,
   },
   {
+    id: "aura-2-celeste-es",
+    label: "Celeste",
+    gender: "female",
+    style: "clear",
+    priority: 88,
+  },
+  {
     id: "aura-asteria-en",
     label: "Asteria",
     gender: "female",
@@ -95,6 +102,11 @@ function normalizeVoiceProfileKey(value) {
 function normalizeVoiceModelId(value) {
   const normalized = String(value || "").trim();
   return normalized || "";
+}
+
+function isCuratedDeepgramVoiceModel(value) {
+  const model = normalizeVoiceModelId(value);
+  return CURATED_DEEPGRAM_VOICE_MODELS.some((entry) => entry.id === model);
 }
 
 function isLegacyVoiceAlias(value) {
@@ -333,6 +345,7 @@ module.exports = {
   DEFAULT_PROFILE_VOICE_POOLS,
   normalizeVoiceProfileKey,
   normalizeVoiceModelId,
+  isCuratedDeepgramVoiceModel,
   parseVoiceModelPool,
   selectDeepgramVoiceModel,
   fetchDeepgramTtsModels,

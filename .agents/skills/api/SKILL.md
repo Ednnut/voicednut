@@ -1,6 +1,6 @@
 ---
 name: api
-description: Add or change internal or external API integrations, request/response contracts, authentication, or API client behavior.
+description: Add or change internal or external API integrations, Express routes and response/error envelopes in api/app.js, Mini App action-bridge contracts, Telegram auth/session handling, webhooks, rate limits, pagination, or API client behavior.
 ---
 
 ## Workflow

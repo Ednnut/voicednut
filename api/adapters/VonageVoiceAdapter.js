@@ -1,5 +1,6 @@
 const { Vonage } = require("@vonage/server-sdk");
 const { runWithTimeout } = require("../utils/asyncControl");
+const { classifyProviderSubmissionState } = require("./providerFlowPolicy");
 
 function isValidHttpsUrl(value) {
   if (!value || typeof value !== "string") return false;
@@ -54,6 +55,11 @@ function extractErrorCode(error) {
     if (normalized) return normalized;
   }
   return "";
+}
+
+function safeErrorCode(value) {
+  const code = String(value || "").trim();
+  return /^[A-Za-z0-9_-]{1,80}$/.test(code) ? code : "provider_operation_failed";
 }
 
 function isRetriableStatus(statusCode) {
@@ -145,12 +151,6 @@ class VonageVoiceAdapter {
       1,
       { min: 0 },
     );
-    // Creating outbound calls is intentionally conservative to avoid duplicate call risks.
-    this.createRetryAttempts = normalizePositiveInteger(
-      voice.createRetryAttempts ?? config.createRetryAttempts,
-      0,
-      { min: 0 },
-    );
     this.retryBaseMs = normalizePositiveInteger(
       voice.retryBaseMs ?? config.retryBaseMs,
       250,
@@ -212,7 +212,13 @@ class VonageVoiceAdapter {
         const statusCode = extractErrorStatusCode(error);
         const errorCode = extractErrorCode(error);
         const retriable = isRetriableStatus(statusCode) || isRetriableErrorCode(errorCode);
-        const willRetry = retriable && attemptNumber < maxAttempts;
+        const willRetry =
+          retriable &&
+          operationName !== "create_outbound_call" &&
+          attemptNumber < maxAttempts;
+        if (operationName === "create_outbound_call" && !error.providerSubmissionState) {
+          error.providerSubmissionState = classifyProviderSubmissionState(statusCode);
+        }
         this.logger?.warn?.("vonage_voice_operation_failed", {
           provider: "vonage",
           operation: operationName,
@@ -222,7 +228,7 @@ class VonageVoiceAdapter {
           will_retry: willRetry,
           status_code: statusCode,
           code: errorCode || null,
-          error: error?.message || String(error || "unknown_error"),
+          error_code: safeErrorCode(error?.code),
           ...meta,
         });
         if (!willRetry) {
@@ -261,35 +267,45 @@ class VonageVoiceAdapter {
    */
   async createOutboundCall(options = {}) {
     const { to, callSid, answerUrl, eventUrl, ncco } = options;
-    if (!to) {
-      throw new Error(
-        "VonageVoiceAdapter.createOutboundCall requires destination number",
-      );
-    }
-    if (!callSid) {
-      throw new Error("VonageVoiceAdapter.createOutboundCall requires callSid");
-    }
-    if (!this.fromNumber) {
-      throw new Error(
-        "VonageVoiceAdapter requires VONAGE_VOICE_FROM_NUMBER for outbound calls",
-      );
-    }
-    const normalizedTo = sanitizePhoneNumber(to, "destination");
-    const normalizedFrom = sanitizePhoneNumber(this.fromNumber, "from");
+    let normalizedTo;
+    let normalizedFrom;
+    let finalAnswerUrl;
+    let finalEventUrl;
+    let hasInlineNcco;
+    try {
+      if (!to) {
+        throw new Error(
+          "VonageVoiceAdapter.createOutboundCall requires destination number",
+        );
+      }
+      if (!callSid) {
+        throw new Error("VonageVoiceAdapter.createOutboundCall requires callSid");
+      }
+      if (!this.fromNumber) {
+        throw new Error(
+          "VonageVoiceAdapter requires VONAGE_VOICE_FROM_NUMBER for outbound calls",
+        );
+      }
+      normalizedTo = sanitizePhoneNumber(to, "destination");
+      normalizedFrom = sanitizePhoneNumber(this.fromNumber, "from");
 
-    const finalAnswerUrl = this.answerUrlOverride || answerUrl;
-    const finalEventUrl = this.eventUrlOverride || eventUrl;
-    const hasInlineNcco = validateInlineNcco(ncco);
+      finalAnswerUrl = this.answerUrlOverride || answerUrl;
+      finalEventUrl = this.eventUrlOverride || eventUrl;
+      hasInlineNcco = validateInlineNcco(ncco);
 
-    if (!hasInlineNcco && !isValidHttpsUrl(finalAnswerUrl)) {
-      throw new Error(
-        "VonageVoiceAdapter.createOutboundCall requires a valid HTTPS answerUrl when ncco is not provided",
-      );
-    }
-    if (finalEventUrl && !isValidHttpsUrl(finalEventUrl)) {
-      throw new Error(
-        "VonageVoiceAdapter.createOutboundCall requires eventUrl to be a valid HTTPS URL",
-      );
+      if (!hasInlineNcco && !isValidHttpsUrl(finalAnswerUrl)) {
+        throw new Error(
+          "VonageVoiceAdapter.createOutboundCall requires a valid HTTPS answerUrl when ncco is not provided",
+        );
+      }
+      if (finalEventUrl && !isValidHttpsUrl(finalEventUrl)) {
+        throw new Error(
+          "VonageVoiceAdapter.createOutboundCall requires eventUrl to be a valid HTTPS URL",
+        );
+      }
+    } catch (error) {
+      error.providerSubmissionState = "not_submitted";
+      throw error;
     }
 
     const payload = {
@@ -331,7 +347,7 @@ class VonageVoiceAdapter {
       () => this.client.voice.createOutboundCall(payload),
       {
         timeoutLabel: "vonage_create_call_timeout",
-        retryAttempts: this.createRetryAttempts,
+        retryAttempts: 0,
         meta: {
           callSid,
           to: maskPhoneForLog(normalizedTo),

@@ -80,6 +80,27 @@ describe("CALL-E server client", () => {
     assert.equal(observed.options.method, "POST");
   });
 
+  it("emits low-cardinality request metrics without provider IDs, destination, task, or credentials", async () => {
+    const metrics = [];
+    const client = new CallEClient({
+      enabled: true,
+      apiKey: "private-metric-test-key",
+      fetchFn: async () => jsonResponse(202, { id: "call_sensitive_123", object: "call" }),
+      onMetric(metric) { metrics.push(metric); },
+    });
+    await client.createCall({ task: "private task", phone: "+14155550123" }, "private-idempotency-key");
+    assert.equal(metrics.length, 1);
+    assert.equal(metrics[0].operation, "call.create");
+    assert.equal(metrics[0].method, "POST");
+    assert.equal(metrics[0].outcome, "success");
+    assert.equal(metrics[0].statusCode, 202);
+    assert.equal(Number.isFinite(metrics[0].durationMs), true);
+    const serialized = JSON.stringify(metrics);
+    for (const privateValue of ["call_sensitive_123", "+14155550123", "private task", "private-idempotency-key", "private-metric-test-key"]) {
+      assert.equal(serialized.includes(privateValue), false);
+    }
+  });
+
   it("restricts call reads, cancel and event cursors to documented, bounded paths", async () => {
     const urls = [];
     const client = new CallEClient({ enabled: true, apiKey: "test-key", fetchFn: async (url) => {
@@ -109,14 +130,32 @@ describe("CALL-E server client", () => {
     });
 
     const generic = new CallEClient({ enabled: true, apiKey: "secret", fetchFn: async () => jsonResponse(409, {
-      error: { code: "creation_in_progress", message: "private detail" },
+      error: { code: "idempotency_conflict", message: "private detail", details: { reason_code: "creation_in_progress" } },
     }) });
     await assert.rejects(generic.createCall({ task: "x" }, "voicednut:call-e:key"), (error) => {
-      assert.equal(error.code, "call_e_http_error");
+      assert.equal(error.code, "call_e_idempotency_conflict");
       assert.equal(error.noCallCreated, false);
+      assert.equal(error.providerCode, "idempotency_conflict");
+      assert.equal(error.reasonCode, "creation_in_progress");
+      assert.equal(error.recoveryAction, "backoff_same_request_and_idempotency_key");
       assert.equal(error.message.includes("private detail"), false);
       return true;
     });
+  });
+
+  it("preserves rate-limit classification without retrying", async () => {
+    let attempts = 0;
+    const client = new CallEClient({ enabled: true, apiKey: "secret", fetchFn: async () => {
+      attempts += 1;
+      return jsonResponse(429, { error: { code: "rate_limit_exceeded" } });
+    } });
+    await assert.rejects(client.getCall("call_test_123"), (error) => {
+      assert.equal(error.code, "call_e_rate_limit_exceeded");
+      assert.equal(error.retryable, true);
+      assert.equal(error.recoveryAction, "backoff_same_request_and_idempotency_key");
+      return true;
+    });
+    assert.equal(attempts, 1);
   });
 
   it("keeps test/prod configuration explicit and never retries requests automatically", async () => {

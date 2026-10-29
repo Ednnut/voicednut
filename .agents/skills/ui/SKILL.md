@@ -1,6 +1,6 @@
 ---
 name: ui
-description: Improve Mini App visual hierarchy, navigation, interaction states, forms, accessibility, and responsive polish.
+description: Improve VOICEDNUT Mini App visual hierarchy, navigation, interaction states (loading/empty/error/disabled), forms and validation feedback, WCAG accessibility and contrast, keyboard operation, touch targets, and responsive polish within the existing Telegram UI design system.
 ---
 
 ## Workflow

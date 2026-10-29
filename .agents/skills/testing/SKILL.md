@@ -1,6 +1,6 @@
 ---
 name: testing
-description: Add or run focused VOICEDNUT unit, integration, regression, contract, or Mini App browser tests.
+description: Add or run focused VOICEDNUT unit, integration, regression, contract, coverage, or Mini App browser tests — Mocha API suites with stubbed providers, node --test bot suites, Playwright e2e and axe accessibility, Mini App contract validators, repeat-after-edit verification loops, and test-failure triage.
 ---
 
 ## Workflow
@@ -8,7 +8,9 @@ description: Add or run focused VOICEDNUT unit, integration, regression, contrac
 1. Inspect package scripts, test conventions, fixtures, and baseline failures; choose the narrowest test that would catch the behavior.
 2. Use API Mocha tests with stubbed services, bot Node tests, Mini App contract checks, and Playwright for meaningful user-visible flows.
 3. Keep tests deterministic, isolated, tenant-safe, and independent of production credentials/providers. Cover failure and authorization cases where relevant.
-4. Run the requested focused test and related validation; report exact commands, counts, baseline failures, and untested paths.
+4. Use the owning package's documented commands and the narrowest test that proves the behavior. API: `cd api && npx mocha __tests__/<name>.test.js`, then `npm test -- --reporter dot` when full-suite verification is in scope. Bot: `cd bot && node --test`. Mini App: `npm run validate:contracts`, `npm run lint`, `npm run build`; use `test:e2e` or `test:a11y` for relevant browser behavior when Chromium is available. Coverage tooling is optional and may require a separate install; avoid it unless requested.
+5. Triage failures as regressions vs. baseline: record counts before starting (`git stash` spot-check or CI history) so a pre-existing failure is reported, not blamed on the change. Never fix a failing assertion by weakening it — route genuine bugs to `debugger`.
+6. Report exact commands, counts, baseline failures, and untested paths; keep secrets and real personal data out of fixtures (synthetic E.164 ranges, fake IDs).
 
 ## Guardrails, tools, and approval
 

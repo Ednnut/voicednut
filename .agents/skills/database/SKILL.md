@@ -1,6 +1,6 @@
 ---
 name: database
-description: Change or review VOICEDNUT SQLite schemas, migrations, indexes, persistence, or data lifecycle behavior.
+description: Design or review VOICEDNUT SQLite schemas, persistence semantics, queries and indexes, transactions, data lifecycle/retention, or tenant scoping in api/db/db.js. For executing schema-change rollouts, backfills, or migration verification use `migration-runner`; this skill covers the design and review of persistence behavior.
 ---
 
 ## Workflow

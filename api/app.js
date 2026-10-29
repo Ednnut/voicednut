@@ -17,6 +17,11 @@ const { StreamService } = require("./routes/stream");
 const { TranscriptionService } = require("./routes/transcription");
 const { TextToSpeechService } = require("./routes/tts");
 const { VoiceAgentBridge } = require("./routes/voiceAgentBridge");
+const {
+  resolveCallAgentHandoffPolicy,
+  exposeCallAgentHandoffAction,
+  createCallAgentHandoffService,
+} = require("./services/callAgentHandoff");
 const { recordingService } = require("./routes/recording");
 const { EnhancedSmsService } = require("./routes/sms.js");
 const { EmailService } = require("./routes/email");
@@ -85,27 +90,47 @@ const {
   setStoredSmsProvider,
   setStoredEmailProvider,
   normalizeProvider,
+  isCallESelectionReady,
 } = require("./adapters/providerState");
 const {
   normalizeProviderName,
   listProviderFlows,
   resolveProviderExecutionOrder,
   resolvePaymentExecutionMode,
+  classifyProviderSubmissionState,
   buildProviderCompatibilityReport,
   buildCanonicalCallStatusEvent,
 } = require("./adapters/providerFlowPolicy");
 const {
   buildCallTemplateExecutionContext,
 } = require("./adapters/templateExecution");
-const { VoiceProviderRegistry } = require("./adapters/voiceProviderRegistry");
+const {
+  VoiceProviderRegistry,
+  normalizeProviderOperationError,
+  canFailoverAfterProviderError,
+} = require("./adapters/voiceProviderRegistry");
+const CallEVoiceAdapter = require("./adapters/CallEVoiceAdapter");
+const { buildTwilioOutboundCallPayload } = require("./adapters/twilioVoiceCallPayload");
 const { previewCallETemplate } = require("./adapters/callETemplateAdapter");
 const { buildCallEDeploymentStatus, createCallEClientFromEnv } = require("./services/callEClient");
 const { parseAllowedDestinations, CallEOutboundCallService } = require("./services/callEOutboundCallService");
 const { CallEReconciliationService, createCallEReconciliationHandler } = require("./services/callEReconciliationService");
+const { createCallEWebhookHandler } = require("./services/callEWebhookService");
 const { CallEContactPolicyService } = require("./services/callEContactPolicyService");
 const { registerCallEContactPolicyRoutes } = require("./services/callEContactPolicyRoutes");
 const { CallEOperatorConfirmationService } = require("./services/callEOperatorConfirmationService");
 const { CallEDispatchService, approvedFingerprintFromEnv } = require("./services/callEDispatchService");
+const {
+  CALL_AGENT_SCHEMA_VERSION,
+  validateCallAgentDefinition,
+  validateCallAgentRuntimeConfig,
+  isCallAgentToolApproved,
+  renderCallAgentBusinessContext,
+  resolveCallAgentEscalationOutcome,
+  constrainCallAgentEscalationTool,
+  buildCallAgentProviderCapabilitySchema,
+} = require("./services/callAgentDefinition");
+const { decideCallAgentToolFailure } = require("./services/callAgentToolFailurePolicy");
 const {
   containsCredentialLikeField,
   fingerprintVapiTemplateMapping,
@@ -147,6 +172,7 @@ const {
 } = require("./services/deepgramVoiceAgentPreflight");
 const {
   normalizeVoiceProfileKey,
+  isCuratedDeepgramVoiceModel,
   selectDeepgramVoiceModel,
   fetchDeepgramTtsModels,
   buildDeepgramVoiceModelCatalog,
@@ -157,6 +183,8 @@ const {
 } = require("./services/callCanary");
 const { runPostCallQaEvaluation } = require("./services/postCallQaService");
 const { PostCallAutomationService } = require("./services/postCallAutomationService");
+const { PostCallWorkflowDefinitionService } = require("./services/postCallWorkflowDefinitionService");
+const { registerPostCallWorkflowDefinitionRoutes } = require("./services/postCallWorkflowDefinitionRoutes");
 const {
   buildCallCompletionAutomationPayload,
   runPostCallAutomationTrigger,
@@ -277,6 +305,7 @@ let smsService = new EnhancedSmsService({
 let emailService;
 let crmContactSyncService;
 let postCallAutomationService;
+let postCallWorkflowDefinitionService;
 const sttFallbackCalls = new Set();
 const streamTimeoutCalls = new Set();
 const inboundRateBuckets = new Map();
@@ -1021,24 +1050,41 @@ function stableVoiceRuntimeBucket(callSid, seed = "voice_agent") {
   return parsed % 100;
 }
 
-function buildVoiceAgentFunctionDefinitions(functionSystem) {
-  const toolDefs = Array.isArray(functionSystem?.tools) ? functionSystem.tools : [];
+function buildVoiceAgentFunctionDefinitions(functionSystem, approvedToolNames, callConfig = {}) {
+  const toolDefs = Array.isArray(functionSystem?.tools)
+    ? functionSystem.tools
+    : Array.isArray(functionSystem?.functions)
+      ? functionSystem.functions
+      : [];
+  const approved = Array.isArray(approvedToolNames)
+    ? new Set(approvedToolNames)
+    : null;
   return toolDefs
     .map((tool) => (tool && typeof tool === "object" ? tool.function || tool : null))
     .filter(Boolean)
     .map((fn) => {
       const name = String(fn.name || "").trim();
       if (!name) return null;
+      const parameters =
+        fn.parameters && typeof fn.parameters === "object"
+          ? fn.parameters
+          : { type: "object", properties: {}, required: [] };
+      const handoffPolicy = resolveRuntimeCallAgentHandoffPolicy(callConfig);
+      const withParameters = { ...fn, parameters };
+      const nextFunction = exposeCallAgentHandoffAction(
+        { function: withParameters },
+        Boolean(handoffPolicy),
+      ).function;
       return {
         name,
-        description: String(fn.description || "").trim() || undefined,
-        parameters:
-          fn.parameters && typeof fn.parameters === "object"
-            ? fn.parameters
-            : { type: "object", properties: {}, required: [] },
+        description:
+          name === "route_to_agent" && handoffPolicy
+            ? `${String(fn.description || "").trim()} Live handoff is available only after the caller requests a person; it requires the caller to press 1 after the confirmation prompt.`
+            : String(fn.description || "").trim() || undefined,
+        parameters: nextFunction.parameters,
       };
     })
-    .filter(Boolean);
+    .filter((fn) => fn && (!approved || approved.has(fn.name)));
 }
 
 function extractVoiceAgentFunctionRequests(payload) {
@@ -1770,6 +1816,52 @@ function normalizeCallScriptObjectiveMetadata(input = {}, options = {}) {
   return { normalized, errors, warnings };
 }
 
+function availableCallAgentToolNames(prompt, firstMessage) {
+  const engine = new DynamicFunctionEngine();
+  const generated = engine.generateAdaptiveFunctionSystem(
+    String(prompt || ""),
+    String(firstMessage || ""),
+  );
+  return Array.from(new Set((generated.functions || [])
+    .map((tool) => String(tool?.function?.name || tool?.name || "").trim())
+    .filter(Boolean)));
+}
+
+function validateTemplateAgentRuntimeConfig(template, config) {
+  if (config === null || config === undefined || config === "") {
+    if (String(template?.voice_model || "").trim().toLowerCase() === "aura-2-celeste-es") {
+      return {
+        valid: false,
+        errors: Object.freeze(["Spanish speech voice requires schema-v6 Spanish Voice Agent settings."]),
+        normalized: null,
+      };
+    }
+    return validateCallAgentRuntimeConfig(config);
+  }
+  const availableToolNames = availableCallAgentToolNames(
+    template?.prompt,
+    template?.first_message,
+  );
+  const runtimeConfig = config?.schema_version === 6 && !Array.isArray(config.approved_tools)
+    ? { ...config, approved_tools: availableToolNames }
+    : config;
+  const validation = validateCallAgentRuntimeConfig(runtimeConfig, {
+    availableToolNames,
+    voiceModel: template?.voice_model,
+  });
+  if (
+    String(template?.voice_model || "").trim().toLowerCase() === "aura-2-celeste-es" &&
+    !validation.normalized?.voice_agent_settings
+  ) {
+    return {
+      valid: false,
+      errors: Object.freeze(["Spanish speech voice requires schema-v6 Spanish Voice Agent settings."]),
+      normalized: null,
+    };
+  }
+  return validation;
+}
+
 function normalizeScriptTemplateRecord(template = null) {
   if (!template || typeof template !== "object") return template;
   const normalized = { ...template };
@@ -1796,6 +1888,13 @@ function normalizeScriptTemplateRecord(template = null) {
     null,
   );
   normalized.payment_policy = parsePaymentPolicy(normalized.payment_policy);
+  try {
+    normalized.agent_config = normalized.agent_config_json
+      ? JSON.parse(normalized.agent_config_json)
+      : (normalized.agent_config || null);
+  } catch (_) {
+    normalized.agent_config = null;
+  }
   const flowTypes = (() => {
     const tags = new Set(
       Array.isArray(normalized.objective_tags) ? normalized.objective_tags : [],
@@ -2394,6 +2493,31 @@ function buildCallToolPolicyGate(callSid, seedConfig = null) {
     const toolName = String(request?.toolName || request?.tool_name || "")
       .trim()
       .toLowerCase();
+    const approvedAgentTools = runtimeConfig?.script_policy?.agent_config?.approved_tools;
+    if (
+      Array.isArray(approvedAgentTools) &&
+      !isCallAgentToolApproved(
+        runtimeConfig?.script_policy?.agent_config,
+        toolName,
+      )
+    ) {
+      const blockedResult = {
+        allowed: false,
+        action: "deny",
+        code: "tool_not_in_agent_allow_list",
+        reason: "agent_tool_allow_list",
+        message: "Tool is not approved for this agent.",
+        profile_type: "general",
+        blocked: ["agent_tool_allow_list"],
+        metadata: { source: "agent_runtime_config", tool: toolName || null },
+      };
+      recordCallToolPolicyDecisionTelemetry(callSid, runtimeConfig, blockedResult, {
+        toolName,
+        profileType: "general",
+        interactionCount: request?.interactionCount,
+      });
+      return blockedResult;
+    }
     const digitFlowGuard = getDigitFlowGuardState(callSid, runtimeConfig);
     const conversationProfile = resolveConversationProfile({
       purpose: digitFlowGuard.active
@@ -3801,6 +3925,13 @@ function buildInboundCallConfig(callSid, payload = {}, options = {}) {
   );
   const inboundTemplate =
     fallbackScript || (Object.keys(route).length > 0 ? route : null);
+  const inboundAgentRuntimeConfig = validateTemplateAgentRuntimeConfig(
+    inboundTemplate || {},
+    inboundTemplate?.agent_config,
+  );
+  const inboundAgentConfig = inboundAgentRuntimeConfig.valid
+    ? inboundAgentRuntimeConfig.normalized
+    : null;
   const templateExecution = buildCallTemplateExecutionContext({
     template: inboundTemplate,
     templateId: inboundTemplateId,
@@ -3866,6 +3997,13 @@ function buildInboundCallConfig(callSid, payload = {}, options = {}) {
       Number.isFinite(Number(route.script_version || fallbackScript?.version))
         ? Math.max(1, Math.floor(Number(route.script_version || fallbackScript?.version)))
         : null,
+    script_policy: {
+      lifecycle_state: inboundTemplate?.lifecycle_state || "draft",
+      ...(inboundAgentConfig ? { agent_config: inboundAgentConfig } : {}),
+      ...(Array.isArray(inboundAgentConfig?.approved_tools)
+        ? { tool_policy: { allowed_tools: inboundAgentConfig.approved_tools } }
+        : {}),
+    },
     emotion: route.emotion || null,
     urgency: route.urgency || null,
     technical_level: route.technical_level || null,
@@ -4046,6 +4184,7 @@ async function ensureCallRecord(
       script: callConfig.script || null,
       script_id: callConfig.script_id || null,
       script_version: callConfig.script_version || null,
+      script_policy: callConfig.script_policy || null,
       template_execution: callConfig.template_execution || null,
       call_profile: callConfig.call_profile || null,
       conversation_profile_lock:
@@ -5018,6 +5157,27 @@ function sendApiError(res, status, code, message, requestId = null, extra = {}) 
     res.locals.apiErrorCode = code;
   }
   return res.status(status).json(buildApiError(code, message, requestId, extra));
+}
+
+function buildCallEErrorMetadata(error) {
+  const safeCode = (value) => {
+    const candidate = String(value || "");
+    return /^[a-z][a-z0-9_]{0,79}$/.test(candidate) ? candidate : null;
+  };
+  const recoveryAction = safeCode(error?.recoveryAction);
+  const allowedRecoveryActions = new Set([
+    "check_server_credentials_or_access",
+    "resolve_provider_billing",
+    "backoff_same_request_and_idempotency_key",
+    "inspect_original_request_and_idempotency_key",
+    "correct_rejected_input_and_reuse_key",
+    "inspect_call_state_before_retry",
+  ]);
+  return {
+    ...(safeCode(error?.providerCode) ? { provider_code: safeCode(error.providerCode) } : {}),
+    ...(safeCode(error?.providerReasonCode) ? { provider_reason_code: safeCode(error.providerReasonCode) } : {}),
+    ...(recoveryAction && allowedRecoveryActions.has(recoveryAction) ? { recovery_action: recoveryAction } : {}),
+  };
 }
 
 function parseBoundedInteger(value, options = {}) {
@@ -8395,6 +8555,7 @@ async function requireMiniAppSession(req, res, next) {
   }
 }
 
+function registerVapiWebCallRoutes() {
 app.get("/miniapp/vapi/web-assistants", requireMiniAppSession, async (req, res) => {
   res.locals.miniAppRoute = "vapi_web_assistants";
   if (await enforceMiniAppRateLimit(req, res, "bootstrap")) return;
@@ -8467,6 +8628,7 @@ app.post("/miniapp/vapi/web-calls", requireMiniAppSession, async (req, res) => {
     });
   }
 });
+}
 
 function requireMiniAppCapability(req, res, capability) {
   const session = req.miniAppSession || {};
@@ -8682,6 +8844,51 @@ async function runMiniAppCallScriptLocalBridgeInternal(options = {}) {
       }
       const requestBody = isPlainObject(bodyInput) ? bodyInput : {};
       const updates = { ...requestBody };
+      if (Object.prototype.hasOwnProperty.call(requestBody, "voice_model")) {
+        const voiceModel = requestBody.voice_model == null
+          ? ""
+          : String(requestBody.voice_model).trim();
+        if (voiceModel && !isCuratedDeepgramVoiceModel(voiceModel)) {
+          return {
+            ok: false,
+            status: 400,
+            data: { success: false, error: "voice_model is not a supported Deepgram Voice Agent voice." },
+          };
+        }
+        updates.voice_model = voiceModel || null;
+      }
+      if (
+        Object.prototype.hasOwnProperty.call(requestBody, "agent_config") ||
+        Object.prototype.hasOwnProperty.call(requestBody, "prompt") ||
+        Object.prototype.hasOwnProperty.call(requestBody, "first_message")
+      ) {
+        const candidateTemplate = {
+          prompt: updates.prompt ?? existing.prompt,
+          first_message: updates.first_message ?? existing.first_message,
+          voice_model: updates.voice_model ?? existing.voice_model,
+        };
+        const candidateConfig = Object.prototype.hasOwnProperty.call(requestBody, "agent_config")
+          ? requestBody.agent_config
+          : existing.agent_config;
+        const agentConfigValidation = validateTemplateAgentRuntimeConfig(
+          candidateTemplate,
+          candidateConfig,
+        );
+        if (!agentConfigValidation.valid) {
+          return {
+            ok: false,
+            status: 400,
+            data: {
+              success: false,
+              code: "CALL_AGENT_DEFINITION_INVALID",
+              error: agentConfigValidation.errors.join(" "),
+            },
+          };
+        }
+        if (Object.prototype.hasOwnProperty.call(requestBody, "agent_config")) {
+          updates.agent_config = agentConfigValidation.normalized;
+        }
+      }
       if (updates.name !== undefined) {
         const normalizedName = normalizeCallTemplateName(updates.name);
         if (!normalizedName) {
@@ -9500,6 +9707,8 @@ function captureRawBody(req, _res, buf) {
   req.rawBody = buf.toString("utf8");
 }
 
+// CALL-E terminal snapshots may include transcripts; keep their larger bounded parser isolated to this path.
+app.use("/api/webhooks/call-e", express.json({ limit: "10mb", verify: captureRawBody }));
 app.use(express.json({ verify: captureRawBody }));
 app.use(express.urlencoded({ extended: true, verify: captureRawBody }));
 
@@ -9549,6 +9758,12 @@ const bypassPathLimiter = rateLimit({
 const callEReconciliationLimiter = rateLimit({
   windowMs: 60000,
   max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+const callEWebhookLimiter = rateLimit({
+  windowMs: 60000,
+  max: 60,
   standardHeaders: true,
   legacyHeaders: false,
 });
@@ -9612,6 +9827,9 @@ app.use((req, res, next) => {
   }
   return bypassPathLimiter(req, res, next);
 });
+
+// Register routes only after app initialization and shared request middleware.
+registerVapiWebCallRoutes();
 
 const PORT = config.server?.port || 3000;
 
@@ -10280,6 +10498,23 @@ const telephonyTools = [
   },
 ];
 
+function createRuntimeCallAgentHandoffService() {
+  return createCallAgentHandoffService({
+    db,
+    twilioClientFactory: () => {
+      if (!config.twilio?.accountSid || !config.twilio?.authToken) {
+        throw new Error("Twilio credentials not configured");
+      }
+      return twilio(config.twilio.accountSid, config.twilio.authToken);
+    },
+  });
+}
+
+function resolveRuntimeCallAgentHandoffPolicy(callConfig = {}) {
+  if (!config.streamAuth?.secret) return null;
+  return resolveCallAgentHandoffPolicy(callConfig);
+}
+
 function buildTelephonyImplementations(callSid, gptService = null) {
   const withToolExecution = (toolName, handler) => async (args = {}) => {
     const now = Date.now();
@@ -10908,11 +11143,51 @@ function buildTelephonyImplementations(callSid, gptService = null) {
         args.intent ||
         args.type ||
         "";
+      if (String(requestedAction).trim().toLowerCase() === "live_transfer") {
+        try {
+          const callConfig = callConfigurations.get(callSid) || {};
+          if (!config.streamAuth?.secret) {
+            return { status: "blocked", code: "stream_auth_required" };
+          }
+          const digitGuard = getDigitFlowGuardState(callSid, callConfig);
+          if (digitGuard.active || digitGuard.paymentActive) {
+            return { status: "blocked", code: "secure_flow_active" };
+          }
+          const result = await createRuntimeCallAgentHandoffService().request(
+            callSid,
+            callConfig,
+          );
+          if (result.status === "awaiting_confirmation") {
+            webhookService.addLiveEvent(
+              callSid,
+              "☎️ Human handoff requested; waiting for caller keypad confirmation",
+              { force: true },
+            );
+          }
+          return result;
+        } catch (_) {
+          return { status: "failed", code: "handoff_request_failed" };
+        }
+      }
+      const agentEscalationPolicy = callConfigurations.get(callSid)
+        ?.script_policy?.agent_config?.escalation_policy;
+      const actionFallback = agentEscalationPolicy?.default_outcome || "review_case";
+      const normalizedRequestedAction = normalizeEscalationOutcome(
+        requestedAction,
+        agentEscalationPolicy ? actionFallback : "review_case",
+      );
+      const constrainedAction = resolveCallAgentEscalationOutcome(
+        agentEscalationPolicy,
+        normalizedRequestedAction,
+      );
       const payload = {
         status: "queued",
-        action: normalizeEscalationOutcome(requestedAction, "review_case"),
+        action: constrainedAction || normalizedRequestedAction,
         reason: args.reason || "unspecified",
         priority: args.priority || "normal",
+        ...(constrainedAction && constrainedAction !== normalizedRequestedAction
+          ? { policy_override: true }
+          : {}),
       };
       const requestedActionKey = normalizeEscalationKey(requestedAction);
       if (requestedActionKey && requestedActionKey !== payload.action) {
@@ -11878,8 +12153,20 @@ function applyTelephonyTools(
   const allowPayment = options.allowPayment === true;
   const normalizedName = (tool) =>
     normalizeEscalationToolName(tool?.function?.name);
+  const escalationPolicy = callConfig?.script_policy?.agent_config?.escalation_policy;
+  const constrainEscalationTool = (tool) => {
+    if (normalizedName(tool) !== "route_to_agent" || !escalationPolicy) {
+      return tool;
+    }
+    return constrainCallAgentEscalationTool(
+      tool,
+      escalationPolicy.allowed_outcomes,
+    );
+  };
 
-  const filteredBaseTools = (Array.isArray(baseTools) ? baseTools : []).filter(
+  const filteredBaseTools = (Array.isArray(baseTools) ? baseTools : [])
+    .map(constrainEscalationTool)
+    .filter(
     (tool) => {
       const name = normalizedName(tool);
       if (!name) return false;
@@ -11894,7 +12181,7 @@ function applyTelephonyTools(
     },
   );
 
-  const filteredTelephonyTools = telephonyTools.filter((tool) => {
+  const filteredTelephonyTools = telephonyTools.map(constrainEscalationTool).filter((tool) => {
     const name = normalizedName(tool);
     if (!allowTransfer && name === "route_to_agent") return false;
     if (
@@ -13249,6 +13536,7 @@ async function evaluateProviderPreflightReport(options = {}) {
       twilio: typeof requireValidTwilioSignature === "function",
       plivo: typeof requireValidPlivoWebhook === "function",
       vonage: typeof requireValidVonageWebhook === "function",
+      call_e: typeof createCallEWebhookHandler === "function",
       paypal: true,
       stripe: true,
     },
@@ -13661,6 +13949,7 @@ function getProviderReadiness() {
     ),
     plivo: plivoHasCredentials && plivoHasRouting && plivoWebhookReady,
     vonage: vonageHasCredentials && vonageHasRouting && vonageWebhookReady,
+    call_e: isCallESelectionReady(config.callE),
   };
 }
 
@@ -13825,6 +14114,11 @@ function getProviderHealthScore(provider) {
 function recordProviderError(provider, error) {
   const normalizedProvider = normalizeProviderName(provider);
   if (!normalizedProvider) return;
+  const safeError = normalizeProviderOperationError(
+    normalizedProvider,
+    error?.operation || "unknown",
+    error,
+  );
   const health = getProviderHealthEntry(normalizedProvider);
   const windowMs = Number(config.providerFailover?.errorWindowMs) || 120000;
   const threshold = Number(config.providerFailover?.errorThreshold) || 3;
@@ -13845,17 +14139,17 @@ function recordProviderError(provider, error) {
     health.degradedUntil = now + cooldownMs;
     health.circuitState = "open";
     health.circuitUpdatedAt = new Date(now).toISOString();
-    health.circuitReason = error?.message || String(error || "unknown");
+    health.circuitReason = safeError.code;
     db?.logServiceHealth?.("provider_failover", "degraded", {
       provider: normalizedProvider,
       errors: health.errorTimestamps.length,
       window_ms: windowMs,
       cooldown_ms: cooldownMs,
-      error: error?.message || String(error || "unknown"),
+      error_code: safeError.code,
       consecutive_errors: health.consecutiveErrors,
     }).catch(() => {});
   } else if (health.circuitState === "closed") {
-    health.circuitReason = error?.message || String(error || "unknown");
+    health.circuitReason = safeError.code;
   }
   health.score = computeProviderHealthScore(normalizedProvider, health, { nowMs: now });
   providerHealth.set(normalizedProvider, health);
@@ -14030,17 +14324,31 @@ function getVoiceProviderRegistry() {
       const authToken = config.twilio.authToken;
       const fromNumber = config.twilio.fromNumber;
       if (!accountSid || !authToken || !fromNumber) {
-        throw new Error("Twilio credentials not configured");
+        const error = new Error("Twilio credentials not configured");
+        error.providerSubmissionState = "not_submitted";
+        throw error;
       }
 
-      const client = twilio(accountSid, authToken);
-      const callPayload = buildTwilioOutboundCallPayload({
-        host,
-        to: number,
-        from: fromNumber,
-        machineDetection: config.twilio?.machineDetection,
-        machineDetectionTimeout: config.twilio?.machineDetectionTimeout,
-      });
+      let client;
+      try {
+        client = twilio(accountSid, authToken);
+      } catch (error) {
+        error.providerSubmissionState = "not_submitted";
+        throw error;
+      }
+      let callPayload;
+      try {
+        callPayload = buildTwilioOutboundCallPayload({
+          host,
+          to: number,
+          from: fromNumber,
+          machineDetection: config.twilio?.machineDetection,
+          machineDetectionTimeout: config.twilio?.machineDetectionTimeout,
+        });
+      } catch (error) {
+        error.providerSubmissionState = "not_submitted";
+        throw error;
+      }
       console.log(
         `Twilio call URLs: twiml=${callPayload.url} statusCallback=${callPayload.statusCallback}`,
       );
@@ -14048,12 +14356,20 @@ function getVoiceProviderRegistry() {
         Number(config.callProvider?.requestTimeoutMs) ||
         Number(config.outboundLimits?.handlerTimeoutMs) ||
         30000;
-      const call = await runWithTimeout(
-        client.calls.create(callPayload),
-        providerTimeoutMs,
-        "twilio_outbound_call",
-        "call_provider_timeout",
-      );
+      let call;
+      try {
+        call = await runWithTimeout(
+          client.calls.create(callPayload),
+          providerTimeoutMs,
+          "twilio_outbound_call",
+          "call_provider_timeout",
+        );
+      } catch (error) {
+        error.providerSubmissionState = classifyProviderSubmissionState(
+          error?.statusCode || error?.status,
+        );
+        throw error;
+      }
       return {
         callId: call.sid,
         providerCallId: call.sid,
@@ -14181,6 +14497,16 @@ function getVoiceProviderRegistry() {
       await getVonageVoiceAdapter().hangupCall(callUuid);
     },
   });
+
+  registry.register("call_e", new CallEVoiceAdapter({
+    createTaskCall: (request) => new CallEOutboundCallService({
+      client: createCallEClientFromEnv(),
+      db,
+    }).createOutboundCall(request),
+    cancelTaskCall: ({ providerCallId }) => createCallEClientFromEnv().cancelCall(providerCallId),
+    getCall: ({ providerCallId }) => createCallEClientFromEnv().getCall(providerCallId),
+    listCallEvents: ({ providerCallId, ...options }) => createCallEClientFromEnv().listCallEvents(providerCallId, options),
+  }));
 
   voiceProviderRegistry = registry;
   return registry;
@@ -14756,6 +15082,7 @@ async function startServer(options = {}) {
       crmService: crmContactSyncService,
       logger: console,
     });
+    postCallWorkflowDefinitionService = new PostCallWorkflowDefinitionService({ db });
     const defaultAutomationRules = await postCallAutomationService.ensureDefaultRules();
     if (defaultAutomationRules.installed > 0) {
       console.log(
@@ -15043,6 +15370,7 @@ app.ws("/connection", (ws, req) => {
     let interactionCount = 0;
     let isInitialized = false;
     let streamAuthOk = false;
+    let streamAuthVerified = false;
     const clearVoiceAgentNoAudioTimer = () => {
       if (voiceAgentNoAudioTimer) {
         clearTimeout(voiceAgentNoAudioTimer);
@@ -15292,6 +15620,7 @@ app.ws("/connection", (ws, req) => {
             return;
           }
           streamAuthOk = authResult.ok || authResult.skipped;
+          streamAuthVerified = authResult.ok === true;
           const priorStreamSid = streamStartSeen.get(callSid);
           if (priorStreamSid && priorStreamSid === streamSid) {
             console.log(
@@ -15420,14 +15749,14 @@ app.ws("/connection", (ws, req) => {
             await db.updateCallStatus(callSid, "started", {
               started_at: callStartTime.toISOString(),
             });
-	            await db.updateCallState(callSid, "stream_started", {
-	              stream_sid: streamSid,
-	              start_time: callStartTime.toISOString(),
-	            });
-	            setCallPhase(callSid, "connected", {
-	              source: "twilio_stream_start",
-	              reason: "stream_started",
-	            });
+                await db.updateCallState(callSid, "stream_started", {
+                  stream_sid: streamSid,
+                  start_time: callStartTime.toISOString(),
+                });
+                setCallPhase(callSid, "connected", {
+                  source: "twilio_stream_start",
+                  reason: "stream_started",
+                });
 
             // Create webhook notification for stream start (internal tracking)
             const call = await db.getCall(callSid);
@@ -15484,7 +15813,16 @@ app.ws("/connection", (ws, req) => {
               callSid,
             });
             const voiceAgentFunctions =
-              buildVoiceAgentFunctionDefinitions(functionSystem);
+              buildVoiceAgentFunctionDefinitions(
+                functionSystem,
+                Array.isArray(callConfig?.script_policy?.agent_config?.approved_tools)
+                  ? callConfig.script_policy.agent_config.approved_tools
+                  : undefined,
+                callConfig,
+              );
+            const handoffDirective = resolveRuntimeCallAgentHandoffPolicy(callConfig)
+              ? "Human handoff rules: only request a live handoff after the caller explicitly asks for a person. When the tool returns its confirmation prompt, say it exactly and wait for the caller to press 1 to transfer or 2 to stay. A transfer happens only after the server receives DTMF 1. Never claim that the destination answered."
+              : "Live human handoff is unavailable unless the current live script explicitly enables it.";
             const rawGreeting = String(
               callConfig?.first_message || DEFAULT_INBOUND_FIRST_MESSAGE,
             );
@@ -15497,16 +15835,30 @@ app.ws("/connection", (ws, req) => {
                   }).text;
             const promptText = [
               callConfig?.prompt || DEFAULT_INBOUND_PROMPT,
+              renderCallAgentBusinessContext(
+                callConfig?.script_policy?.agent_config?.business_context,
+              ),
               intentLine,
               flowStateLine,
               voiceStyleLine,
               VOICE_TURN_TAKING_DIRECTIVE,
               VOICE_OUTPUT_GUARD_DIRECTIVE,
+              handoffDirective,
             ]
               .filter(Boolean)
               .join("\n");
-            const toolTimeoutMs =
+            const globalToolTimeoutMs =
               Number(config.openRouter?.toolExecutionTimeoutMs) || 12000;
+            const agentToolTimeoutMs = Number(
+              callConfig?.script_policy?.agent_config?.tool_timeout_ms,
+            );
+            const toolTimeoutMs = Number.isSafeInteger(agentToolTimeoutMs)
+              ? Math.min(globalToolTimeoutMs, agentToolTimeoutMs)
+              : globalToolTimeoutMs;
+            const voiceAgentOverrides =
+              callConfig?.script_policy?.agent_config?.voice_agent_settings || {};
+            const listenModel =
+              voiceAgentOverrides.listen_model || voiceAgentConfig.listenModel || "nova-2";
 
             try {
               voiceAgentBridge = new VoiceAgentBridge({
@@ -15532,10 +15884,11 @@ app.ws("/connection", (ws, req) => {
                 },
                 greeting: greetingText || undefined,
                 agent: {
-                  language: voiceAgentConfig.language || "en",
+                  language: voiceAgentOverrides.language || voiceAgentConfig.language || "en",
                   listen: {
                     provider: {
-                      model: voiceAgentConfig.listenModel || "nova-2",
+                      model: listenModel,
+                      ...(String(listenModel).startsWith("flux-") ? { version: "v2" } : {}),
                       smart_format: voiceAgentConfig.listenSmartFormat !== false,
                       keyterms: Array.isArray(voiceAgentConfig.listenKeyterms)
                         ? voiceAgentConfig.listenKeyterms
@@ -15553,8 +15906,8 @@ app.ws("/connection", (ws, req) => {
                   },
                   think: {
                     provider: {
-                      type: voiceAgentConfig.thinkProvider || "open_ai",
-                      model: voiceAgentConfig.thinkModel || "gpt-4o-mini",
+                      type: voiceAgentOverrides.think_provider || voiceAgentConfig.thinkProvider || "open_ai",
+                      model: voiceAgentOverrides.think_model || voiceAgentConfig.thinkModel || "gpt-4o-mini",
                       temperature: Number.isFinite(
                         Number(voiceAgentConfig.thinkTemperature),
                       )
@@ -15744,11 +16097,31 @@ app.ws("/connection", (ws, req) => {
                     parsedArgs = rawArgs;
                   }
 
+                  const policyDecision = buildCallToolPolicyGate(callSid, callConfig)({
+                    toolName: name,
+                    args: parsedArgs,
+                  });
+                  if (policyDecision?.allowed === false) {
+                    voiceAgentBridge.respondFunctionCall({
+                      id: requestId,
+                      name,
+                      content: JSON.stringify({
+                        ok: false,
+                        error: "tool_policy_blocked",
+                        code: policyDecision.code || "tool_policy_blocked",
+                        reason: policyDecision.reason || null,
+                      }),
+                    });
+                    continue;
+                  }
+
                   try {
-                    const result = await runOperationWithTimeout(
+                    const toolTimeoutCode = `voice_agent_function_timeout:${name}`;
+                    const result = await runWithTimeout(
                       Promise.resolve().then(() => implementation(parsedArgs)),
                       toolTimeoutMs,
-                      `voice_agent_function_timeout:${name}`,
+                      toolTimeoutCode,
+                      toolTimeoutCode,
                     );
                     voiceAgentBridge.respondFunctionCall({
                       id: requestId,
@@ -15759,14 +16132,35 @@ app.ws("/connection", (ws, req) => {
                           : JSON.stringify(result ?? { ok: true }),
                     });
                   } catch (error) {
+                    const failurePolicy = callConfigurations.get(callSid)
+                      ?.script_policy?.agent_config?.tool_failure_policy;
+                    const failureDecision = decideCallAgentToolFailure(failurePolicy, error);
+                    const failureAction = failureDecision.action;
                     voiceAgentBridge.respondFunctionCall({
                       id: requestId,
                       name,
-                      content: JSON.stringify({
-                        ok: false,
-                        error: error?.message || "function_execution_failed",
-                      }),
+                      content: JSON.stringify(failureDecision.response),
                     });
+                    if (failureAction === "end_call") {
+                      await db.updateCallState(callSid, "agent_tool_failure_fallback", {
+                        tool_name: name,
+                        error_code: failureDecision.errorCode,
+                        action: "end_call",
+                      }).catch(() => {});
+                      try {
+                        await speakAndEndCall(
+                          callSid,
+                          CALL_END_MESSAGES.error,
+                          "agent_tool_failure_fallback",
+                        );
+                      } catch (_) {
+                        console.error("voice_agent_tool_failure_fallback_failed", {
+                          action: "end_call",
+                          error_code: "call_end_failed",
+                        });
+                      }
+                      break;
+                    }
                   }
                 }
               });
@@ -15930,6 +16324,12 @@ app.ws("/connection", (ws, req) => {
           gptService.setCallIntent(
             `Call intent: ${callConfig?.script || "general"} | profile: ${conversationProfile || "general"} | purpose: ${callConfig?.purpose || conversationProfile || "general"} | business: ${callConfig?.business_context?.business_id || callConfig?.business_id || "unspecified"}. Keep replies concise and on-task.`,
           );
+          const agentBusinessContextPrompt = renderCallAgentBusinessContext(
+            callConfig?.script_policy?.agent_config?.business_context,
+          );
+          if (agentBusinessContextPrompt) {
+            gptService.setCallIntent(agentBusinessContextPrompt);
+          }
           if (callConfig) {
             await applyInitialDigitIntent(
               callSid,
@@ -16508,6 +16908,29 @@ app.ws("/connection", (ws, req) => {
         } else if (event === "dtmf") {
           const digits = msg?.dtmf?.digits || msg?.dtmf?.digit || "";
           if (digits) {
+            if (streamAuthVerified) {
+              let handoffInput;
+              try {
+                handoffInput = await createRuntimeCallAgentHandoffService().handleDtmf(
+                  callSid,
+                  digits,
+                  callConfigurations.get(callSid) || {},
+                );
+              } catch (_) {
+                console.error("voice_agent_handoff_confirmation_failed", {
+                  code: "handoff_state_unavailable",
+                });
+                return;
+              }
+              if (handoffInput?.handled) {
+                if (handoffInput.agent_message) {
+                  voiceAgentBridge?.injectAgentMessage?.(
+                    handoffInput.agent_message,
+                  );
+                }
+                return;
+              }
+            }
             markGreetingRecoveryProgress(callSid, "twilio_dtmf");
             setCallPhase(callSid, "active", {
               source: "twilio_dtmf",
@@ -16669,13 +17092,13 @@ app.ws("/connection", (ws, req) => {
             }
             activeCalls.delete(callSid);
             callToolInFlight.delete(callSid);
-	            clearCallEndLock(callSid);
-	            clearSilenceTimer(callSid);
-	            clearGreetingRecoveryWatchdog(callSid, {
-	              clearPhase: false,
-	              source: "twilio_stream_stop_preserve",
-	            });
-	            return;
+                clearCallEndLock(callSid);
+                clearSilenceTimer(callSid);
+                clearGreetingRecoveryWatchdog(callSid, {
+                  clearPhase: false,
+                  source: "twilio_stream_stop_preserve",
+                });
+                return;
           }
 
           const authBypass = streamAuthBypass.get(callSid);
@@ -16699,13 +17122,13 @@ app.ws("/connection", (ws, req) => {
               allowHangup: false,
               reason: "stream_auth_failed",
             });
-	            clearCallEndLock(callSid);
-	            clearSilenceTimer(callSid);
-	            clearGreetingRecoveryWatchdog(callSid, {
-	              clearPhase: false,
-	              source: "twilio_stream_stop_auth_bypass",
-	            });
-	            return;
+                clearCallEndLock(callSid);
+                clearSilenceTimer(callSid);
+                clearGreetingRecoveryWatchdog(callSid, {
+                  clearPhase: false,
+                  source: "twilio_stream_stop_auth_bypass",
+                });
+                return;
           }
 
           await handleCallEnd(callSid, callStartTime);
@@ -16734,12 +17157,12 @@ app.ws("/connection", (ws, req) => {
           if (digitService) {
             digitService.clearCallState(callSid);
           }
-	          clearCallEndLock(callSid);
-	          clearSilenceTimer(callSid);
-	          clearGreetingRecoveryWatchdog(callSid, {
-	            clearPhase: false,
-	            source: "twilio_stream_stop_cleanup",
-	          });
+              clearCallEndLock(callSid);
+              clearSilenceTimer(callSid);
+              clearGreetingRecoveryWatchdog(callSid, {
+                clearPhase: false,
+                source: "twilio_stream_stop_cleanup",
+              });
         } else {
           console.log(
             `Unrecognized WS event for ${callSid || "unknown"}: ${event || "none"}`,
@@ -16985,12 +17408,12 @@ app.ws("/connection", (ws, req) => {
       clearSpeechTicks(callSid);
       clearGptQueue(callSid);
       clearNormalFlowState(callSid);
-	      clearCallEndLock(callSid);
-	      clearSilenceTimer(callSid);
-	      clearGreetingRecoveryWatchdog(callSid, {
-	        clearPhase: false,
-	        source: "twilio_ws_close",
-	      });
+          clearCallEndLock(callSid);
+          clearSilenceTimer(callSid);
+          clearGreetingRecoveryWatchdog(callSid, {
+            clearPhase: false,
+            source: "twilio_ws_close",
+          });
       sttFallbackCalls.delete(callSid);
       streamTimeoutCalls.delete(callSid);
       streamStartTimes.delete(callSid);
@@ -17142,21 +17565,21 @@ app.ws("/vonage/stream", async (ws, req) => {
         .updateCallStatus(callSid, "started", { started_at: startedAt })
         .catch(() => {});
     }
-	    if (db?.updateCallState) {
-	      await db.updateCallState(callSid, "stream_started", {
-	        stream_provider: "vonage",
-	        started_at: startedAt,
-	        vonage_uuid: vonageUuid || callConfig?.provider_metadata?.vonage_uuid,
-	        stream_audio_content_type: vonageAudioSpec.contentType,
-	        stream_audio_encoding: vonageAudioSpec.sttEncoding,
-	        stream_audio_sample_rate: vonageAudioSpec.sampleRate,
-	      })
-	        .catch(() => {});
-	    }
-	    setCallPhase(callSid, "connected", {
-	      source: "vonage_stream_start",
-	      reason: "stream_started",
-	    });
+        if (db?.updateCallState) {
+          await db.updateCallState(callSid, "stream_started", {
+            stream_provider: "vonage",
+            started_at: startedAt,
+            vonage_uuid: vonageUuid || callConfig?.provider_metadata?.vonage_uuid,
+            stream_audio_content_type: vonageAudioSpec.contentType,
+            stream_audio_encoding: vonageAudioSpec.sttEncoding,
+            stream_audio_sample_rate: vonageAudioSpec.sampleRate,
+          })
+            .catch(() => {});
+        }
+        setCallPhase(callSid, "connected", {
+          source: "vonage_stream_start",
+          reason: "stream_started",
+        });
     console.log(`Vonage stream connected for ${callSid}; using legacy STT+GPT+TTS`);
 
     const ttsService = new TextToSpeechService({
@@ -17596,12 +18019,12 @@ app.ws("/vonage/stream", async (ws, req) => {
         clearSpeechTicks(callSid);
         clearGptQueue(callSid);
         clearNormalFlowState(callSid);
-	        clearCallEndLock(callSid);
-	        clearSilenceTimer(callSid);
-	        clearGreetingRecoveryWatchdog(callSid, {
-	          clearPhase: false,
-	          source: "vonage_ws_close",
-	        });
+            clearCallEndLock(callSid);
+            clearSilenceTimer(callSid);
+            clearGreetingRecoveryWatchdog(callSid, {
+              clearPhase: false,
+              source: "vonage_ws_close",
+            });
         sttFallbackCalls.delete(callSid);
         streamTimeoutCalls.delete(callSid);
         streamRetryState.delete(callSid);
@@ -19497,6 +19920,9 @@ const MINI_APP_SUPPORTED_ACTIONS = Object.freeze([
   "calls.list",
   "calls.search",
   "callscript.list",
+  "callscript.versions",
+  "callscript.diff",
+  "callscript.rollback",
   "callscript.promote_live",
   "callscript.review",
   "callscript.simulate",
@@ -19505,6 +19931,11 @@ const MINI_APP_SUPPORTED_ACTIONS = Object.freeze([
   "callscript.calle_dispatch",
   "calle.status",
   "calle.call.reconcile",
+  "calle.call.review",
+  "calle.ops.reconcile",
+  "calle.ops.review",
+  "calle.call.cancel",
+  "calle.calls.list",
   "callscript.submit_review",
   "callscript.update",
   "dlq.call.list",
@@ -19634,6 +20065,9 @@ const MINI_APP_DASHBOARD_MODULE_DEFINITIONS = [
     command: "/scripts",
     action_contracts: [
       "callscript.list",
+      "callscript.versions",
+      "callscript.diff",
+      "callscript.rollback",
       "callscript.update",
       "callscript.submit_review",
       "callscript.review",
@@ -19642,6 +20076,10 @@ const MINI_APP_DASHBOARD_MODULE_DEFINITIONS = [
       "callscript.calle_preview",
       "callscript.calle_confirm",
       "callscript.calle_dispatch",
+      "calle.status",
+      "calle.call.reconcile",
+      "calle.call.review",
+      "calle.call.cancel",
     ],
     order: 4,
     enabled: true,
@@ -19651,7 +20089,7 @@ const MINI_APP_DASHBOARD_MODULE_DEFINITIONS = [
     label: "Call Log Explorer",
     capability: "dashboard_view",
     command: "/calllog",
-    action_contracts: ["calls.list", "calls.search", "calls.get", "calls.events", "callback_tasks.list", "review_cases.list"],
+    action_contracts: ["calls.list", "calls.search", "calls.get", "calls.events", "calle.calls.list", "calle.ops.reconcile", "calle.ops.review", "callback_tasks.list", "review_cases.list"],
     order: 5,
     enabled: true,
   },
@@ -20066,6 +20504,46 @@ function buildMiniAppActionSpec(action, payload = {}) {
     };
   }
 
+  if (normalizedAction === "callscript.versions") {
+    const scriptId = Number(input.id || input.script_id || input.scriptId);
+    if (!Number.isSafeInteger(scriptId) || scriptId <= 0) return { error: "Valid script id is required" };
+    return {
+      capability: "caller_flags_manage",
+      method: "GET",
+      path: `/api/call-scripts/${scriptId}/versions`,
+    };
+  }
+
+  if (normalizedAction === "callscript.diff") {
+    const scriptId = Number(input.id || input.script_id || input.scriptId);
+    const fromVersion = Number(input.from_version);
+    const toVersion = Number(input.to_version);
+    if (!Number.isSafeInteger(scriptId) || scriptId <= 0) return { error: "Valid script id is required" };
+    if (!Number.isSafeInteger(fromVersion) || fromVersion <= 0 || !Number.isSafeInteger(toVersion) || toVersion <= 0) {
+      return { error: "Two positive script versions are required" };
+    }
+    if (fromVersion === toVersion) return { error: "Choose two different script versions to compare" };
+    return {
+      capability: "caller_flags_manage",
+      method: "GET",
+      path: `/api/call-scripts/${scriptId}/diff`,
+      query: { from_version: fromVersion, to_version: toVersion },
+    };
+  }
+
+  if (normalizedAction === "callscript.rollback") {
+    const scriptId = Number(input.id || input.script_id || input.scriptId);
+    const version = Number(input.version);
+    if (!Number.isSafeInteger(scriptId) || scriptId <= 0) return { error: "Valid script id is required" };
+    if (!Number.isSafeInteger(version) || version <= 0) return { error: "A positive script version is required" };
+    return {
+      capability: "caller_flags_manage",
+      method: "POST",
+      path: `/api/call-scripts/${scriptId}/rollback`,
+      body: { version },
+    };
+  }
+
   if (normalizedAction === "callscript.update") {
     const scriptId = Number(input.id || input.script_id || input.scriptId);
     if (!Number.isFinite(scriptId) || scriptId <= 0) {
@@ -20101,6 +20579,18 @@ function buildMiniAppActionSpec(action, payload = {}) {
       } else {
         return { error: "objective_tags must be a comma string, array, or null" };
       }
+    }
+    if (Object.prototype.hasOwnProperty.call(input, "agent_config")) {
+      if (input.agent_config !== null && !isPlainObject(input.agent_config)) {
+        return { error: "agent_config must be a JSON object or null" };
+      }
+      updates.agent_config = input.agent_config;
+    }
+    if (Object.prototype.hasOwnProperty.call(input, "voice_model")) {
+      if (input.voice_model !== null && typeof input.voice_model !== "string") {
+        return { error: "voice_model must be a string or null" };
+      }
+      updates.voice_model = input.voice_model;
     }
     if (Object.keys(updates).length === 0) {
       return { error: "At least one script field must be provided for update" };
@@ -20235,7 +20725,61 @@ function buildMiniAppActionSpec(action, payload = {}) {
     };
   }
 
-  if (normalizedAction === "calle.call.reconcile") {
+  if (normalizedAction === "calle.calls.list") {
+    const limit = parseBoundedInteger(input.limit, { defaultValue: 20, min: 1, max: 100 });
+    const offset = parseBoundedInteger(input.offset, { defaultValue: 0, min: 0, max: 5000 });
+    const executionStatus = String(input.execution_status || "").trim().toLowerCase();
+    const callOutcome = String(input.call_outcome || "").trim().toLowerCase();
+    const resultStatus = String(input.result_status || "").trim().toLowerCase();
+    const query = String(input.query || "").trim();
+    const startDate = String(input.start_date || "").trim();
+    const endDate = String(input.end_date || "").trim();
+    if (executionStatus && !["queued", "in_progress", "completed", "failed", "canceled"].includes(executionStatus)) return { error: "Invalid execution_status" };
+    if (callOutcome && !["completed", "no_answer", "busy", "declined"].includes(callOutcome)) return { error: "Invalid call_outcome" };
+    if (resultStatus && !["pending", "available", "unavailable", "not_applicable"].includes(resultStatus)) return { error: "Invalid result_status" };
+    if (query && !/^[A-Za-z0-9_-]{2,200}$/.test(query)) return { error: "query must be a safe call identifier" };
+    const validDate = (value) => {
+      if (!value) return true;
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+      const parsed = new Date(`${value}T00:00:00.000Z`);
+      return Number.isFinite(parsed.getTime()) && parsed.toISOString().slice(0, 10) === value;
+    };
+    if (!validDate(startDate) || !validDate(endDate) || (startDate && endDate && startDate > endDate)) return { error: "Invalid date filter" };
+    return {
+      capability: "dashboard_view",
+      method: "POST",
+      path: "/miniapp/action",
+      body: { limit, offset, execution_status: executionStatus, call_outcome: callOutcome, result_status: resultStatus, query, start_date: startDate, end_date: endDate },
+    };
+  }
+
+  if (normalizedAction === "calle.call.reconcile" || normalizedAction === "calle.ops.reconcile") {
+    const localCallId = String(input.local_call_id || input.localCallId || "").trim();
+    if (!/^call_e_[0-9a-f-]{36}$/i.test(localCallId)) {
+      return { error: "Valid VOICEDNUT CALL-E call ID is required" };
+    }
+    return {
+      capability: normalizedAction === "calle.ops.reconcile" ? "dashboard_view" : "caller_flags_manage",
+      method: "POST",
+      path: "/miniapp/action",
+      body: { local_call_id: localCallId },
+    };
+  }
+
+  if (normalizedAction === "calle.call.review" || normalizedAction === "calle.ops.review") {
+    const localCallId = String(input.local_call_id || input.localCallId || "").trim();
+    if (!/^call_e_[0-9a-f-]{36}$/i.test(localCallId)) {
+      return { error: "Valid VOICEDNUT CALL-E call ID is required" };
+    }
+    return {
+      capability: normalizedAction === "calle.ops.review" ? "dashboard_view" : "caller_flags_manage",
+      method: "POST",
+      path: "/miniapp/action",
+      body: { local_call_id: localCallId },
+    };
+  }
+
+  if (normalizedAction === "calle.call.cancel") {
     const localCallId = String(input.local_call_id || input.localCallId || "").trim();
     if (!/^call_e_[0-9a-f-]{36}$/i.test(localCallId)) {
       return { error: "Valid VOICEDNUT CALL-E call ID is required" };
@@ -21316,6 +21860,10 @@ const MINI_APP_READ_ONLY_POST_ACTIONS = new Set([
   "automation.preview",
   "callscript.calle_preview",
   "calle.call.reconcile",
+  "calle.call.review",
+  "calle.ops.reconcile",
+  "calle.ops.review",
+  "calle.calls.list",
   "callscript.simulate",
   "crm.health",
   "email.preview",
@@ -22062,11 +22610,12 @@ app.post("/miniapp/action", requireMiniAppSession, async (req, res) => {
 
   if (action === "callscript.calle_dispatch") {
     try {
-      const client = createCallEClientFromEnv();
       const result = await new CallEDispatchService({
         db,
         getTemplate: async (templateId) => normalizeScriptTemplateRecord(await db.getCallTemplateById(templateId)),
-        outbound: new CallEOutboundCallService({ client, db }),
+        outbound: {
+          createOutboundCall: (request) => getVoiceProviderRegistry().createTaskCall("call_e", request),
+        },
       }).dispatch({
         ...spec.body,
         idempotency_key: idempotencyKey,
@@ -22087,15 +22636,38 @@ app.post("/miniapp/action", requireMiniAppSession, async (req, res) => {
         String(error?.code || "call_e_dispatch_failed"),
         error?.message || "CALL-E dispatch failed",
         req.requestId || null,
+        buildCallEErrorMetadata(error),
       );
     }
   }
 
-  if (action === "calle.call.reconcile") {
+  if (action === "calle.calls.list") {
+    try {
+      const result = await new CallEReconciliationService({ db }).listCallsForOperator(
+        String(req.miniAppSession?.telegram_id || '').trim(),
+        spec.body || {},
+      );
+      return res.json({
+        success: true,
+        action,
+        requested_action: actionResolution.requestedAction,
+        was_aliased: actionResolution.wasAliased,
+        data: result,
+        request_id: req.requestId || null,
+      });
+    } catch (error) {
+      const code = String(error?.code || 'call_e_operations_list_failed');
+      const status = Number(error?.status) || (code === 'call_e_reconciliation_storage_unavailable' ? 503 : 502);
+      return sendApiError(res, status, code, error?.message || 'CALL-E operations list is unavailable', req.requestId || null);
+    }
+  }
+
+  if (action === "calle.call.reconcile" || action === "calle.ops.reconcile") {
     try {
       const result = await new CallEReconciliationService({
         client: createCallEClientFromEnv(),
         db,
+        providerRegistry: getVoiceProviderRegistry(),
       }).reconcileLocalCallForOperator(
         spec.body.local_call_id,
         String(req.miniAppSession?.telegram_id || "").trim(),
@@ -22118,6 +22690,73 @@ app.post("/miniapp/action", requireMiniAppSession, async (req, res) => {
         status,
         code,
         status === 502 ? "CALL-E reconciliation failed" : error?.message || "CALL-E reconciliation failed",
+        req.requestId || null,
+      );
+    }
+  }
+
+  if (action === "calle.call.review" || action === "calle.ops.review") {
+    try {
+      const result = await new CallEReconciliationService({
+        client: createCallEClientFromEnv(),
+        db,
+        providerRegistry: getVoiceProviderRegistry(),
+      }).reviewLocalCallForOperator(
+        spec.body.local_call_id,
+        String(req.miniAppSession?.telegram_id || "").trim(),
+      );
+      return res.json({
+        success: true,
+        action,
+        requested_action: actionResolution.requestedAction,
+        was_aliased: actionResolution.wasAliased,
+        data: { result },
+        request_id: req.requestId || null,
+      });
+    } catch (error) {
+      const code = String(error?.code || "call_e_review_failed");
+      const status = code === "call_e_call_not_found" ? 404
+        : code === "call_e_not_configured" || code === "call_e_reconciliation_storage_unavailable" ? 503
+          : code === "call_e_result_invalid" ? 409 : 502;
+      return sendApiError(
+        res,
+        status,
+        code,
+        status === 502 ? "CALL-E content review failed" : error?.message || "CALL-E content review failed",
+        req.requestId || null,
+      );
+    }
+  }
+
+  if (action === "calle.call.cancel") {
+    try {
+      const result = await new CallEReconciliationService({
+        client: createCallEClientFromEnv(),
+        db,
+        providerRegistry: getVoiceProviderRegistry(),
+        cancelTaskCall: (request) => getVoiceProviderRegistry().cancelTaskCall("call_e", request),
+      }).cancelLocalCallForOperator(
+        spec.body.local_call_id,
+        String(req.miniAppSession?.telegram_id || "").trim(),
+      );
+      return res.json({
+        success: true,
+        action,
+        requested_action: actionResolution.requestedAction,
+        was_aliased: actionResolution.wasAliased,
+        data: { result },
+        request_id: req.requestId || null,
+      });
+    } catch (error) {
+      const code = String(error?.code || "call_e_cancellation_failed");
+      const status = code === "call_e_call_not_found" ? 404
+        : code === "call_e_not_configured" || code === "call_e_reconciliation_storage_unavailable" ? 503
+          : code === "call_e_result_invalid" || code === "call_e_call_cannot_cancel" ? 409 : 502;
+      return sendApiError(
+        res,
+        status,
+        code,
+        status === 502 ? "CALL-E cancellation failed" : error.message,
         req.requestId || null,
       );
     }
@@ -22326,6 +22965,9 @@ app.get("/admin/provider", requireAdminToken, async (req, res) => {
       sms: smsState,
       email: emailState,
     },
+    call_agent_capability_schema: buildCallAgentProviderCapabilitySchema({
+      vonageDtmfWebhookEnabled: config.vonage?.dtmfWebhookEnabled === true,
+    }),
     compatibility: getProviderCompatibilityReport(),
   });
 });
@@ -23299,6 +23941,7 @@ function normalizeCallScriptLifecycleState(value, fallback = "draft") {
 
 function buildCallTemplateVersionSnapshot(script = {}) {
   return {
+    schema_version: CALL_AGENT_SCHEMA_VERSION,
     name: script.name || null,
     description: script.description || null,
     prompt: script.prompt || null,
@@ -23337,6 +23980,7 @@ function buildCallTemplateVersionSnapshot(script = {}) {
     payment_currency: script.payment_currency || null,
     payment_description: script.payment_description || null,
     payment_policy: script.payment_policy || null,
+    agent_config: script.agent_config || null,
     payment_start_message: script.payment_start_message || null,
     payment_success_message: script.payment_success_message || null,
     payment_failure_message: script.payment_failure_message || null,
@@ -23527,8 +24171,11 @@ app.post("/api/call-scripts/:id/call-e-preview", requireAdminToken, async (req, 
 });
 
 app.get("/api/call-e/status", requireAdminToken, (req, res) => {
+  const descriptor = getVoiceProviderRegistry().getDescriptor("call_e");
   return res.json({
     success: true,
+    capabilities: descriptor?.capabilities || [],
+    operations: descriptor?.operations || {},
     status: buildCallEDeploymentStatus(createCallEClientFromEnv(), {
       destinationAllowlistReady: parseAllowedDestinations().size > 0,
       dispatchEnabled: String(process.env.CALLE_DISPATCH_ENABLED || "false").trim().toLowerCase() === "true",
@@ -23561,6 +24208,21 @@ app.post(
     createService: () => new CallEReconciliationService({
       client: createCallEClientFromEnv(),
       db,
+      providerRegistry: getVoiceProviderRegistry(),
+      maxPages: 5,
+    }),
+  }),
+);
+
+app.post(
+  "/api/webhooks/call-e",
+  callEWebhookLimiter,
+  createCallEWebhookHandler({
+    db,
+    createService: () => new CallEReconciliationService({
+      client: createCallEClientFromEnv(),
+      db,
+      providerRegistry: getVoiceProviderRegistry(),
       maxPages: 5,
     }),
   }),
@@ -24118,6 +24780,16 @@ app.post("/api/call-scripts", requireAdminToken, async (req, res) => {
         .status(400)
         .json({ success: false, error: "name and first_message are required" });
     }
+    if (Object.prototype.hasOwnProperty.call(requestBody, "voice_model")) {
+      const voiceModel = requestBody.voice_model == null
+        ? ""
+        : String(requestBody.voice_model).trim();
+      if (voiceModel && !isCuratedDeepgramVoiceModel(voiceModel)) {
+        failCallScriptMutationIdempotency(idempotency);
+        return res.status(400).json({ success: false, error: "voice_model is not a supported Deepgram Voice Agent voice." });
+      }
+      requestBody.voice_model = voiceModel || null;
+    }
     const duplicate = await findCallTemplateNameCollision(normalizedName);
     if (duplicate) {
       failCallScriptMutationIdempotency(idempotency);
@@ -24180,10 +24852,24 @@ app.post("/api/call-scripts", requireAdminToken, async (req, res) => {
         error: objectiveMetadata.errors.join(" "),
       });
     }
+    const agentConfigValidation = validateTemplateAgentRuntimeConfig({
+      prompt: requestBody.prompt,
+      first_message: firstMessage,
+      voice_model: requestBody.voice_model,
+    }, requestBody.agent_config);
+    if (!agentConfigValidation.valid) {
+      failCallScriptMutationIdempotency(idempotency);
+      return res.status(400).json({
+        success: false,
+        code: "CALL_AGENT_DEFINITION_INVALID",
+        error: agentConfigValidation.errors.join(" "),
+      });
+    }
     const id = await db.createCallTemplate({
       ...requestBody,
       name: normalizedName,
       first_message: firstMessage,
+      agent_config: agentConfigValidation.normalized,
       ...paymentSettings.normalized,
       ...objectiveMetadata.normalized,
       payment_policy: normalizedPaymentPolicy,
@@ -24254,6 +24940,16 @@ app.put("/api/call-scripts/:id", requireAdminToken, async (req, res) => {
     }
 
     const updates = { ...requestBody };
+    if (Object.prototype.hasOwnProperty.call(requestBody, "voice_model")) {
+      const voiceModel = requestBody.voice_model == null
+        ? ""
+        : String(requestBody.voice_model).trim();
+      if (voiceModel && !isCuratedDeepgramVoiceModel(voiceModel)) {
+        failCallScriptMutationIdempotency(idempotency);
+        return res.status(400).json({ success: false, error: "voice_model is not a supported Deepgram Voice Agent voice." });
+      }
+      updates.voice_model = voiceModel || null;
+    }
     if (updates.name !== undefined) {
       const normalizedName = normalizeCallTemplateName(updates.name);
       if (!normalizedName) {
@@ -24351,6 +25047,35 @@ app.put("/api/call-scripts/:id", requireAdminToken, async (req, res) => {
     }
     Object.assign(updates, objectiveMetadata.normalized);
     paymentWarnings = [...paymentWarnings, ...objectiveMetadata.warnings];
+    if (
+      Object.prototype.hasOwnProperty.call(requestBody, "agent_config") ||
+      Object.prototype.hasOwnProperty.call(requestBody, "prompt") ||
+      Object.prototype.hasOwnProperty.call(requestBody, "first_message")
+    ) {
+      const candidateTemplate = {
+        prompt: updates.prompt ?? existing.prompt,
+        first_message: updates.first_message ?? existing.first_message,
+        voice_model: updates.voice_model ?? existing.voice_model,
+      };
+      const candidateConfig = Object.prototype.hasOwnProperty.call(requestBody, "agent_config")
+        ? requestBody.agent_config
+        : existing.agent_config;
+      const agentConfigValidation = validateTemplateAgentRuntimeConfig(
+        candidateTemplate,
+        candidateConfig,
+      );
+      if (!agentConfigValidation.valid) {
+        failCallScriptMutationIdempotency(idempotency);
+        return res.status(400).json({
+          success: false,
+          code: "CALL_AGENT_DEFINITION_INVALID",
+          error: agentConfigValidation.errors.join(" "),
+        });
+      }
+      if (Object.prototype.hasOwnProperty.call(requestBody, "agent_config")) {
+        updates.agent_config = agentConfigValidation.normalized;
+      }
+    }
     const updated = await db.updateCallTemplate(scriptId, updates);
     if (!updated) {
       failCallScriptMutationIdempotency(idempotency);
@@ -24763,10 +25488,24 @@ app.post("/api/call-scripts/:id/submit-review", requireAdminToken, async (req, r
     if (!script) {
       return res.status(404).json({ success: false, error: "Script not found" });
     }
-    if (!script.prompt || !script.first_message) {
+    const definitionValidation = validateCallAgentDefinition(script);
+    if (!definitionValidation.valid) {
       return res.status(400).json({
         success: false,
-        error: "Script must include prompt and first_message before review",
+        code: "CALL_AGENT_DEFINITION_INVALID",
+        error: definitionValidation.errors.join(" "),
+        schema_version: definitionValidation.schemaVersion,
+      });
+    }
+    const runtimeConfigValidation = validateTemplateAgentRuntimeConfig(
+      script,
+      script.agent_config,
+    );
+    if (!runtimeConfigValidation.valid) {
+      return res.status(400).json({
+        success: false,
+        code: "CALL_AGENT_DEFINITION_INVALID",
+        error: runtimeConfigValidation.errors.join(" "),
       });
     }
     const lifecycleState = normalizeCallScriptLifecycleState(
@@ -25425,45 +26164,6 @@ async function processCallJobs() {
   }
 }
 
-function buildTwilioOutboundCallPayload(options = {}) {
-  const host = String(options.host || "").trim();
-  const to = String(options.to || "").trim();
-  const from = String(options.from || "").trim();
-  if (!host) {
-    throw new Error("Twilio outbound payload requires host");
-  }
-  if (!to) {
-    throw new Error("Twilio outbound payload requires destination number");
-  }
-  if (!from) {
-    throw new Error("Twilio outbound payload requires source number");
-  }
-  const payload = {
-    url: `https://${host}/incoming`,
-    to,
-    from,
-    statusCallback: `https://${host}/webhook/call-status`,
-    statusCallbackEvent: [
-      "initiated",
-      "ringing",
-      "answered",
-      "completed",
-      "busy",
-      "no-answer",
-      "canceled",
-      "failed",
-    ],
-    statusCallbackMethod: "POST",
-  };
-  if (options.machineDetection) {
-    payload.machineDetection = options.machineDetection;
-  }
-  if (Number.isFinite(Number(options.machineDetectionTimeout))) {
-    payload.machineDetectionTimeout = Number(options.machineDetectionTimeout);
-  }
-  return payload;
-}
-
 function normalizeOutboundIdempotencyKey(value = "") {
   const key = String(value || "").trim();
   if (!key) return "";
@@ -25682,6 +26382,15 @@ async function placeOutboundCall(payload, hostOverride = null) {
         }
         const versionMatches =
           !resolvedScriptVersion || resolvedScriptVersion === currentTemplateVersion;
+        // Runtime restrictions follow the current template even when a caller
+        // supplies a stale content version; an old version must not disable them.
+        scriptPolicy = {
+          lifecycle_state: tpl.lifecycle_state || "draft",
+          agent_config: tpl.agent_config || null,
+          ...(Array.isArray(tpl.agent_config?.approved_tools)
+            ? { tool_policy: { allowed_tools: tpl.agent_config.approved_tools } }
+            : {}),
+        };
         if (versionMatches) {
           scriptPolicy = {
             requires_otp: !!tpl.requires_otp,
@@ -25689,6 +26398,7 @@ async function placeOutboundCall(payload, hostOverride = null) {
             expected_length: tpl.expected_length || null,
             allow_terminator: !!tpl.allow_terminator,
             terminator_char: tpl.terminator_char || null,
+            ...scriptPolicy,
           };
           scriptPaymentDefaults = {
             payment_enabled: normalizeBooleanFlag(tpl.payment_enabled, false),
@@ -25778,6 +26488,14 @@ async function placeOutboundCall(payload, hostOverride = null) {
   const readiness = getProviderReadiness();
   const preferredProvider =
     keypadOverride?.provider || requestedProvider || currentProvider;
+  if (preferredProvider === "call_e") {
+    const error = new Error("CALL-E supports confirmed task calls only; use the CALL-E Script Studio dispatch flow");
+    error.code = "provider_operation_unsupported";
+    error.provider = "call_e";
+    error.operation = "outbound_call.create";
+    error.providerSubmissionState = "not_submitted";
+    throw error;
+  }
   const orderedProviders = getProviderOrder(preferredProvider);
   let availableProviders = orderedProviders.filter(
     (provider) => readiness[provider],
@@ -25944,19 +26662,38 @@ async function placeOutboundCall(payload, hostOverride = null) {
       ) {
         throw error;
       }
-      lastError = error;
-      recordProviderError(provider, error);
+      const safeError = normalizeProviderOperationError(
+        provider,
+        "outbound_call.create",
+        error,
+      );
+      lastError = Object.assign(new Error(safeError.message), safeError);
+      recordProviderError(provider, lastError);
       recordProviderFlowMetric("outbound_call_error", {
         channel: "call",
         flow: keypadRequired ? "digit_capture" : "outbound_voice",
         provider,
         attempt: providerIndex + 1,
-        reason: error?.message || String(error || "unknown"),
+        reason: safeError.code,
       });
-      console.error(
-        `Outbound call failed for provider ${provider}:`,
-        error.message || error,
-      );
+      console.error("outbound_call_provider_error", {
+        provider,
+        operation: safeError.operation,
+        code: safeError.code,
+        status_code: safeError.statusCode,
+        submission_state: safeError.submissionState,
+      });
+      if (!canFailoverAfterProviderError(error)) {
+        const ambiguousError = new Error(
+          "Provider submission status is unknown. Do not retry until an operator verifies the provider call state.",
+        );
+        ambiguousError.code = "provider_submission_ambiguous";
+        ambiguousError.status = 503;
+        ambiguousError.provider = provider;
+        ambiguousError.operation = safeError.operation;
+        ambiguousError.providerSubmissionState = "unknown";
+        throw ambiguousError;
+      }
     }
   }
 
@@ -27123,6 +27860,12 @@ app.post("/email/templates/select", requireOutboundAuthorization, async (req, re
       req.requestId,
     );
   }
+});
+
+registerPostCallWorkflowDefinitionRoutes(app, {
+  getService: () => postCallWorkflowDefinitionService,
+  requireAdminToken,
+  sendApiError,
 });
 
 app.get("/post-call/automation/rules", requireOutboundAuthorization, async (req, res) => {
@@ -31236,6 +31979,7 @@ module.exports = {
     setMiniAppTelemetryContext,
     recordMiniAppRouteTelemetry,
     runDeepgramVoiceAgentStartupPreflight,
+    buildMiniAppActionSpec,
   },
 };
 

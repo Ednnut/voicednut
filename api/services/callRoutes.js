@@ -215,6 +215,7 @@ function createOutboundCallHandler(ctx = {}) {
         error?.code === "outbound_persistence_failed";
       const idempotencyConflict = error?.code === "idempotency_conflict";
       const idempotencyInProgress = error?.code === "idempotency_in_progress";
+      const providerOperationUnsupported = error?.code === "provider_operation_unsupported";
       const isValidation =
         paymentRequiresScript ||
         paymentPolicyRequiresScript ||
@@ -222,7 +223,7 @@ function createOutboundCallHandler(ctx = {}) {
         paymentValidationError ||
         message.includes("Missing required fields") ||
         message.includes("Invalid phone number format");
-      const status = idempotencyConflict || idempotencyInProgress
+      const status = idempotencyConflict || idempotencyInProgress || providerOperationUnsupported
         ? 409
         : outboundPersistenceFailed
           ? 503
@@ -244,6 +245,8 @@ function createOutboundCallHandler(ctx = {}) {
         code = "idempotency_in_progress";
       } else if (outboundPersistenceFailed) {
         code = "outbound_persistence_failed";
+      } else if (providerOperationUnsupported) {
+        code = "provider_operation_unsupported";
       } else if (isValidation) {
         code = "validation_error";
       }
@@ -263,6 +266,8 @@ function createOutboundCallHandler(ctx = {}) {
               ? message || "Invalid payment configuration."
           : outboundPersistenceFailed
             ? "Call provider accepted the request but persistence failed; retry with the same idempotency key."
+          : providerOperationUnsupported
+            ? message || "The selected provider does not support this call operation."
           : "Failed to create outbound call",
         req.requestId || null,
         { details: buildErrorDetails(error) },

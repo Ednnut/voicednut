@@ -5,7 +5,7 @@ import {
   DASHBOARD_MODULE_ACTION_IDS,
 } from '@/contracts/miniappParityContracts';
 
-function isNonEmptyString(value: unknown): boolean {
+function isNonEmptyString(value: unknown): value is string {
   return typeof value === 'string' && value.trim().length > 0;
 }
 
@@ -70,9 +70,54 @@ function validateCallScriptIdPayload(payload: Record<string, unknown>): string |
   return null;
 }
 
+function validateCallScriptVersionPayload(payload: Record<string, unknown>): string | null {
+  const id = Number(payload.id ?? payload.script_id ?? payload.scriptId);
+  if (!Number.isSafeInteger(id) || id <= 0) return 'A valid script id is required';
+  if (payload.version !== undefined) {
+    const version = Number(payload.version);
+    if (!Number.isSafeInteger(version) || version <= 0) return 'A positive script version is required';
+  }
+  for (const key of ['from_version', 'to_version']) {
+    if (payload[key] !== undefined) {
+      const version = Number(payload[key]);
+      if (!Number.isSafeInteger(version) || version <= 0) return `${key} must be a positive script version`;
+    }
+  }
+  if (payload.from_version !== undefined && payload.to_version !== undefined
+    && Number(payload.from_version) === Number(payload.to_version)) {
+    return 'Choose two different script versions to compare';
+  }
+  return null;
+}
+
 function validateCallEReconcilePayload(payload: Record<string, unknown>): string | null {
   const localCallId = toText(payload.local_call_id || payload.localCallId, '').trim();
   if (!/^call_e_[0-9a-f-]{36}$/i.test(localCallId)) return 'local_call_id must be a valid VOICEDNUT CALL-E call ID';
+  return null;
+}
+
+function validateCallEOperationsListPayload(payload: Record<string, unknown>): string | null {
+  const validFilter = (value: unknown, allowed: string[]) => value === undefined || value === '' ||
+    (typeof value === 'string' && allowed.includes(value));
+  if (!validFilter(payload.execution_status, ['queued', 'in_progress', 'completed', 'failed', 'canceled'])) {
+    return 'execution_status is invalid';
+  }
+  if (!validFilter(payload.call_outcome, ['completed', 'no_answer', 'busy', 'declined'])) {
+    return 'call_outcome is invalid';
+  }
+  if (!validFilter(payload.result_status, ['pending', 'available', 'unavailable', 'not_applicable'])) {
+    return 'result_status is invalid';
+  }
+  const query = payload.query;
+  if (query !== undefined && query !== '' && (typeof query !== 'string' || !/^[A-Za-z0-9_-]{2,200}$/.test(query.trim()))) {
+    return 'query must be a safe call identifier';
+  }
+  for (const key of ['start_date', 'end_date']) {
+    const value = payload[key];
+    if (value !== undefined && value !== '' && (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value))) {
+      return `${key} must use YYYY-MM-DD`;
+    }
+  }
   return null;
 }
 
@@ -151,6 +196,9 @@ const ACTION_GUARDS: Record<string, (payload: Record<string, unknown>) => string
   [DASHBOARD_ACTION_CONTRACTS.EMAIL_BULK_SEND]: validateEmailBulkSend,
   [DASHBOARD_ACTION_CONTRACTS.USERS_ROLE_SET]: validateUserRoleSet,
   [DASHBOARD_ACTION_CONTRACTS.CALLSCRIPT_UPDATE]: validateCallScriptIdPayload,
+  [DASHBOARD_ACTION_CONTRACTS.CALLSCRIPT_VERSIONS]: validateCallScriptVersionPayload,
+  [DASHBOARD_ACTION_CONTRACTS.CALLSCRIPT_DIFF]: validateCallScriptVersionPayload,
+  [DASHBOARD_ACTION_CONTRACTS.CALLSCRIPT_ROLLBACK]: validateCallScriptVersionPayload,
   [DASHBOARD_ACTION_CONTRACTS.CALLSCRIPT_SUBMIT_REVIEW]: validateCallScriptIdPayload,
   [DASHBOARD_ACTION_CONTRACTS.CALLSCRIPT_REVIEW]: validateCallScriptIdPayload,
   [DASHBOARD_ACTION_CONTRACTS.CALLSCRIPT_PROMOTE_LIVE]: validateCallScriptIdPayload,
@@ -158,12 +206,19 @@ const ACTION_GUARDS: Record<string, (payload: Record<string, unknown>) => string
   [DASHBOARD_ACTION_CONTRACTS.CALLSCRIPT_CALLE_PREVIEW]: validateCallScriptIdPayload,
   [DASHBOARD_ACTION_CONTRACTS.CALLSCRIPT_CALLE_CONFIRM]: (payload) => {
     if (!Number.isSafeInteger(Number(payload.template_id)) || Number(payload.template_id) <= 0) return 'template_id is required';
-    if (!isNonEmptyString(payload.destination) || !/^\+[1-9]\d{7,14}$/.test(payload.destination.trim())) return 'destination must be E.164';
-    if (!isNonEmptyString(payload.preview_fingerprint) || !/^[a-f0-9]{64}$/i.test(payload.preview_fingerprint)) return 'preview_fingerprint is required';
+    const destination = payload.destination;
+    if (!isNonEmptyString(destination) || !/^\+[1-9]\d{7,14}$/.test(destination.trim())) return 'destination must be E.164';
+    const previewFingerprint = payload.preview_fingerprint;
+    if (!isNonEmptyString(previewFingerprint) || !/^[a-f0-9]{64}$/i.test(previewFingerprint)) return 'preview_fingerprint is required';
     if (!isRecord(payload.result_schema)) return 'result_schema must be an object';
     return null;
   },
   [DASHBOARD_ACTION_CONTRACTS.CALLE_CALL_RECONCILE]: validateCallEReconcilePayload,
+  [DASHBOARD_ACTION_CONTRACTS.CALLE_CALL_REVIEW]: validateCallEReconcilePayload,
+  [DASHBOARD_ACTION_CONTRACTS.CALLE_OPS_RECONCILE]: validateCallEReconcilePayload,
+  [DASHBOARD_ACTION_CONTRACTS.CALLE_OPS_REVIEW]: validateCallEReconcilePayload,
+  [DASHBOARD_ACTION_CONTRACTS.CALLE_CALL_CANCEL]: validateCallEReconcilePayload,
+  [DASHBOARD_ACTION_CONTRACTS.CALLE_CALLS_LIST]: validateCallEOperationsListPayload,
   [DASHBOARD_ACTION_CONTRACTS.CALLERFLAGS_UPSERT]: validateCallerFlagsUpsert,
   [DASHBOARD_ACTION_CONTRACTS.SMSSCRIPT_CREATE]: validateSmsScriptCreate,
   [DASHBOARD_ACTION_CONTRACTS.SMSSCRIPT_UPDATE]: validateSmsScriptUpdate,
@@ -303,6 +358,22 @@ const ACTION_POLICIES: Record<string, DashboardActionPolicy> = {
     confirmTitle: 'Confirm script update',
     confirmTone: 'warning',
   },
+  [DASHBOARD_ACTION_CONTRACTS.CALLSCRIPT_VERSIONS]: {
+    capability: 'caller_flags_manage',
+    risk: 'safe',
+  },
+  [DASHBOARD_ACTION_CONTRACTS.CALLSCRIPT_DIFF]: {
+    capability: 'caller_flags_manage',
+    risk: 'safe',
+  },
+  [DASHBOARD_ACTION_CONTRACTS.CALLSCRIPT_ROLLBACK]: {
+    capability: 'caller_flags_manage',
+    risk: 'caution',
+    confirmTitle: 'Restore an earlier agent version',
+    confirmTone: 'warning',
+    confirmConsequence: 'The selected saved definition will be restored as a new draft version. It will not become live automatically.',
+    confirmLabel: 'Restore Draft Version',
+  },
   [DASHBOARD_ACTION_CONTRACTS.CALLSCRIPT_SUBMIT_REVIEW]: {
     capability: 'caller_flags_manage',
     risk: 'caution',
@@ -347,9 +418,41 @@ const ACTION_POLICIES: Record<string, DashboardActionPolicy> = {
     capability: 'caller_flags_manage',
     risk: 'safe',
   },
+  [DASHBOARD_ACTION_CONTRACTS.CALLE_CALLS_LIST]: {
+    capability: 'dashboard_view',
+    risk: 'safe',
+  },
   [DASHBOARD_ACTION_CONTRACTS.CALLE_CALL_RECONCILE]: {
     capability: 'caller_flags_manage',
     risk: 'safe',
+  },
+  [DASHBOARD_ACTION_CONTRACTS.CALLE_CALL_REVIEW]: {
+    capability: 'caller_flags_manage',
+    risk: 'caution',
+    confirmTitle: 'Review CALL-E result and transcript',
+    confirmTone: 'warning',
+    confirmConsequence: 'This loads private call content for authorized business operators. Handle transcript and result data as sensitive information.',
+    confirmLabel: 'Review call content',
+  },
+  [DASHBOARD_ACTION_CONTRACTS.CALLE_OPS_RECONCILE]: {
+    capability: 'dashboard_view',
+    risk: 'safe',
+  },
+  [DASHBOARD_ACTION_CONTRACTS.CALLE_OPS_REVIEW]: {
+    capability: 'dashboard_view',
+    risk: 'caution',
+    confirmTitle: 'Review CALL-E result and transcript',
+    confirmTone: 'warning',
+    confirmConsequence: 'This loads private call content for authorized business operators. Handle transcript and result data as sensitive information.',
+    confirmLabel: 'Review call content',
+  },
+  [DASHBOARD_ACTION_CONTRACTS.CALLE_CALL_CANCEL]: {
+    capability: 'caller_flags_manage',
+    risk: 'caution',
+    confirmTitle: 'Cancel queued CALL-E task call',
+    confirmTone: 'warning',
+    confirmConsequence: 'CALL-E will reject cancellation after provider submission starts. This cannot hang up an active call.',
+    confirmLabel: 'Cancel queued call',
   },
   [DASHBOARD_ACTION_CONTRACTS.SMSSCRIPT_LIST]: {
     capability: 'caller_flags_manage',

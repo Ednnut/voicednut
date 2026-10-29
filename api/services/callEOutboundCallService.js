@@ -1,6 +1,6 @@
 const crypto = require("node:crypto");
 const { buildTask, previewCallETemplate, validateCallEResult } = require("../adapters/callETemplateAdapter");
-const { normalizeCallId } = require("./callEClient");
+const { normalizeCallEWebhookUrl, normalizeCallId } = require("./callEClient");
 const { CallEContactPolicyService } = require("./callEContactPolicyService");
 
 const CALL_E_IDEMPOTENCY_PREFIX = "voicednut:call-e:";
@@ -9,10 +9,13 @@ const CALL_STATUSES = new Set(["queued", "in_progress", "completed", "failed", "
 const CALL_OUTCOMES = new Set(["completed", "no_answer", "busy", "declined"]);
 const RESULT_STATUSES = new Set(["pending", "available", "unavailable", "not_applicable"]);
 
-function callEError(code, message, status = null) {
+function callEError(code, message, status = null, details = {}) {
   const error = new Error(message);
   error.code = code;
   if (Number.isFinite(status)) error.status = status;
+  if (/^[a-z][a-z0-9_]{0,79}$/.test(String(details.providerCode || ""))) error.providerCode = details.providerCode;
+  if (/^[a-z][a-z0-9_]{0,79}$/.test(String(details.reasonCode || ""))) error.providerReasonCode = details.reasonCode;
+  if (/^[a-z][a-z0-9_]{0,79}$/.test(String(details.recoveryAction || ""))) error.recoveryAction = details.recoveryAction;
   return error;
 }
 
@@ -97,6 +100,7 @@ class CallEOutboundCallService {
     this.db = options.db;
     this.contactPolicy = options.contactPolicy || new CallEContactPolicyService({ db: this.db });
     this.allowedDestinations = parseAllowedDestinations(options.allowedDestinations);
+    this.env = options.env || process.env;
   }
 
   async createOutboundCall(input = {}) {
@@ -185,6 +189,17 @@ class CallEOutboundCallService {
       return replay;
     };
     const existing = await this.db.getOutboundCallIdempotency(idempotencyKeyForProvider);
+    const existingPayload = existing ? readResponsePayload(existing.response_payload) : {};
+    const configuredWebhookUrl = String(this.env.CALLE_WEBHOOK_URL || "").trim();
+    if (!existing && configuredWebhookUrl && !normalizeCallEWebhookUrl(configuredWebhookUrl)) {
+      throw callEError("call_e_webhook_url_invalid", "CALL-E webhook endpoint configuration is invalid", 503);
+    }
+    if (existing && existingPayload.webhookUrl && !normalizeCallEWebhookUrl(existingPayload.webhookUrl)) {
+      throw callEError("call_e_recovery_state_invalid", "CALL-E webhook recovery state is invalid", 409);
+    }
+    const webhookUrl = existing
+      ? normalizeCallEWebhookUrl(existingPayload.webhookUrl)
+      : normalizeCallEWebhookUrl(configuredWebhookUrl);
     let existingReplay = null;
     if (existing) {
       const existingResolution = resolveReplay(existing, requestHash);
@@ -272,13 +287,14 @@ class CallEOutboundCallService {
         template_id: Number(template.id ?? template.template_id),
         template_version: Number(template.version ?? template.template_version),
       },
+      ...(webhookUrl ? { webhook_url: webhookUrl } : {}),
     };
     await this.db.completeOutboundCallIdempotency({
       idempotency_key: idempotencyKeyForProvider,
       provider: "call_e",
       request_hash: requestHash,
       status: "pending",
-      response_payload: { localCallId, requestFingerprint: requestHash },
+      response_payload: { localCallId, requestFingerprint: requestHash, ...(webhookUrl ? { webhookUrl } : {}) },
     });
     await persistReconciliation(localCallId);
 
@@ -293,7 +309,7 @@ class CallEOutboundCallService {
           provider: "call_e",
           request_hash: requestHash,
           status: noCallCreated ? "failed" : "pending",
-          response_payload: { localCallId, requestFingerprint: requestHash },
+          response_payload: { localCallId, requestFingerprint: requestHash, ...(webhookUrl ? { webhookUrl } : {}) },
           error_message: noCallCreated ? NO_CALL_CREATED_MARKER : "call_e_outcome_unknown",
         });
       } finally {
@@ -302,9 +318,17 @@ class CallEOutboundCallService {
         }
       }
       if (noCallCreated) {
-        throw callEError(String(error?.code || "call_e_request_rejected"), "CALL-E rejected the request before creating a Call", error?.status || 422);
+        throw callEError(String(error?.code || "call_e_request_rejected"), "CALL-E rejected the request before creating a Call", error?.status || 422, {
+          providerCode: error?.providerCode,
+          reasonCode: error?.reasonCode,
+          recoveryAction: error?.recoveryAction,
+        });
       }
-      throw callEError("call_e_call_outcome_unknown", "CALL-E acceptance is uncertain; retry only with the same request and idempotency key", 409);
+      throw callEError("call_e_call_outcome_unknown", "CALL-E acceptance is uncertain; retry only with the same request and idempotency key", 409, {
+        providerCode: error?.providerCode,
+        reasonCode: error?.reasonCode,
+        recoveryAction: error?.recoveryAction || "inspect_call_state_before_retry",
+      });
     }
 
     const pilotSlotConsumed = await this.db.consumeCallEPilotDispatch({ reservation_key: idempotencyKeyForProvider });
@@ -321,7 +345,7 @@ class CallEOutboundCallService {
         provider: "call_e",
         request_hash: requestHash,
         status: "pending",
-        response_payload: { localCallId, requestFingerprint: requestHash },
+        response_payload: { localCallId, requestFingerprint: requestHash, ...(webhookUrl ? { webhookUrl } : {}) },
         error_message: "call_e_response_unresolved",
       });
       throw callEError("call_e_call_outcome_unknown", "CALL-E returned an unresolved response; retry only with the same request and idempotency key", 409);

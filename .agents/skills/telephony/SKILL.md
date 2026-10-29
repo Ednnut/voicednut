@@ -1,6 +1,6 @@
 ---
 name: telephony
-description: Build or review VOICEDNUT voice, telephony, phone-number, call, recording, messaging, and webhook behavior.
+description: Build or review VOICEDNUT voice, telephony, phone-number, call, recording, messaging, and webhook behavior — Vapi, Twilio, Plivo, Vonage, Deepgram, and CALL-E provider adapters/services, outbound/inbound flows, call records and reconciliation, consent/opt-out, idempotent dispatch, and provider event/webhook handling.
 ---
 
 ## Workflow

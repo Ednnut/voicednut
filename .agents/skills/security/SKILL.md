@@ -1,6 +1,6 @@
 ---
 name: security
-description: Review VOICEDNUT authentication, authorization, secrets, privacy, tenant isolation, dependencies, or risky side effects.
+description: Review VOICEDNUT authentication, authorization, secrets, privacy, tenant/business isolation, webhook signature and replay defenses, payment/OTP/tool-backed template risk, dependency vulnerabilities (npm audit), injection, rate limits, or risky side effects; use for security-focused review of a diff or area — findings-first, minimal fixes only.
 ---
 
 ## Workflow

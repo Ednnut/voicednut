@@ -6,6 +6,8 @@ import {
 
 type DashboardFixtureRole = 'admin' | 'operator' | 'viewer';
 
+let fixtureCallTemplateVersion = 2;
+
 const DASHBOARD_ALL_CAPS = [
   'dashboard_view',
   'sms_bulk_manage',
@@ -393,21 +395,67 @@ function resolveDashboardFixtureActionData(
   payload: Record<string, unknown> = {},
 ): Record<string, unknown> {
   const requestedCallSid = toText(payload.call_sid, '').trim() || 'CA_FIXTURE_CALL_001';
+  const callEPilotFixtureEnabled = typeof window !== 'undefined' &&
+    new URLSearchParams(window.location.search).get('fixtureCallEReady') === '1';
   switch (action) {
+    case DASHBOARD_ACTION_CONTRACTS.CALLE_CALLS_LIST: {
+      const allRows = [
+          {
+            localCallId: 'call_e_123e4567-e89b-12d3-a456-426614174000',
+            templateId: 2,
+            templateVersion: 1,
+            executionStatus: 'completed',
+            callOutcome: 'completed',
+            resultStatus: 'available',
+            errorCode: null,
+            createdAt: nowIso,
+            updatedAt: nowIso,
+          },
+          {
+            localCallId: 'call_e_123e4567-e89b-12d3-a456-426614174001',
+            templateId: 2,
+            templateVersion: 1,
+            executionStatus: 'failed',
+            callOutcome: null,
+            resultStatus: 'unavailable',
+            errorCode: 'call_failed',
+            createdAt: nowIso,
+            updatedAt: nowIso,
+          },
+      ];
+      const fixtureQuery = typeof payload.query === 'string' ? payload.query.toLowerCase() : '';
+      const filteredRows = allRows.filter((row) =>
+        (!payload.execution_status || row.executionStatus === payload.execution_status)
+        && (!payload.call_outcome || row.callOutcome === payload.call_outcome)
+        && (!payload.result_status || row.resultStatus === payload.result_status)
+        && (!fixtureQuery || row.localCallId.toLowerCase().includes(fixtureQuery)));
+      return {
+        provider: 'call_e',
+        rows: filteredRows,
+        total: filteredRows.length,
+        summary: {
+          active: filteredRows.filter((row) => ['queued', 'in_progress'].includes(row.executionStatus)).length,
+          failed: filteredRows.filter((row) => row.executionStatus === 'failed').length,
+          resultsReady: filteredRows.filter((row) => row.resultStatus === 'available').length,
+        },
+        limit: 20,
+        offset: Number(payload.offset) || 0,
+      };
+    }
     case DASHBOARD_ACTION_CONTRACTS.CALLE_STATUS:
       return {
         status: {
-          integrationEnabled: false,
-          providerAccessReady: false,
-          destinationAllowlistReady: false,
-          dispatchKillSwitchEnabled: false,
-          pilotApprovalReady: false,
-          pilotReadinessReviewed: false,
+          integrationEnabled: callEPilotFixtureEnabled,
+          providerAccessReady: callEPilotFixtureEnabled,
+          destinationAllowlistReady: callEPilotFixtureEnabled,
+          dispatchKillSwitchEnabled: callEPilotFixtureEnabled,
+          pilotApprovalReady: callEPilotFixtureEnabled,
+          pilotReadinessReviewed: callEPilotFixtureEnabled,
           previewAvailable: true,
-          dispatchAvailable: false,
-          pilotReady: false,
-          dispatchBlocker: 'dispatch_kill_switch_disabled',
-          dispatchBlockers: [
+          dispatchAvailable: callEPilotFixtureEnabled,
+          pilotReady: callEPilotFixtureEnabled,
+          dispatchBlocker: callEPilotFixtureEnabled ? null : 'dispatch_kill_switch_disabled',
+          dispatchBlockers: callEPilotFixtureEnabled ? [] : [
             'dispatch_kill_switch_disabled',
             'exact_preview_pilot_approval_missing_or_expired',
             'pilot_external_readiness_review_required',
@@ -421,16 +469,129 @@ function resolveDashboardFixtureActionData(
             id: 1,
             name: 'Welcome Script',
             description: 'Default fixture script for local QA flows.',
-            prompt: 'You are a helpful assistant.',
-            first_message: 'Hello, this is the fixture flow.',
+            prompt: 'You are a helpful assistant for {customer_name}.',
+            first_message: 'Hello {customer_name}, this is the fixture flow.',
             default_profile: 'default',
             objective_tags: ['support'],
             flow_type: 'default',
             lifecycle_state: 'draft',
+            version: fixtureCallTemplateVersion,
+          },
+          {
+            id: 2,
+            name: 'CALL-E QA Fixture',
+            description: 'Synthetic local browser-test script. Never contacts CALL-E.',
+            prompt: 'Ask the synthetic fixture question.',
+            first_message: 'This is a local no-call fixture.',
+            default_profile: 'default',
+            objective_tags: ['support'],
+            flow_type: 'default',
+            lifecycle_state: 'live',
             version: 1,
           },
         ],
-        total: 1,
+        total: 2,
+      };
+    case DASHBOARD_ACTION_CONTRACTS.CALLSCRIPT_VERSIONS:
+      return {
+        script_id: Number(payload.id) || 1,
+        current_version: fixtureCallTemplateVersion,
+        versions: [
+          ...Array.from({ length: fixtureCallTemplateVersion - 1 }, (_, index) => ({
+            version: fixtureCallTemplateVersion - index,
+            reason: index === 0 && fixtureCallTemplateVersion > 2 ? 'rollback' : 'update',
+            created_by: 'fixture-operator',
+            created_at: nowIso,
+          })),
+          { version: 1, reason: 'initial', created_by: 'fixture-operator', created_at: nowIso },
+        ],
+      };
+    case DASHBOARD_ACTION_CONTRACTS.CALLSCRIPT_DIFF:
+      return {
+        success: true,
+        script_id: Number(payload.id) || 1,
+        from_version: Number(payload.from_version) || 2,
+        to_version: Number(payload.to_version) || 1,
+        changes: [
+          {
+            field: 'prompt',
+            from: 'You are a helpful assistant for {customer_name}.',
+            to: 'You are a helpful support assistant for {customer_name}.',
+          },
+        ],
+        changed_fields: ['prompt'],
+      };
+    case DASHBOARD_ACTION_CONTRACTS.CALLSCRIPT_SIMULATE: {
+      const variables = asRecord(payload.variables);
+      const customerName = toText(variables.customer_name, '{customer_name}');
+      return {
+        simulation: {
+          script_id: Number(payload.id) || 1,
+          script_name: 'Welcome Script',
+          lifecycle_state: 'draft',
+          required_variables: ['customer_name'],
+          missing_variables: customerName === '{customer_name}' ? ['customer_name'] : [],
+          variables,
+          rendered_prompt: `You are a helpful assistant for ${customerName}.`,
+          rendered_first_message: `Hello ${customerName}, this is the fixture flow.`,
+        },
+      };
+    }
+    case DASHBOARD_ACTION_CONTRACTS.CALLSCRIPT_ROLLBACK:
+      fixtureCallTemplateVersion += 1;
+      return {
+        success: true,
+        rolled_back_to_version: Number(payload.version) || 1,
+        script: { id: Number(payload.id) || 1, version: fixtureCallTemplateVersion, lifecycle_state: 'draft' },
+      };
+    case DASHBOARD_ACTION_CONTRACTS.CALLSCRIPT_CALLE_PREVIEW:
+      return {
+        preview: {
+          compatible: true,
+          fingerprint: 'a'.repeat(64),
+          requestSummary: { phoneMasked: '+1••••••0123', region: null, locale: null },
+          source: { templateVersion: 1 },
+        },
+      };
+    case DASHBOARD_ACTION_CONTRACTS.CALLSCRIPT_CALLE_CONFIRM:
+      return { confirmed: true, confirmationId: 'fixture-confirmation-001' };
+    case DASHBOARD_ACTION_CONTRACTS.CALLSCRIPT_CALLE_DISPATCH:
+      return { localCallId: 'call_e_123e4567-e89b-12d3-a456-426614174000' };
+    case DASHBOARD_ACTION_CONTRACTS.CALLE_CALL_RECONCILE:
+    case DASHBOARD_ACTION_CONTRACTS.CALLE_OPS_RECONCILE:
+      return {
+        result: {
+          executionStatus: toText(payload.local_call_id, '').endsWith('4002') ? 'queued' : 'completed',
+          callOutcome: toText(payload.local_call_id, '').endsWith('4002') ? null : 'completed',
+          resultStatus: toText(payload.local_call_id, '').endsWith('4002') ? 'pending' : 'available',
+          resultAvailable: !toText(payload.local_call_id, '').endsWith('4002'),
+          events: [{ id: 'evt_fixture_01', type: 'call.completed', createdAt: nowIso }],
+        },
+      };
+    case DASHBOARD_ACTION_CONTRACTS.CALLE_CALL_REVIEW:
+    case DASHBOARD_ACTION_CONTRACTS.CALLE_OPS_REVIEW:
+      return {
+        result: {
+          localCallId: toText(payload.local_call_id, ''),
+          executionStatus: 'completed',
+          callOutcome: 'completed',
+          resultStatus: 'available',
+          result: { outcome: 'completed' },
+          resultOmittedForSize: false,
+          transcript: [{ offsetSeconds: 0, speaker: 'bot', text: 'Synthetic fixture transcript.' }],
+          transcriptTruncated: false,
+        },
+      };
+    case DASHBOARD_ACTION_CONTRACTS.CALLE_CALL_CANCEL:
+      return {
+        result: {
+          localCallId: toText(payload.local_call_id, ''),
+          executionStatus: 'canceled',
+          callOutcome: null,
+          resultStatus: 'not_applicable',
+          resultAvailable: false,
+          events: [],
+        },
       };
     case DASHBOARD_ACTION_CONTRACTS.CALLS_GET:
       return {

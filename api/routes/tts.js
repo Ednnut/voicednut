@@ -180,8 +180,8 @@ class TextToSpeechService extends EventEmitter {
               ttsCache.set(fallbackKey, { audio: base64String, at: Date.now() });
               pruneTtsCache();
               return base64String;
-            } catch (fallbackError) {
-              throw fallbackError;
+            } catch {
+              // Fallback voice failed too; rethrow primaryError below.
             }
           }
           throw primaryError;

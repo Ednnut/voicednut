@@ -270,6 +270,17 @@ class EnhancedDatabase {
                 FOREIGN KEY(call_sid) REFERENCES calls(call_sid)
             )`,
 
+            // One durable human-handoff attempt per call; the unique call_sid
+            // and guarded state transitions prevent duplicate transfer legs.
+            `CREATE TABLE IF NOT EXISTS call_handoff_sessions (
+                call_sid TEXT PRIMARY KEY,
+                state TEXT NOT NULL CHECK(state IN ('awaiting_confirmation', 'dispatching', 'started_unconfirmed', 'outcome_unknown', 'cancelled', 'expired', 'failed')),
+                destination_e164 TEXT NOT NULL,
+                expires_at INTEGER NOT NULL,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(call_sid) REFERENCES calls(call_sid)
+            )`,
+
             `CREATE TABLE IF NOT EXISTS call_outcomes (
                 call_sid TEXT PRIMARY KEY,
                 script_used TEXT,
@@ -338,6 +349,7 @@ class EnhancedDatabase {
                 payment_currency TEXT,
                 payment_description TEXT,
                 payment_policy TEXT,
+                agent_config_json TEXT,
                 payment_start_message TEXT,
                 payment_success_message TEXT,
                 payment_failure_message TEXT,
@@ -758,6 +770,14 @@ class EnhancedDatabase {
                 updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )`,
 
+            // Stores only the terminal webhook's stable identifiers, never its PII-bearing payload.
+            `CREATE TABLE IF NOT EXISTS call_e_webhook_receipts (
+                provider_call_id TEXT PRIMARY KEY,
+                event_id TEXT NOT NULL UNIQUE,
+                event_type TEXT NOT NULL CHECK(event_type IN ('call.completed', 'call.failed', 'call.canceled')),
+                processed_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )`,
+
             // One lifetime CALL-E pilot slot. A different request key cannot replace a reserved or accepted call.
             `CREATE TABLE IF NOT EXISTS call_e_pilot_dispatch_guard (
                 singleton_id INTEGER PRIMARY KEY CHECK(singleton_id = 1),
@@ -881,6 +901,16 @@ class EnhancedDatabase {
             });
         }
 
+        await new Promise((resolve, reject) => {
+            this.db.run(
+                `UPDATE call_handoff_sessions
+                 SET state = 'expired', destination_e164 = '', updated_at = CURRENT_TIMESTAMP
+                 WHERE state = 'awaiting_confirmation' AND expires_at <= ?`,
+                [Date.now()],
+                (err) => err ? reject(err) : resolve(),
+            );
+        });
+
         await this.ensureCallColumns(['digit_summary', 'digit_count', 'last_otp', 'last_otp_masked', 'direction']);
         await this.ensureCallEContactPolicyColumns();
         await this.ensureCallEReconciliationBusinessColumn();
@@ -904,6 +934,7 @@ class EnhancedDatabase {
             'payment_success_message',
             'payment_failure_message',
             'payment_retry_message',
+            'agent_config_json',
             'lifecycle_state',
             'submitted_for_review_at',
             'reviewed_at',
@@ -1193,6 +1224,8 @@ class EnhancedDatabase {
                 await addColumn('payment_failure_message', 'TEXT');
             } else if (column === 'payment_retry_message') {
                 await addColumn('payment_retry_message', 'TEXT');
+            } else if (column === 'agent_config_json') {
+                await addColumn('agent_config_json', 'TEXT');
             } else if (column === 'lifecycle_state') {
                 await addColumn('lifecycle_state', "TEXT DEFAULT 'draft'");
             } else if (column === 'submitted_for_review_at') {
@@ -1456,6 +1489,72 @@ class EnhancedDatabase {
                     }
                 }
             });
+        });
+    }
+
+    async createCallHandoffSession(call_sid, destination_e164, expires_at) {
+        const callSid = String(call_sid || '').trim();
+        const destination = String(destination_e164 || '').trim();
+        const expiresAt = Number(expires_at);
+        if (!callSid || !/^\+[1-9]\d{7,14}$/.test(destination) || !Number.isSafeInteger(expiresAt)) {
+            throw new Error('Invalid call handoff session.');
+        }
+        return new Promise((resolve, reject) => {
+            this.db.run(
+                `INSERT OR IGNORE INTO call_handoff_sessions
+                    (call_sid, state, destination_e164, expires_at)
+                 VALUES (?, 'awaiting_confirmation', ?, ?)`,
+                [callSid, destination, expiresAt],
+                function (err) {
+                    if (err) reject(err);
+                    else resolve(this.changes === 1);
+                },
+            );
+        });
+    }
+
+    async getCallHandoffSession(call_sid) {
+        const callSid = String(call_sid || '').trim();
+        if (!callSid) return null;
+        return new Promise((resolve, reject) => {
+            this.db.get(
+                `SELECT call_sid, state, destination_e164, expires_at, updated_at,
+                        CAST(strftime('%s', updated_at) AS INTEGER) * 1000 AS updated_at_ms
+                 FROM call_handoff_sessions WHERE call_sid = ?`,
+                [callSid],
+                (err, row) => err ? reject(err) : resolve(row || null),
+            );
+        });
+    }
+
+    async transitionCallHandoffSession(call_sid, from_state, to_state, options = {}) {
+        const callSid = String(call_sid || '').trim();
+        const fromState = String(from_state || '').trim();
+        const toState = String(to_state || '').trim();
+        const allowedStates = new Set([
+            'awaiting_confirmation', 'dispatching', 'started_unconfirmed',
+            'outcome_unknown', 'cancelled', 'expired', 'failed',
+        ]);
+        if (!callSid || !allowedStates.has(fromState) || !allowedStates.has(toState)) {
+            throw new Error('Invalid call handoff state transition.');
+        }
+        const now = Number.isSafeInteger(Number(options.now)) ? Number(options.now) : Date.now();
+        const requireUnexpired = options.require_unexpired === true;
+        return new Promise((resolve, reject) => {
+            this.db.run(
+                `UPDATE call_handoff_sessions
+                 SET state = ?,
+                     destination_e164 = CASE WHEN ? = 'awaiting_confirmation' THEN destination_e164 ELSE '' END,
+                     updated_at = CURRENT_TIMESTAMP
+                 WHERE call_sid = ? AND state = ?${requireUnexpired ? ' AND expires_at > ?' : ''}`,
+                requireUnexpired
+                    ? [toState, toState, callSid, fromState, now]
+                    : [toState, toState, callSid, fromState],
+                function (err) {
+                    if (err) reject(err);
+                    else resolve(this.changes === 1);
+                },
+            );
         });
     }
 
@@ -1842,7 +1941,7 @@ class EnhancedDatabase {
                        objective_tags, supports_payment, supports_digit_capture,
                        requires_otp, default_profile, expected_length, allow_terminator, terminator_char,
                        payment_enabled, payment_connector, payment_amount, payment_currency, payment_description,
-                       payment_policy,
+                       payment_policy, agent_config_json,
                        payment_start_message, payment_success_message, payment_failure_message, payment_retry_message,
                        lifecycle_state, submitted_for_review_at, reviewed_at, reviewed_by, review_note, live_at, live_by,
                        created_at, updated_at
@@ -1866,7 +1965,7 @@ class EnhancedDatabase {
                        objective_tags, supports_payment, supports_digit_capture,
                        requires_otp, default_profile, expected_length, allow_terminator, terminator_char,
                        payment_enabled, payment_connector, payment_amount, payment_currency, payment_description,
-                       payment_policy,
+                       payment_policy, agent_config_json,
                        payment_start_message, payment_success_message, payment_failure_message, payment_retry_message,
                        lifecycle_state, submitted_for_review_at, reviewed_at, reviewed_by, review_note, live_at, live_by,
                        created_at, updated_at
@@ -2328,6 +2427,7 @@ class EnhancedDatabase {
             payment_currency = null,
             payment_description = null,
             payment_policy = null,
+            agent_config = null,
             payment_start_message = null,
             payment_success_message = null,
             payment_failure_message = null,
@@ -2426,6 +2526,9 @@ class EnhancedDatabase {
         const normalizedPaymentRetryMessage = payment_retry_message
             ? String(payment_retry_message).trim().slice(0, 240)
             : null;
+        const normalizedAgentConfig = agent_config === null || agent_config === undefined || agent_config === ''
+            ? null
+            : JSON.stringify(agent_config);
         const normalizedLifecycleState = String(lifecycle_state || 'draft')
             .trim()
             .toLowerCase();
@@ -2439,12 +2542,12 @@ class EnhancedDatabase {
                     objective_tags, supports_payment, supports_digit_capture,
                     requires_otp, default_profile, expected_length, allow_terminator, terminator_char,
                     payment_enabled, payment_connector, payment_amount, payment_currency, payment_description,
-                    payment_policy,
+                    payment_policy, agent_config_json,
                     payment_start_message, payment_success_message, payment_failure_message, payment_retry_message,
                     lifecycle_state, submitted_for_review_at, reviewed_at, reviewed_by, review_note, live_at, live_by,
                     created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
             `;
             this.db.run(
                 sql,
@@ -2470,6 +2573,7 @@ class EnhancedDatabase {
                     normalizedPaymentCurrency,
                     normalizedPaymentDescription,
                     normalizedPaymentPolicy,
+                    normalizedAgentConfig,
                     normalizedPaymentStartMessage,
                     normalizedPaymentSuccessMessage,
                     normalizedPaymentFailureMessage,
@@ -2517,6 +2621,7 @@ class EnhancedDatabase {
             payment_currency: 'payment_currency',
             payment_description: 'payment_description',
             payment_policy: 'payment_policy',
+            agent_config: 'agent_config_json',
             payment_start_message: 'payment_start_message',
             payment_success_message: 'payment_success_message',
             payment_failure_message: 'payment_failure_message',
@@ -2583,6 +2688,16 @@ class EnhancedDatabase {
                     } else {
                         try {
                             value = JSON.stringify(value);
+                        } catch (_) {
+                            value = null;
+                        }
+                    }
+                } else if (key === 'agent_config') {
+                    if (value === null || value === undefined || value === '') {
+                        value = null;
+                    } else {
+                        try {
+                            value = typeof value === 'string' ? value : JSON.stringify(value);
                         } catch (_) {
                             value = null;
                         }
@@ -4444,6 +4559,153 @@ class EnhancedDatabase {
                 try { seenEventIds = JSON.parse(row.seen_event_ids_json || '[]'); } catch (_) {}
                 resolve({ ...row, result_schema: resultSchema, seen_event_ids: Array.isArray(seenEventIds) ? seenEventIds : [] });
             });
+        });
+    }
+
+    async hasActiveCallEOperator(telegramId) {
+        const actorId = String(telegramId || '').trim();
+        if (!/^\d{1,20}$/.test(actorId)) return false;
+        return new Promise((resolve, reject) => {
+            this.db.get(
+                `SELECT 1 AS present FROM call_e_business_operator_events current
+                 WHERE current.telegram_id = ? AND current.event_type = 'access_granted'
+                   AND current.role IN ('policy_manager', 'call_operator')
+                   AND NOT EXISTS (
+                     SELECT 1 FROM call_e_business_operator_events newer
+                     WHERE newer.business_id = current.business_id
+                       AND newer.telegram_id = current.telegram_id AND newer.id > current.id
+                   ) LIMIT 1`,
+                [actorId],
+                (error, row) => error ? reject(error) : resolve(Boolean(row)),
+            );
+        });
+    }
+
+    async listCallEReconciliationCallsForOperator(input = {}) {
+        const actorId = String(input.telegram_id || '').trim();
+        const limit = Number(input.limit);
+        const offset = Number(input.offset);
+        const status = String(input.execution_status || '').trim().toLowerCase();
+        const outcome = String(input.call_outcome || '').trim().toLowerCase();
+        const resultStatus = String(input.result_status || '').trim().toLowerCase();
+        const query = String(input.query || '').trim();
+        const startDate = String(input.start_date || '').trim();
+        const endDate = String(input.end_date || '').trim();
+        const validDate = (value) => {
+            if (!value) return true;
+            if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+            const parsed = new Date(`${value}T00:00:00.000Z`);
+            return Number.isFinite(parsed.getTime()) && parsed.toISOString().slice(0, 10) === value;
+        };
+        if (!/^\d{1,20}$/.test(actorId) || !Number.isSafeInteger(limit) || limit < 1 || limit > 100 ||
+            !Number.isSafeInteger(offset) || offset < 0 || offset > 5000 ||
+            (status && !['queued', 'in_progress', 'completed', 'failed', 'canceled'].includes(status)) ||
+            (outcome && !['completed', 'no_answer', 'busy', 'declined'].includes(outcome)) ||
+            (resultStatus && !['pending', 'available', 'unavailable', 'not_applicable'].includes(resultStatus)) ||
+            (query && !/^[A-Za-z0-9_-]{2,200}$/.test(query)) || !validDate(startDate) || !validDate(endDate) ||
+            (startDate && endDate && startDate > endDate)) {
+            throw new Error('CALL-E operations list filters are invalid');
+        }
+
+        const operatorAccess = await this.hasActiveCallEOperator(actorId);
+        if (!operatorAccess) return { operator_access: false, rows: [], total: 0, summary: { active: 0, failed: 0, results_ready: 0 }, limit, offset };
+
+        const conditions = [`r.business_id IS NOT NULL`, `EXISTS (
+            SELECT 1 FROM call_e_business_operator_events grant_event
+            WHERE grant_event.business_id = r.business_id AND grant_event.telegram_id = ?
+              AND grant_event.event_type = 'access_granted'
+              AND grant_event.role IN ('policy_manager', 'call_operator')
+              AND NOT EXISTS (
+                SELECT 1 FROM call_e_business_operator_events newer
+                WHERE newer.business_id = grant_event.business_id
+                  AND newer.telegram_id = grant_event.telegram_id AND newer.id > grant_event.id
+              )
+        )`];
+        const params = [actorId];
+        if (status) { conditions.push('r.execution_status = ?'); params.push(status); }
+        if (outcome) { conditions.push('r.call_outcome = ?'); params.push(outcome); }
+        if (resultStatus) { conditions.push('r.result_status = ?'); params.push(resultStatus); }
+        if (query) {
+            conditions.push('(instr(lower(r.local_call_id), lower(?)) > 0 OR instr(lower(COALESCE(r.provider_call_id, "")), lower(?)) > 0)');
+            params.push(query, query);
+        }
+        if (startDate) { conditions.push('date(r.created_at) >= date(?)'); params.push(startDate); }
+        if (endDate) { conditions.push('date(r.created_at) <= date(?)'); params.push(endDate); }
+        const where = conditions.join(' AND ');
+        const summaryPromise = new Promise((resolve, reject) => {
+            this.db.get(
+                `SELECT COUNT(*) AS total,
+                    SUM(CASE WHEN r.execution_status IN ('queued', 'in_progress') THEN 1 ELSE 0 END) AS active,
+                    SUM(CASE WHEN r.execution_status = 'failed' THEN 1 ELSE 0 END) AS failed,
+                    SUM(CASE WHEN r.result_status = 'available' THEN 1 ELSE 0 END) AS results_ready
+                 FROM call_e_reconciliation r WHERE ${where}`,
+                params,
+                (error, row) => error ? reject(error) : resolve(row || {}),
+            );
+        });
+        const rowsPromise = new Promise((resolve, reject) => {
+            this.db.all(
+                `SELECT r.local_call_id, r.provider_call_id, r.template_id, r.template_version,
+                    r.execution_status, r.call_outcome, r.result_status, r.error_code, r.created_at, r.updated_at
+                 FROM call_e_reconciliation r WHERE ${where}
+                 ORDER BY COALESCE(r.updated_at, r.created_at) DESC, r.local_call_id DESC LIMIT ? OFFSET ?`,
+                [...params, limit, offset],
+                (error, rows) => error ? reject(error) : resolve(rows || []),
+            );
+        });
+        const [summary, rows] = await Promise.all([summaryPromise, rowsPromise]);
+        return {
+            operator_access: true,
+            rows,
+            total: Number(summary.total) || 0,
+            summary: {
+                active: Number(summary.active) || 0,
+                failed: Number(summary.failed) || 0,
+                results_ready: Number(summary.results_ready) || 0,
+            },
+            limit,
+            offset,
+        };
+    }
+
+    async getCallEReconciliationRecordByProviderId(providerCallId) {
+        const id = String(providerCallId || '').trim();
+        if (!/^call_[A-Za-z0-9_-]{1,190}$/.test(id)) return null;
+        return new Promise((resolve, reject) => {
+            this.db.get('SELECT local_call_id FROM call_e_reconciliation WHERE provider_call_id = ?', [id], (err, row) => {
+                if (err) return reject(err);
+                resolve(row || null);
+            });
+        });
+    }
+
+    async getCallEWebhookReceipt(providerCallId) {
+        const id = String(providerCallId || '').trim();
+        if (!/^call_[A-Za-z0-9_-]{1,190}$/.test(id)) return null;
+        return new Promise((resolve, reject) => {
+            this.db.get('SELECT event_id, event_type, processed_at FROM call_e_webhook_receipts WHERE provider_call_id = ?', [id], (err, row) => {
+                if (err) return reject(err);
+                resolve(row || null);
+            });
+        });
+    }
+
+    async recordCallEWebhookReceipt(payload = {}) {
+        const providerCallId = String(payload.provider_call_id || '').trim();
+        const eventId = String(payload.event_id || '').trim();
+        const eventType = String(payload.event_type || '').trim();
+        if (!/^call_[A-Za-z0-9_-]{1,190}$/.test(providerCallId) ||
+            !/^[A-Za-z0-9_-]{1,200}$/.test(eventId) ||
+            !['call.completed', 'call.failed', 'call.canceled'].includes(eventType)) {
+            throw new Error('CALL-E webhook receipt is invalid');
+        }
+        return new Promise((resolve, reject) => {
+            this.db.run(
+                `INSERT OR IGNORE INTO call_e_webhook_receipts (provider_call_id, event_id, event_type)
+                 VALUES (?, ?, ?)`,
+                [providerCallId, eventId, eventType],
+                function (err) { if (err) return reject(err); resolve({ saved: this.changes > 0 }); },
+            );
         });
     }
 
@@ -7254,6 +7516,20 @@ class EnhancedDatabase {
                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                completed_at DATETIME
            )`,
+           `CREATE TABLE IF NOT EXISTS post_call_workflow_definitions (
+               workflow_id TEXT NOT NULL,
+               version INTEGER NOT NULL,
+               name TEXT NOT NULL,
+               trigger_event TEXT NOT NULL,
+               schema_version INTEGER NOT NULL,
+               status TEXT NOT NULL CHECK(status IN ('draft', 'approved')),
+               definition_json TEXT NOT NULL,
+               created_by TEXT NOT NULL,
+               approved_by TEXT,
+               created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+               approved_at DATETIME,
+               PRIMARY KEY(workflow_id, version)
+           )`,
            `CREATE TABLE IF NOT EXISTS crm_contact_sync_records (
                id INTEGER PRIMARY KEY AUTOINCREMENT,
                provider TEXT NOT NULL,
@@ -7281,6 +7557,7 @@ class EnhancedDatabase {
            'CREATE INDEX IF NOT EXISTS idx_post_call_rules_priority ON post_call_automation_rules(priority)',
            'CREATE INDEX IF NOT EXISTS idx_post_call_runs_call_sid ON post_call_automation_runs(call_sid)',
            'CREATE INDEX IF NOT EXISTS idx_post_call_runs_idempotency ON post_call_automation_runs(idempotency_key)',
+           'CREATE INDEX IF NOT EXISTS idx_post_call_workflow_status ON post_call_workflow_definitions(status, created_at)',
            'CREATE INDEX IF NOT EXISTS idx_crm_contact_sync_email ON crm_contact_sync_records(email)',
            'CREATE INDEX IF NOT EXISTS idx_crm_activity_sync_contact ON crm_activity_sync_events(external_contact_id)',
        ];
@@ -8222,6 +8499,91 @@ class EnhancedDatabase {
                    } else {
                        resolve(row || null);
                    }
+               },
+           );
+       });
+   }
+
+   async createPostCallWorkflowDefinitionDraft(definition = {}) {
+       return new Promise((resolve, reject) => {
+           const sql = `
+               INSERT INTO post_call_workflow_definitions (
+                   workflow_id, version, name, trigger_event, schema_version, status,
+                   definition_json, created_by, created_at
+               )
+               SELECT ?, COALESCE(MAX(version), 0) + 1, ?, ?, ?, 'draft', ?, ?, CURRENT_TIMESTAMP
+               FROM post_call_workflow_definitions
+               WHERE workflow_id = ?
+               RETURNING *
+           `;
+           this.db.get(sql, [
+               definition.workflow_id,
+               definition.name,
+               definition.trigger_event,
+               definition.schema_version,
+               definition.definition_json,
+               definition.created_by,
+               definition.workflow_id,
+           ], (err, row) => {
+               if (err) {
+                   reject(err);
+                   return;
+               }
+               resolve(row || null);
+           });
+       });
+   }
+
+   async getPostCallWorkflowDefinition(workflowId, version) {
+       return new Promise((resolve, reject) => {
+           this.db.get(
+               'SELECT * FROM post_call_workflow_definitions WHERE workflow_id = ? AND version = ?',
+               [workflowId, version],
+               (err, row) => err ? reject(err) : resolve(row || null),
+           );
+       });
+   }
+
+   async getLatestPostCallWorkflowDefinition(workflowId) {
+       return new Promise((resolve, reject) => {
+           this.db.get(
+               'SELECT * FROM post_call_workflow_definitions WHERE workflow_id = ? ORDER BY version DESC LIMIT 1',
+               [workflowId],
+               (err, row) => err ? reject(err) : resolve(row || null),
+           );
+       });
+   }
+
+   async listPostCallWorkflowDefinitions(filters = {}) {
+       const params = [];
+       const where = [];
+       if (filters.workflow_id) {
+           where.push('workflow_id = ?');
+           params.push(filters.workflow_id);
+       }
+       const safeLimit = Number.isFinite(Number(filters.limit))
+           ? Math.max(1, Math.min(200, Math.floor(Number(filters.limit))))
+           : 100;
+       params.push(safeLimit);
+       return new Promise((resolve, reject) => {
+           this.db.all(
+               `SELECT * FROM post_call_workflow_definitions ${where.length ? `WHERE ${where.join(' AND ')}` : ''} ORDER BY workflow_id ASC, version DESC LIMIT ?`,
+               params,
+               (err, rows) => err ? reject(err) : resolve(rows || []),
+           );
+       });
+   }
+
+   async approvePostCallWorkflowDefinition(workflowId, version, approvedBy) {
+       return new Promise((resolve, reject) => {
+           this.db.run(
+               `UPDATE post_call_workflow_definitions
+                SET status = 'approved', approved_by = ?, approved_at = CURRENT_TIMESTAMP
+                WHERE workflow_id = ? AND version = ? AND status = 'draft'`,
+               [approvedBy, workflowId, version],
+               function (err) {
+                   if (err) reject(err);
+                   else resolve(this.changes || 0);
                },
            );
        });

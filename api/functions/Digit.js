@@ -6324,6 +6324,25 @@ function createDigitCollectionService(options = {}) {
 
   const MIN_INFER_CONFIDENCE = 0.65;
 
+  function buildProfileExpectation(profile, overrides = {}, reason = 'keyword', confidence = 0.7, scriptPolicy = {}) {
+    const defaults = getDigitProfileDefaults(profile);
+    return {
+      profile,
+      min_digits: overrides.min_digits || defaults.min_digits || 1,
+      max_digits: overrides.max_digits || defaults.max_digits || overrides.min_digits || defaults.min_digits || 1,
+      force_exact_length: overrides.force_exact_length || false,
+      prompt: '',
+      end_call_on_success: typeof overrides.end_call_on_success === 'boolean'
+        ? overrides.end_call_on_success
+        : true,
+      max_retries: overrides.max_retries || defaults.max_retries || 2,
+      confidence,
+      reason,
+      allow_terminator: scriptPolicy.allow_terminator === true,
+      terminator_char: scriptPolicy.terminator_char || '#'
+    };
+  }
+
   function inferDigitExpectationFromText(text = '', callConfig = {}) {
     const lower = String(text || '').toLowerCase();
     const tpl = callConfig.script_policy || {};
@@ -6391,25 +6410,6 @@ function createDigitCollectionService(options = {}) {
       };
     }
 
-    const buildProfileExpectation = (profile, overrides = {}, reason = 'keyword', confidence = 0.7) => {
-      const defaults = getDigitProfileDefaults(profile);
-      return {
-        profile,
-        min_digits: overrides.min_digits || defaults.min_digits || 1,
-        max_digits: overrides.max_digits || defaults.max_digits || overrides.min_digits || defaults.min_digits || 1,
-        force_exact_length: overrides.force_exact_length || false,
-        prompt: '',
-        end_call_on_success: typeof overrides.end_call_on_success === 'boolean'
-          ? overrides.end_call_on_success
-          : true,
-        max_retries: overrides.max_retries || defaults.max_retries || 2,
-        confidence,
-        reason,
-        allow_terminator: tpl.allow_terminator === true,
-        terminator_char: tpl.terminator_char || '#'
-      };
-    };
-
     const exactKeywordProfiles = [
       { profile: 'verification', regex: /\b(otp|one[-\s]?time|one[-\s]?time password|verification code|passcode)\b/, reason: 'otp_exact_keyword', confidence: 0.9 },
       { profile: 'pin', regex: /\bpin\b/, min: 4, max: 8, reason: 'pin_keyword', confidence: 0.85 },
@@ -6436,7 +6436,7 @@ function createDigitCollectionService(options = {}) {
         max_digits: useLen || entry.max,
         force_exact_length: useLen || entry.exact || false,
         end_call_on_success: true
-      }, entry.reason, entry.confidence);
+      }, entry.reason, entry.confidence, tpl);
     }
 
     // OTP / verification keyword fallback (requires action verb or explicit length)
@@ -6493,7 +6493,7 @@ function createDigitCollectionService(options = {}) {
           min_digits: best.min,
           max_digits: best.max,
           end_call_on_success: true
-        }, best.reason, Math.min(0.85, best.score));
+        }, best.reason, Math.min(0.85, best.score), tpl);
       }
     }
 
@@ -6604,7 +6604,13 @@ function createDigitCollectionService(options = {}) {
       });
       const top = candidates[0];
       if (top?.profile && (top.score || 0) >= INTENT_PREDICT_MIN_SCORE) {
-        const predicted = buildProfileExpectation(top.profile, {}, 'predictive_intent', top.score);
+        const predicted = buildProfileExpectation(
+          top.profile,
+          {},
+          'predictive_intent',
+          top.score,
+          callConfig.script_policy || {},
+        );
         if (predicted) {
           return {
             mode: 'dtmf',

@@ -24,6 +24,9 @@ class CallEApiError extends Error {
     this.code = String(details.code || "call_e_request_failed");
     this.retryable = Boolean(details.retryable);
     this.noCallCreated = details.noCallCreated === true;
+    this.providerCode = String(details.providerCode || "");
+    this.reasonCode = String(details.reasonCode || "");
+    this.recoveryAction = String(details.recoveryAction || "inspect_call_state");
   }
 }
 
@@ -37,6 +40,19 @@ function isAllowedBaseUrl(value) {
   }
 }
 
+function normalizeCallEWebhookUrl(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return null;
+  if (raw.length > 2048) return null;
+  try {
+    const url = new URL(raw);
+    if (url.protocol !== "https:" || !url.hostname || url.username || url.password || url.search || url.hash) return null;
+    return url.toString();
+  } catch {
+    return null;
+  }
+}
+
 function normalizeCallId(value) {
   const callId = String(value || "").trim();
   return CALL_ID_PATTERN.test(callId) ? callId : null;
@@ -47,6 +63,14 @@ function readErrorCode(payload) {
   return /^[a-z][a-z0-9_]{0,79}$/.test(raw) ? raw : "";
 }
 
+function callEOperationName(method, pathname) {
+  if (pathname === "/v2/calls" && method === "POST") return "call.create";
+  if (/^\/v2\/calls\/[A-Za-z0-9_-]{1,200}\/cancel$/.test(pathname)) return "call.cancel";
+  if (/^\/v2\/calls\/[A-Za-z0-9_-]{1,200}\/events$/.test(pathname)) return "call.events.read";
+  if (/^\/v2\/calls\/[A-Za-z0-9_-]{1,200}$/.test(pathname)) return "call.read";
+  return "unknown";
+}
+
 class CallEClient {
   constructor(options = {}) {
     this.enabled = options.enabled === true;
@@ -54,6 +78,9 @@ class CallEClient {
     this.baseUrl = String(options.baseUrl || CALL_E_PRODUCTION_BASE_URL).replace(/\/+$/, "");
     this.timeoutMs = Math.max(1000, Math.min(30000, Number(options.timeoutMs) || 10000));
     this.fetch = options.fetchFn || fetch;
+    this.onMetric = typeof options.onMetric === "function" ? options.onMetric : (metric) => {
+      console.info("call_e_request_metric", metric);
+    };
   }
 
   isConfigured() {
@@ -76,9 +103,15 @@ class CallEClient {
 
     const controller = typeof AbortController !== "undefined" ? new AbortController() : null;
     const timeout = controller ? setTimeout(() => controller.abort(), this.timeoutMs) : null;
+    const startedAt = Date.now();
+    const requestMethod = String(method || "GET").toUpperCase();
+    const operation = callEOperationName(requestMethod, pathname);
+    let outcome = "error";
+    let statusCode = null;
+    let errorCode = null;
     try {
       const response = await this.fetch(`${this.baseUrl}${path}`, {
-        method: String(method || "GET").toUpperCase(),
+        method: requestMethod,
         headers: {
           Authorization: `Bearer ${this.apiKey}`,
           Accept: "application/json",
@@ -92,28 +125,66 @@ class CallEClient {
       try { payload = await response.json(); } catch { payload = null; }
       if (!response.ok) {
         const status = Number(response.status) || null;
+        statusCode = status;
         const providerCode = readErrorCode(payload);
+        const rawReasonCode = String(payload?.error?.details?.reason_code || "").trim();
+        const reasonCode = /^[a-z][a-z0-9_]{0,79}$/.test(rawReasonCode) ? rawReasonCode : "";
         const noCallCreated = (status === 422 && KNOWN_NO_CALL_CODES.has(providerCode)) ||
           (status === 400 && providerCode === "result_schema_invalid");
+        const recoveryAction = providerCode === "unauthorized" || providerCode === "forbidden"
+          ? "check_server_credentials_or_access"
+          : providerCode === "insufficient_balance"
+            ? "resolve_provider_billing"
+            : providerCode === "rate_limit_exceeded"
+              ? "backoff_same_request_and_idempotency_key"
+              : providerCode === "idempotency_conflict" && reasonCode === "creation_in_progress"
+                ? "backoff_same_request_and_idempotency_key"
+                : providerCode === "idempotency_conflict"
+                  ? "inspect_original_request_and_idempotency_key"
+                  : noCallCreated
+                    ? "correct_rejected_input_and_reuse_key"
+                    : "inspect_call_state_before_retry";
+        errorCode = providerCode ? `call_e_${providerCode}` : "call_e_http_error";
         throw new CallEApiError("CALL-E API request failed", {
           status,
-          code: noCallCreated ? `call_e_${providerCode}` : "call_e_http_error",
+          code: errorCode,
           noCallCreated,
+          providerCode,
+          reasonCode,
+          recoveryAction,
+          retryable: status === 429 || (status !== null && status >= 500),
         });
       }
       if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+        errorCode = "call_e_invalid_response";
         throw new CallEApiError("CALL-E returned an invalid response", { code: "call_e_invalid_response" });
       }
+      outcome = "success";
+      statusCode = Number(response.status) || null;
       return payload;
     } catch (error) {
+      if (error instanceof CallEApiError) errorCode = error.code;
       if (error instanceof CallEApiError) throw error;
       const timedOut = error?.name === "AbortError";
+      errorCode = timedOut ? "call_e_timeout" : "call_e_network_error";
       throw new CallEApiError(
         timedOut ? "CALL-E API request timed out" : "CALL-E API request failed",
-        { code: timedOut ? "call_e_timeout" : "call_e_network_error", retryable: true },
+        { code: errorCode, retryable: true },
       );
     } finally {
       if (timeout) clearTimeout(timeout);
+      try {
+        this.onMetric({
+          operation,
+          method: requestMethod,
+          outcome,
+          statusCode,
+          durationMs: Math.max(0, Date.now() - startedAt),
+          ...(errorCode ? { errorCode } : {}),
+        });
+      } catch {
+        // Metrics must never alter provider request behavior.
+      }
     }
   }
 
@@ -198,5 +269,6 @@ module.exports = {
   buildCallEDeploymentStatus,
   createCallEClientFromEnv,
   isAllowedBaseUrl,
+  normalizeCallEWebhookUrl,
   normalizeCallId,
 };

@@ -19,6 +19,9 @@ import {
   toText,
 } from '@/services/admin-dashboard/dashboardPrimitives';
 import { resolveDashboardAction } from '@/services/admin-dashboard/dashboardActionGuards';
+import type { CallVoiceModelOption } from '@/shared/callVoiceModels';
+export { CALL_FALLBACK_VOICE_MODELS } from '@/shared/callVoiceModels';
+export type { CallVoiceModelOption } from '@/shared/callVoiceModels';
 
 export type CommandPageId = Exclude<keyof typeof MINIAPP_COMMAND_PAGE_CONTRACTS, 'CALL'>;
 export type CallWorkflowMode = 'custom' | 'script';
@@ -116,13 +119,6 @@ export type CallPersonaCatalogResponse = {
   success?: boolean;
   builtin?: unknown;
   custom?: unknown;
-};
-
-export type CallVoiceModelOption = {
-  id: string;
-  label: string;
-  gender: string;
-  style: string;
 };
 
 type EmailCommandBulkHistoryJob = {
@@ -461,15 +457,6 @@ export const CALL_FALLBACK_PERSONAS: ReadonlyArray<CallPersonaProfile> = [
     custom: false,
     dynamic: false,
   },
-];
-
-export const CALL_FALLBACK_VOICE_MODELS: ReadonlyArray<CallVoiceModelOption> = [
-  { id: 'aura-2-andromeda-en', label: 'aura-2-andromeda-en', gender: 'female', style: 'balanced' },
-  { id: 'aura-2-helena-en', label: 'aura-2-helena-en', gender: 'female', style: 'warm' },
-  { id: 'aura-2-thalia-en', label: 'aura-2-thalia-en', gender: 'female', style: 'clear' },
-  { id: 'aura-2-arcas-en', label: 'aura-2-arcas-en', gender: 'male', style: 'grounded' },
-  { id: 'aura-2-aries-en', label: 'aura-2-aries-en', gender: 'male', style: 'confident' },
-  { id: 'aura-asteria-en', label: 'aura-asteria-en', gender: 'female', style: 'bright' },
 ];
 
 const ACTIVE_CALL_CONSOLE_STORAGE_PREFIX = 'voxly-miniapp-active-call-console';

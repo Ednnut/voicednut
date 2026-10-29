@@ -1,5 +1,6 @@
 const fetch = require("node-fetch");
 const { runWithTimeout } = require("../utils/asyncControl");
+const { classifyProviderSubmissionState } = require("./providerFlowPolicy");
 
 function isValidHttpsUrl(value) {
   if (!value || typeof value !== "string") return false;
@@ -58,6 +59,11 @@ function isRetriableNetworkCode(code) {
     "network_error",
     "fetcherror",
   ]).has(normalized);
+}
+
+function safeErrorCode(value) {
+  const code = String(value || "").trim();
+  return /^[A-Za-z0-9_-]{1,80}$/.test(code) ? code : "provider_operation_failed";
 }
 
 function buildRetryDelayMs(baseMs, maxDelayMs, jitterMs, retryNumber) {
@@ -124,11 +130,6 @@ class PlivoVoiceAdapter {
       1,
       { min: 0 },
     );
-    this.createRetryAttempts = normalizePositiveInteger(
-      voice.createRetryAttempts ?? config.createRetryAttempts,
-      0,
-      { min: 0 },
-    );
     this.retryBaseMs = normalizePositiveInteger(
       voice.retryBaseMs ?? config.retryBaseMs,
       250,
@@ -187,6 +188,9 @@ class PlivoVoiceAdapter {
               error.provider = "plivo";
               error.operation = operationName;
               error.providerResponse = parsedBody;
+              if (operationName === "create_outbound_call") {
+                error.providerSubmissionState = classifyProviderSubmissionState(response.status);
+              }
               error.retryable = isRetriableStatus(response.status);
               throw error;
             }
@@ -217,7 +221,13 @@ class PlivoVoiceAdapter {
           error?.retryable === true ||
           isRetriableStatus(statusCode) ||
           isRetriableNetworkCode(code);
-        const willRetry = retriable && attemptNumber < maxAttempts;
+        const willRetry =
+          retriable &&
+          operationName !== "create_outbound_call" &&
+          attemptNumber < maxAttempts;
+        if (operationName === "create_outbound_call" && !error.providerSubmissionState) {
+          error.providerSubmissionState = "unknown";
+        }
         this.logger?.warn?.("plivo_voice_operation_failed", {
           provider: "plivo",
           operation: operationName,
@@ -227,7 +237,7 @@ class PlivoVoiceAdapter {
           will_retry: willRetry,
           status_code: Number.isFinite(statusCode) ? statusCode : null,
           code: code || null,
-          error: error?.message || String(error || "unknown_error"),
+          error_code: safeErrorCode(code),
           ...(options.meta || {}),
         });
         if (!willRetry) {
@@ -253,26 +263,35 @@ class PlivoVoiceAdapter {
 
   async createOutboundCall(options = {}) {
     const { to, callSid, answerUrl, eventUrl, from } = options;
-    if (!to) {
-      throw new Error("PlivoVoiceAdapter.createOutboundCall requires destination number");
-    }
-    if (!callSid) {
-      throw new Error("PlivoVoiceAdapter.createOutboundCall requires callSid");
-    }
-    const normalizedFrom = sanitizePhoneNumber(from || this.fromNumber, "from");
-    const normalizedTo = sanitizePhoneNumber(to, "destination");
-    const finalAnswerUrl = this.answerUrlOverride || answerUrl;
-    const finalEventUrl = this.eventUrlOverride || eventUrl;
+    let normalizedFrom;
+    let normalizedTo;
+    let finalAnswerUrl;
+    let finalEventUrl;
+    try {
+      if (!to) {
+        throw new Error("PlivoVoiceAdapter.createOutboundCall requires destination number");
+      }
+      if (!callSid) {
+        throw new Error("PlivoVoiceAdapter.createOutboundCall requires callSid");
+      }
+      normalizedFrom = sanitizePhoneNumber(from || this.fromNumber, "from");
+      normalizedTo = sanitizePhoneNumber(to, "destination");
+      finalAnswerUrl = this.answerUrlOverride || answerUrl;
+      finalEventUrl = this.eventUrlOverride || eventUrl;
 
-    if (!isValidHttpsUrl(finalAnswerUrl)) {
-      throw new Error(
-        "PlivoVoiceAdapter.createOutboundCall requires a valid HTTPS answerUrl",
-      );
-    }
-    if (finalEventUrl && !isValidHttpsUrl(finalEventUrl)) {
-      throw new Error(
-        "PlivoVoiceAdapter.createOutboundCall requires eventUrl to be a valid HTTPS URL",
-      );
+      if (!isValidHttpsUrl(finalAnswerUrl)) {
+        throw new Error(
+          "PlivoVoiceAdapter.createOutboundCall requires a valid HTTPS answerUrl",
+        );
+      }
+      if (finalEventUrl && !isValidHttpsUrl(finalEventUrl)) {
+        throw new Error(
+          "PlivoVoiceAdapter.createOutboundCall requires eventUrl to be a valid HTTPS URL",
+        );
+      }
+    } catch (error) {
+      error.providerSubmissionState = "not_submitted";
+      throw error;
     }
 
     const payload = {
@@ -303,7 +322,7 @@ class PlivoVoiceAdapter {
       `/v1/Account/${encodeURIComponent(this.authId)}/Call/`,
       payload,
       {
-        retryAttempts: this.createRetryAttempts,
+        retryAttempts: 0,
         meta: {
           callSid,
           to: maskPhoneForLog(normalizedTo),

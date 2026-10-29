@@ -1,0 +1,28 @@
+{
+  "root": true,
+  "env": { "node": true, "es2023": true },
+  "parserOptions": { "ecmaVersion": "latest", "sourceType": "script" },
+  "extends": ["eslint:recommended"],
+  "rules": {
+    "no-unused-vars": ["warn", { "args": "none", "caughtErrors": "none" }],
+    "no-empty": ["warn", { "allowEmptyCatch": false }],
+    "no-constant-condition": ["error", { "checkLoops": false }],
+    "no-control-regex": "off",
+    "no-useless-escape": "off",
+    "no-fallthrough": "warn"
+  },
+  "globals": {
+    "getCurrentProvider": "readonly",
+    "routeToAgentOnRisk": "readonly"
+  },
+  "ignorePatterns": ["node_modules/", "coverage/", "*.min.js"],
+  "overrides": [
+    {
+      "files": ["__tests__/**/*.js"],
+      "env": { "mocha": true }
+    },
+    {
+      "files": ["scripts/**/*.js"]
+    }
+  ]
+}

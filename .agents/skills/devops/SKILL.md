@@ -1,6 +1,6 @@
 ---
 name: devops
-description: Change or review VOICEDNUT environments, CI/CD, infrastructure, observability, deployment, or operational recovery.
+description: Change or review VOICEDNUT GitHub Actions (.github/workflows/main.yml validate jobs + EC2 deploy), PM2/ecosystem configs, environments and env-var rollout, health checks, observability, backups, and deployment/rollback recovery; production apply always requires explicit approval.
 ---
 
 ## Workflow
