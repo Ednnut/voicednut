@@ -4,6 +4,8 @@ const os = require("node:os");
 const path = require("node:path");
 const sqlite3 = require("sqlite3").verbose();
 const Database = require("../db/db");
+const { mapCallTemplateToVapiAssistant } = require("../adapters/vapiTemplateAdapter");
+const { VAPI_BUSINESS_CONTEXT_TOOL_ID } = require("../services/vapiToolRegistry");
 
 describe("Vapi template mapping persistence", () => {
   let db;
@@ -21,6 +23,42 @@ describe("Vapi template mapping persistence", () => {
     [dbPath, `${dbPath}-wal`, `${dbPath}-shm`].forEach((file) => {
       try { fs.unlinkSync(file); } catch (_) {}
     });
+  });
+
+  it("maps only the explicitly approved read-only business context tool", () => {
+    const preview = mapCallTemplateToVapiAssistant({
+      id: 4,
+      version: 2,
+      prompt: "Answer callers using approved company information.",
+      first_message: "Hello.",
+      agent_config: {
+        schema_version: 2,
+        approved_tools: [VAPI_BUSINESS_CONTEXT_TOOL_ID],
+        business_context: { facts: [{ label: "Hours", value: "Weekdays" }] },
+      },
+      configuration: {
+        vapi: {
+          model: { provider: "openai", model: "gpt-4o-mini" },
+          voice: { provider: "11labs", voiceId: "voice-id" },
+        },
+      },
+    }, {
+      serverConfiguration: { url: "https://api.example.test/webhook/vapi", credentialId: "vapi-webhook" },
+    });
+    assert.equal(preview.compatible, true);
+    assert.equal(preview.assistant.tools.length, 1);
+    assert.equal(preview.assistant.tools[0].function.name, "lookup_business_context");
+    assert.equal(preview.assistant.tools[0].server.credentialId, "vapi-webhook");
+
+    const missingServer = mapCallTemplateToVapiAssistant({
+      prompt: "Prompt", first_message: "Hello", agent_config: {
+        schema_version: 2,
+        approved_tools: [VAPI_BUSINESS_CONTEXT_TOOL_ID],
+        business_context: { facts: [{ label: "Hours", value: "Weekdays" }] },
+      },
+    });
+    assert.equal(missingServer.compatible, false);
+    assert.ok(missingServer.unsupported.includes("agent_tool_webhook_unavailable"));
   });
 
   it("upserts a versioned audit record without storing submitted model configuration", async () => {
@@ -85,6 +123,38 @@ describe("Vapi template mapping persistence", () => {
     assert.equal(mapping.mapping_status, "provisioned");
     assert.equal(mapping.vapi_assistant_id, "asst_sync_test");
     assert.equal(mapping.vapi_assistant_version, "v2");
+    const byAssistantId = await db.listVapiTemplateMappingsByAssistantId("asst_sync_test");
+    assert.equal(byAssistantId.length, 1);
+    assert.equal(byAssistantId[0].template_id, templateId);
+  });
+
+  it("persists compact Vapi simulation summaries with per-template idempotency", async () => {
+    const templateId = await db.createCallTemplate({ name: "Vapi simulation persistence", prompt: "Prompt", first_message: "Hello" });
+    const fingerprint = "d".repeat(64);
+    await db.upsertVapiTemplateMapping({
+      template_id: templateId, template_version: 1, config_fingerprint: fingerprint,
+      compatibility_status: "compatible", summary: { mapped_fields: ["model", "voice"] },
+    });
+    await db.completeVapiTemplateSync({
+      template_id: templateId, template_version: 1, config_fingerprint: fingerprint,
+      vapi_assistant_id: "assistant_sim_persist", vapi_assistant_version: "v2",
+    });
+    const [mapping] = await db.listVapiTemplateMappings(templateId);
+    const input = {
+      run_id: "vapi-run-persist-1", template_id: templateId, template_version: 1, mapping_id: mapping.id,
+      assistant_id: "assistant_sim_persist", suite_id: "suite-persist", idempotency_key: "sim-persist-key-001",
+      actor_id: "admin", summary: { status: "queued", item_counts: {} }, safety: "tools_mocked_assistant_and_scenario_hooks_clear",
+    };
+    const first = await db.recordVapiSimulationRun(input);
+    const replay = await db.recordVapiSimulationRun(input);
+    const latest = await db.getLatestVapiSimulationRun(templateId, 1);
+    const rows = await db.listVapiSimulationRuns(templateId, 5);
+    assert.equal(first.idempotent_replay, false);
+    assert.equal(replay.idempotent_replay, true);
+    assert.equal(latest.run_id, "vapi-run-persist-1");
+    assert.deepEqual(latest.summary, { status: "queued", item_counts: {} });
+    assert.equal(rows.length, 1);
+    assert.equal(JSON.stringify(rows).includes("transcript"), false);
   });
 
   it("routes an inbound Vapi number only to an explicit current synced template mapping", async () => {

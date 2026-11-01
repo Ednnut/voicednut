@@ -88,6 +88,10 @@ export const MODULE_CONTEXT: Record<DashboardModule, { subtitle: string; detail:
     subtitle: 'System posture, alert triage, response actions, and audit history.',
     detail: 'Operational status and audit workspace.',
   },
+  workflows: {
+    subtitle: 'Draft post-call workflows and inspect sanitized execution history.',
+    detail: 'Platform-admin workflow authoring and run review.',
+  },
 };
 
 export const MODULE_ID_SET = new Set<DashboardModule>(DASHBOARD_MODULE_IDS);
@@ -105,10 +109,11 @@ export const MODULE_DEFAULT_ORDER: Record<DashboardModule, number> = {
   persona: 9,
   users: 10,
   audit: 11,
+  workflows: 12,
 };
 
 type DashboardModuleGroup = {
-  id: 'operations' | 'messaging' | 'governance';
+  id: 'operations' | 'messaging' | 'governance' | 'automation';
   label: string;
   subtitle: string;
   moduleIds: DashboardModule[];
@@ -132,6 +137,12 @@ export const MODULE_GROUPS: DashboardModuleGroup[] = [
     label: 'Governance',
     subtitle: 'Content controls, persona policy, and access management.',
     moduleIds: ['content', 'scriptsparity', 'callerflags', 'persona', 'users'],
+  },
+  {
+    id: 'automation',
+    label: 'Automation',
+    subtitle: 'Platform-admin workflow authoring and execution review.',
+    moduleIds: ['workflows'],
   },
 ];
 
@@ -223,6 +234,8 @@ export function moduleGlyph(moduleId: string): string {
       return '◎';
     case 'audit':
       return '⚑';
+    case 'workflows':
+      return '⌁';
     default:
       return '•';
   }

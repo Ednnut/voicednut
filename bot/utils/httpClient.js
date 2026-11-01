@@ -1,5 +1,6 @@
 const axios = require('axios');
 const config = require('../config');
+const { createCallEActorAssertionHeaders } = require('./callEActorAssertion');
 
 const DEFAULT_TIMEOUT_MS = 12000;
 const ADMIN_HEADER = 'x-admin-token';
@@ -162,16 +163,32 @@ function getUserMessage(error, fallback = 'API request failed.') {
 
 async function request(method, ctx, url, data, options = {}) {
   const normalized = normalizeOptions(options, url);
+  let callEActorHeaders = {};
+  const pathname = new URL(url, config.apiUrl).pathname;
+  if (pathname.startsWith('/api/call-e/') || pathname.startsWith('/api/cartesia/') || pathname === '/outbound-call' || /\/api\/call-scripts\/\d+\/vapi-call$/.test(pathname)) {
+    callEActorHeaders = createCallEActorAssertionHeaders({
+      actorId: ctx?.from?.id || data?.user_chat_id || data?.actor_id,
+      method,
+      url,
+      params: normalized.params,
+      body: data,
+      secret: config.apiAuth?.callEActorAssertionSecret,
+    });
+  }
+  normalized.headers = { ...normalized.headers, ...callEActorHeaders };
   const { retry, ...axiosOptions } = normalized;
   try {
     if (method === 'get') {
       return await withRetry(() => axios.get(url, axiosOptions), retry);
     }
     if (method === 'delete') {
-      return await withRetry(() => axios.delete(url, axiosOptions), retry);
+      return await withRetry(() => axios.delete(url, { ...axiosOptions, ...(data !== undefined && data !== null ? { data } : {}) }), retry);
     }
     if (method === 'put') {
       return await withRetry(() => axios.put(url, data, axiosOptions), retry);
+    }
+    if (method === 'patch') {
+      return await withRetry(() => axios.patch(url, data, axiosOptions), retry);
     }
     return await withRetry(() => axios.post(url, data, axiosOptions), retry);
   } catch (error) {
@@ -197,7 +214,11 @@ async function put(ctx, url, data, options = {}) {
 }
 
 async function del(ctx, url, options = {}) {
-  return request('delete', ctx, url, null, options);
+  return request('delete', ctx, url, options.data ?? null, options);
+}
+
+async function patch(ctx, url, data, options = {}) {
+  return request('patch', ctx, url, data, options);
 }
 
 module.exports = {
@@ -208,5 +229,6 @@ module.exports = {
   get,
   post,
   put,
-  del
+  del,
+  patch
 };

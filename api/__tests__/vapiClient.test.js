@@ -48,6 +48,61 @@ describe("VapiClient", () => {
     assert.equal(requests[2].options.method, "PATCH");
   });
 
+  it("uses documented Vapi simulation suite, scenario, run, and idempotency endpoints", async () => {
+    const requests = [];
+    const client = new VapiClient({ enabled: true, apiKey: "private-key", fetchFn: async (url, options) => {
+      requests.push({ url, options });
+      return { ok: true, status: 200, json: async () => ({ id: "run-1" }) };
+    } });
+    await client.listSimulationSuites({ assistantId: "assistant-1", limit: 10 });
+    await client.getSimulationSuite("suite-1");
+    await client.getSimulation("simulation-1");
+    await client.getSimulationScenario("scenario-1");
+    await client.createSimulationRun({ simulations: [{ type: "simulationSuite", simulationSuiteId: "suite-1" }] }, "voicednut-run-key-1");
+    await client.getSimulationRun("run-1");
+    assert.match(requests[0].url, /\/eval\/simulation\/suite\?assistantId=assistant-1&limit=10$/);
+    assert.equal(requests[1].url, "https://api.vapi.ai/eval/simulation/suite/suite-1");
+    assert.equal(requests[2].url, "https://api.vapi.ai/eval/simulation/simulation-1");
+    assert.equal(requests[3].url, "https://api.vapi.ai/eval/simulation/scenario/scenario-1");
+    assert.equal(requests[4].url, "https://api.vapi.ai/eval/simulation/run");
+    assert.equal(requests[4].options.headers["Idempotency-Key"], "voicednut-run-key-1");
+    assert.equal(requests[4].options.headers.Authorization, "Bearer private-key");
+    assert.equal(requests[5].url, "https://api.vapi.ai/eval/simulation/run/run-1");
+  });
+
+  it("uses the documented Vapi Eval endpoints with server-side bearer authentication", async () => {
+    const requests = [];
+    const client = new VapiClient({ enabled: true, apiKey: "private-test-key", fetchFn: async (url, options) => {
+      requests.push({ url, options });
+      return { ok: true, status: 201, json: async () => ({ id: "eval-1" }) };
+    } });
+    await client.listEvals({ page: 2, limit: 10 });
+    await client.createEval({ type: "chat.mockConversation", messages: [{ role: "user", content: "Hi" }] });
+    await client.listEvalRuns({ page: 1, limit: 5 });
+    await client.createEvalRun({ type: "eval", evalId: "eval-1", target: { type: "assistant", assistantId: "assistant-1" } });
+    await client.getEvalRun("run-1");
+    assert.match(requests[0].url, /\/eval\?page=2&limit=10&sortOrder=DESC$/);
+    assert.equal(requests[1].url, "https://api.vapi.ai/eval");
+    assert.match(requests[2].url, /\/eval\/run\?page=1&limit=5&sortOrder=DESC$/);
+    assert.equal(requests[3].url, "https://api.vapi.ai/eval/run");
+    assert.equal(requests[4].url, "https://api.vapi.ai/eval/run/run-1");
+    assert.equal(requests[4].options.headers.Authorization, "Bearer private-test-key");
+  });
+
+  it("uses the documented Vapi Squad inventory and detail endpoints", async () => {
+    const requests = [];
+    const client = new VapiClient({ enabled: true, apiKey: "private-test-key", fetchFn: async (url, options) => {
+      requests.push({ url, options });
+      return { ok: true, status: 200, json: async () => ({ id: "squad-1" }) };
+    } });
+    await client.listSquads({ limit: 20 });
+    await client.getSquad("squad/1");
+    assert.equal(requests[0].url, "https://api.vapi.ai/squad?limit=20");
+    assert.equal(requests[1].url, "https://api.vapi.ai/squad/squad%2F1");
+    assert.equal(requests[0].options.headers.Authorization, "Bearer private-test-key");
+    assert.equal(requests[1].options.method, "GET");
+  });
+
   it("lists phone numbers through the documented paginated v2 endpoint", async () => {
     const requests = [];
     const client = new VapiClient({

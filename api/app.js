@@ -27,6 +27,25 @@ const { EnhancedSmsService } = require("./routes/sms.js");
 const { EmailService } = require("./routes/email");
 const { createTwilioGatherHandler } = require("./routes/gather");
 const { registerCallRoutes } = require("./services/callRoutes");
+const { CartesiaClient } = require("./services/cartesiaClient");
+const { CartesiaOutboundCallService } = require("./services/cartesiaOutboundCallService");
+const { CartesiaCampaignService, confirmationPhrase: cartesiaCampaignConfirmationPhrase } = require("./services/cartesiaCampaignService");
+const { CartesiaStudioClient } = require("./services/cartesiaStudioClient");
+const { CartesiaAgentRuntime } = require("./services/cartesiaAgentRuntime");
+const { CartesiaTtsSessionRuntime } = require("./services/cartesiaTtsSessionRuntime");
+const { CartesiaSttSessionRuntime, selectSessionQuery } = require("./services/cartesiaSttSessionRuntime");
+const { CartesiaStudioService } = require("./services/cartesiaStudioService");
+const { CartesiaPhraseCacheStore } = require("./services/cartesiaPhraseCacheStore");
+const { CartesiaSttProfileStore } = require("./services/cartesiaSttProfileStore");
+const { CartesiaAgentProfileStore } = require("./services/cartesiaAgentProfileStore");
+const { registerCartesiaStudioRoutes } = require("./services/cartesiaStudioRoutes");
+const { registerCartesiaWebhookRoutes } = require("./services/cartesiaWebhookRoutes");
+const { CartesiaKnowledgeBaseClient } = require("./services/cartesiaKnowledgeBaseClient");
+const { CartesiaKnowledgeBaseService } = require("./services/cartesiaKnowledgeBaseService");
+const { registerCartesiaKnowledgeBaseRoutes } = require("./services/cartesiaKnowledgeBaseRoutes");
+const { CartesiaSipProviderClient } = require("./services/cartesiaSipProviderClient");
+const { CartesiaSipProviderService } = require("./services/cartesiaSipProviderService");
+const { registerCartesiaSipProviderRoutes } = require("./services/cartesiaSipProviderRoutes");
 const { registerStatusRoutes } = require("./services/statusRoutes");
 const { registerWebhookRoutes } = require("./services/webhookRoutes");
 const Database = require("./db/db");
@@ -112,14 +131,30 @@ const {
 const CallEVoiceAdapter = require("./adapters/CallEVoiceAdapter");
 const { buildTwilioOutboundCallPayload } = require("./adapters/twilioVoiceCallPayload");
 const { previewCallETemplate } = require("./adapters/callETemplateAdapter");
-const { buildCallEDeploymentStatus, createCallEClientFromEnv } = require("./services/callEClient");
+const { buildCallEDeploymentStatus, createCallEClientFromEnv, getCallEProviderHealth } = require("./services/callEClient");
 const { parseAllowedDestinations, CallEOutboundCallService } = require("./services/callEOutboundCallService");
-const { CallEReconciliationService, createCallEReconciliationHandler } = require("./services/callEReconciliationService");
+const { CallEReconciliationService, createCallEReconciliationHandler, createCallEOperatorReconciliationHandler } = require("./services/callEReconciliationService");
 const { createCallEWebhookHandler } = require("./services/callEWebhookService");
 const { CallEContactPolicyService } = require("./services/callEContactPolicyService");
+const { OutboundCallSafetyService } = require("./services/outboundCallSafetyService");
 const { registerCallEContactPolicyRoutes } = require("./services/callEContactPolicyRoutes");
 const { CallEOperatorConfirmationService } = require("./services/callEOperatorConfirmationService");
 const { CallEDispatchService, approvedFingerprintFromEnv } = require("./services/callEDispatchService");
+const { CallECampaignService } = require("./services/callECampaignService");
+const { CallECampaignMissionService } = require("./services/callECampaignMissionService");
+const { CallECampaignMissionWorker } = require("./services/callECampaignMissionWorker");
+const { CallECampaignSafetyService } = require("./services/callECampaignSafetyService");
+const { CallECampaignRetentionService } = require("./services/callECampaignRetentionService");
+const { CallECampaignRetentionWorker } = require("./services/callECampaignRetentionWorker");
+const { CallEMissionAlertWorker } = require("./services/callEMissionAlertWorker");
+const { CallEMissionAutomationWorker } = require("./services/callEMissionAutomationWorker");
+const { CallEMissionOperationsService } = require("./services/callEMissionOperationsService");
+const { CallEResultFollowupService } = require("./services/callEResultFollowupService");
+const { buildConfiguredProviderOrder, summarizeCallRoutingPolicy } = require("./services/callRoutingPolicy");
+const { CallEGoalRunService } = require("./services/callEGoalRunService");
+const { createCallECampaignRouteHandlers } = require("./services/callECampaignRouteHandlers");
+const { createCallEActorAssertionMiddleware, verifyCallEActorAssertion } = require("./services/callEActorAssertion");
+const { CallEGoalPlannerService } = require("./services/callEGoalPlannerService");
 const {
   CALL_AGENT_SCHEMA_VERSION,
   validateCallAgentDefinition,
@@ -131,6 +166,7 @@ const {
   buildCallAgentProviderCapabilitySchema,
 } = require("./services/callAgentDefinition");
 const { decideCallAgentToolFailure } = require("./services/callAgentToolFailurePolicy");
+const { CallAgentSimulationService } = require("./services/callAgentSimulationService");
 const {
   containsCredentialLikeField,
   fingerprintVapiTemplateMapping,
@@ -138,6 +174,11 @@ const {
 } = require("./adapters/vapiTemplateAdapter");
 const { createVapiClientFromEnv } = require("./services/vapiClient");
 const { VapiTemplateSyncService } = require("./services/vapiTemplateSyncService");
+const { VapiTemplateHealthService } = require("./services/vapiTemplateHealthService");
+const { VapiSimulationService } = require("./services/vapiSimulationService");
+const { VapiEvalService } = require("./services/vapiEvalService");
+const { VapiSquadService } = require("./services/vapiSquadService");
+const { VapiToolPolicyService, VAPI_BUSINESS_CONTEXT_TOOL_ID } = require("./services/vapiToolPolicyService");
 const { VapiOutboundCallService } = require("./services/vapiOutboundCallService");
 const { VapiCallControlService } = require("./services/vapiCallControlService");
 const { VapiCallReconciliationService } = require("./services/vapiCallReconciliationService");
@@ -184,10 +225,16 @@ const {
 const { runPostCallQaEvaluation } = require("./services/postCallQaService");
 const { PostCallAutomationService } = require("./services/postCallAutomationService");
 const { PostCallWorkflowDefinitionService } = require("./services/postCallWorkflowDefinitionService");
+const { PostCallWorkflowExecutionService } = require("./services/postCallWorkflowExecutionService");
 const { registerPostCallWorkflowDefinitionRoutes } = require("./services/postCallWorkflowDefinitionRoutes");
+const { BusinessIntegrationSecretResolver } = require("./services/businessIntegrationSecretResolver");
+const { BusinessIntegrationConnectionService } = require("./services/businessIntegrationConnectionService");
+const { registerBusinessIntegrationConnectionRoutes } = require("./services/businessIntegrationConnectionRoutes");
 const {
   buildCallCompletionAutomationPayload,
+  buildPostCallOutcomeClassificationPayload,
   runPostCallAutomationTrigger,
+  triggerPostCallOutcomeWorkflow,
 } = require("./services/postCallAutomationTriggers");
 const { CrmContactSyncService } = require("./services/crmContactSyncService");
 const { assertWebhookAuthConfiguration } = require("./services/webhookAuthConfig");
@@ -306,6 +353,12 @@ let emailService;
 let crmContactSyncService;
 let postCallAutomationService;
 let postCallWorkflowDefinitionService;
+let postCallWorkflowExecutionService;
+let callECampaignMissionWorker = null;
+let callECampaignRetentionWorker = null;
+let callEMissionAlertWorker = null;
+let callEMissionAutomationWorker = null;
+let businessIntegrationConnectionService;
 const sttFallbackCalls = new Set();
 const streamTimeoutCalls = new Set();
 const inboundRateBuckets = new Map();
@@ -1816,7 +1869,7 @@ function normalizeCallScriptObjectiveMetadata(input = {}, options = {}) {
   return { normalized, errors, warnings };
 }
 
-function availableCallAgentToolNames(prompt, firstMessage) {
+function availableCallAgentToolNames(prompt, firstMessage, additionalNames = []) {
   const engine = new DynamicFunctionEngine();
   const generated = engine.generateAdaptiveFunctionSystem(
     String(prompt || ""),
@@ -1824,10 +1877,10 @@ function availableCallAgentToolNames(prompt, firstMessage) {
   );
   return Array.from(new Set((generated.functions || [])
     .map((tool) => String(tool?.function?.name || tool?.name || "").trim())
-    .filter(Boolean)));
+    .filter(Boolean).concat(additionalNames.map((name) => String(name || "").trim()).filter(Boolean))));
 }
 
-function validateTemplateAgentRuntimeConfig(template, config) {
+function validateTemplateAgentRuntimeConfig(template, config, options = {}) {
   if (config === null || config === undefined || config === "") {
     if (String(template?.voice_model || "").trim().toLowerCase() === "aura-2-celeste-es") {
       return {
@@ -1841,6 +1894,11 @@ function validateTemplateAgentRuntimeConfig(template, config) {
   const availableToolNames = availableCallAgentToolNames(
     template?.prompt,
     template?.first_message,
+    options.allowVapiBusinessContextTool &&
+      Array.isArray(config?.approved_tools) &&
+      config.approved_tools.includes(VAPI_BUSINESS_CONTEXT_TOOL_ID)
+      ? [VAPI_BUSINESS_CONTEXT_TOOL_ID]
+      : [],
   );
   const runtimeConfig = config?.schema_version === 6 && !Array.isArray(config.approved_tools)
     ? { ...config, approved_tools: availableToolNames }
@@ -5173,10 +5231,20 @@ function buildCallEErrorMetadata(error) {
     "correct_rejected_input_and_reuse_key",
     "inspect_call_state_before_retry",
   ]);
+  const clarificationFields = new Set(["task", "phone", "region", "locale", "result_schema"]);
+  const safeFields = (value) => Array.isArray(value)
+    ? [...new Set(value.filter((field) => typeof field === "string" && clarificationFields.has(field)))].slice(0, 5)
+    : [];
   return {
     ...(safeCode(error?.providerCode) ? { provider_code: safeCode(error.providerCode) } : {}),
     ...(safeCode(error?.providerReasonCode) ? { provider_reason_code: safeCode(error.providerReasonCode) } : {}),
     ...(recoveryAction && allowedRecoveryActions.has(recoveryAction) ? { recovery_action: recoveryAction } : {}),
+    ...(error?.clarification && typeof error.clarification === 'object' ? {
+      clarification: {
+        missing_inputs: safeFields(error.clarification.missingInputs),
+        fields: safeFields(error.clarification.fields),
+      },
+    } : {}),
   };
 }
 
@@ -7016,6 +7084,11 @@ function buildInboundHoldTwiml(hostname) {
 function shouldBypassHmac(req) {
   const path = req.path || "";
   if (!path) return false;
+  // express-ws rewrites upgrade URLs with `/.websocket`; authenticate these
+  // upgrades explicitly against their public paths in the handlers below.
+  if (/^\/api\/cartesia\/agents\/[A-Za-z0-9._:-]{1,200}\/runtime\/\.websocket$/.test(path)) return true;
+  if (path === "/api/cartesia/studio/tts-session/.websocket") return true;
+  if (path === "/api/cartesia/studio/stt-session/.websocket") return true;
   if (req.method === "OPTIONS") {
     return true;
   }
@@ -8429,7 +8502,7 @@ function getMiniAppCapabilitiesForRole(role) {
       "dlq_manage",
     ];
   }
-  return [
+  const capabilities = [
     "dashboard_view",
     "provider_manage",
     "sms_bulk_manage",
@@ -8438,6 +8511,8 @@ function getMiniAppCapabilitiesForRole(role) {
     "dlq_manage",
     "users_manage",
   ];
+  if (normalizedRole === "admin") capabilities.push("workflow_manage");
+  return capabilities;
 }
 
 function parseMiniAppAuthorization(req) {
@@ -9178,7 +9253,33 @@ async function runMiniAppCallScriptLocalBridgeInternal(options = {}) {
         };
       }
       if (lifecycleState !== "live") {
-        await db.promoteCallTemplateLive(scriptId, getMiniAppScriptActor(options));
+        const promotionGate = await new CallAgentSimulationService({
+          db, validateRuntimeConfig: validateTemplateAgentRuntimeConfig,
+        }).getPromotionReadiness({ script_id: scriptId });
+        if (!promotionGate.eligible) {
+          return {
+            ok: false,
+            status: 409,
+            data: {
+              success: false,
+              code: "call_agent_promotion_gate_blocked",
+              error: "The current approved script version has not passed the required Agent Lab checks",
+              readiness: promotionGate,
+            },
+          };
+        }
+        const promoted = await db.promoteCallTemplateLive(scriptId, getMiniAppScriptActor(options), existing.version, {
+          simulation_run_id: promotionGate.run_id,
+          simulation_score: promotionGate.score,
+          config_fingerprint: promotionGate.config_fingerprint,
+        });
+        if (!promoted) {
+          return {
+            ok: false,
+            status: 409,
+            data: { success: false, code: "call_agent_promotion_version_changed", error: "The script changed during promotion; rerun Agent Lab checks" },
+          };
+        }
       }
       const updated = normalizeScriptTemplateRecord(await db.getCallTemplateById(scriptId));
       return {
@@ -9645,9 +9746,18 @@ function selectWsProtocol(protocols) {
 }
 
 const app = express();
+let activeCartesiaAgentSessions = 0;
+const MAX_CARTESIA_AGENT_SESSIONS = 20;
+let activeCartesiaTtsSessions = 0;
+const MAX_CARTESIA_TTS_SESSIONS = 10;
+let activeCartesiaSttSessions = 0;
+const MAX_CARTESIA_STT_SESSIONS = 10;
 ExpressWs(app, null, {
   wsOptions: {
     handleProtocols: (protocols) => selectWsProtocol(protocols),
+    // Cartesia's Agent WebSocket rejects JSON events above 1 MiB. Existing
+    // telephony WebSocket frames are substantially smaller media chunks.
+    maxPayload: 1024 * 1024,
   },
 });
 // Trust the first proxy (ngrok/load balancer) so rate limiting can read X-Forwarded-For safely
@@ -9709,6 +9819,8 @@ function captureRawBody(req, _res, buf) {
 
 // CALL-E terminal snapshots may include transcripts; keep their larger bounded parser isolated to this path.
 app.use("/api/webhooks/call-e", express.json({ limit: "10mb", verify: captureRawBody }));
+// Cartesia lifecycle events can carry final transcript payloads; bound them separately from small JSON APIs.
+app.use("/webhook/cartesia", express.json({ limit: "5mb", verify: captureRawBody }));
 app.use(express.json({ verify: captureRawBody }));
 app.use(express.urlencoded({ extended: true, verify: captureRawBody }));
 
@@ -9774,6 +9886,12 @@ const callEPolicyAdminLimiter = rateLimit({
   legacyHeaders: false,
 });
 const callEPolicyWriteLimiter = rateLimit({
+  windowMs: 60000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+const vapiEvalWriteLimiter = rateLimit({
   windowMs: 60000,
   max: 10,
   standardHeaders: true,
@@ -14111,6 +14229,13 @@ function getProviderHealthScore(provider) {
   return health.score;
 }
 
+function persistProviderDiagnostics(provider, health) {
+  if (!['twilio', 'plivo', 'vonage'].includes(String(provider || '').toLowerCase())) return;
+  const readiness = getProviderReadiness();
+  void db?.logProviderDiagnosticsSnapshot?.([{ provider, ready: readiness[provider] === true,
+    circuit_state: health?.circuitState, score: health?.score, reason_code: health?.circuitReason }]).catch(() => {});
+}
+
 function recordProviderError(provider, error) {
   const normalizedProvider = normalizeProviderName(provider);
   if (!normalizedProvider) return;
@@ -14153,6 +14278,7 @@ function recordProviderError(provider, error) {
   }
   health.score = computeProviderHealthScore(normalizedProvider, health, { nowMs: now });
   providerHealth.set(normalizedProvider, health);
+  persistProviderDiagnostics(normalizedProvider, health);
 }
 
 function recordProviderSuccess(provider) {
@@ -14187,6 +14313,7 @@ function recordProviderSuccess(provider) {
   }
   health.score = computeProviderHealthScore(normalizedProvider, health);
   providerHealth.set(normalizedProvider, health);
+  persistProviderDiagnostics(normalizedProvider, health);
 }
 
 function forceProviderDegraded(provider, reason = "unknown", meta = {}) {
@@ -14207,6 +14334,7 @@ function forceProviderDegraded(provider, reason = "unknown", meta = {}) {
   health.consecutiveSuccesses = 0;
   health.score = computeProviderHealthScore(normalizedProvider, health, { nowMs: now });
   providerHealth.set(normalizedProvider, health);
+  persistProviderDiagnostics(normalizedProvider, health);
   db?.logServiceHealth?.("provider_failover", "forced_degraded", {
     provider: normalizedProvider,
     reason: String(reason || "unknown"),
@@ -14268,13 +14396,27 @@ function recordProviderFlowMetric(event, meta = {}) {
   db?.logServiceHealth?.("provider_flow", payload.event, payload).catch(() => {});
 }
 
-function getProviderOrder(preferred) {
-  const order = [];
-  if (preferred) order.push(preferred);
-  for (const provider of SUPPORTED_PROVIDERS) {
-    if (!order.includes(provider)) order.push(provider);
-  }
-  return order;
+function getProviderOrder(preferred, businessOrder = []) {
+  const configured = Array.isArray(config.providerFailover?.callOrder) ? config.providerFailover.callOrder : [];
+  const tenantOrder = Array.isArray(businessOrder) ? businessOrder : [];
+  return buildConfiguredProviderOrder(preferred, [...tenantOrder, ...configured], SUPPORTED_PROVIDERS);
+}
+
+function buildCallRoutingPolicyReport(preferredProvider, businessOrder = []) {
+  const readiness = getProviderReadiness();
+  const order = getProviderOrder(preferredProvider, businessOrder);
+  const circuitState = {};
+  for (const provider of order) circuitState[provider] = getProviderHealthEntry(provider).circuitState;
+  return summarizeCallRoutingPolicy({
+    preferredProvider,
+    configuredOrder: order,
+    supportedProviders: SUPPORTED_PROVIDERS,
+    readiness,
+    requestedFlow: 'outbound_voice',
+    failoverEnabled: config.providerFailover?.enabled !== false,
+    isProviderDegraded,
+    circuitState,
+  });
 }
 
 let warnedMachineDetection = false;
@@ -14502,6 +14644,7 @@ function getVoiceProviderRegistry() {
     createTaskCall: (request) => new CallEOutboundCallService({
       client: createCallEClientFromEnv(),
       db,
+      outboundSafety: createOutboundCallSafetyService(),
     }).createOutboundCall(request),
     cancelTaskCall: ({ providerCallId }) => createCallEClientFromEnv().cancelCall(providerCallId),
     getCall: ({ providerCallId }) => createCallEClientFromEnv().getCall(providerCallId),
@@ -14711,6 +14854,103 @@ async function runCallSloGuardrailCycle(options = {}) {
 function startBackgroundWorkers() {
   if (backgroundWorkersStarted) return;
   backgroundWorkersStarted = true;
+
+  postCallWorkflowExecutionService?.start();
+
+  if (config.cartesia?.dispatchEnabled === true && typeof db?.listDueCartesiaCampaigns === "function") {
+    const dispatchDueCartesiaCampaigns = async () => {
+      const now = new Date();
+      const due = await db.listDueCartesiaCampaigns({ now_iso: now.toISOString(), limit: 10 });
+      for (const campaign of due) {
+        try {
+          const service = createCartesiaCampaignService();
+          const stored = await db.getCartesiaCampaign(campaign.campaign_id, campaign.business_id);
+          if (!stored || stored.campaign.status !== "approved") continue;
+          await service.submit({
+            campaign_id: campaign.campaign_id,
+            business_id: campaign.business_id,
+            actor_id: String(campaign.approved_by || ""),
+            confirmation_phrase: cartesiaCampaignConfirmationPhrase(stored.campaign),
+          });
+        } catch (error) {
+          console.warn("Cartesia scheduled campaign dispatch deferred or blocked", {
+            code: String(error?.code || "cartesia_campaign_dispatch_failed").slice(0, 80),
+          });
+        }
+      }
+    };
+    setInterval(() => dispatchDueCartesiaCampaigns().catch((error) => {
+      console.error("Cartesia scheduled campaign worker failed", { code: String(error?.code || "worker_failed").slice(0, 80) });
+    }), 30000).unref?.();
+    dispatchDueCartesiaCampaigns().catch((error) => {
+      console.error("Initial Cartesia scheduled campaign scan failed", { code: String(error?.code || "worker_failed").slice(0, 80) });
+    });
+    console.info("Cartesia just-in-time campaign dispatch enabled; consent and policy are checked at release time.");
+  }
+
+  const missionWorkerConfig = {
+    enabled: config.callE?.missionWorkerEnabled === true,
+    missionId: config.callE?.missionApprovedId,
+    businessId: config.callE?.missionWorkerBusinessId,
+    actorId: config.callE?.missionWorkerActorId,
+    workerId: config.callE?.missionWorkerId,
+    intervalMs: config.callE?.missionWorkerIntervalMs,
+  };
+  callECampaignMissionWorker = new CallECampaignMissionWorker({
+    config: missionWorkerConfig,
+    db,
+    createMissionService: createCallECampaignMissionService,
+  });
+  if (missionWorkerConfig.enabled) {
+    if (!callECampaignMissionWorker.start()) {
+      console.warn('CALL-E mission worker requested but is not fully configured; it remains stopped.');
+    } else {
+      console.info('CALL-E mission worker started for its explicitly configured mission scope.');
+    }
+  }
+
+  callECampaignRetentionWorker = new CallECampaignRetentionWorker({
+    enabled: config.callE?.dataRetentionWorkerEnabled === true,
+    intervalMs: config.callE?.dataRetentionWorkerIntervalMs,
+    db,
+  });
+  if (config.callE?.dataRetentionWorkerEnabled === true) {
+    if (!callECampaignRetentionWorker.start()) {
+      console.warn('CALL-E retention worker requested but persistence is unavailable; it remains stopped.');
+    } else {
+      console.info('CALL-E expired sensitive-data retention worker started.');
+    }
+  }
+
+  callEMissionAlertWorker = new CallEMissionAlertWorker({
+    enabled: config.callE?.opsAlertsWorkerEnabled === true,
+    intervalMs: config.callE?.opsAlertsWorkerIntervalMs,
+    db,
+    botToken: config.telegram?.botToken,
+  });
+  if (config.callE?.opsAlertsWorkerEnabled === true) {
+    if (!callEMissionAlertWorker.start()) {
+      console.warn('CALL-E mission alert notifications requested but required bot/API configuration is unavailable; worker remains stopped.');
+    } else {
+      console.info('CALL-E mission alert notifications started for opted-in business operators.');
+    }
+  }
+
+  callEMissionAutomationWorker = new CallEMissionAutomationWorker({
+    enabled: config.callE?.missionAutomationWorkerEnabled === true,
+    intervalMs: config.callE?.missionAutomationWorkerIntervalMs,
+    db,
+    createMissionService: createCallECampaignMissionService,
+    createOperationsService: createCallEMissionOperationsService,
+    botToken: config.telegram?.botToken,
+  });
+  if (config.callE?.missionAutomationWorkerEnabled === true) {
+    if (!callEMissionAutomationWorker.start()) {
+      console.warn('CALL-E mission automation requested but required persistence or Telegram configuration is unavailable; worker remains stopped.');
+    } else {
+      console.info('CALL-E scheduled missions, review escalations, and report digests started.');
+    }
+  }
 
   setInterval(() => {
     smsService.processScheduledMessages().catch((error) => {
@@ -15083,6 +15323,18 @@ async function startServer(options = {}) {
       logger: console,
     });
     postCallWorkflowDefinitionService = new PostCallWorkflowDefinitionService({ db });
+    businessIntegrationConnectionService = new BusinessIntegrationConnectionService({
+      db,
+      secretResolver: new BusinessIntegrationSecretResolver(),
+    });
+    postCallWorkflowExecutionService = new PostCallWorkflowExecutionService({
+      db,
+      definitionService: postCallWorkflowDefinitionService,
+      automationService: postCallAutomationService,
+      enabled: config.postCallWorkflows?.enabled === true,
+      pollMs: config.postCallWorkflows?.pollIntervalMs,
+      logger: console,
+    });
     const defaultAutomationRules = await postCallAutomationService.ensureDefaultRules();
     if (defaultAutomationRules.installed > 0) {
       console.log(
@@ -18793,6 +19045,7 @@ async function handleCallEnd(callSid, callStartTime) {
 
     void runPostCallAutomationTrigger({
       service: postCallAutomationService,
+      workflowService: postCallWorkflowExecutionService,
       webhookService,
       db,
       logger: console,
@@ -18805,6 +19058,15 @@ async function handleCallEnd(callSid, callStartTime) {
         finalStatus,
         notificationType,
         duration,
+      }),
+    });
+    void triggerPostCallOutcomeWorkflow({
+      workflowService: postCallWorkflowExecutionService,
+      logger: console,
+      payload: buildPostCallOutcomeClassificationPayload({
+        callSid,
+        finalStatus,
+        notificationType,
       }),
     });
 
@@ -19929,6 +20191,12 @@ const MINI_APP_SUPPORTED_ACTIONS = Object.freeze([
   "callscript.calle_preview",
   "callscript.calle_confirm",
   "callscript.calle_dispatch",
+  "calle.campaign.create",
+  "calle.campaign.list",
+  "calle.campaign.get",
+  "calle.campaign.review",
+  "calle.campaign.preflight",
+  "calle.campaign.rehearse",
   "calle.status",
   "calle.call.reconcile",
   "calle.call.review",
@@ -19997,6 +20265,10 @@ const MINI_APP_SUPPORTED_ACTIONS = Object.freeze([
   "emailtemplate.versions",
   "users.list",
   "users.role.set",
+  "workflow.versions",
+  "workflow.draft",
+  "workflow.runs",
+  "workflow.run.get",
 ]);
 
 const MINI_APP_DASHBOARD_MODULE_DEFINITIONS = [
@@ -20076,6 +20348,12 @@ const MINI_APP_DASHBOARD_MODULE_DEFINITIONS = [
       "callscript.calle_preview",
       "callscript.calle_confirm",
       "callscript.calle_dispatch",
+      "calle.campaign.create",
+      "calle.campaign.list",
+      "calle.campaign.get",
+      "calle.campaign.review",
+      "calle.campaign.preflight",
+      "calle.campaign.rehearse",
       "calle.status",
       "calle.call.reconcile",
       "calle.call.review",
@@ -20172,6 +20450,15 @@ const MINI_APP_DASHBOARD_MODULE_DEFINITIONS = [
     order: 11,
     enabled: true,
   },
+  {
+    id: "workflows",
+    label: "Post-call Workflows",
+    capability: "workflow_manage",
+    command: "/workflows",
+    action_contracts: ["workflow.versions", "workflow.draft", "workflow.runs", "workflow.run.get"],
+    order: 12,
+    enabled: true,
+  },
 ];
 
 const MINI_APP_SUPPORTED_ACTION_SET = new Set(MINI_APP_SUPPORTED_ACTIONS);
@@ -20226,6 +20513,59 @@ const MINI_APP_DASHBOARD_MODULES = Object.freeze(
 function buildMiniAppActionSpec(action, payload = {}) {
   const normalizedAction = normalizeMiniAppAction(action);
   const input = payload && typeof payload === "object" ? payload : {};
+
+  if (normalizedAction === "workflow.versions") {
+    const workflowId = String(input.workflow_id || "").trim();
+    if (workflowId && !/^[A-Za-z0-9][A-Za-z0-9_-]{0,119}$/.test(workflowId)) {
+      return { error: "workflow_id is invalid" };
+    }
+    const limit = parseBoundedInteger(input.limit, { defaultValue: 100, min: 1, max: 100 });
+    return {
+      capability: "workflow_manage",
+      method: "GET",
+      path: "/post-call/workflows",
+      query: { workflow_id: workflowId || undefined, limit },
+    };
+  }
+
+  if (normalizedAction === "workflow.draft") {
+    if (!input.definition || typeof input.definition !== "object" || Array.isArray(input.definition)) {
+      return { error: "definition must be a JSON object" };
+    }
+    return {
+      capability: "workflow_manage",
+      method: "POST",
+      path: "/post-call/workflows",
+      body: input.definition,
+    };
+  }
+
+  if (normalizedAction === "workflow.runs") {
+    const workflowId = String(input.workflow_id || "").trim();
+    if (workflowId && !/^[A-Za-z0-9][A-Za-z0-9_-]{0,119}$/.test(workflowId)) {
+      return { error: "workflow_id is invalid" };
+    }
+    const status = String(input.status || "").trim().toLowerCase();
+    const allowedStatuses = new Set(["queued", "running", "waiting", "waiting_approval", "completed", "failed", "canceled", "needs_review"]);
+    if (status && !allowedStatuses.has(status)) return { error: "status is invalid" };
+    const limit = parseBoundedInteger(input.limit, { defaultValue: 50, min: 1, max: 100 });
+    return {
+      capability: "workflow_manage",
+      method: "GET",
+      path: "/post-call/workflows/runs",
+      query: { workflow_id: workflowId || undefined, status: status || undefined, limit },
+    };
+  }
+
+  if (normalizedAction === "workflow.run.get") {
+    const runId = String(input.run_id || "").trim();
+    if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,119}$/.test(runId)) return { error: "run_id is invalid" };
+    return {
+      capability: "workflow_manage",
+      method: "GET",
+      path: `/post-call/workflows/runs/${encodeURIComponent(runId)}`,
+    };
+  }
 
   if (normalizedAction === "provider.get") {
     const channel = resolveProviderChannel(input.channel || PROVIDER_CHANNELS.CALL);
@@ -20715,6 +21055,67 @@ function buildMiniAppActionSpec(action, payload = {}) {
         preview_fingerprint: input.preview_fingerprint,
       },
     };
+  }
+
+  if (normalizedAction === "calle.campaign.create") {
+    const businessId = String(input.business_id || '').trim();
+    const templateId = Number(input.template_id);
+    const destinations = input.destinations;
+    if (!/^[A-Za-z0-9._:-]{1,120}$/.test(businessId)) return { error: 'Valid business_id is required' };
+    if (!Number.isSafeInteger(templateId) || templateId < 1) return { error: 'Valid template_id is required' };
+    if (!Array.isArray(destinations) || destinations.length < 1 || destinations.length > 25 || destinations.some((value) => typeof value !== 'string' || value.length > 80)) {
+      return { error: 'destinations must contain between 1 and 25 strings of at most 80 characters' };
+    }
+    if (!isPlainObject(input.result_schema) || input.authorized !== true) return { error: 'result_schema and destination authorization are required' };
+    return { capability: 'caller_flags_manage', method: 'POST', path: '/miniapp/action', body: {} };
+  }
+
+  if (normalizedAction === "calle.campaign.list") {
+    const businessId = String(input.business_id || '').trim();
+    if (!/^[A-Za-z0-9._:-]{1,120}$/.test(businessId)) return { error: 'Valid business_id is required' };
+    return { capability: 'caller_flags_manage', method: 'GET', path: '/miniapp/action', query: {} };
+  }
+
+  if (normalizedAction === "calle.campaign.get") {
+    const businessId = String(input.business_id || '').trim();
+    const campaignId = String(input.campaign_id || '').trim();
+    if (!/^[A-Za-z0-9._:-]{1,120}$/.test(businessId) || !/^campaign_[a-f0-9]{64}$/.test(campaignId)) return { error: 'Valid business_id and campaign_id are required' };
+    return { capability: 'caller_flags_manage', method: 'GET', path: '/miniapp/action', query: {} };
+  }
+
+  if (normalizedAction === "calle.campaign.review") {
+    const businessId = String(input.business_id || '').trim();
+    const campaignId = String(input.campaign_id || '').trim();
+    const decision = String(input.decision || '').trim().toLowerCase();
+    const note = input.note == null ? '' : String(input.note);
+    if (!/^[A-Za-z0-9._:-]{1,120}$/.test(businessId) || !/^campaign_[a-f0-9]{64}$/.test(campaignId) || !['approve', 'reject'].includes(decision) || note.length > 500) {
+      return { error: 'Valid campaign review fields are required' };
+    }
+    return { capability: 'caller_flags_manage', method: 'POST', path: '/miniapp/action', body: {} };
+  }
+
+  if (normalizedAction === "calle.campaign.preflight") {
+    const businessId = String(input.business_id || '').trim();
+    const campaignId = String(input.campaign_id || '').trim();
+    if (!/^[A-Za-z0-9._:-]{1,120}$/.test(businessId) || !/^campaign_[a-f0-9]{64}$/.test(campaignId) ||
+        !Array.isArray(input.destinations) || input.destinations.length < 1 || input.destinations.length > 25 ||
+        input.destinations.some((value) => typeof value !== 'string' || value.length > 80) ||
+        !isPlainObject(input.result_schema) || input.authorized !== true) {
+      return { error: 'Valid campaign, destinations, result schema, and authorization are required' };
+    }
+    return { capability: 'caller_flags_manage', method: 'POST', path: '/miniapp/action', body: {} };
+  }
+
+  if (normalizedAction === "calle.campaign.rehearse") {
+    const businessId = String(input.business_id || '').trim();
+    const campaignId = String(input.campaign_id || '').trim();
+    if (!/^[A-Za-z0-9._:-]{1,120}$/.test(businessId) || !/^campaign_[a-f0-9]{64}$/.test(campaignId) ||
+        !Array.isArray(input.destinations) || input.destinations.length < 1 || input.destinations.length > 25 ||
+        input.destinations.some((value) => typeof value !== 'string' || value.length > 80) ||
+        !isPlainObject(input.result_schema) || input.authorized !== true) {
+      return { error: 'Valid campaign, destinations, result schema, and authorization are required' };
+    }
+    return { capability: 'caller_flags_manage', method: 'POST', path: '/miniapp/action', body: {} };
   }
 
   if (normalizedAction === "calle.status") {
@@ -22579,6 +22980,158 @@ app.post("/miniapp/action", requireMiniAppSession, async (req, res) => {
     return;
   }
 
+  if (action === "workflow.draft") {
+    const result = await runMiniAppCallScriptMutationWithIdempotency({
+      idempotencyKey,
+      action,
+      target: "post-call-workflows",
+      payload: spec.body,
+      requestId: req.requestId || null,
+      execute: () => callMiniAppBridgeApi({
+        method: spec.method,
+        path: spec.path,
+        query: spec.query,
+        body: spec.body,
+        actionId,
+        idempotencyKey,
+        requestId: req.requestId || null,
+      }),
+    });
+    if (!result.ok) {
+      return sendApiError(
+        res,
+        Number(result.status) || 500,
+        String(result.data?.code || "miniapp_action_failed"),
+        result.data?.error || "Workflow draft could not be saved",
+        req.requestId || null,
+      );
+    }
+    return res.status(Number(result.status) || 200).json({
+      success: true,
+      action,
+      requested_action: actionResolution.requestedAction,
+      was_aliased: actionResolution.wasAliased,
+      data: result.data,
+      request_id: req.requestId || null,
+    });
+  }
+
+  if (action === "calle.campaign.create") {
+    try {
+      const service = new CallECampaignService({
+        db,
+        getTemplate: async (templateId) => normalizeScriptTemplateRecord(await db.getCallTemplateById(templateId)),
+        contactPolicy: new CallEContactPolicyService({ db, cooldownHashSecret: config.apiAuth?.hmacSecret }),
+        idempotencySecret: config.apiAuth?.hmacSecret,
+      });
+      const result = await service.createDraft({
+        ...payload,
+        idempotency_key: idempotencyKey,
+        actor_id: String(req.miniAppSession?.telegram_id || '').trim(),
+      });
+      return res.status(result.idempotentReplay ? 200 : 201).json({
+        success: true,
+        action,
+        requested_action: actionResolution.requestedAction,
+        was_aliased: actionResolution.wasAliased,
+        data: result,
+        request_id: req.requestId || null,
+      });
+    } catch (error) {
+      const status = Number(error?.status) || (error?.code === 'call_e_business_operator_access_denied' ? 403
+        : error?.code === 'call_e_template_not_found' ? 404
+          : error?.code === 'call_e_campaign_review_cap_reached' || error?.code === 'call_e_template_not_live' ? 409
+            : error?.code === 'call_e_campaign_unavailable' ? 503 : 400);
+      return sendApiError(res, status, String(error?.code || 'call_e_campaign_create_failed'), error?.message || 'CALL-E campaign review could not be created', req.requestId || null);
+    }
+  }
+
+  if (action === "calle.campaign.list" || action === "calle.campaign.get") {
+    try {
+      const service = new CallECampaignService({
+        db,
+        getTemplate: async (templateId) => normalizeScriptTemplateRecord(await db.getCallTemplateById(templateId)),
+        contactPolicy: new CallEContactPolicyService({ db, cooldownHashSecret: config.apiAuth?.hmacSecret }),
+        idempotencySecret: config.apiAuth?.hmacSecret,
+      });
+      const actorId = String(req.miniAppSession?.telegram_id || '').trim();
+      const result = action === 'calle.campaign.list'
+        ? await service.list({ ...payload, actor_id: actorId })
+        : await service.get({ ...payload, actor_id: actorId });
+      return res.json({ success: true, action, requested_action: actionResolution.requestedAction, was_aliased: actionResolution.wasAliased, data: result, request_id: req.requestId || null });
+    } catch (error) {
+      const status = Number(error?.status) || (error?.code === 'call_e_business_operator_access_denied' ? 403 : error?.code === 'call_e_campaign_not_found' ? 404 : 400);
+      return sendApiError(res, status, String(error?.code || 'call_e_campaign_read_failed'), error?.message || 'CALL-E campaign review is unavailable', req.requestId || null);
+    }
+  }
+
+  if (action === "calle.campaign.review") {
+    try {
+      const service = new CallECampaignService({
+        db,
+        getTemplate: async (templateId) => normalizeScriptTemplateRecord(await db.getCallTemplateById(templateId)),
+        contactPolicy: new CallEContactPolicyService({ db, cooldownHashSecret: config.apiAuth?.hmacSecret }),
+        idempotencySecret: config.apiAuth?.hmacSecret,
+      });
+      const result = await service.review({
+        ...payload,
+        actor_id: String(req.miniAppSession?.telegram_id || '').trim(),
+      });
+      return res.json({ success: true, action, requested_action: actionResolution.requestedAction, was_aliased: actionResolution.wasAliased, data: result, request_id: req.requestId || null });
+    } catch (error) {
+      const status = Number(error?.status) || (error?.code === 'call_e_business_operator_access_denied' ? 403
+        : error?.code === 'call_e_campaign_not_found' ? 404
+          : error?.code === 'call_e_campaign_review_final' || error?.code === 'call_e_campaign_four_eyes_required' || error?.code === 'call_e_campaign_blocked_recipients' ? 409
+            : 400);
+      return sendApiError(res, status, String(error?.code || 'call_e_campaign_review_failed'), error?.message || 'CALL-E campaign review could not be recorded', req.requestId || null);
+    }
+  }
+
+  if (action === "calle.campaign.preflight") {
+    try {
+      const service = new CallECampaignService({
+        db,
+        getTemplate: async (templateId) => normalizeScriptTemplateRecord(await db.getCallTemplateById(templateId)),
+        contactPolicy: new CallEContactPolicyService({ db, cooldownHashSecret: config.apiAuth?.hmacSecret }),
+        idempotencySecret: config.apiAuth?.hmacSecret,
+      });
+      const result = await service.preflight({
+        ...payload,
+        actor_id: String(req.miniAppSession?.telegram_id || '').trim(),
+      });
+      return res.json({ success: true, action, requested_action: actionResolution.requestedAction, was_aliased: actionResolution.wasAliased, data: result, request_id: req.requestId || null });
+    } catch (error) {
+      const status = Number(error?.status) || (error?.code === 'call_e_business_operator_access_denied' ? 403
+        : error?.code === 'call_e_campaign_not_found' ? 404
+          : ['call_e_campaign_not_approved', 'call_e_template_changed', 'call_e_campaign_destinations_mismatch'].includes(error?.code) ? 409
+            : error?.code === 'call_e_campaign_unavailable' ? 503 : 400);
+      return sendApiError(res, status, String(error?.code || 'call_e_campaign_preflight_failed'), error?.message || 'CALL-E campaign preflight could not be completed', req.requestId || null);
+    }
+  }
+
+  if (action === "calle.campaign.rehearse") {
+    try {
+      const service = new CallECampaignService({
+        db,
+        getTemplate: async (templateId) => normalizeScriptTemplateRecord(await db.getCallTemplateById(templateId)),
+        contactPolicy: new CallEContactPolicyService({ db, cooldownHashSecret: config.apiAuth?.hmacSecret }),
+        idempotencySecret: config.apiAuth?.hmacSecret,
+      });
+      const result = await service.rehearseExecution({
+        ...payload,
+        idempotency_key: idempotencyKey,
+        actor_id: String(req.miniAppSession?.telegram_id || '').trim(),
+      });
+      return res.json({ success: true, action, requested_action: actionResolution.requestedAction, was_aliased: actionResolution.wasAliased, data: result, request_id: req.requestId || null });
+    } catch (error) {
+      const status = Number(error?.status) || (error?.code === 'call_e_business_operator_access_denied' ? 403
+        : error?.code === 'call_e_campaign_not_found' ? 404
+          : ['call_e_campaign_not_approved', 'call_e_template_changed', 'call_e_campaign_destinations_mismatch', 'call_e_campaign_rehearsal_conflict'].includes(error?.code) ? 409
+            : error?.code === 'call_e_campaign_unavailable' ? 503 : 400);
+      return sendApiError(res, status, String(error?.code || 'call_e_campaign_rehearsal_failed'), error?.message || 'CALL-E execution rehearsal could not be completed', req.requestId || null);
+    }
+  }
+
   if (action === "callscript.calle_confirm") {
     try {
       const result = await new CallEOperatorConfirmationService({
@@ -22968,6 +23521,12 @@ app.get("/admin/provider", requireAdminToken, async (req, res) => {
     call_agent_capability_schema: buildCallAgentProviderCapabilitySchema({
       vonageDtmfWebhookEnabled: config.vonage?.dtmfWebhookEnabled === true,
     }),
+    voice_provider_capabilities: getVoiceProviderRegistry().listDescriptors(),
+    call_routing_policy: buildCallRoutingPolicyReport(callState.provider),
+    call_e_provider: {
+      configured: createCallEClientFromEnv().isConfigured(),
+      health: getCallEProviderHealth(),
+    },
     compatibility: getProviderCompatibilityReport(),
   });
 });
@@ -24182,13 +24741,725 @@ app.get("/api/call-e/status", requireAdminToken, (req, res) => {
       pilotApprovalReady: Boolean(approvedFingerprintFromEnv()),
       pilotReadinessReviewed: String(process.env.CALLE_PILOT_READINESS_REVIEWED || "false").trim().toLowerCase() === "true",
     }),
+    providerHealth: getCallEProviderHealth(),
+    missionWorker: {
+      enabled: config.callE?.missionWorkerEnabled === true,
+      configured: Boolean(config.callE?.missionApprovedId && config.callE?.missionWorkerBusinessId && config.callE?.missionWorkerActorId),
+      intervalMs: config.callE?.missionWorkerIntervalMs || 60000,
+    },
   });
+});
+
+const requireCallEActorAssertion = createCallEActorAssertionMiddleware({
+  secret: config.callE?.actorAssertionSecret,
+});
+
+app.get("/api/call-e/campaign-rehearsals", requireOutboundAuthorization, requireCallEActorAssertion, async (req, res) => {
+  const businessId = String(req.query?.business_id || '').trim();
+  const actorId = String(req.query?.actor_id || '').trim();
+  const limit = parseBoundedInteger(req.query?.limit, { defaultValue: 20, min: 1, max: 50 });
+  if (!/^[A-Za-z0-9._:-]{1,120}$/.test(businessId) || !/^\d{1,20}$/.test(actorId)) {
+    return sendApiError(res, 400, 'call_e_campaign_invalid', 'Valid business and Telegram actor scope are required', req.requestId || null);
+  }
+  try {
+    const result = await new CallECampaignService({ db }).listApprovedSummaries({
+      business_id: businessId,
+      actor_id: actorId,
+      limit,
+    });
+    return res.json({ success: true, request_id: req.requestId || null, ...result });
+  } catch (error) {
+    const status = Number(error?.status) || (error?.code === 'call_e_business_operator_access_denied' ? 403 : 503);
+    return sendApiError(res, status, String(error?.code || 'call_e_campaign_summary_failed'), 'Campaign rehearsal summaries could not be loaded', req.requestId || null);
+  }
+});
+
+function createCallECampaignService() {
+  return new CallECampaignService({
+    db,
+    getTemplate: async (templateId) => normalizeScriptTemplateRecord(await db.getCallTemplateById(templateId)),
+    contactPolicy: new CallEContactPolicyService({ db, cooldownHashSecret: config.apiAuth?.hmacSecret }),
+    idempotencySecret: config.apiAuth?.hmacSecret,
+  });
+}
+
+function createCallECampaignMissionService() {
+  const campaignService = createCallECampaignService();
+  return new CallECampaignMissionService({
+    db,
+    campaignService,
+    safetyService: new CallECampaignSafetyService({ db, campaignService }),
+    idempotencySecret: config.apiAuth?.hmacSecret,
+    encryptionKeys: config.callE?.missionEncryptionKeys,
+    encryptionKeyVersion: config.callE?.missionEncryptionKeyVersion,
+    sensitiveDataRetentionDays: config.callE?.sensitiveDataRetentionDays,
+    providerRoutingPreview: ({ preferredProvider, configuredOrder }) => buildCallRoutingPolicyReport(preferredProvider || configuredOrder[0], configuredOrder),
+    getTemplate: async (templateId) => normalizeScriptTemplateRecord(await db.getCallTemplateById(templateId)),
+    dispatchRecipient: (request) => getVoiceProviderRegistry().createTaskCall("call_e", request),
+    reconcileCall: (localCallId) => new CallEReconciliationService({
+      db,
+      client: createCallEClientFromEnv(),
+      providerRegistry: getVoiceProviderRegistry(),
+    }).reconcileLocalCall(localCallId),
+  });
+}
+
+function createCallEGoalRunService() {
+  return new CallEGoalRunService({
+    client: createCallEClientFromEnv(),
+    db,
+    campaignService: createCallECampaignService(),
+    contactPolicy: new CallEContactPolicyService({ db, cooldownHashSecret: config.apiAuth?.hmacSecret }),
+    workflowService: postCallWorkflowExecutionService,
+    idempotencySecret: config.apiAuth?.hmacSecret,
+    encryptionKeys: config.callE?.missionEncryptionKeys,
+    encryptionKeyVersion: config.callE?.missionEncryptionKeyVersion,
+    sensitiveDataRetentionDays: config.callE?.sensitiveDataRetentionDays,
+    allowedDestinations: parseAllowedDestinations(),
+    env: process.env,
+  });
+}
+
+function createCallECampaignSafetyService() {
+  return new CallECampaignSafetyService({ db, campaignService: createCallECampaignService(),
+    isWorkerConfigured: () => callECampaignMissionWorker?.isConfigured?.() === true });
+}
+
+function createOutboundCallSafetyService() {
+  return new OutboundCallSafetyService({
+    db,
+    secret: config.apiAuth?.hmacSecret,
+    contactPolicy: new CallEContactPolicyService({ db, cooldownHashSecret: config.apiAuth?.hmacSecret }),
+    safetyPolicy: createCallECampaignSafetyService(),
+  });
+}
+
+function createCartesiaOutboundCallService() {
+  return new CartesiaOutboundCallService({
+    client: new CartesiaClient(config.cartesia),
+    db,
+    outboundSafety: createOutboundCallSafetyService(),
+    approvalSecret: config.cartesia?.approvalSecret,
+  });
+}
+
+function createCartesiaCampaignService() {
+  return new CartesiaCampaignService({
+    client: new CartesiaClient(config.cartesia),
+    db,
+    outboundSafety: createOutboundCallSafetyService(),
+    idempotencySecret: config.apiAuth?.hmacSecret,
+    encryptionKeys: config.callE?.missionEncryptionKeys,
+    encryptionKeyVersion: config.callE?.missionEncryptionKeyVersion || 1,
+  });
+}
+
+const cartesiaPhraseCacheStore = new CartesiaPhraseCacheStore();
+const cartesiaSttProfileStore = new CartesiaSttProfileStore();
+const cartesiaAgentProfileStore = new CartesiaAgentProfileStore();
+
+function createCartesiaStudioService() {
+  return new CartesiaStudioService({
+    client: new CartesiaStudioClient(config.cartesia),
+    cacheStore: cartesiaPhraseCacheStore,
+    sttProfileStore: cartesiaSttProfileStore,
+    agentProfileStore: cartesiaAgentProfileStore,
+    voiceGovernanceStore: db,
+    webhookEventStore: db,
+  });
+}
+
+function createCartesiaKnowledgeBaseService() {
+  return new CartesiaKnowledgeBaseService({ client: new CartesiaKnowledgeBaseClient(config.cartesia) });
+}
+
+function createCartesiaSipProviderService() {
+  return new CartesiaSipProviderService({
+    client: new CartesiaSipProviderClient({ ...config.cartesia, apiKey: config.cartesia?.adminApiKey || config.cartesia?.apiKey }),
+  });
+}
+
+function createCallECampaignRetentionService() {
+  return new CallECampaignRetentionService({ db, campaignService: createCallECampaignService(),
+    retentionDays: config.callE?.sensitiveDataRetentionDays });
+}
+
+function createCallEMissionOperationsService() {
+  return new CallEMissionOperationsService({
+    db, campaignService: createCallECampaignService(), missionService: createCallECampaignMissionService(), idempotencySecret: config.apiAuth?.hmacSecret,
+    providerRoutingPreview: ({ preferredProvider, configuredOrder }) => {
+      const preview = buildCallRoutingPolicyReport(preferredProvider || configuredOrder[0], configuredOrder);
+      const readiness = getProviderReadiness();
+      return {
+        ...preview,
+        provider_health: preview.configured_order.map((provider) => {
+          const health = getProviderHealthEntry(provider);
+          return { provider, state: health.circuitState, score: health.score,
+            last_error_at: health.lastErrorAt, last_success_at: health.lastSuccessAt,
+            circuit_reason: health.circuitReason,
+            ready: readiness[provider] === true };
+        }),
+        dispatch_performed: false,
+      };
+    },
+  });
+}
+
+function createCallEResultFollowupService() {
+  return new CallEResultFollowupService({
+    db,
+    campaignService: createCallECampaignService(),
+    definitionService: postCallWorkflowDefinitionService || new PostCallWorkflowDefinitionService({ db }),
+    workflowExecutionService: postCallWorkflowExecutionService,
+    idempotencySecret: config.apiAuth?.hmacSecret,
+  });
+}
+
+function sendCallEGoalRunError(res, error, requestId) {
+  const code = String(error?.code || 'call_e_goal_run_failed');
+  const status = Number(error?.status) || (code.includes('forbidden') || code.includes('access_denied') || code.includes('consent') ? 403
+    : code.includes('not_found') ? 404 : code.includes('conflict') || code.includes('already_reviewed') || code.includes('changed') ? 409
+      : code.includes('disabled') || code.includes('unavailable') || code.includes('circuit_open') ? 503 : 400);
+  return sendApiError(res, status, code, status >= 500 ? 'CALL-E Goal Run operation is unavailable' : error?.message || 'CALL-E Goal Run request is invalid', requestId || null);
+}
+
+app.get('/api/call-e/goals', callEReconciliationLimiter, requireOutboundAuthorization, requireCallEActorAssertion, async (req, res) => {
+  try {
+    const result = await createCallEGoalRunService().listGoals({
+      business_id: req.query?.business_id, actor_id: req.query?.actor_id,
+      limit: parseBoundedInteger(req.query?.limit, { defaultValue: 20, min: 1, max: 100 }), after: req.query?.after,
+    });
+    return res.json({ success: true, request_id: req.requestId || null, ...result });
+  } catch (error) { return sendCallEGoalRunError(res, error, req.requestId); }
+});
+
+app.get('/api/call-e/goals/:goalId', callEReconciliationLimiter, requireOutboundAuthorization, requireCallEActorAssertion, async (req, res) => {
+  try {
+    const result = await createCallEGoalRunService().getGoal({ goal_id: req.params.goalId, business_id: req.query?.business_id, actor_id: req.query?.actor_id });
+    return res.json({ success: true, request_id: req.requestId || null, ...result });
+  } catch (error) { return sendCallEGoalRunError(res, error, req.requestId); }
+});
+
+app.post('/api/call-e/goal-runs', callEPolicyWriteLimiter, requireOutboundAuthorization, requireCallEActorAssertion, async (req, res) => {
+  const body = isPlainObject(req.body) ? req.body : {};
+  const idempotencyKey = String(req.get('Idempotency-Key') || body.idempotency_key || '').trim();
+  try {
+    const result = await createCallEGoalRunService().createDraft({ ...body, idempotency_key: idempotencyKey });
+    return res.status(result.idempotent_replay ? 200 : 201).json({ success: true, request_id: req.requestId || null, ...result });
+  } catch (error) { return sendCallEGoalRunError(res, error, req.requestId); }
+});
+
+app.get('/api/call-e/goal-runs', requireOutboundAuthorization, requireCallEActorAssertion, async (req, res) => {
+  try {
+    const result = await createCallEGoalRunService().list({ business_id: req.query?.business_id, actor_id: req.query?.actor_id,
+      status: req.query?.status, limit: parseBoundedInteger(req.query?.limit, { defaultValue: 20, min: 1, max: 50 }) });
+    return res.json({ success: true, request_id: req.requestId || null, ...result });
+  } catch (error) { return sendCallEGoalRunError(res, error, req.requestId); }
+});
+
+app.get('/api/call-e/goal-runs/:requestId', requireOutboundAuthorization, requireCallEActorAssertion, async (req, res) => {
+  try {
+    const result = await createCallEGoalRunService().get({ goal_run_request_id: req.params.requestId, business_id: req.query?.business_id, actor_id: req.query?.actor_id });
+    return res.json({ success: true, request_id: req.requestId || null, ...result });
+  } catch (error) { return sendCallEGoalRunError(res, error, req.requestId); }
+});
+
+app.post('/api/call-e/goal-runs/:requestId/review', callEPolicyWriteLimiter, requireOutboundAuthorization, requireCallEActorAssertion, async (req, res) => {
+  const body = isPlainObject(req.body) ? req.body : {};
+  try {
+    const result = await createCallEGoalRunService().review({ goal_run_request_id: req.params.requestId, business_id: body.business_id, actor_id: body.actor_id, decision: body.decision });
+    return res.json({ success: true, request_id: req.requestId || null, ...result });
+  } catch (error) { return sendCallEGoalRunError(res, error, req.requestId); }
+});
+
+app.post('/api/call-e/goal-runs/:requestId/advance', callEReconciliationLimiter, requireOutboundAuthorization, requireCallEActorAssertion, async (req, res) => {
+  const body = isPlainObject(req.body) ? req.body : {};
+  try {
+    const result = await createCallEGoalRunService().advance({ goal_run_request_id: req.params.requestId, business_id: body.business_id, actor_id: body.actor_id });
+    return res.status(result.goal_run?.provider_goal_run_id ? 202 : 200).json({ success: true, request_id: req.requestId || null, ...result });
+  } catch (error) { return sendCallEGoalRunError(res, error, req.requestId); }
+});
+
+app.post('/api/call-e/goal-runs/:requestId/reconcile', callEReconciliationLimiter, requireOutboundAuthorization, requireCallEActorAssertion, async (req, res) => {
+  const body = isPlainObject(req.body) ? req.body : {};
+  try {
+    const result = await createCallEGoalRunService().reconcile({ goal_run_request_id: req.params.requestId, business_id: body.business_id, actor_id: body.actor_id });
+    return res.json({ success: true, request_id: req.requestId || null, ...result });
+  } catch (error) { return sendCallEGoalRunError(res, error, req.requestId); }
+});
+
+function sendCallECampaignSafetyError(res, error, requestId) {
+  const code = String(error?.code || 'call_e_safety_operation_failed');
+  const status = Number(error?.status) || (code.includes('forbidden') || code.includes('access_denied') ? 403
+    : code.includes('not_found') ? 404 : code.includes('paused') || code.includes('stop') || code.includes('limit') || code.includes('quiet') ? 409
+      : code.includes('unavailable') ? 503 : 400);
+  return sendApiError(res, status, code, status >= 500 ? 'CALL-E safety operation is unavailable' : error?.message || 'CALL-E safety request is invalid', requestId || null);
+}
+
+app.get('/api/call-e/mission-safety', callEReconciliationLimiter, requireOutboundAuthorization, requireCallEActorAssertion, async (req, res) => {
+  try {
+    const result = await createCallECampaignSafetyService().getPolicy({ business_id: req.query?.business_id, actor_id: req.query?.actor_id });
+    return res.json({ success: true, request_id: req.requestId || null, ...result });
+  } catch (error) { return sendCallECampaignSafetyError(res, error, req.requestId); }
+});
+
+app.put('/api/call-e/mission-safety', callEPolicyWriteLimiter, requireOutboundAuthorization, requireCallEActorAssertion, async (req, res) => {
+  try {
+    const result = await createCallECampaignSafetyService().updatePolicy(isPlainObject(req.body) ? req.body : {});
+    return res.json({ success: true, request_id: req.requestId || null, ...result });
+  } catch (error) { return sendCallECampaignSafetyError(res, error, req.requestId); }
+});
+
+app.get('/api/call-e/missions/:missionId/worker', callEReconciliationLimiter, requireOutboundAuthorization, requireCallEActorAssertion, async (req, res) => {
+  try {
+    const result = await createCallECampaignSafetyService().getWorkerStatus({
+      mission_id: req.params.missionId, business_id: req.query?.business_id, actor_id: req.query?.actor_id,
+    });
+    return res.json({ success: true, request_id: req.requestId || null, ...result });
+  } catch (error) { return sendCallECampaignSafetyError(res, error, req.requestId); }
+});
+
+app.put('/api/call-e/missions/:missionId/worker', callEPolicyWriteLimiter, requireOutboundAuthorization, requireCallEActorAssertion, async (req, res) => {
+  const body = isPlainObject(req.body) ? req.body : {};
+  try {
+    const result = await createCallECampaignSafetyService().setWorkerPaused({
+      mission_id: req.params.missionId, business_id: body.business_id, actor_id: body.actor_id, paused: body.paused,
+    });
+    return res.json({ success: true, request_id: req.requestId || null, ...result });
+  } catch (error) { return sendCallECampaignSafetyError(res, error, req.requestId); }
+});
+
+app.get('/api/call-e/operations-audit', callEReconciliationLimiter, requireOutboundAuthorization, requireCallEActorAssertion, async (req, res) => {
+  try {
+    const result = await createCallECampaignSafetyService().getAudit({
+      business_id: req.query?.business_id, actor_id: req.query?.actor_id,
+      limit: parseBoundedInteger(req.query?.limit, { defaultValue: 50, min: 1, max: 100 }),
+    });
+    return res.json({ success: true, request_id: req.requestId || null, ...result });
+  } catch (error) { return sendCallECampaignSafetyError(res, error, req.requestId); }
+});
+
+app.get('/api/call-e/retention', callEReconciliationLimiter, requireOutboundAuthorization, requireCallEActorAssertion, async (req, res) => {
+  try {
+    const result = await createCallECampaignRetentionService().preview({ business_id: req.query?.business_id, actor_id: req.query?.actor_id });
+    return res.json({ success: true, request_id: req.requestId || null, ...result });
+  } catch (error) { return sendCallECampaignSafetyError(res, error, req.requestId); }
+});
+
+app.post('/api/call-e/retention/purge', callEPolicyWriteLimiter, requireOutboundAuthorization, requireCallEActorAssertion, async (req, res) => {
+  try {
+    const result = await createCallECampaignRetentionService().purge(isPlainObject(req.body) ? req.body : {});
+    return res.json({ success: true, request_id: req.requestId || null, ...result });
+  } catch (error) { return sendCallECampaignSafetyError(res, error, req.requestId); }
+});
+
+app.get('/api/call-e/mission-approval-policy', requireOutboundAuthorization, requireCallEActorAssertion, async (req, res) => {
+  try { return res.json({ success: true, request_id: req.requestId || null, ...(await createCallEMissionOperationsService().getApprovalPolicy(req.query || {})) }); }
+  catch (error) { return sendApiError(res, Number(error?.status) || (error?.code === 'call_e_business_operator_access_denied' ? 403 : 503), String(error?.code || 'call_e_mission_policy_read_failed'), error?.message || 'Mission approval policy could not be loaded', req.requestId || null); }
+});
+
+app.put('/api/call-e/mission-approval-policy', callEPolicyWriteLimiter, requireOutboundAuthorization, requireCallEActorAssertion, async (req, res) => {
+  try { return res.json({ success: true, request_id: req.requestId || null, ...(await createCallEMissionOperationsService().setApprovalPolicy(isPlainObject(req.body) ? req.body : {})) }); }
+  catch (error) { return sendApiError(res, Number(error?.status) || (error?.code === 'call_e_business_operator_access_denied' ? 403 : 400), String(error?.code || 'call_e_mission_policy_update_failed'), error?.message || 'Mission approval policy could not be saved', req.requestId || null); }
+});
+
+app.get('/api/call-e/provider-routing', requireOutboundAuthorization, requireCallEActorAssertion, async (req, res) => {
+  try { return res.json({ success: true, request_id: req.requestId || null, ...(await createCallEMissionOperationsService().getProviderRouting(req.query || {})) }); }
+  catch (error) { return sendApiError(res, Number(error?.status) || (error?.code === 'call_e_business_operator_access_denied' ? 403 : 503), String(error?.code || 'call_e_provider_routing_read_failed'), error?.message || 'Provider routing policy could not be loaded', req.requestId || null); }
+});
+
+app.put('/api/call-e/provider-routing', callEPolicyWriteLimiter, requireOutboundAuthorization, requireCallEActorAssertion, async (req, res) => {
+  try { return res.json({ success: true, request_id: req.requestId || null, ...(await createCallEMissionOperationsService().setProviderRouting(isPlainObject(req.body) ? req.body : {})) }); }
+  catch (error) { return sendApiError(res, Number(error?.status) || (error?.code === 'call_e_business_operator_access_denied' ? 403 : 400), String(error?.code || 'call_e_provider_routing_update_failed'), error?.message || 'Provider routing policy could not be saved', req.requestId || null); }
+});
+
+app.post('/api/call-e/provider-routing/preview', callEReconciliationLimiter, requireOutboundAuthorization, requireCallEActorAssertion, async (req, res) => {
+  const body = isPlainObject(req.body) ? req.body : {};
+  if (Object.keys(body).some((key) => !['business_id', 'actor_id', 'preferred_provider', 'provider_order'].includes(key))) {
+    return sendApiError(res, 400, 'call_e_provider_routing_invalid', 'Provider routing preview contains unsupported fields', req.requestId || null);
+  }
+  try { return res.json({ success: true, request_id: req.requestId || null, ...(await createCallEMissionOperationsService().previewProviderRouting(body)) }); }
+  catch (error) { return sendApiError(res, Number(error?.status) || (error?.code === 'call_e_business_operator_access_denied' ? 403 : 400), String(error?.code || 'call_e_provider_routing_preview_failed'), error?.message || 'Provider routing preview could not be produced', req.requestId || null); }
+});
+
+app.get('/api/call-e/provider-diagnostics', callEReconciliationLimiter, requireOutboundAuthorization, requireCallEActorAssertion, async (req, res) => {
+  try { return res.json({ success: true, request_id: req.requestId || null, ...(await createCallEMissionOperationsService().getProviderDiagnostics(req.query || {})) }); }
+  catch (error) { return sendApiError(res, Number(error?.status) || (error?.code === 'call_e_business_operator_access_denied' ? 403 : 503), String(error?.code || 'call_e_provider_diagnostics_failed'), error?.message || 'Provider diagnostics could not be loaded', req.requestId || null); }
+});
+
+app.post('/api/call-e/mission-cdr-imports', callEPolicyWriteLimiter, requireOutboundAuthorization, requireCallEActorAssertion, async (req, res) => {
+  const body = isPlainObject(req.body) ? req.body : {};
+  if (Object.keys(body).some((key) => !['business_id', 'mission_id', 'actor_id', 'idempotency_key', 'source_reference', 'records'].includes(key))) {
+    return sendApiError(res, 400, 'call_e_cdr_import_invalid', 'CDR import contains unsupported fields', req.requestId || null);
+  }
+  try { return res.status(201).json({ success: true, request_id: req.requestId || null, ...(await createCallEMissionOperationsService().stageMissionCdrImport(body)) }); }
+  catch (error) { return sendApiError(res, Number(error?.status) || (error?.code === 'call_e_business_operator_access_denied' ? 403 : 400), String(error?.code || 'call_e_cdr_import_failed'), error?.message || 'CDR import could not be staged', req.requestId || null); }
+});
+
+app.post('/api/call-e/mission-cdr-imports/:importId/commit', callEPolicyWriteLimiter, requireOutboundAuthorization, requireCallEActorAssertion, async (req, res) => {
+  const body = isPlainObject(req.body) ? req.body : {};
+  if (Object.keys(body).some((key) => !['business_id', 'actor_id'].includes(key))) return sendApiError(res, 400, 'call_e_cdr_import_invalid', 'CDR import commit contains unsupported fields', req.requestId || null);
+  try { return res.json({ success: true, request_id: req.requestId || null, ...(await createCallEMissionOperationsService().commitMissionCdrImport({ ...body, import_id: req.params.importId })) }); }
+  catch (error) { return sendApiError(res, Number(error?.status) || (error?.code === 'call_e_business_operator_access_denied' ? 403 : 400), String(error?.code || 'call_e_cdr_import_commit_failed'), error?.message || 'CDR import could not be committed', req.requestId || null); }
+});
+
+app.get('/api/call-e/mission-review-inbox', callEReconciliationLimiter, requireOutboundAuthorization, requireCallEActorAssertion, async (req, res) => {
+  try { return res.json({ success: true, request_id: req.requestId || null, ...(await createCallEMissionOperationsService().getMissionReviewInbox(req.query || {})) }); }
+  catch (error) { return sendApiError(res, Number(error?.status) || (error?.code === 'call_e_business_operator_access_denied' ? 403 : 503), String(error?.code || 'call_e_mission_review_inbox_failed'), error?.message || 'Mission review inbox could not be loaded', req.requestId || null); }
+});
+
+app.get('/api/call-e/mission-recovery-inbox', callEReconciliationLimiter, requireOutboundAuthorization, requireCallEActorAssertion, async (req, res) => {
+  try { return res.json({ success: true, request_id: req.requestId || null, ...(await createCallEMissionOperationsService().getMissionRecoveryInbox(req.query || {})) }); }
+  catch (error) { return sendApiError(res, Number(error?.status) || (error?.code === 'call_e_business_operator_access_denied' ? 403 : 503), String(error?.code || 'call_e_mission_recovery_inbox_failed'), error?.message || 'Mission recovery inbox could not be loaded', req.requestId || null); }
+});
+
+app.post('/api/call-e/mission-recovery-actions', callEPolicyWriteLimiter, requireOutboundAuthorization, requireCallEActorAssertion, async (req, res) => {
+  const body = isPlainObject(req.body) ? req.body : {};
+  if (Object.keys(body).some((key) => !['business_id', 'mission_id', 'position', 'actor_id', 'action', 'idempotency_key'].includes(key))) {
+    return sendApiError(res, 400, 'call_e_mission_recovery_invalid', 'Mission recovery action contains unsupported fields', req.requestId || null);
+  }
+  try { return res.json({ success: true, request_id: req.requestId || null, ...(await createCallEMissionOperationsService().recoverMissionRecipient(body)) }); }
+  catch (error) { return sendApiError(res, Number(error?.status) || (error?.code === 'call_e_business_operator_access_denied' ? 403 : 400), String(error?.code || 'call_e_mission_recovery_failed'), error?.message || 'Mission recovery action failed', req.requestId || null); }
+});
+
+app.post('/api/call-e/mission-review-actions', callEPolicyWriteLimiter, requireOutboundAuthorization, requireCallEActorAssertion, async (req, res) => {
+  const body = isPlainObject(req.body) ? req.body : {};
+  if (Object.keys(body).some((key) => !['business_id', 'mission_id', 'actor_id', 'action', 'assigned_to', 'idempotency_key', 'extend_minutes'].includes(key))) {
+    return sendApiError(res, 400, 'call_e_mission_review_action_invalid', 'Mission review action contains unsupported fields', req.requestId || null);
+  }
+  try {
+    const service = createCallEMissionOperationsService();
+    const result = body.action === 'assign' ? await service.assignMissionReview(body)
+      : body.action === 'acknowledge' ? await service.acknowledgeMissionReview(body)
+        : ['reassign', 'extend_deadline'].includes(body.action) ? await service.updateMissionEscalation(body)
+        : null;
+    if (!result) return sendApiError(res, 400, 'call_e_mission_review_action_invalid', 'action must be assign, acknowledge, reassign, or extend_deadline', req.requestId || null);
+    return res.json({ success: true, request_id: req.requestId || null, ...result });
+  } catch (error) { return sendApiError(res, Number(error?.status) || (error?.code === 'call_e_business_operator_access_denied' ? 403 : 400), String(error?.code || 'call_e_mission_review_action_failed'), error?.message || 'Mission review action could not be recorded', req.requestId || null); }
+});
+
+app.post('/api/call-e/mission-usage', callEPolicyWriteLimiter, requireOutboundAuthorization, requireCallEActorAssertion, async (req, res) => {
+  const body = isPlainObject(req.body) ? req.body : {};
+  if (Object.keys(body).some((key) => !['business_id', 'mission_id', 'actor_id', 'recipient_position', 'provider', 'provider_call_id', 'amount_minor', 'currency', 'billed_duration_seconds', 'source_type', 'source_reference', 'idempotency_key', 'occurred_at'].includes(key))) {
+    return sendApiError(res, 400, 'call_e_mission_usage_invalid', 'Mission usage record contains unsupported fields', req.requestId || null);
+  }
+  try { return res.status(201).json({ success: true, request_id: req.requestId || null, ...(await createCallEMissionOperationsService().recordMissionUsage(body)) }); }
+  catch (error) { return sendApiError(res, Number(error?.status) || (error?.code === 'call_e_business_operator_access_denied' ? 403 : 400), String(error?.code || 'call_e_mission_usage_failed'), error?.message || 'Mission usage could not be recorded', req.requestId || null); }
+});
+
+app.get('/api/call-e/missions/:missionId/usage', callEReconciliationLimiter, requireOutboundAuthorization, requireCallEActorAssertion, async (req, res) => {
+  try { return res.json({ success: true, request_id: req.requestId || null, ...(await createCallEMissionOperationsService().getMissionUsageReport({
+    business_id: req.query?.business_id, actor_id: req.query?.actor_id, mission_id: req.params.missionId,
+  })) }); }
+  catch (error) { return sendApiError(res, Number(error?.status) || (error?.code === 'call_e_business_operator_access_denied' ? 403 : 503), String(error?.code || 'call_e_mission_usage_report_failed'), error?.message || 'Mission usage report could not be loaded', req.requestId || null); }
+});
+
+app.get('/api/call-e/missions/:missionId/readiness', callEReconciliationLimiter, requireOutboundAuthorization, requireCallEActorAssertion, async (req, res) => {
+  try {
+    const report = await createCallECampaignMissionService().readinessReport({
+      mission_id: req.params.missionId, business_id: req.query?.business_id, actor_id: req.query?.actor_id,
+    });
+    return res.json({ success: true, request_id: req.requestId || null, readiness: report });
+  } catch (error) {
+    return sendApiError(res, Number(error?.status) || (error?.code === 'call_e_business_operator_access_denied' ? 403 : 503),
+      String(error?.code || 'call_e_mission_readiness_failed'), error?.message || 'Mission readiness report could not be generated', req.requestId || null);
+  }
+});
+
+app.get('/api/call-e/result-follow-up-workflows', callEReconciliationLimiter, requireOutboundAuthorization, requireCallEActorAssertion, async (req, res) => {
+  try { return res.json({ success: true, request_id: req.requestId || null, ...(await createCallEResultFollowupService().list(req.query || {})) }); }
+  catch (error) { return sendApiError(res, Number(error?.status) || (error?.code === 'call_e_business_operator_access_denied' ? 403 : 503), String(error?.code || 'call_e_result_workflow_list_failed'), error?.message || 'CALL-E result workflows could not be listed', req.requestId || null); }
+});
+
+app.get('/api/call-e/result-follow-up-workflows/runs', callEReconciliationLimiter, requireOutboundAuthorization, requireCallEActorAssertion, async (req, res) => {
+  try { return res.json({ success: true, request_id: req.requestId || null, ...(await createCallEResultFollowupService().listPendingRuns(req.query || {})) }); }
+  catch (error) { return sendApiError(res, Number(error?.status) || (error?.code === 'call_e_business_operator_access_denied' ? 403 : 503), String(error?.code || 'call_e_result_workflow_runs_failed'), error?.message || 'Pending result follow-up approvals could not be listed', req.requestId || null); }
+});
+
+app.post('/api/call-e/result-follow-up-workflows', callEPolicyWriteLimiter, requireOutboundAuthorization, requireCallEActorAssertion, async (req, res) => {
+  const body = isPlainObject(req.body) ? req.body : {};
+  if (Object.keys(body).some((key) => !['business_id', 'actor_id', 'definition'].includes(key)) || !isPlainObject(body.definition)) {
+    return sendApiError(res, 400, 'call_e_result_workflow_invalid', 'Result follow-up draft contains unsupported fields', req.requestId || null);
+  }
+  try { return res.status(201).json({ success: true, request_id: req.requestId || null, ...(await createCallEResultFollowupService().createDraft(body)) }); }
+  catch (error) { return sendApiError(res, Number(error?.status) || (error?.code === 'call_e_business_operator_access_denied' ? 403 : 400), String(error?.code || 'call_e_result_workflow_create_failed'), error?.message || 'CALL-E result follow-up draft could not be created', req.requestId || null); }
+});
+
+app.post('/api/call-e/result-follow-up-workflows/:workflowId/versions/:version/approve-actions', callEPolicyWriteLimiter, requireOutboundAuthorization, requireCallEActorAssertion, async (req, res) => {
+  const body = isPlainObject(req.body) ? req.body : {};
+  if (Object.keys(body).some((key) => !['business_id', 'actor_id', 'idempotency_key'].includes(key))) {
+    return sendApiError(res, 400, 'call_e_result_workflow_approval_invalid', 'Result workflow approval contains unsupported fields', req.requestId || null);
+  }
+  try { return res.json({ success: true, request_id: req.requestId || null, ...(await createCallEResultFollowupService().approveActions({
+    ...body, workflow_id: req.params.workflowId, version: req.params.version,
+  })) }); }
+  catch (error) { return sendApiError(res, Number(error?.status) || (error?.code === 'call_e_business_operator_access_denied' ? 403 : 400), String(error?.code || 'call_e_result_workflow_approval_failed'), error?.message || 'CALL-E result workflow action approval failed', req.requestId || null); }
+});
+
+app.post('/api/call-e/result-follow-up-workflows/runs/:runId/approve', callEPolicyWriteLimiter, requireOutboundAuthorization, requireCallEActorAssertion, async (req, res) => {
+  const body = isPlainObject(req.body) ? req.body : {};
+  if (Object.keys(body).some((key) => !['business_id', 'actor_id'].includes(key))) {
+    return sendApiError(res, 400, 'call_e_result_workflow_run_invalid', 'Result workflow run approval contains unsupported fields', req.requestId || null);
+  }
+  try { return res.json({ success: true, request_id: req.requestId || null, ...(await createCallEResultFollowupService().approveRun({
+    ...body, run_id: req.params.runId,
+  })) }); }
+  catch (error) { return sendApiError(res, Number(error?.status) || (error?.code === 'call_e_business_operator_access_denied' ? 403 : 400), String(error?.code || 'call_e_result_workflow_run_approval_failed'), error?.message || 'Result workflow run approval failed', req.requestId || null); }
+});
+
+app.get('/api/call-e/mission-report', requireOutboundAuthorization, requireCallEActorAssertion, async (req, res) => {
+  try { return res.json({ success: true, request_id: req.requestId || null, ...(await createCallEMissionOperationsService().report(req.query || {})) }); }
+  catch (error) { return sendApiError(res, Number(error?.status) || (error?.code === 'call_e_business_operator_access_denied' ? 403 : 400), String(error?.code || 'call_e_mission_report_failed'), error?.message || 'Mission outcome report could not be loaded', req.requestId || null); }
+});
+
+app.get('/api/call-e/mission-alert-subscription', requireOutboundAuthorization, requireCallEActorAssertion, async (req, res) => {
+  try { return res.json({ success: true, request_id: req.requestId || null, ...(await createCallEMissionOperationsService().getAlertSubscription(req.query || {})) }); }
+  catch (error) { return sendApiError(res, Number(error?.status) || (error?.code === 'call_e_business_operator_access_denied' ? 403 : 503), String(error?.code || 'call_e_alert_subscription_read_failed'), error?.message || 'Alert subscription could not be loaded', req.requestId || null); }
+});
+
+app.put('/api/call-e/mission-alert-subscription', callEPolicyWriteLimiter, requireOutboundAuthorization, requireCallEActorAssertion, async (req, res) => {
+  try { return res.json({ success: true, request_id: req.requestId || null, worker_enabled: config.callE?.opsAlertsWorkerEnabled === true, ...(await createCallEMissionOperationsService().setAlertSubscription(isPlainObject(req.body) ? req.body : {})) }); }
+  catch (error) { return sendApiError(res, Number(error?.status) || (error?.code === 'call_e_business_operator_access_denied' ? 403 : 400), String(error?.code || 'call_e_alert_subscription_update_failed'), error?.message || 'Alert subscription could not be saved', req.requestId || null); }
+});
+
+app.get('/api/call-e/mission-report-digest-subscription', requireOutboundAuthorization, requireCallEActorAssertion, async (req, res) => {
+  try { return res.json({ success: true, request_id: req.requestId || null, worker_enabled: config.callE?.missionAutomationWorkerEnabled === true, ...(await createCallEMissionOperationsService().getReportDigestSubscription(req.query || {})) }); }
+  catch (error) { return sendApiError(res, Number(error?.status) || (error?.code === 'call_e_business_operator_access_denied' ? 403 : 503), String(error?.code || 'call_e_report_digest_read_failed'), error?.message || 'Report digest subscription could not be loaded', req.requestId || null); }
+});
+
+app.put('/api/call-e/mission-report-digest-subscription', callEPolicyWriteLimiter, requireOutboundAuthorization, requireCallEActorAssertion, async (req, res) => {
+  try { return res.json({ success: true, request_id: req.requestId || null, worker_enabled: config.callE?.missionAutomationWorkerEnabled === true, ...(await createCallEMissionOperationsService().setReportDigestSubscription(isPlainObject(req.body) ? req.body : {})) }); }
+  catch (error) { return sendApiError(res, Number(error?.status) || (error?.code === 'call_e_business_operator_access_denied' ? 403 : 400), String(error?.code || 'call_e_report_digest_update_failed'), error?.message || 'Report digest subscription could not be saved', req.requestId || null); }
+});
+
+const callECampaignRouteHandlers = createCallECampaignRouteHandlers({
+  createService: createCallECampaignService,
+  sendApiError,
+  parseBoundedInteger,
+});
+app.post("/api/call-e/campaigns", callEPolicyWriteLimiter, requireOutboundAuthorization, requireCallEActorAssertion, callECampaignRouteHandlers.create);
+app.get("/api/call-e/campaigns", requireOutboundAuthorization, requireCallEActorAssertion, callECampaignRouteHandlers.list);
+app.get("/api/call-e/campaigns/:campaignId", requireOutboundAuthorization, requireCallEActorAssertion, callECampaignRouteHandlers.get);
+app.post("/api/call-e/campaigns/:campaignId/review", callEPolicyWriteLimiter, requireOutboundAuthorization, requireCallEActorAssertion, callECampaignRouteHandlers.review);
+
+app.post("/api/call-e/missions", callEReconciliationLimiter, requireOutboundAuthorization, requireCallEActorAssertion, async (req, res) => {
+  const body = isPlainObject(req.body) ? req.body : {};
+  const idempotencyKey = String(req.get('Idempotency-Key') || body.idempotency_key || '').trim();
+  try {
+    const result = await createCallECampaignMissionService().create({ ...body, idempotency_key: idempotencyKey });
+    return res.status(result.idempotent_replay ? 200 : 201).json({ success: true, request_id: req.requestId || null, ...result });
+  } catch (error) {
+    const code = String(error?.code || 'call_e_mission_create_failed');
+    const status = Number(error?.status) || (code === 'call_e_business_operator_access_denied' ? 403
+      : ['call_e_mission_idempotency_conflict', 'call_e_mission_campaign_not_approved'].includes(code) ? 409
+        : code.startsWith('call_e_mission_') ? 400 : 503);
+    return sendApiError(res, status, code, status >= 500 ? 'CALL-E mission could not be created' : error?.message || 'CALL-E mission could not be created', req.requestId || null);
+  }
+});
+
+app.get("/api/call-e/missions", requireOutboundAuthorization, requireCallEActorAssertion, async (req, res) => {
+  try {
+    const result = await createCallECampaignMissionService().list({
+      business_id: req.query?.business_id,
+      actor_id: req.query?.actor_id,
+      limit: parseBoundedInteger(req.query?.limit, { defaultValue: 20, min: 1, max: 50 }),
+    });
+    return res.json({ success: true, request_id: req.requestId || null, ...result });
+  } catch (error) {
+    const code = String(error?.code || 'call_e_mission_list_failed');
+    const status = Number(error?.status) || (code === 'call_e_business_operator_access_denied' ? 403 : 503);
+    return sendApiError(res, status, code, 'CALL-E mission summaries could not be loaded', req.requestId || null);
+  }
+});
+
+app.post("/api/call-e/missions/:missionId/review", callEReconciliationLimiter, requireOutboundAuthorization, requireCallEActorAssertion, async (req, res) => {
+  const body = isPlainObject(req.body) ? req.body : {};
+  try {
+    const result = await createCallECampaignMissionService().review({
+      mission_id: req.params.missionId,
+      business_id: body.business_id,
+      actor_id: body.actor_id,
+      decision: body.decision,
+    });
+    return res.json({ success: true, request_id: req.requestId || null, ...result });
+  } catch (error) {
+    const code = String(error?.code || 'call_e_mission_review_failed');
+    const status = Number(error?.status) || (code === 'call_e_business_operator_access_denied' ? 403
+      : code === 'call_e_mission_not_found' ? 404 : 409);
+    return sendApiError(res, status, code, status >= 500 ? 'CALL-E mission decision could not be recorded' : error?.message || 'CALL-E mission decision could not be recorded', req.requestId || null);
+  }
+});
+
+app.post("/api/call-e/missions/:missionId/resolve", callEReconciliationLimiter, requireOutboundAuthorization, requireCallEActorAssertion, async (req, res) => {
+  const body = isPlainObject(req.body) ? req.body : {};
+  const idempotencyKey = String(req.get('Idempotency-Key') || body.idempotency_key || '').trim();
+  try {
+    const result = await createCallECampaignMissionService().resolve({
+      mission_id: req.params.missionId,
+      business_id: body.business_id,
+      actor_id: body.actor_id,
+      decision: body.decision,
+      idempotency_key: idempotencyKey,
+    });
+    return res.json({ success: true, request_id: req.requestId || null, ...result });
+  } catch (error) {
+    const code = String(error?.code || 'call_e_mission_resolve_failed');
+    const status = Number(error?.status) || (code === 'call_e_business_operator_access_denied' ? 403
+      : code === 'call_e_mission_not_found' ? 404
+        : code === 'call_e_mission_unavailable' ? 503 : 409);
+    return sendApiError(res, status, code, status >= 500 ? 'CALL-E mission resolution could not be recorded' : error?.message || 'CALL-E mission resolution could not be recorded', req.requestId || null);
+  }
+});
+
+app.post("/api/call-e/missions/:missionId/advance", callEReconciliationLimiter, requireOutboundAuthorization, requireCallEActorAssertion, async (req, res) => {
+  const body = isPlainObject(req.body) ? req.body : {};
+  try {
+    const result = await createCallECampaignMissionService().advance({
+      mission_id: req.params.missionId,
+      business_id: body.business_id,
+      actor_id: body.actor_id,
+    });
+    return res.status(result.provider_requests > 0 ? 202 : 200).json({ success: true, request_id: req.requestId || null, ...result });
+  } catch (error) {
+    const code = String(error?.code || 'call_e_mission_advance_failed');
+    const status = Number(error?.status) || (code === 'call_e_business_operator_access_denied' ? 403
+      : code === 'call_e_mission_not_found' ? 404
+        : code === 'call_e_mission_dispatch_disabled' ? 503
+          : code.startsWith('call_e_mission_') || code.startsWith('call_e_template_') || code.startsWith('call_e_consent_') ? 409 : 502);
+    return sendApiError(res, status, code, status >= 500 ? 'CALL-E mission could not advance' : error?.message || 'CALL-E mission could not advance', req.requestId || null,
+      buildCallEErrorMetadata(error));
+  }
+});
+
+app.post("/api/call-e/missions/:missionId/recipients/:position/retry", callEReconciliationLimiter, requireOutboundAuthorization, requireCallEActorAssertion, async (req, res) => {
+  const body = isPlainObject(req.body) ? req.body : {};
+  const idempotencyKey = String(req.get('Idempotency-Key') || body.idempotency_key || '').trim();
+  try {
+    const result = await createCallECampaignMissionService().retryRecipient({
+      mission_id: req.params.missionId, position: Number(req.params.position),
+      business_id: body.business_id, actor_id: body.actor_id, idempotency_key: idempotencyKey,
+    });
+    return res.json({ success: true, request_id: req.requestId || null, ...result });
+  } catch (error) {
+    const code = String(error?.code || 'call_e_mission_retry_failed');
+    const status = Number(error?.status) || (code === 'call_e_business_operator_access_denied' ? 403
+      : code === 'call_e_mission_not_found' ? 404 : code === 'call_e_mission_unavailable' ? 503 : 409);
+    return sendApiError(res, status, code, error?.message || 'Mission recipient could not be queued for a safe retry', req.requestId || null);
+  }
+});
+
+app.get("/api/call-e/missions/:missionId", requireOutboundAuthorization, requireCallEActorAssertion, async (req, res) => {
+  try {
+    const result = await createCallECampaignMissionService().get({
+      mission_id: req.params.missionId,
+      business_id: req.query?.business_id,
+      actor_id: req.query?.actor_id,
+    });
+    return res.json({ success: true, request_id: req.requestId || null, ...result });
+  } catch (error) {
+    const code = String(error?.code || 'call_e_mission_read_failed');
+    const status = Number(error?.status) || (code === 'call_e_business_operator_access_denied' ? 403 : 404);
+    return sendApiError(res, status, code, 'CALL-E mission was not found', req.requestId || null);
+  }
+});
+
+app.get("/api/call-e/call-results", requireOutboundAuthorization, requireCallEActorAssertion, async (req, res) => {
+  const actorId = String(req.query?.actor_id || '').trim();
+  if (!/^\d{1,20}$/.test(actorId)) {
+    return sendApiError(res, 400, 'call_e_actor_invalid', 'A valid Telegram actor scope is required', req.requestId || null);
+  }
+  const limit = parseBoundedInteger(req.query?.limit, { defaultValue: 10, min: 1, max: 50 });
+  const offset = parseBoundedInteger(req.query?.offset, { defaultValue: 0, min: 0, max: 5000 });
+  try {
+    const result = await new CallEReconciliationService({ db }).listCallsForOperator(actorId, { limit, offset });
+    return res.json({ success: true, request_id: req.requestId || null, ...result });
+  } catch (error) {
+    const status = Number(error?.status) || (error?.code === 'call_e_reconciliation_storage_unavailable' ? 503 : 502);
+    return sendApiError(res, status, String(error?.code || 'call_e_results_list_failed'), 'CALL-E result summaries could not be loaded', req.requestId || null);
+  }
+});
+
+app.get("/api/call-e/calls/:localCallId/result", callEReconciliationLimiter, requireOutboundAuthorization, requireCallEActorAssertion, async (req, res) => {
+  const actorId = String(req.query?.actor_id || '').trim();
+  if (!/^\d{1,20}$/.test(actorId)) {
+    return sendApiError(res, 400, 'call_e_actor_invalid', 'A valid Telegram actor scope is required', req.requestId || null);
+  }
+  try {
+    const result = await new CallEReconciliationService({ client: createCallEClientFromEnv(), db, providerRegistry: getVoiceProviderRegistry() })
+      .getStructuredResultForOperator(req.params.localCallId, actorId);
+    return res.json({ success: true, request_id: req.requestId || null, ...result });
+  } catch (error) {
+    const code = String(error?.code || 'call_e_structured_result_failed');
+    const status = code === 'call_e_call_not_found' ? 404
+      : code === 'call_e_not_configured' || code === 'call_e_reconciliation_storage_unavailable' ? 503
+        : code === 'call_e_result_invalid' ? 409 : 502;
+    return sendApiError(res, status, code, status === 502 ? 'CALL-E structured result could not be loaded' : error?.message || 'CALL-E structured result could not be loaded', req.requestId || null);
+  }
+});
+
+app.get("/api/call-e/calls/:localCallId/quality", callEReconciliationLimiter, requireOutboundAuthorization, requireCallEActorAssertion, async (req, res) => {
+  const actorId = String(req.query?.actor_id || '').trim();
+  if (!/^\d{1,20}$/.test(actorId)) {
+    return sendApiError(res, 400, 'call_e_actor_invalid', 'A valid Telegram actor scope is required', req.requestId || null);
+  }
+  try {
+    const service = new CallEReconciliationService({ client: createCallEClientFromEnv(), db, providerRegistry: getVoiceProviderRegistry() });
+    const result = await service.getConversationQualityForOperator(req.params.localCallId, actorId);
+    return res.json({ success: true, request_id: req.requestId || null, ...result });
+  } catch (error) {
+    const code = String(error?.code || 'call_e_quality_failed');
+    const status = code === 'call_e_call_not_found' ? 404
+      : code === 'call_e_not_configured' || code === 'call_e_reconciliation_storage_unavailable' ? 503
+        : code === 'call_e_result_invalid' ? 409 : 502;
+    return sendApiError(res, status, code, status === 502 ? 'CALL-E quality evaluation failed' : error?.message || 'CALL-E quality evaluation failed', req.requestId || null);
+  }
+});
+
+const callEGoalPlanner = new CallEGoalPlannerService({
+  db,
+  getTemplate: async (templateId) => normalizeScriptTemplateRecord(await db.getCallTemplateById(templateId)),
+  contactPolicy: new CallEContactPolicyService({ db, cooldownHashSecret: config.apiAuth?.hmacSecret }),
+});
+
+app.get("/api/call-e/planner/templates", requireOutboundAuthorization, requireCallEActorAssertion, async (req, res) => {
+  try {
+    const result = await callEGoalPlanner.listTemplates({
+      business_id: req.query?.business_id,
+      actor_id: req.query?.actor_id,
+    });
+    return res.json({ success: true, request_id: req.requestId || null, ...result });
+  } catch (error) {
+    const status = Number(error?.status) || 503;
+    return sendApiError(res, status, String(error?.code || 'call_e_goal_templates_failed'), 'CALL-E goal templates could not be loaded', req.requestId || null);
+  }
+});
+
+app.post("/api/call-e/planner/suggest", requireOutboundAuthorization, requireCallEActorAssertion, async (req, res) => {
+  const body = isPlainObject(req.body) ? req.body : {};
+  try {
+    const result = await callEGoalPlanner.suggestTemplates(body);
+    return res.json({ success: true, request_id: req.requestId || null, ...result });
+  } catch (error) {
+    const status = Number(error?.status) || (error?.code === 'call_e_business_operator_access_denied' ? 403 : 503);
+    return sendApiError(res, status, String(error?.code || 'call_e_goal_suggest_failed'), error?.message || 'CALL-E goal suggestions could not be created', req.requestId || null);
+  }
+});
+
+app.post("/api/call-e/planner/preview", requireOutboundAuthorization, requireCallEActorAssertion, async (req, res) => {
+  const body = isPlainObject(req.body) ? req.body : {};
+  try {
+    const result = await callEGoalPlanner.plan(body);
+    return res.json({ success: true, request_id: req.requestId || null, ...result });
+  } catch (error) {
+    const status = Number(error?.status) || (error?.code === 'call_e_business_operator_access_denied' ? 403 : 503);
+    return sendApiError(res, status, String(error?.code || 'call_e_goal_plan_failed'), error?.message || 'CALL-E goal plan could not be created', req.requestId || null);
+  }
 });
 
 registerCallEContactPolicyRoutes(app, {
   db,
   getTemplate: (templateId) => db.getCallTemplateById(templateId),
-  policyService: new CallEContactPolicyService({ db }),
+  policyService: new CallEContactPolicyService({ db, cooldownHashSecret: config.apiAuth?.hmacSecret }),
   requireAdminToken,
   requireMiniAppSession,
   requireMiniAppCapability,
@@ -24198,7 +25469,25 @@ registerCallEContactPolicyRoutes(app, {
       .then((limited) => { if (!limited) next(); })
       .catch(next);
   },
+  requireCallEApiAuthorization: requireOutboundAuthorization,
+  requireCallEActorAssertion,
+  callEApiLimiter: callEReconciliationLimiter,
 });
+
+app.post(
+  "/api/call-e/calls/:localCallId/operator-reconcile",
+  callEReconciliationLimiter,
+  requireOutboundAuthorization,
+  requireCallEActorAssertion,
+  createCallEOperatorReconciliationHandler({
+    createService: () => new CallEReconciliationService({
+      client: createCallEClientFromEnv(),
+      db,
+      providerRegistry: getVoiceProviderRegistry(),
+      maxPages: 5,
+    }),
+  }),
+);
 
 app.post(
   "/api/call-e/calls/:localCallId/reconcile",
@@ -24219,6 +25508,7 @@ app.post(
   callEWebhookLimiter,
   createCallEWebhookHandler({
     db,
+    getWorkflowService: () => postCallWorkflowExecutionService,
     createService: () => new CallEReconciliationService({
       client: createCallEClientFromEnv(),
       db,
@@ -24227,6 +25517,41 @@ app.post(
     }),
   }),
 );
+
+app.get("/api/call-scripts/:id/vapi-tools", requireAdminToken, async (req, res) => {
+  try {
+    const service = new VapiToolPolicyService({ db });
+    return res.json({ success: true, ...(await service.getStatus(req.params.id)) });
+  } catch (error) {
+    const status = Number.isInteger(error?.status) ? error.status : 500;
+    return res.status(status).json({ success: false, error: status >= 500 ? "Failed to load Vapi tool policy" : error.message, code: error?.code || "vapi_tool_policy_failed" });
+  }
+});
+
+app.put("/api/call-scripts/:id/vapi-tools", requireAdminToken, async (req, res) => {
+  try {
+    const body = isPlainObject(req.body) ? req.body : {};
+    if (Object.keys(body).some((key) => !["tool_id", "enabled"].includes(key)) ||
+        body.tool_id !== VAPI_BUSINESS_CONTEXT_TOOL_ID || typeof body.enabled !== "boolean") {
+      return res.status(400).json({ success: false, error: "A supported tool_id and boolean enabled value are required", code: "vapi_tool_policy_request_invalid" });
+    }
+    const service = new VapiToolPolicyService({
+      db,
+      validateTemplateConfig: (template, candidate) => validateTemplateAgentRuntimeConfig(
+        normalizeScriptTemplateRecord(template), candidate, { allowVapiBusinessContextTool: true },
+      ),
+      getAvailableToolNames: (template) => availableCallAgentToolNames(template?.prompt, template?.first_message),
+      onTemplateUpdated: async (template) => persistCallTemplateVersionSnapshot(
+        normalizeScriptTemplateRecord(template), { reason: "update", actor: "admin_token" },
+      ),
+    });
+    const result = await service.setBusinessContextLookup(req.params.id, body.enabled, "admin_token");
+    return res.json({ success: true, ...result });
+  } catch (error) {
+    const status = Number.isInteger(error?.status) ? error.status : 500;
+    return res.status(status).json({ success: false, error: status >= 500 ? "Failed to update Vapi tool policy" : error.message, code: error?.code || "vapi_tool_policy_failed" });
+  }
+});
 
 app.post(
   "/api/call-scripts/:id/vapi-preview",
@@ -24252,6 +25577,7 @@ app.post(
           error: "Vapi preview settings must not include credentials",
         });
       }
+      const serverConfiguration = buildVapiWebhookServerConfiguration();
       const preview = mapCallTemplateToVapiAssistant({
         ...template,
         configuration: {
@@ -24260,11 +25586,12 @@ app.post(
             ...(vapiVoice ? { voice: vapiVoice } : {}),
           },
         },
-      });
+      }, { serverConfiguration });
       const configFingerprint = fingerprintVapiTemplateMapping(
         template,
         vapiModel,
         vapiVoice,
+        serverConfiguration,
       );
       await db.upsertVapiTemplateMapping({
         template_id: scriptId,
@@ -24275,6 +25602,9 @@ app.post(
           mapped_fields: preview.mappedFields,
           unsupported: preview.unsupported,
           missing: preview.missing,
+          approved_tools: Array.isArray(preview.assistant?.tools) && preview.assistant.tools.length
+            ? [VAPI_BUSINESS_CONTEXT_TOOL_ID]
+            : [],
         },
       });
       return res.json({
@@ -24290,6 +25620,109 @@ app.post(
       return res.status(500).json({
         success: false,
         error: "Failed to preview Vapi template mapping",
+      });
+    }
+  },
+);
+
+app.get(
+  "/api/call-scripts/:id/vapi-health",
+  requireAdminToken,
+  async (req, res) => {
+    try {
+      const service = new VapiTemplateHealthService({
+        db,
+        client: createVapiClientFromEnv(),
+      });
+      return res.json({ success: true, health: await service.getHealth(req.params.id) });
+    } catch (error) {
+      const status = Number.isInteger(error?.status) ? error.status : 500;
+      return res.status(status).json({
+        success: false,
+        error: status >= 500 ? "Failed to inspect Vapi template health" : error.message,
+        code: error?.code || "vapi_health_failed",
+      });
+    }
+  },
+);
+
+app.get("/api/call-scripts/:id/vapi-simulation-suites", requireAdminToken, async (req, res) => {
+  try {
+    const service = new VapiSimulationService({ db, client: createVapiClientFromEnv() });
+    return res.json({ success: true, ...await service.listSuites(req.params.id) });
+  } catch (error) {
+    const status = Number(error?.status) || 500;
+    return res.status(status).json({ success: false, error: status >= 500 ? "Failed to inspect Vapi simulation suites" : error.message,
+      code: error?.code || "vapi_simulation_suites_failed" });
+  }
+});
+
+app.get("/api/call-scripts/:id/vapi-simulation-runs", requireAdminToken, async (req, res) => {
+  try {
+    const service = new VapiSimulationService({ db, client: createVapiClientFromEnv() });
+    return res.json({ success: true, ...await service.listRuns(req.params.id, req.query?.limit) });
+  } catch (error) {
+    const status = Number(error?.status) || 500;
+    return res.status(status).json({ success: false, error: status >= 500 ? "Failed to load Vapi simulation history" : error.message,
+      code: error?.code || "vapi_simulation_history_failed" });
+  }
+});
+
+app.post("/api/call-scripts/:id/vapi-simulation-runs", requireAdminToken, async (req, res) => {
+  const body = isPlainObject(req.body) ? req.body : {};
+  const allowed = new Set(["suite_id", "confirmation", "iterations", "idempotency_key"]);
+  if (Object.keys(body).some((key) => !allowed.has(key))) {
+    return res.status(400).json({ success: false, error: "Simulation request contains invalid or unsupported fields", code: "vapi_simulation_request_invalid" });
+  }
+  try {
+    const service = new VapiSimulationService({ db, client: createVapiClientFromEnv() });
+    const result = await service.startRun({
+      template_id: req.params.id,
+      suite_id: body.suite_id,
+      confirmation: body.confirmation,
+      iterations: body.iterations,
+      idempotency_key: body.idempotency_key,
+      actor_id: req.headers?.["x-admin-user"] || "admin",
+    });
+    return res.status(result.idempotent_replay ? 200 : 201).json({ success: true, result });
+  } catch (error) {
+    const status = Number(error?.status) || 500;
+    return res.status(status).json({ success: false, error: status >= 500 ? "Vapi simulation could not be started" : error.message,
+      code: error?.code || "vapi_simulation_run_failed" });
+  }
+});
+
+app.post(
+  "/api/call-scripts/:id/vapi-mappings/:mapping_id/resync",
+  requireAdminToken,
+  async (req, res) => {
+    const templateId = Number(req.params.id);
+    const mappingId = Number(req.params.mapping_id);
+    const confirmation = `RESYNC VAPI TEMPLATE ${templateId} MAPPING ${mappingId}`;
+    const body = isPlainObject(req.body) ? req.body : {};
+    if (!Number.isSafeInteger(templateId) || templateId <= 0 ||
+        !Number.isSafeInteger(mappingId) || mappingId <= 0 ||
+        Object.keys(body).some((key) => key !== "confirmation") || body.confirmation !== confirmation) {
+      return res.status(400).json({ success: false, error: "Exact resync confirmation is required", code: "vapi_resync_confirmation_required" });
+    }
+    try {
+      const service = new VapiTemplateHealthService({
+        db,
+        client: createVapiClientFromEnv(),
+        serverConfiguration: buildVapiWebhookServerConfiguration(),
+      });
+      const result = await service.resync(templateId, mappingId);
+      return res.json({ success: true, result });
+    } catch (error) {
+      const status = Number.isInteger(error?.status) ? error.status : 502;
+      console.error("vapi_template_resync_error", {
+        code: redactSensitiveLogValue(error?.code || "vapi_resync_failed"),
+        status,
+      });
+      return res.status(status).json({
+        success: false,
+        error: status >= 500 ? "Vapi template resynchronization failed" : error.message,
+        code: error?.code || "vapi_resync_failed",
       });
     }
   },
@@ -24330,6 +25763,7 @@ app.get(
 app.post(
   "/api/call-scripts/:id/vapi-call",
   requireAdminToken,
+  requireCallEActorAssertion,
   async (req, res) => {
     const scriptId = Number(req.params.id);
     if (!Number.isSafeInteger(scriptId) || scriptId <= 0) {
@@ -24340,6 +25774,8 @@ app.post(
     try {
       const service = new VapiOutboundCallService({
         client,
+        db,
+        outboundSafety: createOutboundCallSafetyService(),
         getMapping: (mappingId) => db.getVapiTemplateMappingById(mappingId),
         getTemplate: (templateId) => db.getCallTemplateById(templateId),
       });
@@ -24349,11 +25785,14 @@ app.post(
         phoneNumberId: body.phone_number_id,
         number: body.number,
         idempotencyKey: body.idempotency_key,
+        actorId: req.callEActorId,
       });
       return res.status(result.idempotentReplay ? 200 : 201).json({ success: true, result });
     } catch (error) {
       const code = String(error?.code || "vapi_call_failed");
-      const status = code === "vapi_not_configured"
+      const status = code.startsWith("outbound_")
+        ? Number(error?.status) || 409
+        : code === "vapi_not_configured" || code === "vapi_call_dependencies_missing"
         ? 503
         : [
           "vapi_mapping_required",
@@ -24409,6 +25848,101 @@ app.get("/api/vapi/call-events", requireAdminToken, async (req, res) => {
       error: redactSensitiveLogValue(error.message || "event_list_failed"),
     });
     return res.status(500).json({ success: false, error: "Failed to list Vapi call events" });
+  }
+});
+
+app.get("/api/vapi/status", requireAdminToken, (req, res) => {
+  const client = createVapiClientFromEnv();
+  const webhookConfigured = Boolean(buildVapiWebhookServerConfiguration());
+  return res.json({
+    success: true,
+    status: {
+      enabled: client.enabled === true,
+      configured: client.isConfigured(),
+      webhook_configured: webhookConfigured,
+      provider_selection: "per_call",
+      capabilities: ["assistant_sync", "outbound_calls", "web_calls", "inbound_routing", "call_events", "call_control", "campaign_drafts", "eval_center", "squad_operations"],
+    },
+  });
+});
+
+app.get("/api/vapi/evals", requireAdminToken, async (req, res) => {
+  try {
+    const service = new VapiEvalService({ client: createVapiClientFromEnv() });
+    return res.json({ success: true, ...await service.listEvals({ page: req.query?.page, limit: req.query?.limit }) });
+  } catch (error) {
+    const status = Number(error?.status) || 502;
+    return res.status(status).json({ success: false, error: status >= 500 ? "Failed to load Vapi evals" : error.message, code: error?.code || "vapi_evals_failed" });
+  }
+});
+
+app.get("/api/vapi/squads", requireAdminToken, async (req, res) => {
+  try {
+    const service = new VapiSquadService({ client: createVapiClientFromEnv() });
+    return res.json({ success: true, ...await service.list({ limit: req.query?.limit }) });
+  } catch (error) {
+    const status = Number(error?.status) || 502;
+    return res.status(status).json({ success: false, error: status >= 500 ? "Failed to load Vapi squads" : error.message, code: error?.code || "vapi_squads_failed" });
+  }
+});
+
+app.get("/api/vapi/squads/:squadId", requireAdminToken, async (req, res) => {
+  try {
+    const service = new VapiSquadService({ client: createVapiClientFromEnv() });
+    return res.json({ success: true, squad: await service.get(req.params.squadId) });
+  } catch (error) {
+    const status = Number(error?.status) || 502;
+    return res.status(status).json({ success: false, error: status >= 500 ? "Failed to load Vapi squad details" : error.message, code: error?.code || "vapi_squad_get_failed" });
+  }
+});
+
+app.post("/api/vapi/evals", requireAdminToken, vapiEvalWriteLimiter, async (req, res) => {
+  const body = isPlainObject(req.body) ? req.body : {};
+  if (Object.keys(body).some((key) => !["name", "description", "messages", "confirmation"].includes(key))) {
+    return res.status(400).json({ success: false, error: "Eval request contains unsupported fields", code: "vapi_eval_request_invalid" });
+  }
+  try {
+    const service = new VapiEvalService({ client: createVapiClientFromEnv() });
+    const evaluation = await service.createEval(body);
+    return res.status(201).json({ success: true, evaluation });
+  } catch (error) {
+    const status = Number(error?.status) || 502;
+    return res.status(status).json({ success: false, error: status >= 500 ? "Vapi eval could not be created" : error.message, code: error?.code || "vapi_eval_create_failed" });
+  }
+});
+
+app.get("/api/vapi/eval-runs", requireAdminToken, async (req, res) => {
+  try {
+    const service = new VapiEvalService({ client: createVapiClientFromEnv() });
+    return res.json({ success: true, ...await service.listRuns({ page: req.query?.page, limit: req.query?.limit }) });
+  } catch (error) {
+    const status = Number(error?.status) || 502;
+    return res.status(status).json({ success: false, error: status >= 500 ? "Failed to load Vapi eval run history" : error.message, code: error?.code || "vapi_eval_runs_failed" });
+  }
+});
+
+app.get("/api/vapi/eval-runs/:runId", requireAdminToken, async (req, res) => {
+  try {
+    const service = new VapiEvalService({ client: createVapiClientFromEnv() });
+    return res.json({ success: true, run: await service.getRun(req.params.runId) });
+  } catch (error) {
+    const status = Number(error?.status) || 502;
+    return res.status(status).json({ success: false, error: status >= 500 ? "Failed to load Vapi eval run" : error.message, code: error?.code || "vapi_eval_run_get_failed" });
+  }
+});
+
+app.post("/api/vapi/eval-runs", requireAdminToken, vapiEvalWriteLimiter, async (req, res) => {
+  const body = isPlainObject(req.body) ? req.body : {};
+  if (Object.keys(body).some((key) => !["eval_id", "target_type", "target_id", "confirmation"].includes(key))) {
+    return res.status(400).json({ success: false, error: "Eval run request contains unsupported fields", code: "vapi_eval_run_request_invalid" });
+  }
+  try {
+    const service = new VapiEvalService({ client: createVapiClientFromEnv() });
+    const run = await service.startRun(body);
+    return res.status(201).json({ success: true, run, cost_notice: "Vapi eval runs may incur model charges. This evaluates a mock conversation and does not place a phone call." });
+  } catch (error) {
+    const status = Number(error?.status) || 502;
+    return res.status(status).json({ success: false, error: status >= 500 ? "Vapi eval run could not be started" : error.message, code: error?.code || "vapi_eval_run_failed" });
   }
 });
 
@@ -25639,8 +27173,26 @@ app.post("/api/call-scripts/:id/promote-live", requireAdminToken, async (req, re
         error: "Script must be approved before it can be promoted to live",
       });
     }
+    const promotionGate = await new CallAgentSimulationService({
+      db, validateRuntimeConfig: validateTemplateAgentRuntimeConfig,
+    }).getPromotionReadiness({ script_id: scriptId });
+    if (!promotionGate.eligible) {
+      return res.status(409).json({
+        success: false,
+        code: "call_agent_promotion_gate_blocked",
+        error: "The current approved script version has not passed the required Agent Lab checks",
+        readiness: promotionGate,
+      });
+    }
     const actor = req.headers?.["x-admin-user"] || null;
-    await db.promoteCallTemplateLive(scriptId, actor);
+    const promoted = await db.promoteCallTemplateLive(scriptId, actor, script.version, {
+      simulation_run_id: promotionGate.run_id,
+      simulation_score: promotionGate.score,
+      config_fingerprint: promotionGate.config_fingerprint,
+    });
+    if (!promoted) {
+      return res.status(409).json({ success: false, code: "call_agent_promotion_version_changed", error: "The script changed during promotion; rerun Agent Lab checks" });
+    }
     const updated = normalizeScriptTemplateRecord(
       await db.getCallTemplateById(scriptId),
     );
@@ -25653,6 +27205,54 @@ app.post("/api/call-scripts/:id/promote-live", requireAdminToken, async (req, re
       success: false,
       error: "Failed to promote script to live",
     });
+  }
+});
+
+app.get("/api/call-scripts/:id/promotion-readiness", requireAdminToken, async (req, res) => {
+  const scriptId = Number(req.params.id);
+  if (!Number.isSafeInteger(scriptId) || scriptId < 1) return res.status(400).json({ success: false, error: "Invalid script id" });
+  try {
+    const readiness = await new CallAgentSimulationService({
+      db, validateRuntimeConfig: validateTemplateAgentRuntimeConfig,
+    }).getPromotionReadiness({ script_id: scriptId });
+    return res.json({ success: true, readiness });
+  } catch (error) {
+    return res.status(Number(error?.status) || 500).json({
+      success: false,
+      code: String(error?.code || "call_agent_promotion_readiness_failed"),
+      error: Number(error?.status) ? String(error.message) : "Promotion readiness could not be checked",
+    });
+  }
+});
+
+app.get("/api/call-scripts/:id/promotion-history", requireAdminToken, async (req, res) => {
+  const scriptId = Number(req.params.id);
+  if (!Number.isSafeInteger(scriptId) || scriptId < 1) return res.status(400).json({ success: false, error: "Invalid script id" });
+  try {
+    const script = await db.getCallTemplateById(scriptId);
+    const rawLimit = Number(req.query?.limit);
+    const limit = Number.isSafeInteger(rawLimit) ? Math.max(1, Math.min(50, rawLimit)) : 20;
+    const events = await db.listCallTemplatePromotionEvents(scriptId, limit);
+    if (!script && !events.length) return res.status(404).json({ success: false, error: "Script or promotion history not found" });
+    return res.json({
+      success: true,
+      script_id: scriptId,
+      current_version: script ? Number(script.version) || 1 : null,
+      current_lifecycle_state: script ? String(script.lifecycle_state || "draft") : "deleted",
+      events: events.map((event) => ({
+        event_id: Number(event.event_id),
+        version: Number(event.template_version),
+        actor: String(event.actor_label || "admin_token"),
+        simulation_run_id: String(event.simulation_run_id),
+        score: Number(event.simulation_score),
+        config_fingerprint: String(event.config_fingerprint),
+        previous_live_script_id: event.previous_live_template_id == null ? null : Number(event.previous_live_template_id),
+        previous_live_version: event.previous_live_version == null ? null : Number(event.previous_live_version),
+        created_at: event.created_at || null,
+      })),
+    });
+  } catch (error) {
+    return res.status(500).json({ success: false, error: "Failed to load script promotion history" });
   }
 });
 
@@ -25710,6 +27310,44 @@ app.post("/api/call-scripts/:id/simulate", requireAdminToken, async (req, res) =
       success: false,
       error: "Failed to simulate call script",
     });
+  }
+});
+
+app.get("/api/call-scripts/:id/simulation-scenarios", requireAdminToken, async (req, res) => {
+  const scriptId = Number(req.params.id);
+  if (!Number.isSafeInteger(scriptId) || scriptId < 1) return res.status(400).json({ success: false, error: "Invalid script id" });
+  try {
+    const script = await db.getCallTemplateById(scriptId);
+    if (!script) return res.status(404).json({ success: false, error: "Script not found" });
+    const service = new CallAgentSimulationService({ db, validateRuntimeConfig: validateTemplateAgentRuntimeConfig });
+    return res.json({ success: true, script_id: scriptId, scenarios: service.listScenarios() });
+  } catch (_) { return res.status(500).json({ success: false, error: "Failed to load simulation scenarios" }); }
+});
+
+app.post("/api/call-scripts/:id/simulation-runs", requireAdminToken, async (req, res) => {
+  const scriptId = Number(req.params.id);
+  const body = isPlainObject(req.body) ? req.body : {};
+  if (!Number.isSafeInteger(scriptId) || scriptId < 1 || Object.keys(body).some((key) => !['version', 'scenario_ids', 'idempotency_key'].includes(key))) {
+    return res.status(400).json({ success: false, error: "Simulation request contains invalid or unsupported fields" });
+  }
+  try {
+    const service = new CallAgentSimulationService({ db, validateRuntimeConfig: validateTemplateAgentRuntimeConfig });
+    const simulation = await service.run({ ...body, script_id: scriptId, actor_id: req.headers?.["x-admin-user"] || "admin" });
+    return res.status(simulation.idempotent_replay ? 200 : 201).json({ success: true, simulation });
+  } catch (error) {
+    const status = Number(error?.status) || 500;
+    return res.status(status).json({ success: false, code: String(error?.code || "call_agent_simulation_failed"), error: status >= 500 ? "Agent simulation failed" : String(error?.message || "Agent simulation failed") });
+  }
+});
+
+app.get("/api/call-scripts/:id/simulation-runs", requireAdminToken, async (req, res) => {
+  const scriptId = Number(req.params.id);
+  if (!Number.isSafeInteger(scriptId) || scriptId < 1) return res.status(400).json({ success: false, error: "Invalid script id" });
+  try {
+    const service = new CallAgentSimulationService({ db, validateRuntimeConfig: validateTemplateAgentRuntimeConfig });
+    return res.json({ success: true, script_id: scriptId, runs: await service.listRuns({ script_id: scriptId, limit: req.query?.limit }) });
+  } catch (error) {
+    return res.status(Number(error?.status) || 500).json({ success: false, code: String(error?.code || "call_agent_simulation_history_failed"), error: "Simulation history could not be loaded" });
   }
 });
 
@@ -26496,7 +28134,33 @@ async function placeOutboundCall(payload, hostOverride = null) {
     error.providerSubmissionState = "not_submitted";
     throw error;
   }
-  const orderedProviders = getProviderOrder(preferredProvider);
+  const trustedTemplateBusinessId = String(resolvedScriptTemplate?.business_id || resolvedScriptTemplate?.businessId || '').trim();
+  const requestedBusinessId = String(payloadObject.business_id || '').trim();
+  if (trustedTemplateBusinessId && requestedBusinessId && trustedTemplateBusinessId !== requestedBusinessId) {
+    const error = new Error('Outbound business scope must match the selected saved script');
+    error.code = 'outbound_business_scope_mismatch';
+    error.status = 403;
+    throw error;
+  }
+  const outboundBusinessId = trustedTemplateBusinessId || requestedBusinessId;
+  if (!trustedTemplateBusinessId && outboundBusinessId && typeof db?.hasCallTemplateBusinessId === 'function' &&
+      !await db.hasCallTemplateBusinessId(outboundBusinessId)) {
+    const error = new Error('Outbound business scope is not registered');
+    error.code = 'outbound_business_scope_required';
+    error.status = 403;
+    throw error;
+  }
+  const trustedRoutingBusinessId = trustedTemplateBusinessId;
+  let businessProviderOrder = [];
+  if (/^[A-Za-z0-9._:-]{1,120}$/.test(trustedRoutingBusinessId) && typeof db?.getCallEBusinessProviderRouting === 'function') {
+    try {
+      const routing = await db.getCallEBusinessProviderRouting(trustedRoutingBusinessId);
+      businessProviderOrder = Array.isArray(routing?.provider_order) ? routing.provider_order : [];
+    } catch (error) {
+      callWarnings.push('Business provider routing policy could not be loaded; using the global provider order.');
+    }
+  }
+  const orderedProviders = getProviderOrder(preferredProvider, businessProviderOrder);
   let availableProviders = orderedProviders.filter(
     (provider) => readiness[provider],
   );
@@ -26546,7 +28210,8 @@ async function placeOutboundCall(payload, hostOverride = null) {
     },
     failoverEnabled,
     isProviderDegraded,
-    getProviderHealthScore,
+    // The configured provider order is the operator's explicit preference;
+    // readiness and circuit state decide eligibility, not score-based reordering.
   });
   const attemptProviders = providerPlan.attempt_order;
   recordProviderFlowMetric("provider_selection_plan", {
@@ -26571,6 +28236,10 @@ async function placeOutboundCall(payload, hostOverride = null) {
     providerPlan.selected_provider || preferredProvider || currentProvider,
   );
   if (outboundIdempotencyContext?.replay) {
+    await createOutboundCallSafetyService().authorizeActor({
+      business_id: outboundBusinessId,
+      actor_id: user_chat_id,
+    });
     callId = outboundIdempotencyContext.replay.callId;
     callStatus = outboundIdempotencyContext.replay.callStatus || "queued";
     providerMetadata =
@@ -26610,6 +28279,23 @@ async function placeOutboundCall(payload, hostOverride = null) {
       warnings: callWarnings,
     };
   }
+  let outboundSafetyReservation;
+  const outboundSafety = createOutboundCallSafetyService();
+  try {
+    outboundSafetyReservation = await outboundSafety.reserveDispatch({
+      business_id: outboundBusinessId,
+      actor_id: user_chat_id,
+      destination: number,
+      provider: providerPlan.selected_provider || preferredProvider || currentProvider,
+      idempotency_key: normalizedOutboundIdempotencyKey || `generated:${crypto.randomUUID()}`,
+    });
+  } catch (error) {
+    await completeOutboundCallIdempotency(outboundIdempotencyContext, 'failed', {
+      provider: providerPlan.selected_provider || preferredProvider || currentProvider,
+      errorMessage: String(error?.code || 'outbound_contact_policy_blocked'),
+    }).catch(() => {});
+    throw error;
+  }
   let lastError = null;
 
   for (let providerIndex = 0; providerIndex < attemptProviders.length; providerIndex += 1) {
@@ -26646,6 +28332,7 @@ async function placeOutboundCall(payload, hostOverride = null) {
           },
         },
       );
+      await outboundSafety.completeDispatch(outboundSafetyReservation, 'accepted');
       recordProviderSuccess(provider);
       recordProviderFlowMetric("outbound_call_success", {
         channel: "call",
@@ -26660,6 +28347,7 @@ async function placeOutboundCall(payload, hostOverride = null) {
         error?.code === "idempotency_conflict" ||
         error?.code === "idempotency_in_progress"
       ) {
+        await outboundSafety.completeDispatch(outboundSafetyReservation, 'released');
         throw error;
       }
       const safeError = normalizeProviderOperationError(
@@ -26698,6 +28386,7 @@ async function placeOutboundCall(payload, hostOverride = null) {
   }
 
   if (!selectedProvider) {
+    await outboundSafety.completeDispatch(outboundSafetyReservation, 'released');
     await completeOutboundCallIdempotency(
       outboundIdempotencyContext,
       "failed",
@@ -27864,6 +29553,13 @@ app.post("/email/templates/select", requireOutboundAuthorization, async (req, re
 
 registerPostCallWorkflowDefinitionRoutes(app, {
   getService: () => postCallWorkflowDefinitionService,
+  getExecutionService: () => postCallWorkflowExecutionService,
+  requireAdminToken,
+  sendApiError,
+});
+
+registerBusinessIntegrationConnectionRoutes(app, {
+  getService: () => businessIntegrationConnectionService,
   requireAdminToken,
   sendApiError,
 });
@@ -31494,6 +33190,7 @@ app.get("/api/sms/status/:messageSid", requireOutboundAuthorization, async (req,
 
 registerCallRoutes(app, {
   requireOutboundAuthorization,
+  requireCallEActorAssertion,
   sendApiError,
   resolveHost,
   config,
@@ -31501,9 +33198,30 @@ registerCallRoutes(app, {
   placeVapiOutboundCall: (input) => new VapiOutboundCallService({
     client: createVapiClientFromEnv(),
     db,
+    outboundSafety: createOutboundCallSafetyService(),
     getMapping: (mappingId) => db.getVapiTemplateMappingById(mappingId),
     getTemplate: (templateId) => db.getCallTemplateById(templateId),
   }).createOutboundCall(input),
+  createCartesiaCallApproval: (input) => createCartesiaOutboundCallService().createApproval(input),
+  placeCartesiaOutboundCall: (input) => createCartesiaOutboundCallService().createOutboundCall(input),
+  reconcileCartesiaOutboundCall: (input) => createCartesiaOutboundCallService().reconcileOutboundCall(input),
+  listCartesiaAgents: () => createCartesiaOutboundCallService().listAgentInventory(),
+  getCartesiaAgentDeploymentHealth: (input) => createCartesiaOutboundCallService().getAgentDeploymentHealth(input),
+  listCartesiaCalls: (input) => createCartesiaOutboundCallService().listCallsForOperations(input),
+  getCartesiaCall: (callId, options) => createCartesiaOutboundCallService().getCallForOperations(callId, options),
+  getCartesiaCallAudio: (callId, options) => createCartesiaOutboundCallService().getCallAudioForOperations(callId, options),
+  redactCartesiaCallData: (callId, options) => createCartesiaOutboundCallService().redactCallData(callId, options),
+  getCartesiaCallReviewRules: (input) => createCartesiaOutboundCallService().getCallReviewRules(input),
+  saveCartesiaCallReviewRules: (input) => createCartesiaOutboundCallService().saveCallReviewRules(input),
+  cancelCartesiaCall: (callId, options) => createCartesiaOutboundCallService().cancelStartedCall(callId, options),
+  createCartesiaCampaignDraft: (input) => createCartesiaCampaignService().createDraft(input),
+  getCartesiaCampaign: (input) => createCartesiaCampaignService().getCampaign(input),
+  reconcileCartesiaCampaign: (input) => createCartesiaCampaignService().reconcileCampaign(input),
+  cancelCartesiaCampaignBatch: (input) => createCartesiaCampaignService().cancelBatch(input),
+  retryCartesiaCampaignBatch: (input) => createCartesiaCampaignService().retryFailedRecipients(input),
+  submitCartesiaCampaign: (input) => createCartesiaCampaignService().submit(input),
+  isCartesiaAdminActor: (actorId) => isTelegramAdminUser(actorId),
+  cartesiaApprovalLimiter: callEPolicyWriteLimiter,
   scheduleCallJob,
   buildErrorDetails,
   getCurrentProvider: () => currentProvider,
@@ -31530,6 +33248,266 @@ registerCallRoutes(app, {
   },
   transcriptAudioTimeoutMs: Number(config.api?.transcriptAudioTimeoutMs) || 12000,
   transcriptAudioMaxChars: Number(config.api?.transcriptAudioMaxChars) || 2600,
+});
+
+registerCartesiaStudioRoutes(app, {
+  requireOutboundAuthorization,
+  requireCallEActorAssertion,
+  sendApiError,
+  isCartesiaAdminActor: (actorId) => isTelegramAdminUser(actorId),
+  cartesiaApprovalLimiter: callEPolicyWriteLimiter,
+  createCartesiaStudioService,
+}, express);
+
+registerCartesiaWebhookRoutes(app, { db, secret: config.cartesia?.webhookSecret, enabled: config.cartesia?.enabled === true, limiter: callEWebhookLimiter });
+
+registerCartesiaKnowledgeBaseRoutes(app, {
+  requireOutboundAuthorization,
+  requireCallEActorAssertion,
+  sendApiError,
+  isCartesiaAdminActor: (actorId) => isTelegramAdminUser(actorId),
+  cartesiaApprovalLimiter: callEPolicyWriteLimiter,
+  createCartesiaKnowledgeBaseService,
+});
+
+registerCartesiaSipProviderRoutes(app, {
+  requireOutboundAuthorization,
+  requireCallEActorAssertion,
+  sendApiError,
+  isCartesiaAdminActor: (actorId) => isTelegramAdminUser(actorId),
+  cartesiaApprovalLimiter: callEPolicyWriteLimiter,
+  createCartesiaSipProviderService,
+});
+
+app.get("/api/cartesia/agents/:agentId/runtime", callEPolicyWriteLimiter, requireOutboundAuthorization, requireCallEActorAssertion, async (req, res) => {
+  const actorId = String(req.callEActorId || "");
+  const businessId = String(req.query?.business_id || "").trim();
+  const agentId = String(req.params?.agentId || "").trim();
+  try {
+    if (!(await isTelegramAdminUser(actorId))) return sendApiError(res, 403, "cartesia_admin_required", "Cartesia agent runtime is restricted to administrators", req.requestId || null);
+    if (!/^[A-Za-z0-9._:-]{1,120}$/.test(businessId) || !/^[A-Za-z0-9._:-]{1,200}$/.test(agentId)) return sendApiError(res, 400, "cartesia_agent_session_invalid", "A business and agent scope are required", req.requestId || null);
+    await createOutboundCallSafetyService().authorizeActor({ business_id: businessId, actor_id: actorId });
+    return res.json({
+      success: true,
+      agent_id: agentId,
+      enabled: config.cartesia?.agentRuntimeEnabled === true && config.cartesia?.enabled === true && Boolean(config.cartesia?.apiKey),
+      websocket_path: `/api/cartesia/agents/${encodeURIComponent(agentId)}/runtime`,
+      audio_input_formats: ["pcm_16000", "pcm_24000", "pcm_44100", "mulaw_8000"],
+      supported_tool_handlers: ["get_campaign_status"],
+    });
+  } catch (error) {
+    const code = String(error?.code || "cartesia_agent_runtime_status_failed");
+    const status = Number(error?.status) || (code.includes("admin") ? 403 : 502);
+    return sendApiError(res, status, code, status >= 500 ? "Cartesia agent runtime status is unavailable" : "Cartesia agent runtime is not available for this business", req.requestId || null);
+  }
+});
+
+app.ws("/api/cartesia/agents/:agentId/runtime", async (ws, req) => {
+  let countedSession = false;
+  let releasedSession = false;
+  const releaseSessionSlot = () => {
+    if (!countedSession || releasedSession) return;
+    releasedSession = true;
+    activeCartesiaAgentSessions = Math.max(0, activeCartesiaAgentSessions - 1);
+  };
+  ws.once("close", releaseSessionSlot);
+  ws.once("error", releaseSessionSlot);
+  const clientOpen = () => ws.readyState === 1;
+  const publicTarget = String(req.originalUrl || req.url || "").replace(/\/\.websocket(?=\?|$)/, "");
+  const authRequest = Object.create(req);
+  authRequest.originalUrl = publicTarget;
+  authRequest.url = publicTarget;
+  const reject = (code, message, closeCode = 1008) => {
+    try { ws.send(JSON.stringify({ type: "error", code, message })); } catch { /* socket may not be open */ }
+    try { ws.close(closeCode, message.slice(0, 120)); } catch { /* cleanup is best effort */ }
+  };
+  if (process.env.NODE_ENV === "production" && !req.secure && req.headers?.["x-forwarded-proto"] !== "https") {
+    reject("cartesia_agent_https_required", "Secure WebSocket connections are required.");
+    return;
+  }
+  if (config.apiAuth?.hmacSecret) {
+    const hmac = verifyHmacSignature(authRequest);
+    if (!hmac.ok || hmac.replayDetected) {
+      reject("cartesia_agent_authentication_required", "WebSocket authentication failed.");
+      return;
+    }
+  } else if (!hasAdminToken(req)) {
+    reject("cartesia_agent_authentication_required", "WebSocket authentication failed.");
+    return;
+  }
+  const assertion = verifyCallEActorAssertion(authRequest, { secret: config.callE?.actorAssertionSecret });
+  let isAdmin = false;
+  try { isAdmin = assertion.ok && await isTelegramAdminUser(assertion.actorId); }
+  catch { isAdmin = false; }
+  if (!assertion.ok || !isAdmin) {
+    reject("cartesia_agent_actor_forbidden", "A verified administrator actor is required.");
+    return;
+  }
+  const businessId = String(req.query?.business_id || "").trim();
+  const actorId = String(assertion.actorId);
+  const agentId = String(req.params?.agentId || "").trim();
+  if (!/^[A-Za-z0-9._:-]{1,120}$/.test(businessId) || !/^[A-Za-z0-9._:-]{1,200}$/.test(agentId)) {
+    reject("cartesia_agent_session_invalid", "A business and agent scope are required.");
+    return;
+  }
+  if (config.cartesia?.agentRuntimeEnabled !== true || config.cartesia?.enabled !== true || !config.cartesia?.apiKey) {
+    reject("cartesia_agent_runtime_disabled", "Cartesia agent runtime is disabled or not configured.", 1013);
+    return;
+  }
+  if (activeCartesiaAgentSessions >= MAX_CARTESIA_AGENT_SESSIONS) {
+    reject("cartesia_agent_capacity_reached", "Cartesia agent session capacity is full.", 1013);
+    return;
+  }
+  activeCartesiaAgentSessions += 1;
+  countedSession = true;
+  if (!clientOpen()) { releaseSessionSlot(); return; }
+  try {
+    await createOutboundCallSafetyService().authorizeActor({ business_id: businessId, actor_id: actorId });
+    if (!clientOpen()) return;
+    const inventory = await new CartesiaClient(config.cartesia).listAgents();
+    if (!clientOpen()) return;
+    const resolved = (Array.isArray(inventory?.summaries) ? inventory.summaries : []).find((item) =>
+      String(item?.id || "") === agentId && !item?.deleted_at);
+    if (!resolved) {
+      reject("cartesia_agent_not_available", "The selected Cartesia agent is not available.");
+      return;
+    }
+    const campaignService = createCartesiaCampaignService();
+    const runtime = new CartesiaAgentRuntime({
+      apiKey: config.cartesia.apiKey,
+      agentId,
+      apiBaseUrl: config.cartesia.apiBaseUrl,
+      websocketBaseUrl: config.cartesia.websocketBaseUrl,
+      toolHandlers: {
+        get_campaign_status: async (parameters) => {
+          const campaignId = String(parameters?.campaign_id || "");
+          const result = await campaignService.getCampaign({ campaign_id: campaignId, business_id: businessId, actor_id: actorId });
+          return result.campaign;
+        },
+      },
+    });
+    runtime.connect({
+      clientSocket: ws,
+      actor: { id: actorId, businessId },
+      agentId,
+      audio: {
+        input_format: req.query?.input_format || "pcm_16000",
+        output_delivery: req.query?.output_delivery || "speaking_pace",
+        continuous_input: req.query?.continuous_input === "true",
+      },
+    });
+    if (!clientOpen()) return;
+  } catch (error) {
+    console.warn("Cartesia agent session rejected", { code: String(error?.code || "cartesia_agent_session_failed").slice(0, 80) });
+    reject("cartesia_agent_session_failed", "Cartesia agent session could not be started.", 1011);
+  }
+});
+
+app.ws("/api/cartesia/studio/tts-session", async (ws, req) => {
+  let counted = false;
+  let released = false;
+  const release = () => {
+    if (!counted || released) return;
+    released = true;
+    activeCartesiaTtsSessions = Math.max(0, activeCartesiaTtsSessions - 1);
+  };
+  ws.once("close", release);
+  ws.once("error", release);
+  const reject = (code, message, closeCode = 1008) => {
+    try { ws.send(JSON.stringify({ type: "error", code, message })); } catch { /* socket may be closed */ }
+    try { ws.close(closeCode, message.slice(0, 120)); } catch { /* cleanup is best effort */ }
+  };
+  if (process.env.NODE_ENV === "production" && !req.secure && req.headers?.["x-forwarded-proto"] !== "https") {
+    reject("cartesia_tts_session_https_required", "Secure WebSocket connections are required."); return;
+  }
+  const publicTarget = String(req.originalUrl || req.url || "").replace(/\/\.websocket(?=\?|$)/, "");
+  const authRequest = Object.create(req);
+  authRequest.originalUrl = publicTarget;
+  authRequest.url = publicTarget;
+  if (config.apiAuth?.hmacSecret) {
+    const hmac = verifyHmacSignature(authRequest);
+    if (!hmac.ok || hmac.replayDetected) { reject("cartesia_tts_session_authentication_required", "WebSocket authentication failed."); return; }
+  } else if (!hasAdminToken(req)) {
+    reject("cartesia_tts_session_authentication_required", "WebSocket authentication failed."); return;
+  }
+  const assertion = verifyCallEActorAssertion(authRequest, { secret: config.callE?.actorAssertionSecret });
+  let isAdmin = false;
+  try { isAdmin = assertion.ok && await isTelegramAdminUser(assertion.actorId); } catch { isAdmin = false; }
+  if (!assertion.ok || !isAdmin) { reject("cartesia_tts_session_admin_required", "A verified administrator actor is required."); return; }
+  if (config.cartesia?.enabled !== true || !config.cartesia?.apiKey) {
+    reject("cartesia_tts_session_disabled", "Cartesia TTS sessions are disabled or not configured.", 1013); return;
+  }
+  if (activeCartesiaTtsSessions >= MAX_CARTESIA_TTS_SESSIONS) {
+    reject("cartesia_tts_session_capacity_reached", "Cartesia TTS session capacity is full.", 1013); return;
+  }
+  activeCartesiaTtsSessions += 1;
+  counted = true;
+  try {
+    new CartesiaTtsSessionRuntime({
+      apiKey: config.cartesia.apiKey,
+      apiBaseUrl: config.cartesia.apiBaseUrl,
+      websocketBaseUrl: config.cartesia.websocketBaseUrl,
+    }).connect({ clientSocket: ws, actor: { id: String(assertion.actorId) } });
+  } catch (error) {
+    console.warn("Cartesia TTS session rejected", { code: String(error?.code || "cartesia_tts_session_failed").slice(0, 80) });
+    release();
+    reject("cartesia_tts_session_failed", "Cartesia TTS session could not be started.", 1011);
+  }
+});
+
+app.ws("/api/cartesia/studio/stt-session", async (ws, req) => {
+  let counted = false;
+  let released = false;
+  const release = () => {
+    if (!counted || released) return;
+    released = true;
+    activeCartesiaSttSessions = Math.max(0, activeCartesiaSttSessions - 1);
+  };
+  ws.once("close", release);
+  ws.once("error", release);
+  const reject = (code, message, closeCode = 1008) => {
+    try { ws.send(JSON.stringify({ type: "error", code, message })); } catch { /* socket may be closed */ }
+    try { ws.close(closeCode, message.slice(0, 120)); } catch { /* cleanup is best effort */ }
+  };
+  if (process.env.NODE_ENV === "production" && !req.secure && req.headers?.["x-forwarded-proto"] !== "https") {
+    reject("cartesia_stt_session_https_required", "Secure WebSocket connections are required."); return;
+  }
+  const publicTarget = String(req.originalUrl || req.url || "").replace(/\/\.websocket(?=\?|$)/, "");
+  const authRequest = Object.create(req);
+  authRequest.originalUrl = publicTarget;
+  authRequest.url = publicTarget;
+  if (config.apiAuth?.hmacSecret) {
+    const hmac = verifyHmacSignature(authRequest);
+    if (!hmac.ok || hmac.replayDetected) { reject("cartesia_stt_session_authentication_required", "WebSocket authentication failed."); return; }
+  } else if (!hasAdminToken(req)) {
+    reject("cartesia_stt_session_authentication_required", "WebSocket authentication failed."); return;
+  }
+  const assertion = verifyCallEActorAssertion(authRequest, { secret: config.callE?.actorAssertionSecret });
+  let isAdmin = false;
+  try { isAdmin = assertion.ok && await isTelegramAdminUser(assertion.actorId); } catch { isAdmin = false; }
+  if (!assertion.ok || !isAdmin) { reject("cartesia_stt_session_admin_required", "A verified administrator actor is required."); return; }
+  if (config.cartesia?.enabled !== true || !config.cartesia?.apiKey) {
+    reject("cartesia_stt_session_disabled", "Cartesia live STT is disabled or not configured.", 1013); return;
+  }
+  if (activeCartesiaSttSessions >= MAX_CARTESIA_STT_SESSIONS) {
+    reject("cartesia_stt_session_capacity_reached", "Cartesia live STT capacity is full.", 1013); return;
+  }
+  activeCartesiaSttSessions += 1;
+  counted = true;
+  try {
+    new CartesiaSttSessionRuntime({
+      apiKey: config.cartesia.apiKey,
+      apiBaseUrl: config.cartesia.apiBaseUrl,
+    }).connect({
+      clientSocket: ws,
+      actor: { id: String(assertion.actorId) },
+      query: selectSessionQuery(req.query || {}),
+    });
+  } catch (error) {
+    console.warn("Cartesia STT session rejected", { code: String(error?.code || "cartesia_stt_session_failed").slice(0, 80) });
+    release();
+    reject("cartesia_stt_session_failed", "Cartesia live STT session could not be started.", 1011);
+  }
 });
 
 registerStatusRoutes(app, {
@@ -31616,6 +33594,7 @@ registerWebhookRoutes(app, {
   endCallForProvider,
   webhookService,
   postCallAutomationService,
+  postCallWorkflowExecutionService,
   buildVonageTalkHangupNcco,
   buildVonageUnavailableNcco,
   buildTwilioStreamTwiml,
@@ -31980,6 +33959,7 @@ module.exports = {
     recordMiniAppRouteTelemetry,
     runDeepgramVoiceAgentStartupPreflight,
     buildMiniAppActionSpec,
+    getMiniAppCapabilitiesForRole,
   },
 };
 
@@ -32013,6 +33993,8 @@ async function gracefulShutdown(options = {}) {
     }
 
     webhookService.stop();
+    await callECampaignMissionWorker?.stop?.();
+    await callECampaignRetentionWorker?.stop?.();
     callConfigurations.clear();
     callFunctionSystems.clear();
     callDirections.clear();

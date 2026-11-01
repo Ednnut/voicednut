@@ -10,10 +10,21 @@ function createHarness() {
     async createDraft(definition, actor) { calls.push(["create", definition, actor]); return { workflow_id: definition.workflow_id, version: 1, status: "draft" }; },
     async approveVersion(workflowId, version, actor) { calls.push(["approve", workflowId, version, actor]); return { workflow_id: workflowId, version: Number(version), status: "approved" }; },
   };
+  const executionService = {
+    async listRuns(filters) { calls.push(["runs", filters]); return []; },
+    async getRun(runId) { calls.push(["getRun", runId]); return { run_id: runId, status: "waiting_approval", steps: [] }; },
+    async approveRun(runId, actor) { calls.push(["approveRun", runId, actor]); return { run_id: runId, status: "queued" }; },
+    async cancelRun(runId, actor) { calls.push(["cancelRun", runId, actor]); return { run_id: runId, status: "canceled" }; },
+  };
   const app = Object.fromEntries(["get", "post"].map((method) => [method, (route, ...handlers) => routes.set(`${method.toUpperCase()} ${route}`, handlers)]));
   const requireAdminToken = (req, res, next) => req.get("x-admin") === "authorized" ? next() : res.status(403).json({ success: false });
   const sendApiError = (res, status, code, message, requestId) => res.status(status).json({ success: false, error: { code, message }, request_id: requestId || null });
-  registerPostCallWorkflowDefinitionRoutes(app, { getService: () => service, requireAdminToken, sendApiError });
+  registerPostCallWorkflowDefinitionRoutes(app, {
+    getService: () => service,
+    getExecutionService: () => executionService,
+    requireAdminToken,
+    sendApiError,
+  });
 
   async function dispatch(method, route, options = {}) {
     const handlers = routes.get(`${method} ${route}`);
@@ -67,5 +78,33 @@ describe("Post-call workflow definition routes", () => {
     assert.deepEqual(calls.map(([kind]) => kind), ["create", "approve"]);
     assert.equal(calls[0][2], "admin_token");
     assert.equal(calls[1][3], "admin_token");
+  });
+
+  it("keeps run audit, approval, and cancellation endpoints behind admin authorization", async () => {
+    const { dispatch, calls } = createHarness();
+    let response = await dispatch("GET", "/post-call/workflows/runs");
+    assert.equal(response.status, 403);
+    assert.equal(calls.length, 0);
+
+    const headers = { "x-admin": "authorized" };
+    response = await dispatch("GET", "/post-call/workflows/runs", { headers, query: { status: "waiting_approval", limit: "10" } });
+    assert.equal(response.status, 200);
+    assert.deepEqual(calls[0], ["runs", { workflow_id: undefined, status: "waiting_approval", trigger_reference: undefined, limit: "10" }]);
+
+    response = await dispatch("POST", "/post-call/workflows/runs/:run_id/approve", { headers, params: { run_id: "run_1" } });
+    assert.equal(response.body.run.status, "queued");
+    response = await dispatch("POST", "/post-call/workflows/runs/:run_id/cancel", { headers, params: { run_id: "run_1" } });
+    assert.equal(response.body.run.status, "canceled");
+    assert.deepEqual(calls.slice(1), [["approveRun", "run_1", "admin_token"], ["cancelRun", "run_1", "admin_token"]]);
+  });
+
+  it("passes a requested workflow filter to the global version list", async () => {
+    const { dispatch, calls } = createHarness();
+    const response = await dispatch("GET", "/post-call/workflows", {
+      headers: { "x-admin": "authorized" },
+      query: { workflow_id: "followup", limit: "12" },
+    });
+    assert.equal(response.status, 200);
+    assert.deepEqual(calls[0], ["list", "followup", "12"]);
   });
 });

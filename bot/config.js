@@ -18,6 +18,7 @@ if (missing.length > 0) {
 const apiSecret = process.env.API_SECRET;
 const adminApiToken = apiSecret || process.env.ADMIN_API_TOKEN;
 const apiHmacSecret = apiSecret || process.env.API_HMAC_SECRET;
+const callEActorAssertionSecret = process.env.CALL_E_ACTOR_ASSERTION_SECRET || '';
 if (!adminApiToken || !apiHmacSecret) {
   console.error('❌ Bot environment is missing API credentials. Set API_SECRET (preferred) or both ADMIN_API_TOKEN + API_HMAC_SECRET.');
   process.exit(1);
@@ -70,5 +71,6 @@ module.exports = {
   },
   apiAuth: {
     hmacSecret: apiHmacSecret,
+    callEActorAssertionSecret,
   },
 };

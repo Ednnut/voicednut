@@ -90,6 +90,7 @@ class CallEDispatchService {
       resultSchema: input.result_schema,
       confirmedFingerprint: fingerprint,
       idempotencyKey,
+      actor_id: telegramId,
     });
     return {
       localCallId: result.localCallId,

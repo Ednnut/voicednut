@@ -25,7 +25,7 @@ describe("Vapi webhook route authentication policy", () => {
     const res = response();
     await handler({ body: { message: { type: "tool-calls", toolCallList: [{ id: "tool-1", function: { name: "lookup" } }] } } }, res);
     assert.deepEqual(res.body, {
-      results: [{ name: "lookup", toolCallId: "tool-1", result: "This tool is not enabled in VOICEDNUT." }],
+      results: [{ toolCallId: "tool-1", error: "This function is not enabled for this assistant." }],
     });
   });
 

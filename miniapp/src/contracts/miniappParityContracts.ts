@@ -95,6 +95,7 @@ export const DASHBOARD_MODULE_IDS = [
   'persona',
   'users',
   'audit',
+  'workflows',
 ] as const;
 
 export type DashboardModuleId = typeof DASHBOARD_MODULE_IDS[number];
@@ -130,6 +131,7 @@ export const DASHBOARD_MODULE_ROUTE_CONTRACTS: Record<DashboardModuleId, string>
   persona: '/persona',
   users: '/users',
   audit: '/audit',
+  workflows: '/workflows',
 };
 
 export const DASHBOARD_MODULE_SCREEN_CONTRACTS: Record<DashboardModuleId, {
@@ -183,6 +185,10 @@ export const DASHBOARD_MODULE_SCREEN_CONTRACTS: Record<DashboardModuleId, {
   audit: {
     label: 'System Status & Audit',
     capability: 'dashboard_view',
+  },
+  workflows: {
+    label: 'Workflow Builder',
+    capability: 'workflow_manage',
   },
 };
 
@@ -357,6 +363,18 @@ export const DASHBOARD_PAGE_WORKFLOW_CONTRACTS: readonly DashboardPageWorkflowCo
     fallbackPath: DASHBOARD_STATIC_ROUTE_CONTRACTS.ROOT,
     moduleId: 'audit',
     notes: 'Review health/status posture, alert history, response actions, and audit trails in one place.',
+  },
+  {
+    pageId: 'dashboard.module.workflows',
+    path: DASHBOARD_MODULE_ROUTE_CONTRACTS.workflows,
+    pageComponent: 'PostCallWorkflowPage',
+    canonicalCommand: BOT_PRIMARY_COMMANDS.ADMIN,
+    relatedCommands: [],
+    capability: DASHBOARD_MODULE_SCREEN_CONTRACTS.workflows.capability,
+    workflowStatus: 'partial',
+    fallbackPath: DASHBOARD_STATIC_ROUTE_CONTRACTS.ROOT,
+    moduleId: 'workflows',
+    notes: 'Platform-admin workflow draft editor and sanitized run audit. Approval controls remain in the admin API.',
   },
   {
     pageId: 'dashboard.settings',
@@ -1136,6 +1154,11 @@ export const DASHBOARD_ACTION_CONTRACTS = {
   CALLSCRIPT_CALLE_PREVIEW: 'callscript.calle_preview',
   CALLSCRIPT_CALLE_CONFIRM: 'callscript.calle_confirm',
   CALLSCRIPT_CALLE_DISPATCH: 'callscript.calle_dispatch',
+  CALLE_CAMPAIGN_CREATE: 'calle.campaign.create',
+  CALLE_CAMPAIGN_LIST: 'calle.campaign.list',
+  CALLE_CAMPAIGN_GET: 'calle.campaign.get',
+  CALLE_CAMPAIGN_REVIEW: 'calle.campaign.review',
+  CALLE_CAMPAIGN_PREFLIGHT: 'calle.campaign.preflight',
   CALLE_STATUS: 'calle.status',
   CALLE_CALL_RECONCILE: 'calle.call.reconcile',
   CALLE_CALL_REVIEW: 'calle.call.review',
@@ -1193,6 +1216,10 @@ export const DASHBOARD_ACTION_CONTRACTS = {
   RUNBOOK_SMS_RECONCILE: 'runbook.sms.reconcile',
   RUNBOOK_PAYMENT_RECONCILE: 'runbook.payment.reconcile',
   RUNBOOK_PROVIDER_PREFLIGHT: 'runbook.provider.preflight',
+  WORKFLOW_VERSIONS: 'workflow.versions',
+  WORKFLOW_DRAFT: 'workflow.draft',
+  WORKFLOW_RUNS: 'workflow.runs',
+  WORKFLOW_RUN_GET: 'workflow.run.get',
 } as const;
 
 export const BOT_CALLBACK_TO_DASHBOARD_ACTION_CONTRACTS: Record<string, string> = {
@@ -1299,6 +1326,11 @@ export const DASHBOARD_MODULE_ACTION_CONTRACTS = {
     DASHBOARD_ACTION_CONTRACTS.CALLSCRIPT_CALLE_PREVIEW,
     DASHBOARD_ACTION_CONTRACTS.CALLSCRIPT_CALLE_CONFIRM,
     DASHBOARD_ACTION_CONTRACTS.CALLSCRIPT_CALLE_DISPATCH,
+    DASHBOARD_ACTION_CONTRACTS.CALLE_CAMPAIGN_CREATE,
+    DASHBOARD_ACTION_CONTRACTS.CALLE_CAMPAIGN_LIST,
+    DASHBOARD_ACTION_CONTRACTS.CALLE_CAMPAIGN_GET,
+    DASHBOARD_ACTION_CONTRACTS.CALLE_CAMPAIGN_REVIEW,
+    DASHBOARD_ACTION_CONTRACTS.CALLE_CAMPAIGN_PREFLIGHT,
     DASHBOARD_ACTION_CONTRACTS.CALLE_STATUS,
     DASHBOARD_ACTION_CONTRACTS.CALLE_CALL_RECONCILE,
     DASHBOARD_ACTION_CONTRACTS.CALLE_CALL_REVIEW,
@@ -1346,6 +1378,12 @@ export const DASHBOARD_MODULE_ACTION_CONTRACTS = {
     DASHBOARD_ACTION_CONTRACTS.RUNBOOK_SMS_RECONCILE,
     DASHBOARD_ACTION_CONTRACTS.RUNBOOK_PAYMENT_RECONCILE,
     DASHBOARD_ACTION_CONTRACTS.RUNBOOK_PROVIDER_PREFLIGHT,
+  ],
+  workflows: [
+    DASHBOARD_ACTION_CONTRACTS.WORKFLOW_VERSIONS,
+    DASHBOARD_ACTION_CONTRACTS.WORKFLOW_DRAFT,
+    DASHBOARD_ACTION_CONTRACTS.WORKFLOW_RUNS,
+    DASHBOARD_ACTION_CONTRACTS.WORKFLOW_RUN_GET,
   ],
 } as const;
 

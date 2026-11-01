@@ -1,3 +1,4 @@
+const crypto = require('node:crypto');
 const axios = require('axios');
 const { InlineKeyboard } = require('grammy');
 const config = require('../config');
@@ -1328,13 +1329,109 @@ async function reviewCallScript(id, decision, note = null) {
   return data.script;
 }
 
-async function promoteCallScriptLive(id) {
+async function promoteCallScriptLive(id, actor = null) {
   const data = await scriptsApiRequest({
     method: 'post',
     url: `/api/call-scripts/${id}/promote-live`,
     data: {},
+    ...(actor ? { headers: { 'x-admin-user': String(actor).slice(0, 120) } } : {}),
   });
   return data.script;
+}
+
+async function getCallScriptPromotionReadiness(id) {
+  const data = await scriptsApiRequest({
+    method: 'get',
+    url: `/api/call-scripts/${id}/promotion-readiness`,
+  });
+  return data.readiness || {};
+}
+
+function buildCallScriptPromotionReadinessSummary(readiness = {}) {
+  const version = Number(readiness.version) || 1;
+  const blockers = {
+    evaluation_required: 'Run Agent Lab for this version.',
+    evaluation_fingerprint_stale: 'The script changed after the last evaluation; rerun Agent Lab.',
+    scenario_coverage_incomplete: `Missing checks: ${(readiness.missing_scenarios || []).join(', ') || 'full-suite coverage is required'}.`,
+    required_scenario_failed: `Failed checks: ${(readiness.failed_scenarios || []).join(', ') || 'review failed scenarios below'}.`,
+    score_below_threshold: `Score is below the ${Number(readiness.minimum_score) || 90}% minimum.`,
+    script_not_approved: 'A separate human review must approve the script first.',
+  };
+  const checks = Array.isArray(readiness.checks) ? readiness.checks : [];
+  const checkLines = checks.map((check) => {
+    const status = String(check.status || 'missing');
+    const marker = status === 'passed' ? '✅' : status === 'not_applicable' ? '➖' : status === 'failed' ? '⛔' : '▫️';
+    const label = String(check.label || check.id || 'Required check').slice(0, 80);
+    const detail = check.code ? ` · ${String(check.code).slice(0, 80)}` : '';
+    return `${marker} ${label} · ${status}${detail}`;
+  });
+  if (!checks.length) {
+    for (const id of [...new Set([...(readiness.failed_scenarios || []), ...(readiness.missing_scenarios || [])])]) {
+      checkLines.push(`⛔ ${String(id).slice(0, 80)} · ${readiness.failed_scenarios?.includes(id) ? 'failed' : 'missing'}`);
+    }
+  }
+  const reasons = Array.isArray(readiness.reasons) ? readiness.reasons : [];
+  const blockerLines = reasons.map((reason) => `• ${blockers[reason] || `API gate: ${String(reason).slice(0, 100)}`}`);
+  const state = readiness.eligible === true ? '✅ Promotion ready' : '⛔ Promotion blocked';
+  const score = readiness.score !== null && readiness.score !== undefined && Number.isFinite(Number(readiness.score))
+    ? `${Number(readiness.score)}%`
+    : 'not run';
+  return [
+    `🛡 Promotion readiness · v${version}`,
+    state,
+    `Score: ${score} · minimum ${Number(readiness.minimum_score) || 90}%`,
+    `Suite coverage: ${readiness.complete_suite === true ? 'complete' : 'incomplete'} · fingerprint: ${readiness.fingerprint_matches === true ? 'current' : 'stale or unavailable'}`,
+    `Evaluation run: ${String(readiness.run_id || 'none')}`,
+    'Required checks:',
+    ...(checkLines.length ? checkLines : ['▫️ No scenario results are available.']),
+    'Blockers:',
+    ...(blockerLines.length ? blockerLines : ['• None']),
+    ...(readiness.eligible === true ? ['Next step: separate live-promotion confirmation is required.'] : []),
+  ].join('\n');
+}
+
+async function showCallScriptPromotionReadiness(ctx, script, ensureActive, apiClient = null) {
+  const safeEnsureActive = typeof ensureActive === 'function'
+    ? ensureActive
+    : () => ensureOperationActive(ctx, getCurrentOpId(ctx));
+  try {
+    const readiness = apiClient?.getPromotionReadiness
+      ? await apiClient.getPromotionReadiness(script.id)
+      : await getCallScriptPromotionReadiness(script.id);
+    safeEnsureActive();
+    await ctx.reply(buildCallScriptPromotionReadinessSummary(readiness));
+    return readiness;
+  } catch (error) {
+    console.error('Promotion readiness summary failed:', error);
+    await ctx.reply(formatScriptsApiError(error, 'Failed to load promotion readiness'));
+    return null;
+  }
+}
+
+async function runCallScriptPromotionFlow(conversation, ctx, script, ensureActive, apiClient = null) {
+  const safeEnsureActive = typeof ensureActive === 'function'
+    ? ensureActive
+    : () => ensureOperationActive(ctx, getCurrentOpId(ctx));
+  const readiness = apiClient?.getPromotionReadiness
+    ? await apiClient.getPromotionReadiness(script.id)
+    : await getCallScriptPromotionReadiness(script.id);
+  safeEnsureActive();
+  await ctx.reply(buildCallScriptPromotionReadinessSummary(readiness));
+  if (readiness?.eligible !== true) {
+    return null;
+  }
+  const ok = await confirm(conversation, ctx, `Promote *${escapeMarkdown(script.name)}* v${Number(readiness.version)} to live?`, safeEnsureActive);
+  if (!ok) {
+    await ctx.reply('Promotion cancelled.');
+    return null;
+  }
+  const actor = Number.isSafeInteger(Number(ctx.from?.id)) ? `telegram:${Number(ctx.from.id)}` : null;
+  const updated = apiClient?.promote
+    ? await apiClient.promote(script.id, actor)
+    : await promoteCallScriptLive(script.id, actor);
+  safeEnsureActive();
+  await ctx.reply('🚀 Script promoted to live after passing the Agent Lab gate.');
+  return updated;
 }
 
 async function listCallScriptApiVersions(id) {
@@ -1343,6 +1440,59 @@ async function listCallScriptApiVersions(id) {
     url: `/api/call-scripts/${id}/versions`,
   });
   return data.versions || [];
+}
+
+async function listCallScriptPromotionHistory(id, limit = 20) {
+  const data = await scriptsApiRequest({
+    method: 'get',
+    url: `/api/call-scripts/${id}/promotion-history`,
+    params: { limit },
+  });
+  return data.events || [];
+}
+
+async function showCallScriptPromotionHistory(conversation, ctx, script, ensureActive, apiClient = null) {
+  const safeEnsureActive = typeof ensureActive === 'function'
+    ? ensureActive
+    : () => ensureOperationActive(ctx, getCurrentOpId(ctx));
+  try {
+    const events = apiClient?.listPromotionHistory
+      ? await apiClient.listPromotionHistory(script.id, 20)
+      : await listCallScriptPromotionHistory(script.id, 20);
+    safeEnsureActive();
+    if (!events.length) {
+      await ctx.reply('ℹ️ No audited live promotions are recorded for this script yet.');
+      return [];
+    }
+    const lines = events.map((event) => {
+      const timestamp = event.created_at ? new Date(event.created_at).toLocaleString() : 'time unavailable';
+      const priorLive = event.previous_live_script_id
+        ? ` · replaced script ${Number(event.previous_live_script_id)} v${Number(event.previous_live_version) || '?'}`
+        : '';
+      return `🚀 v${Number(event.version)} · ${Number(event.score)}% · ${escapeMarkdown(String(event.actor || 'admin_token'))} · ${escapeMarkdown(timestamp)} · run ${escapeMarkdown(String(event.simulation_run_id || 'unknown'))}${priorLive}`;
+    });
+    await ctx.reply(`🧾 Promotion history · ${escapeMarkdown(script.name || `Script ${script.id}`)}\n${lines.join('\n')}`);
+    return events;
+  } catch (error) {
+    console.error('Promotion history failed:', error);
+    await ctx.reply(formatScriptsApiError(error, 'Failed to load promotion history'));
+    return [];
+  }
+}
+
+async function runCallAgentSimulationApi(id, body = {}) {
+  const data = await scriptsApiRequest({ method: 'post', url: `/api/call-scripts/${id}/simulation-runs`, data: body });
+  return data.simulation || {};
+}
+
+async function listCallAgentSimulationScenarios(id) {
+  const data = await scriptsApiRequest({ method: 'get', url: `/api/call-scripts/${id}/simulation-scenarios` });
+  return data.scenarios || [];
+}
+
+async function listCallAgentSimulationRuns(id, limit = 5) {
+  const data = await scriptsApiRequest({ method: 'get', url: `/api/call-scripts/${id}/simulation-runs`, params: { limit } });
+  return data.runs || [];
 }
 
 async function diffCallScriptApiVersions(id, fromVersion, toVersion) {
@@ -2118,7 +2268,7 @@ async function rollbackCallScriptVersionFlow(conversation, ctx, script, ensureAc
     const ok = await confirm(
       conversation,
       ctx,
-      `Rollback *${escapeMarkdown(script.name)}* to v${versionNumber}?`,
+      `Restore *${escapeMarkdown(script.name)}* from v${versionNumber} as a draft? It will need review, fresh Agent Lab checks, and approval before it can go live.`,
       safeEnsureActive
     );
     if (!ok) {
@@ -2127,7 +2277,7 @@ async function rollbackCallScriptVersionFlow(conversation, ctx, script, ensureAc
     }
     const updated = await rollbackCallScriptApiVersion(script.id, versionNumber);
     await ctx.reply(
-      `✅ Rolled back to v${versionNumber} (${escapeMarkdown(updated.name)}).`,
+      `✅ Restored saved content from v${versionNumber} as draft v${Number(updated.version) || '?'} (${escapeMarkdown(updated.name)}). Review, fresh Agent Lab checks, and approval are required before it can go live.`,
       { parse_mode: 'Markdown' }
     );
     return updated || script;
@@ -2236,6 +2386,88 @@ async function simulateCallScriptFlow(conversation, ctx, script, ensureActive) {
   }
 }
 
+async function runCallAgentSimulationLabFlow(conversation, ctx, script, ensureActive, apiClient = null) {
+  const safeEnsureActive = typeof ensureActive === 'function'
+    ? ensureActive
+    : () => ensureOperationActive(ctx, getCurrentOpId(ctx));
+  try {
+    const [versions, scenarios, runs] = await Promise.all([
+      apiClient?.listVersions ? apiClient.listVersions(script.id) : listCallScriptApiVersions(script.id),
+      apiClient?.listScenarios ? apiClient.listScenarios(script.id) : listCallAgentSimulationScenarios(script.id),
+      apiClient?.listRuns ? apiClient.listRuns(script.id, 5) : listCallAgentSimulationRuns(script.id, 5),
+    ]);
+    safeEnsureActive();
+    const currentVersion = Number(script.version) || 1;
+    const versionNumbers = Array.from(new Set([currentVersion, ...(versions || []).map((row) => Number(row.version)).filter(Number.isSafeInteger)]))
+      .sort((a, b) => b - a).slice(0, 8);
+    const choices = versionNumbers.map((version) => ({ id: String(version), label: version === currentVersion ? `Current · v${version}` : `Saved · v${version}` }));
+    if (runs.length) {
+      await ctx.reply(`🧪 Offline Agent Lab · last ${runs.length} run(s): ${runs.map((run) => `v${Number(run.version)} ${Number(run.score)}% ${run.evaluation_scope === 'focused' ? 'focused' : 'full'}`).join(' · ')}.\nThe lab uses fixed synthetic scenarios and deterministic policy checks. It does not run an AI model or place a call.`);
+    } else {
+      await ctx.reply('🧪 Offline Agent Lab uses fixed synthetic scenarios and deterministic policy checks. It does not run an AI model or place a call.');
+    }
+    const selected = await askOptionWithButtons(conversation, ctx, 'Choose the saved agent version to test.', choices, {
+      prefix: 'agent-simulation-version', columns: 2, ensureActive: safeEnsureActive,
+    });
+    if (!selected?.id) return;
+    let scenarioIds = scenarios.map((scenario) => String(scenario.id));
+    if (!scenarioIds.length) { await ctx.reply('No offline scenarios are available.'); return; }
+    const runsForVersion = runs.filter((run) => Number(run.version) === Number(selected.id));
+    const latestRelevantRun = runsForVersion.length
+      ? runsForVersion[0]
+      : runs[0];
+    const availableScenarioIds = new Set(scenarioIds);
+    const failedScenarioIds = latestRelevantRun && Array.isArray(latestRelevantRun.results?.scenarios)
+      ? Array.from(new Set(latestRelevantRun.results.scenarios
+        .filter((scenario) => scenario.status === 'failed' || scenario.passed === false)
+        .map((scenario) => String(scenario.id))
+        .filter((id) => availableScenarioIds.has(id))))
+      : [];
+    let focusedRun = false;
+    if (failedScenarioIds.length) {
+      const scope = await askOptionWithButtons(conversation, ctx,
+        `A prior v${Number(latestRelevantRun.version)} run failed ${failedScenarioIds.length} check(s). Choose full suite or focused rerun.`,
+        [
+          { id: 'full', label: 'Run full suite' },
+          { id: 'failed', label: `Rerun ${failedScenarioIds.length} failed` },
+          { id: 'back', label: '⬅️ Back' },
+        ],
+        { prefix: 'agent-simulation-scope', columns: 1, ensureActive: safeEnsureActive },
+      );
+      if (!scope || scope.id === 'back') return;
+      if (scope.id === 'failed') {
+        scenarioIds = failedScenarioIds;
+        focusedRun = true;
+      }
+    }
+    const runDescription = focusedRun
+      ? `Rerun ${scenarioIds.length} previously failed check(s) against v${selected.id}? This focused debug run cannot satisfy promotion; a full suite is still required. Type RUN OFFLINE SIMULATION to continue.`
+      : `Run the full ${scenarioIds.length}-check suite against v${selected.id}? Type RUN OFFLINE SIMULATION to continue.`;
+    const confirmation = await promptText(conversation, ctx,
+      runDescription,
+      { ensureActive: safeEnsureActive });
+    if (confirmation !== 'RUN OFFLINE SIMULATION') { await ctx.reply('Offline simulation canceled.'); return; }
+    const request = { version: Number(selected.id), scenario_ids: scenarioIds, idempotency_key: `agent-sim:${crypto.randomUUID()}` };
+    const simulation = apiClient?.run ? await apiClient.run(script.id, request) : await runCallAgentSimulationApi(script.id, request);
+    safeEnsureActive();
+    const scenarioLines = (simulation.scenarios || []).map((row) => `${row.status === 'passed' || row.status === 'not_applicable' ? '✅' : '⛔'} ${escapeMarkdown(String(scenarios.find((item) => item.id === row.id)?.label || row.id))} · ${escapeMarkdown(String(row.code || row.status))}`);
+    const comparison = simulation.comparison;
+    const comparisonSummary = comparison
+      ? comparison.same_scenario_coverage === false
+        ? `Compared with ${escapeMarkdown(String(comparison.baseline_run_id))} (v${Number(comparison.baseline_version)}): scenario coverage differs, so score delta is unavailable${comparison.regressions?.length ? ` · regressions: ${comparison.regressions.map(escapeMarkdown).join(', ')}` : ''}`
+        : `Compared with ${escapeMarkdown(String(comparison.baseline_run_id))} (v${Number(comparison.baseline_version)}): ${Number(comparison.score_delta) > 0 ? '+' : ''}${Number(comparison.score_delta)} points${comparison.regressions?.length ? ` · regressions: ${comparison.regressions.map(escapeMarkdown).join(', ')}` : ' · no newly failing checks'}`
+      : 'No prior run was available for comparison.';
+    const isFocusedResult = simulation.evaluation_scope === 'focused' || simulation.complete_suite === false || focusedRun;
+    const scopeSummary = isFocusedResult
+      ? 'Focused debug run only. It cannot satisfy promotion; rerun the full suite after edits.'
+      : 'Full suite run. Promotion still requires a current approved version and a passing full-suite result.';
+    await ctx.reply(`🧪 Offline simulation · v${Number(simulation.version)}\n${scopeSummary}\nScore: ${Number(simulation.score) || 0}% · passed ${Number(simulation.passed_count) || 0} · failed ${Number(simulation.failed_count) || 0}\n${scenarioLines.join('\n')}\n\n${comparisonSummary}\n\nMock model requests: ${Number(simulation.model_requests) || 0} · provider requests: ${Number(simulation.provider_requests) || 0}.`, { parse_mode: 'Markdown' });
+  } catch (error) {
+    console.error('Agent simulation lab failed:', error);
+    await ctx.reply(formatScriptsApiError(error, 'Offline Agent Lab failed'));
+  }
+}
+
 async function showCallScriptDetail(conversation, ctx, script, ensureActive) {
   const safeEnsureActive = typeof ensureActive === 'function'
     ? ensureActive
@@ -2250,9 +2482,12 @@ async function showCallScriptDetail(conversation, ctx, script, ensureActive) {
       const actions = [
         { id: 'preview', label: '📞 Preview' },
         { id: 'simulate', label: '🧪 Simulate' },
+        { id: 'agent_lab', label: '🧪 Agent Lab' },
         { id: 'edit', label: '✏️ Edit' },
         { id: 'clone', label: '🧬 Clone' },
         { id: 'versions', label: '🗂️ Versions' },
+        { id: 'promotion_readiness', label: '🛡 Readiness' },
+        { id: 'promotion_history', label: '🧾 Promotion history' },
         { id: 'diff', label: '🧮 Diff' },
         { id: 'rollback', label: '↩️ Rollback' }
       ];
@@ -2292,6 +2527,9 @@ async function showCallScriptDetail(conversation, ctx, script, ensureActive) {
         case 'simulate':
           await simulateCallScriptFlow(conversation, ctx, script, safeEnsureActive);
           break;
+        case 'agent_lab':
+          await runCallAgentSimulationLabFlow(conversation, ctx, script, safeEnsureActive);
+          break;
         case 'edit':
           await editCallScriptFlow(conversation, ctx, script, safeEnsureActive);
           try {
@@ -2307,6 +2545,12 @@ async function showCallScriptDetail(conversation, ctx, script, ensureActive) {
           break;
         case 'versions':
           await showCallScriptVersions(conversation, ctx, script, safeEnsureActive);
+          break;
+        case 'promotion_readiness':
+          await showCallScriptPromotionReadiness(ctx, script, safeEnsureActive);
+          break;
+        case 'promotion_history':
+          await showCallScriptPromotionHistory(conversation, ctx, script, safeEnsureActive);
           break;
         case 'diff':
           await showCallScriptVersionDiffFlow(conversation, ctx, script, safeEnsureActive);
@@ -2369,19 +2613,9 @@ async function showCallScriptDetail(conversation, ctx, script, ensureActive) {
           break;
         }
         case 'promote_live': {
-          const ok = await confirm(
-            conversation,
-            ctx,
-            `Promote *${escapeMarkdown(script.name)}* to live?`,
-            safeEnsureActive
-          );
-          if (!ok) {
-            await ctx.reply('Promotion cancelled.');
-            break;
-          }
           try {
-            script = await promoteCallScriptLive(script.id);
-            await ctx.reply('🚀 Script promoted to live.');
+            const promoted = await runCallScriptPromotionFlow(conversation, ctx, script, safeEnsureActive);
+            if (promoted) script = promoted;
           } catch (error) {
             await ctx.reply(formatScriptsApiError(error, 'Failed to promote script'));
           }
@@ -3658,5 +3892,14 @@ function registerScriptsCommand(bot) {
 
 module.exports = {
   scriptsFlow,
+  runCallAgentSimulationLabFlow,
+  runCallScriptPromotionFlow,
+  buildCallScriptPromotionReadinessSummary,
+  showCallScriptPromotionReadiness,
+  showCallScriptPromotionHistory,
+  listCallScriptPromotionHistory,
+  runCallAgentSimulationApi,
+  listCallAgentSimulationScenarios,
+  listCallAgentSimulationRuns,
   registerScriptsCommand
 };

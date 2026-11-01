@@ -32,7 +32,7 @@ describe("Vapi webhook event normalization", () => {
     assert.equal(result.assistantId, undefined);
   });
 
-  it("returns explicit unavailable results for tool requests without executing or storing arguments", async () => {
+  it("returns explicit unavailable errors for unapproved tool requests without storing arguments", async () => {
     let stored = 0;
     const service = new VapiWebhookService({
       db: { async recordVapiCallEvent() { stored += 1; return { inserted: true }; } },
@@ -49,8 +49,8 @@ describe("Vapi webhook event normalization", () => {
     assert.deepEqual(result, {
       toolCallResponse: true,
       results: [
-        { name: "lookupCustomer", toolCallId: "tool-1", result: "This tool is not enabled in VOICEDNUT." },
-        { name: "sendMessage", toolCallId: "tool-2", result: "This tool is not enabled in VOICEDNUT." },
+        { toolCallId: "tool-1", error: "This function is not enabled for this assistant." },
+        { toolCallId: "tool-2", error: "This function is not enabled for this assistant." },
       ],
     });
     assert.equal(JSON.stringify(result).includes("private@example.test"), false);

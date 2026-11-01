@@ -1,4 +1,5 @@
 const { VapiApiError } = require("./vapiClient");
+const { VAPI_BUSINESS_CONTEXT_TOOL_ID } = require("./vapiToolRegistry");
 const {
   fingerprintVapiTemplateMapping,
   mapCallTemplateToVapiAssistant,
@@ -49,6 +50,7 @@ function buildAssistantSyncPayload(
             "end-of-call-report",
             "hang",
             "transfer-update",
+            ...(Array.isArray(preview.assistant?.tools) && preview.assistant.tools.length ? ["tool-calls"] : []),
           ])),
         }
       : {}),
@@ -102,7 +104,7 @@ class VapiTemplateSyncService {
           ...(vapiVoice ? { voice: vapiVoice } : {}),
         },
       },
-    });
+    }, { serverConfiguration });
     if (!preview.compatible) {
       throw new VapiApiError("Template has unmapped behavior and cannot be synchronized", {
         code: "vapi_template_incompatible",
@@ -125,6 +127,9 @@ class VapiTemplateSyncService {
         mapped_fields: preview.mappedFields,
         unsupported: preview.unsupported,
         missing: preview.missing,
+        approved_tools: Array.isArray(preview.assistant?.tools) && preview.assistant.tools.length
+          ? [VAPI_BUSINESS_CONTEXT_TOOL_ID]
+          : [],
       },
     });
     const records = await this.db.listVapiTemplateMappings(templateId);

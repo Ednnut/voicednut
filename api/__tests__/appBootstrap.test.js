@@ -18,6 +18,69 @@ describe("API app bootstrap", function () {
     }
   });
 
+  it("registers the Vapi readiness route behind admin-token authorization", function () {
+    const route = app._router.stack.find((layer) => layer.route?.path === "/api/vapi/status");
+    assert.ok(route, "Vapi readiness route should be registered");
+    assert.equal(route.route.methods.get, true);
+    assert.equal(route.route.stack[0].name, "requireAdminToken");
+  });
+
+  it("registers Vapi tool policy reads and mutations behind admin-token authorization", function () {
+    for (const [path, method] of [
+      ["/api/call-scripts/:id/vapi-tools", "get"],
+      ["/api/call-scripts/:id/vapi-tools", "put"],
+    ]) {
+      const route = app._router.stack.find((layer) => layer.route?.path === path && layer.route.methods[method]);
+      assert.ok(route, `${method.toUpperCase()} ${path} should be registered`);
+      assert.equal(route.route.stack[0].name, "requireAdminToken");
+    }
+  });
+
+  it("registers Vapi mapping health and exact-confirmation resync behind admin-token authorization", function () {
+    for (const [path, method] of [
+      ["/api/call-scripts/:id/vapi-health", "get"],
+      ["/api/call-scripts/:id/vapi-mappings/:mapping_id/resync", "post"],
+    ]) {
+      const route = app._router.stack.find((layer) => layer.route?.path === path && layer.route.methods[method]);
+      assert.ok(route, `${method.toUpperCase()} ${path} should be registered`);
+      assert.equal(route.route.stack[0].name, "requireAdminToken");
+    }
+  });
+
+  it("registers Vapi simulation coverage, history, and runs behind admin-token authorization", function () {
+    for (const [path, method] of [
+      ["/api/call-scripts/:id/vapi-simulation-suites", "get"],
+      ["/api/call-scripts/:id/vapi-simulation-runs", "get"],
+      ["/api/call-scripts/:id/vapi-simulation-runs", "post"],
+    ]) {
+      const route = app._router.stack.find((layer) => layer.route?.path === path && layer.route.methods[method]);
+      assert.ok(route, `${method.toUpperCase()} ${path} should be registered`);
+      assert.equal(route.route.stack[0].name, "requireAdminToken");
+    }
+  });
+
+  it("registers Vapi eval definitions and run history behind admin-token authorization", function () {
+    for (const [path, method] of [
+      ["/api/vapi/evals", "get"],
+      ["/api/vapi/evals", "post"],
+      ["/api/vapi/eval-runs", "get"],
+      ["/api/vapi/eval-runs/:runId", "get"],
+      ["/api/vapi/eval-runs", "post"],
+    ]) {
+      const route = app._router.stack.find((layer) => layer.route?.path === path && layer.route.methods[method]);
+      assert.ok(route, `${method.toUpperCase()} ${path} should be registered`);
+      assert.equal(route.route.stack[0].name, "requireAdminToken");
+    }
+  });
+
+  it("registers Vapi Squad inventory and details behind admin-token authorization", function () {
+    for (const path of ["/api/vapi/squads", "/api/vapi/squads/:squadId"]) {
+      const route = app._router.stack.find((layer) => layer.route?.path === path && layer.route.methods.get);
+      assert.ok(route, `GET ${path} should be registered`);
+      assert.equal(route.route.stack[0].name, "requireAdminToken");
+    }
+  });
+
   it("registers workflow definition reads and mutations behind admin-token authorization", function () {
     const layers = app._router.stack;
     const paths = [
@@ -32,6 +95,15 @@ describe("API app bootstrap", function () {
       return matching.map((layer) => layer.route.stack.map((handler) => handler.name));
     });
     assert.ok(routes.every((handlers) => handlers.length >= 2));
+  });
+
+  it("registers Agent Lab promotion controls behind admin-token authorization", function () {
+    const layers = app._router.stack;
+    for (const path of ["/api/call-scripts/:id/promotion-readiness", "/api/call-scripts/:id/promotion-history", "/api/call-scripts/:id/promote-live"]) {
+      const route = layers.find((layer) => layer.route?.path === path);
+      assert.ok(route, `${path} should be registered`);
+      assert.equal(route.route.stack[0].name, "requireAdminToken");
+    }
   });
 
   it("forwards agent runtime configuration and voice selection through Script Studio updates", function () {
@@ -52,5 +124,33 @@ describe("API app bootstrap", function () {
       }),
       { error: "agent_config must be a JSON object or null" },
     );
+  });
+
+  it("limits platform-global workflow actions to platform admins and bounds their API specs", function () {
+    const adminCaps = __testables.getMiniAppCapabilitiesForRole("admin");
+    assert.ok(adminCaps.includes("workflow_manage"));
+    assert.equal(__testables.getMiniAppCapabilitiesForRole("operator").includes("workflow_manage"), false);
+    assert.equal(__testables.getMiniAppCapabilitiesForRole("viewer").includes("workflow_manage"), false);
+
+    const versions = __testables.buildMiniAppActionSpec("workflow.versions", { limit: 500 });
+    assert.equal(versions.capability, "workflow_manage");
+    assert.deepEqual(versions.query, { workflow_id: undefined, limit: 100 });
+    assert.equal(__testables.buildMiniAppActionSpec("workflow.versions", { workflow_id: "bad id" }).error, "workflow_id is invalid");
+
+    const draft = __testables.buildMiniAppActionSpec("workflow.draft", { definition: { workflow_id: "safe" } });
+    assert.equal(draft.capability, "workflow_manage");
+    assert.equal(draft.method, "POST");
+    assert.equal(draft.body.workflow_id, "safe");
+    assert.equal(__testables.buildMiniAppActionSpec("workflow.draft", { definition: [] }).error, "definition must be a JSON object");
+
+    const runs = __testables.buildMiniAppActionSpec("workflow.runs", { status: "waiting_approval", limit: 5 });
+    assert.equal(runs.capability, "workflow_manage");
+    assert.deepEqual(runs.query, { workflow_id: undefined, status: "waiting_approval", limit: 5 });
+    assert.equal(__testables.buildMiniAppActionSpec("workflow.runs", { status: "unknown" }).error, "status is invalid");
+
+    const run = __testables.buildMiniAppActionSpec("workflow.run.get", { run_id: "run_1" });
+    assert.equal(run.path, "/post-call/workflows/runs/run_1");
+    assert.equal(run.capability, "workflow_manage");
+    assert.equal(__testables.buildMiniAppActionSpec("workflow.run.get", { run_id: "../admin" }).error, "run_id is invalid");
   });
 });

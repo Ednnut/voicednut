@@ -1,8 +1,18 @@
 require("dotenv").config();
 const fs = require("fs");
 const path = require("path");
+const { DEFAULT_API_BASE_URL: DEFAULT_CARTESIA_API_BASE_URL, normalizeCartesiaApiBaseUrl, cartesiaWebSocketBaseUrl } = require("./services/cartesiaEndpoints");
 
 const isProduction = process.env.NODE_ENV === "production";
+
+const cartesiaEnabled = readBooleanEnv("CARTESIA_ENABLED", false);
+let cartesiaApiBaseUrl = DEFAULT_CARTESIA_API_BASE_URL;
+try {
+  cartesiaApiBaseUrl = normalizeCartesiaApiBaseUrl(readEnv("CARTESIA_API_BASE_URL"));
+} catch (error) {
+  if (cartesiaEnabled) throw error;
+  console.warn("Invalid CARTESIA_API_BASE_URL ignored because Cartesia is disabled", { code: String(error?.code || "cartesia_endpoint_invalid") });
+}
 
 function readEnv(name) {
   const value = process.env[name];
@@ -460,6 +470,7 @@ const callE = {
   enabled: readBooleanEnv("CALLE_ENABLED", false),
   dispatchEnabled: readBooleanEnv("CALLE_DISPATCH_ENABLED", false),
   apiKey: readEnv("CALLE_API_KEY") || "",
+  actorAssertionSecret: readEnv("CALL_E_ACTOR_ASSERTION_SECRET") || "",
   baseUrl: readEnv("CALLE_BASE_URL") || "https://api.heycall-e.com",
   apiTimeoutMs: Number(readEnv("CALLE_API_TIMEOUT_MS") || "10000"),
   allowedDestinations: parseList(readEnv("CALLE_ALLOWED_DESTINATIONS")),
@@ -468,6 +479,27 @@ const callE = {
   pilotApprovalReference: readEnv("CALLE_PILOT_APPROVAL_REFERENCE") || "",
   pilotApprovalExpiresAt: readEnv("CALLE_PILOT_APPROVAL_EXPIRES_AT") || "",
   pilotReadinessReviewed: readBooleanEnv("CALLE_PILOT_READINESS_REVIEWED", false),
+  missionEncryptionKeys: parseJsonObject(readEnv("CALLE_MISSION_ENCRYPTION_KEYS"), "CALLE_MISSION_ENCRYPTION_KEYS"),
+  missionEncryptionKeyVersion: Number(readEnv("CALLE_MISSION_ENCRYPTION_KEY_VERSION") || "1"),
+  missionDispatchEnabled: readBooleanEnv("CALLE_MISSION_DISPATCH_ENABLED", false),
+  missionApprovedId: readEnv("CALLE_MISSION_APPROVED_ID") || "",
+  missionApprovedFingerprint: readEnv("CALLE_MISSION_APPROVED_FINGERPRINT") || "",
+  missionApprovalReference: readEnv("CALLE_MISSION_APPROVAL_REFERENCE") || "",
+  missionApprovalExpiresAt: readEnv("CALLE_MISSION_APPROVAL_EXPIRES_AT") || "",
+  missionMaxRecipients: Number(readEnv("CALLE_MISSION_MAX_RECIPIENTS") || "0"),
+  missionWorkerEnabled: readBooleanEnv("CALLE_MISSION_WORKER_ENABLED", false),
+  missionWorkerBusinessId: readEnv("CALLE_MISSION_WORKER_BUSINESS_ID") || "",
+  missionWorkerActorId: readEnv("CALLE_MISSION_WORKER_ACTOR_ID") || "",
+  missionWorkerId: readEnv("CALLE_MISSION_WORKER_ID") || "voicednut-call-e-mission-worker-1",
+  missionWorkerIntervalMs: Number(readEnv("CALLE_MISSION_WORKER_INTERVAL_MS") || "60000"),
+  goalRunDispatchEnabled: readBooleanEnv("CALLE_GOAL_RUN_DISPATCH_ENABLED", false),
+  sensitiveDataRetentionDays: Number(readEnv("CALLE_SENSITIVE_DATA_RETENTION_DAYS") || "90"),
+  dataRetentionWorkerEnabled: readBooleanEnv("CALLE_DATA_RETENTION_WORKER_ENABLED", false),
+  dataRetentionWorkerIntervalMs: Number(readEnv("CALLE_DATA_RETENTION_WORKER_INTERVAL_MS") || "3600000"),
+  opsAlertsWorkerEnabled: readBooleanEnv("CALLE_OPS_ALERTS_WORKER_ENABLED", false),
+  opsAlertsWorkerIntervalMs: Number(readEnv("CALLE_OPS_ALERTS_WORKER_INTERVAL_MS") || "60000"),
+  missionAutomationWorkerEnabled: readBooleanEnv("CALLE_MISSION_AUTOMATION_WORKER_ENABLED", false),
+  missionAutomationWorkerIntervalMs: Number(readEnv("CALLE_MISSION_AUTOMATION_WORKER_INTERVAL_MS") || "60000"),
 };
 const apiSecret = readEnv("API_SECRET");
 const adminApiToken = apiSecret || readEnv("ADMIN_API_TOKEN");
@@ -652,6 +684,8 @@ const providerFailoverWindowMs =
   Number(readEnv("PROVIDER_ERROR_WINDOW_S") || "120") * 1000;
 const providerFailoverCooldownMs =
   Number(readEnv("PROVIDER_COOLDOWN_S") || "300") * 1000;
+const callProviderOrder = String(readEnv("CALL_PROVIDER_ORDER") || "")
+  .split(",").map((provider) => provider.trim().toLowerCase()).filter(Boolean);
 const keypadGuardEnabled =
   String(readEnv("KEYPAD_GUARD_ENABLED") || "true").toLowerCase() === "true";
 const keypadVonageDtmfTimeoutMs = Number(
@@ -736,6 +770,7 @@ const postCallQaAllowlist = parseList(readEnv("POST_CALL_QA_ALLOWLIST") || "");
 const postCallQaMinTurns = Number(readEnv("POST_CALL_QA_MIN_TURNS") || "4");
 const postCallQaMinScore = Number(readEnv("POST_CALL_QA_MIN_SCORE") || "70");
 const postCallQaVersion = String(readEnv("POST_CALL_QA_VERSION") || "post_call_qa_v1").trim();
+const postCallWorkflowsEnabled = readBooleanEnv("POST_CALL_WORKFLOWS_ENABLED", false);
 const postCallQaProfileThresholds = parseNumericMap(
   readEnv("POST_CALL_QA_PROFILE_THRESHOLDS"),
   { min: 0, max: 100 },
@@ -1113,6 +1148,19 @@ module.exports = {
     provider: callProvider,
   },
   callE,
+  cartesia: {
+    enabled: cartesiaEnabled,
+    dispatchEnabled: readBooleanEnv("CARTESIA_DISPATCH_ENABLED", false),
+    agentRuntimeEnabled: readBooleanEnv("CARTESIA_AGENT_RUNTIME_ENABLED", false),
+    apiKey: readEnv("CARTESIA_API_KEY") || "",
+    apiBaseUrl: cartesiaApiBaseUrl,
+    websocketBaseUrl: cartesiaWebSocketBaseUrl(cartesiaApiBaseUrl),
+    adminApiKey: readEnv("CARTESIA_ADMIN_API_KEY") || "",
+    approvalSecret: readEnv("CARTESIA_APPROVAL_SECRET") || "",
+    webhookSecret: readEnv("CARTESIA_WEBHOOK_SECRET") || "",
+    webhookUrl: readEnv("CARTESIA_WEBHOOK_URL") || "",
+    requestTimeoutMs: Number(readEnv("CARTESIA_API_TIMEOUT_MS") || "12000"),
+  },
   twilio: {
     accountSid: ensure("TWILIO_ACCOUNT_SID"),
     authToken: ensure("TWILIO_AUTH_TOKEN"),
@@ -1650,6 +1698,7 @@ module.exports = {
   },
   providerFailover: {
     enabled: providerFailoverEnabled,
+    callOrder: callProviderOrder,
     errorThreshold: providerFailoverThreshold,
     errorWindowMs: providerFailoverWindowMs,
     cooldownMs: providerFailoverCooldownMs,
@@ -1758,6 +1807,10 @@ module.exports = {
     version: postCallQaVersion || "post_call_qa_v1",
     profileThresholds: postCallQaProfileThresholds,
     rubricWeights: postCallQaRubricWeights,
+  },
+  postCallWorkflows: {
+    enabled: postCallWorkflowsEnabled,
+    pollIntervalMs: Number(readEnv("POST_CALL_WORKFLOWS_POLL_INTERVAL_MS") || "1500"),
   },
   domainFlows: {
     enabled: domainFlowsEnabled,

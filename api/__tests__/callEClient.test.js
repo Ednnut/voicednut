@@ -117,6 +117,53 @@ describe("CALL-E server client", () => {
     assert.throws(() => client.listCallEvents("call_test_123", { cursor: "x".repeat(513) }), (error) => error.code === "call_e_invalid_cursor");
   });
 
+  it("lists and reads published CALL-E Goals with an opaque cursor", async () => {
+    const requests = [];
+    const client = new CallEClient({ enabled: true, apiKey: "goal-test-key", baseUrl: CALL_E_TEST_BASE_URL, fetchFn: async (url, options) => {
+      requests.push({ url, options });
+      return jsonResponse(200, { object: "list", data: [], next_cursor: null });
+    } });
+    await client.listGoals({ limit: 35, after: "opaque cursor/+1" });
+    await client.getGoal("goal delivery/confirm v1");
+    assert.equal(requests[0].url, `${CALL_E_TEST_BASE_URL}/v1/goals?limit=35&after=opaque+cursor%2F%2B1`);
+    assert.equal(requests[1].url, `${CALL_E_TEST_BASE_URL}/v1/goals/goal%20delivery%2Fconfirm%20v1`);
+    assert.equal(requests[0].options.headers.Authorization, "Bearer goal-test-key");
+    assert.equal(requests[0].options.method, "GET");
+    assert.throws(() => client.listGoals({ limit: 101 }), (error) => error.code === "call_e_invalid_goal_limit");
+    assert.throws(() => client.listGoals({ after: "x".repeat(513) }), (error) => error.code === "call_e_invalid_goal_cursor");
+    assert.throws(() => client.getGoal("bad\npath"), (error) => error.code === "call_e_invalid_goal_id");
+  });
+
+  it("creates and reads singleton Goal Runs with stable idempotency and closed scalar inputs", async () => {
+    const requests = [];
+    const metrics = [];
+    const client = new CallEClient({ enabled: true, apiKey: "goal-run-server-key", baseUrl: CALL_E_TEST_BASE_URL, onMetric: (metric) => metrics.push(metric), fetchFn: async (url, options) => {
+      requests.push({ url, options });
+      return jsonResponse(url.includes("/runs/") ? 200 : 201, { object: "goal_run", id: "rgrp_123", status: "queued", result_status: "pending" });
+    } });
+    const created = await client.createGoalRun("goal_delivery_v1", {
+      phone: "+14155550123",
+      variables: { customer_name: "Test User", order_reference: "ORD-TEST-1", is_priority: false, attempt: 1 },
+    }, "voicednut:goal-run:order-test-1:v1");
+    await client.getGoalRun("goal_delivery_v1", created.id);
+    assert.equal(requests[0].url, `${CALL_E_TEST_BASE_URL}/v1/goals/goal_delivery_v1/runs`);
+    assert.equal(requests[0].options.method, "POST");
+    assert.equal(requests[0].options.headers.Authorization, "Bearer goal-run-server-key");
+    assert.equal(requests[0].options.headers["Idempotency-Key"], "voicednut:goal-run:order-test-1:v1");
+    assert.deepEqual(JSON.parse(requests[0].options.body), {
+      phone: "+14155550123",
+      variables: { customer_name: "Test User", order_reference: "ORD-TEST-1", is_priority: false, attempt: 1 },
+    });
+    assert.equal(requests[1].url, `${CALL_E_TEST_BASE_URL}/v1/goals/goal_delivery_v1/runs/rgrp_123`);
+    assert.deepEqual(metrics.map((metric) => metric.operation), ["goal_run.create", "goal_run.read"]);
+    assert.equal(JSON.stringify(metrics).includes("ORD-TEST-1"), false);
+
+    assert.throws(() => client.createGoalRun("goal_delivery_v1", { phone: "4155550123", variables: {} }, "stable-key"), (error) => error.code === "call_e_invalid_goal_phone");
+    assert.throws(() => client.createGoalRun("goal_delivery_v1", { phone: "+14155550123", variables: { nested: { private: true } } }, "stable-key"), (error) => error.code === "call_e_invalid_goal_variables");
+    assert.throws(() => client.createGoalRun("goal_delivery_v1", { phone: "+14155550123", task: "not allowed" }, "stable-key"), (error) => error.code === "call_e_goal_run_request_invalid");
+    assert.throws(() => client.createGoalRun("goal_delivery_v1", { phone: "+14155550123" }, ""), (error) => error.code === "call_e_idempotency_key_required");
+  });
+
   it("returns sanitized errors and marks only documented pre-acceptance errors as no-call", async () => {
     const client = new CallEClient({ enabled: true, apiKey: "secret", fetchFn: async () => jsonResponse(422, {
       error: { code: "unsupported_region", message: "sensitive provider detail" },
@@ -139,6 +186,27 @@ describe("CALL-E server client", () => {
       assert.equal(error.reasonCode, "creation_in_progress");
       assert.equal(error.recoveryAction, "backoff_same_request_and_idempotency_key");
       assert.equal(error.message.includes("private detail"), false);
+      return true;
+    });
+  });
+
+  it("normalizes CALL-E input clarification into bounded allowlisted field names", async () => {
+    const client = new CallEClient({ enabled: true, apiKey: "secret", fetchFn: async () => jsonResponse(422, {
+      error: {
+        code: "input_incomplete",
+        message: "private provider text",
+        details: {
+          missing_inputs: ["locale", "region", "customer_email", "phone", "task", "result_schema", "phone"],
+          fields: ["phone", "region", "customer_email"],
+        },
+      },
+    }) });
+    await assert.rejects(client.createCall({ task: "x" }, "voicednut:call-e:clarification"), (error) => {
+      assert.deepEqual(error.clarification, {
+        missingInputs: ["locale", "region", "phone", "task", "result_schema"],
+        fields: ["phone", "region"],
+      });
+      assert.equal(error.message.includes("private provider text"), false);
       return true;
     });
   });

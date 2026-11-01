@@ -1,4 +1,5 @@
-const fetch = require("node-fetch");
+const defaultFetch = globalThis.fetch || require("node-fetch");
+const { CallEProviderHealth, sharedCallEProviderHealth } = require('./callEProviderHealth');
 
 const CALL_E_PRODUCTION_BASE_URL = "https://api.heycall-e.com";
 const CALL_E_TEST_BASE_URL = "https://test-api.heycall-e.com";
@@ -10,6 +11,17 @@ const KNOWN_NO_CALL_CODES = new Set([
   "unsupported_language",
   "result_schema_invalid",
 ]);
+const CLARIFICATION_FIELDS = new Set(["task", "phone", "region", "locale", "result_schema"]);
+
+function normalizeClarification(providerCode, details = {}) {
+  if (providerCode !== "input_incomplete") return null;
+  const normalize = (value) => Array.isArray(value)
+    ? [...new Set(value.filter((item) => typeof item === "string" && CLARIFICATION_FIELDS.has(item.trim())).map((item) => item.trim()))].slice(0, 5)
+    : [];
+  const missingInputs = normalize(details.missing_inputs);
+  const fields = normalize(details.fields);
+  return missingInputs.length || fields.length ? { missingInputs, fields } : null;
+}
 const CALL_E_PILOT_DISPATCH_BLOCKERS = Object.freeze([
   "dispatch_kill_switch_disabled",
   "exact_preview_pilot_approval_missing_or_expired",
@@ -27,6 +39,12 @@ class CallEApiError extends Error {
     this.providerCode = String(details.providerCode || "");
     this.reasonCode = String(details.reasonCode || "");
     this.recoveryAction = String(details.recoveryAction || "inspect_call_state");
+    this.clarification = details.clarification && typeof details.clarification === "object"
+      ? Object.freeze({
+        missingInputs: Object.freeze(Array.isArray(details.clarification.missingInputs) ? [...details.clarification.missingInputs] : []),
+        fields: Object.freeze(Array.isArray(details.clarification.fields) ? [...details.clarification.fields] : []),
+      })
+      : null;
   }
 }
 
@@ -68,7 +86,53 @@ function callEOperationName(method, pathname) {
   if (/^\/v2\/calls\/[A-Za-z0-9_-]{1,200}\/cancel$/.test(pathname)) return "call.cancel";
   if (/^\/v2\/calls\/[A-Za-z0-9_-]{1,200}\/events$/.test(pathname)) return "call.events.read";
   if (/^\/v2\/calls\/[A-Za-z0-9_-]{1,200}$/.test(pathname)) return "call.read";
+  if (pathname === "/v1/goals" && method === "GET") return "goal.list";
+  if (/^\/v1\/goals\/.{1,765}$/.test(pathname) && !pathname.includes("/runs")) return "goal.read";
+  if (/^\/v1\/goals\/.{1,765}\/runs$/.test(pathname) && method === "POST") return "goal_run.create";
+  if (/^\/v1\/goals\/.{1,765}\/runs\/.{1,765}$/.test(pathname) && method === "GET") return "goal_run.read";
   return "unknown";
+}
+
+function normalizeOpaquePathId(value, label, code) {
+  const id = String(value == null ? "" : value).trim();
+  if (!id || id.length > 255 || /[\u0000-\u001f\u007f]/.test(id)) {
+    throw new CallEApiError(`CALL-E ${label} is invalid`, { code });
+  }
+  return id;
+}
+
+function validateGoalRunVariables(value) {
+  if (value === undefined) return undefined;
+  if (!value || typeof value !== "object" || Array.isArray(value) || Object.getPrototypeOf(value) !== Object.prototype) {
+    throw new CallEApiError("CALL-E Goal Run variables must be a flat object", { code: "call_e_invalid_goal_variables" });
+  }
+  const entries = Object.entries(value);
+  if (entries.length > 100) {
+    throw new CallEApiError("CALL-E Goal Run variables contain too many fields", { code: "call_e_invalid_goal_variables" });
+  }
+  for (const [key, item] of entries) {
+    if (!key || key.length > 120 || /[\u0000-\u001f\u007f]/.test(key) ||
+        (typeof item !== "string" && typeof item !== "boolean" && !(typeof item === "number" && Number.isFinite(item)))) {
+      throw new CallEApiError("CALL-E Goal Run variables must contain only finite scalar values", { code: "call_e_invalid_goal_variables" });
+    }
+  }
+  return value;
+}
+
+function validateGoalRunRequest(request = {}) {
+  if (!request || typeof request !== "object" || Array.isArray(request) || Object.getPrototypeOf(request) !== Object.prototype) {
+    throw new CallEApiError("CALL-E Goal Run request is invalid", { code: "call_e_goal_run_request_invalid" });
+  }
+  const allowedKeys = new Set(["phone", "variables"]);
+  if (Object.keys(request).some((key) => !allowedKeys.has(key))) {
+    throw new CallEApiError("CALL-E Goal Run request contains unsupported fields", { code: "call_e_goal_run_request_invalid" });
+  }
+  const phone = String(request.phone || "").trim();
+  if (!/^\+[1-9]\d{7,14}$/.test(phone)) {
+    throw new CallEApiError("CALL-E Goal Run phone must be canonical E.164", { code: "call_e_invalid_goal_phone" });
+  }
+  const variables = validateGoalRunVariables(request.variables);
+  return { phone, ...(variables === undefined ? {} : { variables }) };
 }
 
 class CallEClient {
@@ -77,7 +141,8 @@ class CallEClient {
     this.apiKey = String(options.apiKey || "").trim();
     this.baseUrl = String(options.baseUrl || CALL_E_PRODUCTION_BASE_URL).replace(/\/+$/, "");
     this.timeoutMs = Math.max(1000, Math.min(30000, Number(options.timeoutMs) || 10000));
-    this.fetch = options.fetchFn || fetch;
+    this.fetch = options.fetchFn || defaultFetch;
+    this.providerHealth = options.providerHealth || new CallEProviderHealth();
     this.onMetric = typeof options.onMetric === "function" ? options.onMetric : (metric) => {
       console.info("call_e_request_metric", metric);
     };
@@ -96,7 +161,11 @@ class CallEClient {
     }
     const pathname = typeof path === "string" ? path.split("?", 1)[0] : "";
     const validPath = pathname === "/v2/calls" ||
-      /^\/v2\/calls\/[A-Za-z0-9_-]{1,200}(?:\/(?:cancel|events))?$/.test(pathname);
+      /^\/v2\/calls\/[A-Za-z0-9_-]{1,200}(?:\/(?:cancel|events))?$/.test(pathname) ||
+      pathname === "/v1/goals" ||
+      /^\/v1\/goals\/(?:[A-Za-z0-9_.~-]|%[0-9A-F]{2}){1,765}$/.test(pathname) ||
+      /^\/v1\/goals\/(?:[A-Za-z0-9_.~-]|%[0-9A-F]{2}){1,765}\/runs$/.test(pathname) ||
+      /^\/v1\/goals\/(?:[A-Za-z0-9_.~-]|%[0-9A-F]{2}){1,765}\/runs\/(?:[A-Za-z0-9_.~-]|%[0-9A-F]{2}){1,765}$/.test(pathname);
     if (!validPath || path.startsWith("//")) {
       throw new CallEApiError("CALL-E API path is invalid", { code: "call_e_invalid_path" });
     }
@@ -127,6 +196,7 @@ class CallEClient {
         const status = Number(response.status) || null;
         statusCode = status;
         const providerCode = readErrorCode(payload);
+        const clarification = normalizeClarification(providerCode, payload?.error?.details || {});
         const rawReasonCode = String(payload?.error?.details?.reason_code || "").trim();
         const reasonCode = /^[a-z][a-z0-9_]{0,79}$/.test(rawReasonCode) ? rawReasonCode : "";
         const noCallCreated = (status === 422 && KNOWN_NO_CALL_CODES.has(providerCode)) ||
@@ -152,6 +222,7 @@ class CallEClient {
           providerCode,
           reasonCode,
           recoveryAction,
+          clarification,
           retryable: status === 429 || (status !== null && status >= 500),
         });
       }
@@ -174,14 +245,16 @@ class CallEClient {
     } finally {
       if (timeout) clearTimeout(timeout);
       try {
-        this.onMetric({
+        const metric = {
           operation,
           method: requestMethod,
           outcome,
           statusCode,
           durationMs: Math.max(0, Date.now() - startedAt),
           ...(errorCode ? { errorCode } : {}),
-        });
+        };
+        this.providerHealth?.observe?.(metric);
+        this.onMetric(metric);
       } catch {
         // Metrics must never alter provider request behavior.
       }
@@ -195,7 +268,16 @@ class CallEClient {
     if (!request || typeof request !== "object" || Array.isArray(request)) {
       throw new CallEApiError("CALL-E call request is invalid", { code: "call_e_request_invalid" });
     }
+    if (this.providerHealth?.canDispatch && !this.providerHealth.canDispatch()) {
+      throw new CallEApiError('CALL-E create circuit is open; retry after the provider cooldown', {
+        code: 'call_e_circuit_open', status: 503, noCallCreated: true, retryable: true,
+      });
+    }
     return this.request("POST", "/v2/calls", { body: request, idempotencyKey: String(idempotencyKey) });
+  }
+
+  getProviderHealth() {
+    return this.providerHealth?.snapshot?.() || { circuitState: 'unknown', dispatchAllowed: false };
   }
 
   getCall(callId) {
@@ -223,6 +305,48 @@ class CallEClient {
     }
     return this.request("GET", `/v2/calls/${encodeURIComponent(id)}/events?${query.toString()}`);
   }
+
+  listGoals(options = {}) {
+    const limit = options.limit === undefined ? 20 : Number(options.limit);
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+      throw new CallEApiError("CALL-E Goal list limit must be between 1 and 100", { code: "call_e_invalid_goal_limit" });
+    }
+    const query = new URLSearchParams({ limit: String(limit) });
+    if (options.after !== undefined && options.after !== null && options.after !== "") {
+      const after = String(options.after);
+      if (after.length > 512 || /[\u0000-\u001f\u007f]/.test(after)) {
+        throw new CallEApiError("CALL-E Goal cursor is invalid", { code: "call_e_invalid_goal_cursor" });
+      }
+      query.set("after", after);
+    }
+    return this.request("GET", `/v1/goals?${query.toString()}`);
+  }
+
+  getGoal(goalId) {
+    const id = normalizeOpaquePathId(goalId, "Goal ID", "call_e_invalid_goal_id");
+    return this.request("GET", `/v1/goals/${encodeURIComponent(id)}`);
+  }
+
+  createGoalRun(goalId, request, idempotencyKey) {
+    const id = normalizeOpaquePathId(goalId, "Goal ID", "call_e_invalid_goal_id");
+    const key = String(idempotencyKey || "").trim();
+    if (!key || key.length > 255 || /[\u0000-\u001f\u007f]/.test(key)) {
+      throw new CallEApiError("A valid CALL-E Goal Run idempotency key is required", { code: "call_e_idempotency_key_required" });
+    }
+    const body = validateGoalRunRequest(request);
+    if (this.providerHealth?.canDispatch && !this.providerHealth.canDispatch()) {
+      throw new CallEApiError('CALL-E create circuit is open; retry after the provider cooldown', {
+        code: 'call_e_circuit_open', status: 503, noCallCreated: true, retryable: true,
+      });
+    }
+    return this.request("POST", `/v1/goals/${encodeURIComponent(id)}/runs`, { body, idempotencyKey: key });
+  }
+
+  getGoalRun(goalId, goalRunId) {
+    const goal = normalizeOpaquePathId(goalId, "Goal ID", "call_e_invalid_goal_id");
+    const run = normalizeOpaquePathId(goalRunId, "Goal Run ID", "call_e_invalid_goal_run_id");
+    return this.request("GET", `/v1/goals/${encodeURIComponent(goal)}/runs/${encodeURIComponent(run)}`);
+  }
 }
 
 function createCallEClientFromEnv(options = {}) {
@@ -231,6 +355,7 @@ function createCallEClientFromEnv(options = {}) {
     apiKey: process.env.CALLE_API_KEY,
     baseUrl: process.env.CALLE_BASE_URL || CALL_E_PRODUCTION_BASE_URL,
     timeoutMs: process.env.CALLE_API_TIMEOUT_MS,
+    providerHealth: sharedCallEProviderHealth,
     ...options,
   });
 }
@@ -269,6 +394,11 @@ module.exports = {
   buildCallEDeploymentStatus,
   createCallEClientFromEnv,
   isAllowedBaseUrl,
+  normalizeClarification,
   normalizeCallEWebhookUrl,
   normalizeCallId,
+  normalizeOpaquePathId,
+  validateGoalRunVariables,
+  validateGoalRunRequest,
+  getCallEProviderHealth: () => sharedCallEProviderHealth.snapshot(),
 };

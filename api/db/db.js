@@ -1,5 +1,6 @@
 const sqlite3 = require('sqlite3').verbose();
 const path = require('path');
+const crypto = require('crypto');
 const {
     buildObjectiveTagsForFlow,
     getEffectiveObjectiveTags,
@@ -159,6 +160,7 @@ class EnhancedDatabase {
         this.emailDlqColumnsEnsured = false;
         this.emailQueueColumnsEnsured = false;
         this.outboundRateLastCleanupMs = 0;
+        this.callECampaignWriteChain = Promise.resolve();
     }
 
     async applyConnectionPragmas() {
@@ -188,6 +190,12 @@ class EnhancedDatabase {
                 console.log('Connected to enhanced SQLite database');
                 this.applyConnectionPragmas()
                     .then(() => this.createEnhancedTables())
+                    .then(() => this.ensureOutboundContactDispatchCartesiaProvider())
+                    .then(() => this.ensureOutboundCallBusinessScopeColumn())
+                    .then(() => this.ensureCartesiaCampaignProgressColumns())
+                    .then(() => this.ensureCartesiaVoiceGovernanceColumns())
+                    .then(() => this.ensureCallESensitiveDataColumns())
+                    .then(() => this.ensureCallEMissionEnhancementColumns())
                     .then(() => this.initializeSMSTables())
                     .then(() => this.initializeEmailTables())
                     .then(() => this.initializePostCallAutomationTables())
@@ -377,6 +385,36 @@ class EnhancedDatabase {
                 UNIQUE(template_id, version),
                 FOREIGN KEY(template_id) REFERENCES call_templates(id) ON DELETE CASCADE
             )`,
+            `CREATE TABLE IF NOT EXISTS call_template_promotion_events (
+                event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                template_id INTEGER NOT NULL,
+                template_version INTEGER NOT NULL CHECK(template_version > 0),
+                actor_label TEXT NOT NULL,
+                simulation_run_id TEXT NOT NULL,
+                simulation_score INTEGER NOT NULL CHECK(simulation_score BETWEEN 90 AND 100),
+                config_fingerprint TEXT NOT NULL CHECK(length(config_fingerprint) = 64),
+                previous_live_template_id INTEGER,
+                previous_live_version INTEGER,
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )`,
+            `CREATE TABLE IF NOT EXISTS call_agent_simulation_runs (
+                run_id TEXT PRIMARY KEY,
+                template_id INTEGER NOT NULL,
+                template_version INTEGER NOT NULL,
+                created_by TEXT NOT NULL,
+                idempotency_key TEXT NOT NULL,
+                request_hash TEXT NOT NULL,
+                config_fingerprint TEXT NOT NULL,
+                scenario_ids_json TEXT NOT NULL,
+                results_json TEXT NOT NULL,
+                score INTEGER NOT NULL CHECK(score BETWEEN 0 AND 100),
+                passed_count INTEGER NOT NULL DEFAULT 0,
+                failed_count INTEGER NOT NULL DEFAULT 0,
+                created_at DATETIME NOT NULL,
+                UNIQUE(template_id, idempotency_key),
+                FOREIGN KEY(template_id) REFERENCES call_templates(id) ON DELETE CASCADE
+            )`,
+            'CREATE INDEX IF NOT EXISTS idx_call_agent_simulation_runs_template_created ON call_agent_simulation_runs(template_id, created_at DESC)',
 
             // Auditable local mapping state for call-template compatibility with Vapi.
             `CREATE TABLE IF NOT EXISTS vapi_template_mappings (
@@ -398,6 +436,24 @@ class EnhancedDatabase {
                 updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(template_id, template_version, config_fingerprint)
             )`,
+
+            `CREATE TABLE IF NOT EXISTS vapi_simulation_runs (
+                vapi_run_id TEXT PRIMARY KEY,
+                template_id INTEGER NOT NULL,
+                template_version INTEGER NOT NULL,
+                mapping_id INTEGER NOT NULL,
+                assistant_id TEXT NOT NULL,
+                suite_id TEXT NOT NULL,
+                idempotency_key TEXT NOT NULL,
+                actor_id TEXT NOT NULL,
+                summary_json TEXT NOT NULL,
+                safety_status TEXT NOT NULL,
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(template_id, idempotency_key),
+                FOREIGN KEY(template_id) REFERENCES call_templates(id) ON DELETE CASCADE,
+                FOREIGN KEY(mapping_id) REFERENCES vapi_template_mappings(id) ON DELETE CASCADE
+            )`,
+            'CREATE INDEX IF NOT EXISTS idx_vapi_simulation_runs_template_created ON vapi_simulation_runs(template_id, created_at DESC)',
 
             `CREATE TABLE IF NOT EXISTS vapi_inbound_routes (
                 phone_number_id TEXT PRIMARY KEY,
@@ -736,11 +792,22 @@ class EnhancedDatabase {
                 expires_at DATETIME NOT NULL,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )`,
+            `CREATE TABLE IF NOT EXISTS cartesia_webhook_events (
+                webhook_request_id TEXT PRIMARY KEY,
+                call_id TEXT NOT NULL,
+                agent_id TEXT NOT NULL,
+                webhook_id TEXT NOT NULL,
+                event_type TEXT NOT NULL CHECK(event_type IN ('call_started', 'call_completed', 'call_failed', 'call_turn', 'post_call_analysis')),
+                event_timestamp TEXT NOT NULL,
+                payload_hash TEXT NOT NULL,
+                received_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )`,
 
             // Outbound call idempotency guard (provider-agnostic)
             `CREATE TABLE IF NOT EXISTS outbound_call_idempotency (
                 idempotency_key TEXT PRIMARY KEY,
                 provider TEXT NOT NULL,
+                business_id TEXT,
                 request_hash TEXT,
                 call_sid TEXT,
                 status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'completed', 'failed')),
@@ -749,6 +816,111 @@ class EnhancedDatabase {
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )`,
+            `CREATE TABLE IF NOT EXISTS cartesia_campaigns (
+                campaign_id TEXT PRIMARY KEY,
+                business_id TEXT NOT NULL,
+                created_by TEXT NOT NULL,
+                approved_by TEXT,
+                request_key TEXT NOT NULL,
+                request_hash TEXT NOT NULL,
+                campaign_name TEXT NOT NULL,
+                agent_id TEXT NOT NULL,
+                from_number_id TEXT NOT NULL,
+                target_concurrency_limit INTEGER NOT NULL,
+                scheduled_at TEXT,
+                status TEXT NOT NULL CHECK(status IN ('draft', 'approved', 'submitting', 'submitted', 'unknown', 'blocked')),
+                recipient_count INTEGER NOT NULL CHECK(recipient_count BETWEEN 1 AND 25),
+                ready_count INTEGER NOT NULL,
+                blocked_count INTEGER NOT NULL,
+                encryption_key_version INTEGER NOT NULL,
+                provider_batch_id TEXT,
+                provider_status TEXT,
+                provider_retry_count INTEGER NOT NULL DEFAULT 0,
+                error_code TEXT,
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(business_id, request_key)
+            )`,
+            `CREATE TABLE IF NOT EXISTS cartesia_campaign_recipients (
+                campaign_id TEXT NOT NULL,
+                position INTEGER NOT NULL,
+                encrypted_destination TEXT NOT NULL,
+                encrypted_dynamic_variables TEXT,
+                destination_masked TEXT NOT NULL,
+                readiness TEXT NOT NULL CHECK(readiness IN ('ready', 'blocked')),
+                reason_code TEXT NOT NULL,
+                provider_recipient_id TEXT,
+                provider_call_id TEXT,
+                provider_status TEXT,
+                provider_end_reason TEXT,
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY(campaign_id, position),
+                FOREIGN KEY(campaign_id) REFERENCES cartesia_campaigns(campaign_id) ON DELETE CASCADE
+            )`,
+            `CREATE TABLE IF NOT EXISTS cartesia_call_review_rules (
+                business_id TEXT PRIMARY KEY,
+                review_failed_calls INTEGER NOT NULL DEFAULT 1 CHECK(review_failed_calls IN (0, 1)),
+                review_tool_calls INTEGER NOT NULL DEFAULT 0 CHECK(review_tool_calls IN (0, 1)),
+                review_missing_summary INTEGER NOT NULL DEFAULT 0 CHECK(review_missing_summary IN (0, 1)),
+                updated_by TEXT,
+                updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )`,
+            `CREATE TABLE IF NOT EXISTS cartesia_campaign_daily_reservations (
+                campaign_id TEXT NOT NULL,
+                business_id TEXT NOT NULL,
+                recipient_position INTEGER NOT NULL,
+                usage_date TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(status IN ('reserved', 'released')),
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                released_at DATETIME,
+                PRIMARY KEY(campaign_id, recipient_position),
+                FOREIGN KEY(campaign_id) REFERENCES cartesia_campaigns(campaign_id) ON DELETE CASCADE
+            )`,
+            `CREATE TABLE IF NOT EXISTS cartesia_campaign_retry_attempts (
+                campaign_id TEXT NOT NULL,
+                retry_number INTEGER NOT NULL,
+                status TEXT NOT NULL CHECK(status IN ('submitting', 'accepted', 'unknown', 'rejected')),
+                candidate_count INTEGER NOT NULL,
+                actor_id TEXT NOT NULL,
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY(campaign_id, retry_number),
+                FOREIGN KEY(campaign_id) REFERENCES cartesia_campaigns(campaign_id) ON DELETE CASCADE
+            )`,
+            `CREATE TABLE IF NOT EXISTS cartesia_campaign_retry_daily_reservations (
+                campaign_id TEXT NOT NULL,
+                retry_number INTEGER NOT NULL,
+                business_id TEXT NOT NULL,
+                recipient_position INTEGER NOT NULL,
+                usage_date TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(status IN ('reserved', 'released')),
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                released_at DATETIME,
+                PRIMARY KEY(campaign_id, retry_number, recipient_position),
+                FOREIGN KEY(campaign_id) REFERENCES cartesia_campaigns(campaign_id) ON DELETE CASCADE
+            )`,
+            `CREATE TABLE IF NOT EXISTS cartesia_voice_governance (
+                consent_id TEXT PRIMARY KEY,
+                actor_id TEXT NOT NULL,
+                operation TEXT NOT NULL CHECK(operation IN ('instant_clone', 'pro_clone_dataset')),
+                resource_id TEXT,
+                resource_type TEXT CHECK(resource_type IS NULL OR resource_type IN ('voice', 'dataset', 'fine_tune')),
+                fine_tune_id TEXT,
+                sample_count INTEGER NOT NULL DEFAULT 0,
+                active_operations INTEGER NOT NULL DEFAULT 0,
+                operation_token TEXT,
+                operation_started_at DATETIME,
+                resource_name TEXT,
+                status TEXT NOT NULL CHECK(status IN ('active', 'revoked', 'deleted', 'provider_failed')),
+                consented_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                revoked_at DATETIME,
+                deleted_at DATETIME
+            )`,
+            'CREATE INDEX IF NOT EXISTS idx_cartesia_voice_governance_status ON cartesia_voice_governance(status, consented_at DESC)',
+            'CREATE INDEX IF NOT EXISTS idx_cartesia_campaigns_scope ON cartesia_campaigns(business_id, status, created_at DESC)',
+            'CREATE INDEX IF NOT EXISTS idx_cartesia_campaign_daily_usage ON cartesia_campaign_daily_reservations(business_id, usage_date, status)',
 
             // CALL-E normalized lifecycle and durable event cursor; deliberately excludes phone, transcript, result, and raw event payloads.
             `CREATE TABLE IF NOT EXISTS call_e_reconciliation (
@@ -766,6 +938,7 @@ class EnhancedDatabase {
                 event_cursor TEXT,
                 last_event_id TEXT,
                 seen_event_ids_json TEXT NOT NULL DEFAULT '[]',
+                ivr_dtmf_observed INTEGER NOT NULL DEFAULT 0,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )`,
@@ -777,6 +950,406 @@ class EnhancedDatabase {
                 event_type TEXT NOT NULL CHECK(event_type IN ('call.completed', 'call.failed', 'call.canceled')),
                 processed_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
             )`,
+
+            // CALL-E campaign rehearsal reports contain masked destinations only; they are not a dispatch queue.
+            `CREATE TABLE IF NOT EXISTS call_e_campaign_reviews (
+                campaign_id TEXT PRIMARY KEY,
+                business_id TEXT NOT NULL,
+                template_id INTEGER NOT NULL,
+                template_version INTEGER NOT NULL,
+                schema_fingerprint TEXT NOT NULL,
+                request_hash TEXT NOT NULL,
+                created_by TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(status IN ('draft', 'approved', 'rejected')) DEFAULT 'draft',
+                recipient_count INTEGER NOT NULL,
+                ready_count INTEGER NOT NULL,
+                blocked_count INTEGER NOT NULL,
+                reviewed_by TEXT,
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                reviewed_at DATETIME,
+                CHECK(recipient_count BETWEEN 1 AND 25),
+                CHECK(ready_count >= 0 AND blocked_count >= 0 AND ready_count + blocked_count = recipient_count)
+            )`,
+            `CREATE TABLE IF NOT EXISTS call_e_campaign_review_recipients (
+                campaign_id TEXT NOT NULL,
+                position INTEGER NOT NULL,
+                destination_masked TEXT NOT NULL,
+                readiness TEXT NOT NULL CHECK(readiness IN ('ready', 'blocked')),
+                reason_code TEXT NOT NULL CHECK(reason_code IN ('compatible', 'invalid_destination', 'duplicate_destination', 'consent_missing', 'consent_expired', 'consent_not_effective', 'opted_out', 'policy_storage_unavailable', 'template_incompatible', 'preview_failed')),
+                PRIMARY KEY(campaign_id, position),
+                FOREIGN KEY(campaign_id) REFERENCES call_e_campaign_reviews(campaign_id) ON DELETE CASCADE
+            )`,
+            'CREATE INDEX IF NOT EXISTS idx_call_e_campaign_reviews_business_status ON call_e_campaign_reviews(business_id, status, created_at DESC)',
+            `CREATE TABLE IF NOT EXISTS call_e_campaign_execution_rehearsals (
+                rehearsal_id TEXT PRIMARY KEY,
+                campaign_id TEXT NOT NULL,
+                business_id TEXT NOT NULL,
+                request_hash TEXT NOT NULL,
+                started_by TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(status IN ('completed')),
+                recipient_count INTEGER NOT NULL,
+                ready_count INTEGER NOT NULL,
+                blocked_count INTEGER NOT NULL,
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(campaign_id, request_hash),
+                FOREIGN KEY(campaign_id) REFERENCES call_e_campaign_reviews(campaign_id) ON DELETE CASCADE,
+                CHECK(recipient_count BETWEEN 1 AND 25),
+                CHECK(ready_count >= 0 AND blocked_count >= 0 AND ready_count + blocked_count = recipient_count)
+            )`,
+            `CREATE TABLE IF NOT EXISTS call_e_campaign_execution_rehearsal_rows (
+                rehearsal_id TEXT NOT NULL,
+                position INTEGER NOT NULL,
+                state TEXT NOT NULL CHECK(state IN ('simulated_ready', 'blocked')),
+                reason_code TEXT NOT NULL CHECK(reason_code IN ('compatible', 'invalid_destination', 'duplicate_destination', 'consent_missing', 'consent_expired', 'consent_not_effective', 'opted_out', 'policy_storage_unavailable', 'template_incompatible', 'preview_failed')),
+                PRIMARY KEY(rehearsal_id, position),
+                FOREIGN KEY(rehearsal_id) REFERENCES call_e_campaign_execution_rehearsals(rehearsal_id) ON DELETE CASCADE
+            )`,
+            'CREATE INDEX IF NOT EXISTS idx_call_e_campaign_rehearsals_scope ON call_e_campaign_execution_rehearsals(business_id, campaign_id, created_at DESC)',
+
+            // Durable mission orchestration; destinations are encrypted by the service before persistence.
+            `CREATE TABLE IF NOT EXISTS call_e_campaign_missions (
+                mission_id TEXT PRIMARY KEY,
+                business_id TEXT NOT NULL,
+                campaign_id TEXT NOT NULL,
+                template_id INTEGER NOT NULL,
+                template_version INTEGER NOT NULL,
+                result_schema_json TEXT NOT NULL,
+                created_by TEXT NOT NULL,
+                request_hash TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(status IN ('pending_approval', 'approved', 'rejected', 'running', 'paused', 'completed', 'canceled', 'needs_review')),
+                reviewed_by TEXT,
+                reviewed_at DATETIME,
+                recipient_count INTEGER NOT NULL CHECK(recipient_count BETWEEN 1 AND 25),
+                scheduled_at DATETIME,
+                budget_limit_minor INTEGER,
+                per_call_cost_ceiling_minor INTEGER,
+                budget_currency TEXT,
+                encryption_key_version INTEGER NOT NULL DEFAULT 1 CHECK(encryption_key_version > 0),
+                sensitive_data_expires_at DATETIME,
+                sensitive_data_purged_at DATETIME,
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(campaign_id) REFERENCES call_e_campaign_reviews(campaign_id)
+            )`,
+            `CREATE TABLE IF NOT EXISTS call_e_campaign_mission_recipients (
+                mission_id TEXT NOT NULL,
+                position INTEGER NOT NULL,
+                encrypted_destination TEXT NOT NULL,
+                destination_masked TEXT NOT NULL,
+                idempotency_key TEXT NOT NULL UNIQUE,
+                status TEXT NOT NULL CHECK(status IN ('queued', 'in_progress', 'accepted', 'completed', 'failed', 'blocked', 'needs_review', 'canceled')),
+                local_call_id TEXT UNIQUE,
+                error_code TEXT,
+                updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY(mission_id, position),
+                FOREIGN KEY(mission_id) REFERENCES call_e_campaign_missions(mission_id) ON DELETE CASCADE
+            )`,
+            `CREATE TABLE IF NOT EXISTS call_e_campaign_mission_resolutions (
+                mission_id TEXT NOT NULL,
+                idempotency_key TEXT NOT NULL,
+                business_id TEXT NOT NULL,
+                resolved_by TEXT NOT NULL,
+                decision TEXT NOT NULL CHECK(decision IN ('continue', 'cancel')),
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY(mission_id, idempotency_key),
+                FOREIGN KEY(mission_id) REFERENCES call_e_campaign_missions(mission_id) ON DELETE CASCADE
+            )`,
+            // Single configured worker lease per mission; stores status codes only, never request/recipient data.
+            `CREATE TABLE IF NOT EXISTS call_e_campaign_mission_worker_leases (
+                mission_id TEXT PRIMARY KEY,
+                business_id TEXT NOT NULL,
+                lease_owner TEXT,
+                lease_token TEXT,
+                lease_expires_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                last_state TEXT NOT NULL DEFAULT 'idle' CHECK(last_state IN ('idle', 'leased', 'call_accepted', 'waiting_for_call', 'waiting_for_result', 'recovery_required', 'needs_review', 'completed', 'canceled', 'error')),
+                last_error_code TEXT,
+                updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(mission_id) REFERENCES call_e_campaign_missions(mission_id) ON DELETE CASCADE
+            )`,
+            `CREATE TABLE IF NOT EXISTS call_e_business_safety_policies (
+                business_id TEXT PRIMARY KEY,
+                max_calls_per_day INTEGER NOT NULL DEFAULT 0 CHECK(max_calls_per_day BETWEEN 0 AND 1000),
+                quiet_hours_start TEXT,
+                quiet_hours_end TEXT,
+                timezone TEXT NOT NULL DEFAULT 'UTC',
+                emergency_stop INTEGER NOT NULL DEFAULT 1 CHECK(emergency_stop IN (0, 1)),
+                contact_cooldown_hours INTEGER NOT NULL DEFAULT 0 CHECK(contact_cooldown_hours BETWEEN 0 AND 8760),
+                updated_by TEXT NOT NULL,
+                updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )`,
+            `CREATE TABLE IF NOT EXISTS call_e_mission_worker_controls (
+                business_id TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                paused INTEGER NOT NULL DEFAULT 0 CHECK(paused IN (0, 1)),
+                updated_by TEXT NOT NULL,
+                updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY(business_id, mission_id),
+                FOREIGN KEY(mission_id) REFERENCES call_e_campaign_missions(mission_id) ON DELETE CASCADE
+            )`,
+            `CREATE TABLE IF NOT EXISTS call_e_business_dispatch_reservations (
+                business_id TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                recipient_position INTEGER NOT NULL,
+                usage_date TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(status IN ('reserved', 'released')),
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                released_at DATETIME,
+                PRIMARY KEY(mission_id, recipient_position),
+                FOREIGN KEY(mission_id, recipient_position) REFERENCES call_e_campaign_mission_recipients(mission_id, position) ON DELETE CASCADE
+            )`,
+            'CREATE INDEX IF NOT EXISTS idx_call_e_dispatch_reservations_usage ON call_e_business_dispatch_reservations(business_id, usage_date, status)',
+            `CREATE TABLE IF NOT EXISTS call_e_operations_audit (
+                audit_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                business_id TEXT NOT NULL,
+                actor_id TEXT NOT NULL,
+                action TEXT NOT NULL CHECK(action IN ('safety_policy_updated', 'worker_paused', 'worker_resumed', 'sensitive_data_purged')),
+                mission_id TEXT,
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )`,
+            'CREATE INDEX IF NOT EXISTS idx_call_e_operations_audit_scope ON call_e_operations_audit(business_id, created_at DESC)',
+            `CREATE TABLE IF NOT EXISTS call_e_business_mission_policies (
+                business_id TEXT PRIMARY KEY,
+                secondary_approval_threshold INTEGER NOT NULL DEFAULT 26 CHECK(secondary_approval_threshold BETWEEN 2 AND 26),
+                approval_ttl_hours INTEGER NOT NULL DEFAULT 24 CHECK(approval_ttl_hours BETWEEN 1 AND 720),
+                review_sla_minutes INTEGER NOT NULL DEFAULT 0 CHECK(review_sla_minutes BETWEEN 0 AND 10080),
+                review_repeat_minutes INTEGER NOT NULL DEFAULT 0 CHECK(review_repeat_minutes BETWEEN 0 AND 10080),
+                updated_by TEXT NOT NULL,
+                updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )`,
+            `CREATE TABLE IF NOT EXISTS call_e_mission_secondary_approvals (
+                mission_id TEXT PRIMARY KEY,
+                business_id TEXT NOT NULL,
+                reviewed_by TEXT NOT NULL,
+                decision TEXT NOT NULL CHECK(decision = 'approve'),
+                request_hash TEXT NOT NULL CHECK(length(request_hash) = 64),
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(mission_id) REFERENCES call_e_campaign_missions(mission_id) ON DELETE CASCADE
+            )`,
+            `CREATE TABLE IF NOT EXISTS call_e_mission_budget_reservations (
+                mission_id TEXT NOT NULL,
+                recipient_position INTEGER NOT NULL,
+                reserved_minor INTEGER NOT NULL CHECK(reserved_minor > 0),
+                status TEXT NOT NULL CHECK(status IN ('reserved', 'released')),
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                released_at DATETIME,
+                PRIMARY KEY(mission_id, recipient_position),
+                FOREIGN KEY(mission_id, recipient_position) REFERENCES call_e_campaign_mission_recipients(mission_id, position) ON DELETE CASCADE
+            )`,
+            `CREATE TABLE IF NOT EXISTS call_e_contact_dispatch_history (
+                business_id TEXT NOT NULL,
+                destination_hash TEXT NOT NULL CHECK(length(destination_hash) = 64),
+                mission_id TEXT NOT NULL,
+                recipient_position INTEGER NOT NULL,
+                status TEXT NOT NULL CHECK(status IN ('reserved', 'accepted', 'released')),
+                attempted_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY(mission_id, recipient_position),
+                FOREIGN KEY(mission_id, recipient_position) REFERENCES call_e_campaign_mission_recipients(mission_id, position) ON DELETE CASCADE
+            )`,
+            'CREATE INDEX IF NOT EXISTS idx_call_e_contact_dispatch_cooldown ON call_e_contact_dispatch_history(business_id, destination_hash, status, attempted_at DESC)',
+            `CREATE TABLE IF NOT EXISTS outbound_contact_dispatch_history (
+                reservation_key TEXT PRIMARY KEY,
+                business_id TEXT NOT NULL,
+                destination_hash TEXT NOT NULL CHECK(length(destination_hash) = 64),
+                provider TEXT NOT NULL CHECK(provider IN ('twilio', 'plivo', 'vonage', 'vapi', 'call_e', 'cartesia')),
+                status TEXT NOT NULL CHECK(status IN ('reserved', 'accepted', 'released')),
+                attempted_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )`,
+            'CREATE INDEX IF NOT EXISTS idx_outbound_contact_dispatch_cooldown ON outbound_contact_dispatch_history(business_id, destination_hash, status, attempted_at DESC)',
+            `CREATE TABLE IF NOT EXISTS call_e_mission_escalations (
+                mission_id TEXT PRIMARY KEY,
+                business_id TEXT NOT NULL,
+                escalated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                deadline_at DATETIME,
+                next_escalation_at DATETIME,
+                escalation_count INTEGER NOT NULL DEFAULT 1,
+                FOREIGN KEY(mission_id) REFERENCES call_e_campaign_missions(mission_id) ON DELETE CASCADE
+            )`,
+            `CREATE TABLE IF NOT EXISTS call_e_mission_review_actions (
+                action_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                business_id TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                action TEXT NOT NULL CHECK(action IN ('assigned', 'acknowledged')),
+                actor_id TEXT NOT NULL,
+                assigned_to TEXT,
+                idempotency_key TEXT NOT NULL UNIQUE,
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(mission_id) REFERENCES call_e_campaign_missions(mission_id) ON DELETE CASCADE
+            )`,
+            'CREATE INDEX IF NOT EXISTS idx_call_e_mission_review_actions_scope ON call_e_mission_review_actions(business_id, mission_id, action_id DESC)',
+            `CREATE TABLE IF NOT EXISTS call_e_mission_escalation_actions (
+                action_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                business_id TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                action TEXT NOT NULL CHECK(action IN ('reassigned', 'deadline_extended', 'repeat_escalated')),
+                actor_id TEXT NOT NULL,
+                assigned_to TEXT,
+                deadline_at TEXT,
+                request_hash TEXT,
+                idempotency_key TEXT NOT NULL UNIQUE,
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(mission_id) REFERENCES call_e_campaign_missions(mission_id) ON DELETE CASCADE
+            )`,
+            'CREATE INDEX IF NOT EXISTS idx_call_e_mission_escalation_actions_scope ON call_e_mission_escalation_actions(business_id, mission_id, action_id DESC)',
+            `CREATE TRIGGER IF NOT EXISTS call_e_mission_escalation_actions_no_update BEFORE UPDATE ON call_e_mission_escalation_actions
+             BEGIN SELECT RAISE(ABORT, 'CALL-E escalation actions are append-only'); END`,
+            `CREATE TRIGGER IF NOT EXISTS call_e_mission_escalation_actions_no_delete BEFORE DELETE ON call_e_mission_escalation_actions
+             BEGIN SELECT RAISE(ABORT, 'CALL-E escalation actions are append-only'); END`,
+            `CREATE TABLE IF NOT EXISTS call_e_mission_cdr_imports (
+                import_id TEXT PRIMARY KEY,
+                business_id TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                created_by TEXT NOT NULL,
+                idempotency_key TEXT NOT NULL,
+                request_hash TEXT NOT NULL CHECK(length(request_hash) = 64),
+                records_json TEXT NOT NULL,
+                preview_json TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(status IN ('staged', 'committed')),
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                committed_at DATETIME,
+                UNIQUE(business_id, idempotency_key),
+                FOREIGN KEY(mission_id) REFERENCES call_e_campaign_missions(mission_id) ON DELETE CASCADE
+            )`,
+            'CREATE INDEX IF NOT EXISTS idx_call_e_mission_cdr_import_scope ON call_e_mission_cdr_imports(business_id, mission_id, created_at DESC)',
+            `CREATE TABLE IF NOT EXISTS call_e_mission_usage_records (
+                usage_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                business_id TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                recipient_position INTEGER NOT NULL,
+                provider TEXT NOT NULL CHECK(provider IN ('twilio', 'plivo', 'vonage', 'other')),
+                provider_call_id TEXT NOT NULL,
+                amount_minor INTEGER NOT NULL CHECK(amount_minor >= 0),
+                currency TEXT NOT NULL CHECK(currency GLOB '[A-Z][A-Z][A-Z]'),
+                billed_duration_seconds INTEGER,
+                source_type TEXT NOT NULL CHECK(source_type IN ('provider_cdr', 'invoice', 'operator_estimate')),
+                source_reference TEXT NOT NULL,
+                recorded_by TEXT NOT NULL,
+                idempotency_key TEXT NOT NULL,
+                request_hash TEXT NOT NULL CHECK(length(request_hash) = 64),
+                occurred_at TEXT NOT NULL,
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(business_id, provider, provider_call_id),
+                UNIQUE(business_id, idempotency_key),
+                FOREIGN KEY(mission_id, recipient_position) REFERENCES call_e_campaign_mission_recipients(mission_id, position) ON DELETE CASCADE
+            )`,
+            `CREATE TABLE IF NOT EXISTS call_e_mission_report_digest_subscriptions (
+                business_id TEXT NOT NULL,
+                actor_id TEXT NOT NULL,
+                interval_hours INTEGER NOT NULL CHECK(interval_hours IN (24, 168)),
+                enabled INTEGER NOT NULL CHECK(enabled IN (0, 1)),
+                next_delivery_at DATETIME NOT NULL,
+                updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY(business_id, actor_id)
+            )`,
+            `CREATE TABLE IF NOT EXISTS call_e_mission_activity (
+                event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                business_id TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                event_key TEXT NOT NULL UNIQUE,
+                actor_id TEXT,
+                event_type TEXT NOT NULL CHECK(event_type IN ('mission_created', 'approval_recorded', 'mission_resolved', 'recipient_transition', 'recipient_retry_requested', 'mission_advanced')),
+                recipient_position INTEGER,
+                state TEXT NOT NULL,
+                error_code TEXT,
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(mission_id) REFERENCES call_e_campaign_missions(mission_id) ON DELETE CASCADE
+            )`,
+            'CREATE INDEX IF NOT EXISTS idx_call_e_mission_activity_scope ON call_e_mission_activity(business_id, mission_id, event_id DESC)',
+            `CREATE TRIGGER IF NOT EXISTS call_e_mission_activity_no_update
+             BEFORE UPDATE ON call_e_mission_activity
+             BEGIN SELECT RAISE(ABORT, 'CALL-E mission activity is append-only'); END`,
+            `CREATE TRIGGER IF NOT EXISTS call_e_mission_activity_no_delete
+             BEFORE DELETE ON call_e_mission_activity
+             BEGIN SELECT RAISE(ABORT, 'CALL-E mission activity is append-only'); END`,
+            `CREATE TABLE IF NOT EXISTS call_e_business_provider_routing (
+                business_id TEXT PRIMARY KEY,
+                provider_order_json TEXT NOT NULL,
+                updated_by TEXT NOT NULL,
+                updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )`,
+            `CREATE TABLE IF NOT EXISTS call_e_mission_alert_subscriptions (
+                business_id TEXT NOT NULL,
+                actor_id TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0, 1)),
+                last_notified_event_id INTEGER NOT NULL DEFAULT 0,
+                updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY(business_id, actor_id)
+            )`,
+            `CREATE TABLE IF NOT EXISTS call_e_goal_run_requests (
+                goal_run_request_id TEXT PRIMARY KEY,
+                business_id TEXT NOT NULL,
+                goal_id TEXT NOT NULL,
+                goal_title TEXT NOT NULL,
+                published_run_spec_id TEXT NOT NULL,
+                published_run_spec_version INTEGER NOT NULL CHECK(published_run_spec_version > 0),
+                destination_masked TEXT NOT NULL,
+                encrypted_payload TEXT NOT NULL,
+                encrypted_result TEXT,
+                encryption_key_version INTEGER NOT NULL DEFAULT 1 CHECK(encryption_key_version > 0),
+                request_hash TEXT NOT NULL CHECK(length(request_hash) = 64),
+                idempotency_hash TEXT NOT NULL CHECK(length(idempotency_hash) = 64),
+                result_schema_json TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(status IN ('pending_approval', 'approved', 'rejected', 'submitting', 'recovery_required', 'running', 'completed', 'failed', 'canceled', 'needs_review')),
+                provider_goal_run_id TEXT,
+                execution_status TEXT,
+                call_outcome TEXT,
+                result_status TEXT,
+                error_code TEXT,
+                created_by TEXT NOT NULL,
+                reviewed_by TEXT,
+                reviewed_at DATETIME,
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                sensitive_data_expires_at DATETIME,
+                sensitive_data_purged_at DATETIME,
+                UNIQUE(business_id, idempotency_hash)
+            )`,
+            `CREATE TABLE IF NOT EXISTS call_e_goal_run_reviews (
+                goal_run_request_id TEXT NOT NULL,
+                business_id TEXT NOT NULL,
+                reviewed_by TEXT NOT NULL,
+                decision TEXT NOT NULL CHECK(decision IN ('approve', 'reject')),
+                request_hash TEXT NOT NULL CHECK(length(request_hash) = 64),
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(goal_run_request_id),
+                FOREIGN KEY(goal_run_request_id) REFERENCES call_e_goal_run_requests(goal_run_request_id) ON DELETE CASCADE
+            )`,
+            'CREATE INDEX IF NOT EXISTS idx_call_e_goal_run_requests_scope ON call_e_goal_run_requests(business_id, status, created_at DESC)',
+            `CREATE TABLE IF NOT EXISTS call_e_approval_decisions (
+                decision_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                entity_type TEXT NOT NULL CHECK(entity_type IN ('campaign', 'mission')),
+                entity_id TEXT NOT NULL,
+                business_id TEXT NOT NULL,
+                reviewed_by TEXT NOT NULL,
+                decision TEXT NOT NULL CHECK(decision IN ('approve', 'reject')),
+                request_hash TEXT NOT NULL CHECK(length(request_hash) = 64),
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(entity_type, entity_id)
+            )`,
+            `INSERT OR IGNORE INTO call_e_approval_decisions
+                (entity_type, entity_id, business_id, reviewed_by, decision, request_hash, created_at)
+             SELECT 'campaign', campaign_id, business_id, reviewed_by,
+                    CASE WHEN status = 'approved' THEN 'approve' ELSE 'reject' END, request_hash,
+                    COALESCE(reviewed_at, created_at)
+             FROM call_e_campaign_reviews
+             WHERE status IN ('approved', 'rejected') AND reviewed_by IS NOT NULL`,
+            `INSERT OR IGNORE INTO call_e_approval_decisions
+                (entity_type, entity_id, business_id, reviewed_by, decision, request_hash, created_at)
+             SELECT 'mission', mission_id, business_id, reviewed_by,
+                    CASE WHEN status = 'rejected' THEN 'reject' ELSE 'approve' END,
+                    request_hash, COALESCE(reviewed_at, created_at)
+             FROM call_e_campaign_missions
+             WHERE status != 'pending_approval' AND reviewed_by IS NOT NULL`,
+            `CREATE TRIGGER IF NOT EXISTS call_e_approval_decisions_no_update
+             BEFORE UPDATE ON call_e_approval_decisions
+             BEGIN SELECT RAISE(ABORT, 'CALL-E approval decisions are append-only'); END`,
+            `CREATE TRIGGER IF NOT EXISTS call_e_approval_decisions_no_delete
+             BEFORE DELETE ON call_e_approval_decisions
+             BEGIN SELECT RAISE(ABORT, 'CALL-E approval decisions are append-only'); END`,
+            'CREATE INDEX IF NOT EXISTS idx_call_e_approval_decisions_scope ON call_e_approval_decisions(business_id, entity_type, entity_id, decision_id)',
+            'CREATE INDEX IF NOT EXISTS idx_call_e_campaign_missions_scope ON call_e_campaign_missions(business_id, status, created_at DESC)',
+            'CREATE INDEX IF NOT EXISTS idx_call_e_campaign_mission_recipients_queue ON call_e_campaign_mission_recipients(mission_id, status, position)',
 
             // One lifetime CALL-E pilot slot. A different request key cannot replace a reserved or accepted call.
             `CREATE TABLE IF NOT EXISTS call_e_pilot_dispatch_guard (
@@ -816,6 +1389,21 @@ class EnhancedDatabase {
                 CHECK((event_type = 'access_granted' AND role IS NOT NULL) OR (event_type = 'access_revoked' AND role IS NULL))
             )`,
             'CREATE INDEX IF NOT EXISTS idx_call_e_business_operator_events_scope ON call_e_business_operator_events(business_id, telegram_id, id DESC)',
+
+            `CREATE TABLE IF NOT EXISTS business_integration_connections (
+                connection_id TEXT PRIMARY KEY,
+                business_id TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                secret_reference TEXT NOT NULL UNIQUE,
+                status TEXT NOT NULL CHECK(status IN ('active', 'revoked')),
+                created_by TEXT NOT NULL,
+                updated_by TEXT NOT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                revoked_by TEXT,
+                revoked_at DATETIME
+            )`,
+            'CREATE INDEX IF NOT EXISTS idx_business_integration_connections_scope ON business_integration_connections(business_id, status, provider)',
 
             `CREATE TABLE IF NOT EXISTS call_e_operator_confirmation_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -914,6 +1502,7 @@ class EnhancedDatabase {
         await this.ensureCallColumns(['digit_summary', 'digit_count', 'last_otp', 'last_otp_masked', 'direction']);
         await this.ensureCallEContactPolicyColumns();
         await this.ensureCallEReconciliationBusinessColumn();
+        await this.ensureCallEReconciliationIvrColumn();
         await this.ensureTemplateColumns([
             'version',
             'objective_tags',
@@ -981,6 +1570,13 @@ class EnhancedDatabase {
             'CREATE INDEX IF NOT EXISTS idx_call_templates_name ON call_templates(name)',
             'CREATE INDEX IF NOT EXISTS idx_call_templates_lifecycle_state ON call_templates(lifecycle_state)',
             'CREATE INDEX IF NOT EXISTS idx_call_template_versions_template_version ON call_template_versions(template_id, version)',
+            'CREATE INDEX IF NOT EXISTS idx_call_template_promotion_events_template_created ON call_template_promotion_events(template_id, event_id DESC)',
+            `CREATE TRIGGER IF NOT EXISTS call_template_promotion_events_no_update
+             BEFORE UPDATE ON call_template_promotion_events
+             BEGIN SELECT RAISE(ABORT, 'Call script promotion audit is append-only'); END`,
+            `CREATE TRIGGER IF NOT EXISTS call_template_promotion_events_no_delete
+             BEFORE DELETE ON call_template_promotion_events
+             BEGIN SELECT RAISE(ABORT, 'Call script promotion audit is append-only'); END`,
             'CREATE INDEX IF NOT EXISTS idx_vapi_template_mappings_template ON vapi_template_mappings(template_id, template_version, updated_at)',
             'CREATE INDEX IF NOT EXISTS idx_vapi_call_events_call ON vapi_call_events(provider_call_id, received_at)',
             'CREATE INDEX IF NOT EXISTS idx_vapi_call_events_template ON vapi_call_events(template_id, template_version, received_at)',
@@ -1041,6 +1637,8 @@ class EnhancedDatabase {
             'CREATE INDEX IF NOT EXISTS idx_square_payment_session_links_related ON square_payment_session_links(related_id)',
             'CREATE INDEX IF NOT EXISTS idx_provider_event_idem_source ON provider_event_idempotency(source)',
             'CREATE INDEX IF NOT EXISTS idx_provider_event_idem_expires ON provider_event_idempotency(expires_at)',
+            'CREATE INDEX IF NOT EXISTS idx_cartesia_webhook_events_call ON cartesia_webhook_events(call_id, received_at DESC)',
+            'CREATE INDEX IF NOT EXISTS idx_cartesia_webhook_events_received ON cartesia_webhook_events(received_at DESC)',
             'CREATE INDEX IF NOT EXISTS idx_outbound_call_idem_provider ON outbound_call_idempotency(provider)',
             'CREATE INDEX IF NOT EXISTS idx_outbound_call_idem_status ON outbound_call_idempotency(status)',
             'CREATE INDEX IF NOT EXISTS idx_outbound_call_idem_updated ON outbound_call_idempotency(updated_at)',
@@ -1070,6 +1668,82 @@ class EnhancedDatabase {
         console.log('✅ Enhanced database tables and indexes created successfully');
     }
 
+    async ensureOutboundContactDispatchCartesiaProvider() {
+        const schema = await new Promise((resolve, reject) => {
+            this.db.get(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'outbound_contact_dispatch_history'",
+                (error, row) => error ? reject(error) : resolve(String(row?.sql || '')),
+            );
+        });
+        if (!schema || /'cartesia'/i.test(schema)) return;
+
+        const run = (sql) => new Promise((resolve, reject) => this.db.run(sql, (error) => error ? reject(error) : resolve()));
+        try {
+            await run('BEGIN IMMEDIATE');
+            await run('ALTER TABLE outbound_contact_dispatch_history RENAME TO outbound_contact_dispatch_history_pre_cartesia');
+            await run(`CREATE TABLE outbound_contact_dispatch_history (
+                reservation_key TEXT PRIMARY KEY,
+                business_id TEXT NOT NULL,
+                destination_hash TEXT NOT NULL CHECK(length(destination_hash) = 64),
+                provider TEXT NOT NULL CHECK(provider IN ('twilio', 'plivo', 'vonage', 'vapi', 'call_e', 'cartesia')),
+                status TEXT NOT NULL CHECK(status IN ('reserved', 'accepted', 'released')),
+                attempted_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )`);
+            await run(`INSERT INTO outbound_contact_dispatch_history (
+                reservation_key, business_id, destination_hash, provider, status, attempted_at, updated_at
+            ) SELECT reservation_key, business_id, destination_hash, provider, status, attempted_at, updated_at
+              FROM outbound_contact_dispatch_history_pre_cartesia`);
+            await run('DROP TABLE outbound_contact_dispatch_history_pre_cartesia');
+            await run('CREATE INDEX IF NOT EXISTS idx_outbound_contact_dispatch_cooldown ON outbound_contact_dispatch_history(business_id, destination_hash, status, attempted_at DESC)');
+            await run('COMMIT');
+        } catch (error) {
+            await new Promise((resolve) => this.db.run('ROLLBACK', () => resolve()));
+            throw error;
+        }
+    }
+
+    async ensureOutboundCallBusinessScopeColumn() {
+        const columns = await new Promise((resolve, reject) => this.db.all(
+            'PRAGMA table_info(outbound_call_idempotency)', (error, rows) => error ? reject(error) : resolve(new Set((rows || []).map((row) => row.name))),
+        ));
+        if (!columns.has('business_id')) await new Promise((resolve, reject) => this.db.run(
+            'ALTER TABLE outbound_call_idempotency ADD COLUMN business_id TEXT', (error) => error ? reject(error) : resolve(),
+        ));
+    }
+
+    async ensureCartesiaCampaignProgressColumns() {
+        const columns = await new Promise((resolve, reject) => this.db.all(
+            'PRAGMA table_info(cartesia_campaign_recipients)', (error, rows) => error ? reject(error) : resolve(new Set((rows || []).map((row) => row.name))),
+        ));
+        for (const [name, type] of [['provider_status', 'TEXT'], ['provider_end_reason', 'TEXT'], ['encrypted_dynamic_variables', 'TEXT']]) {
+            if (!columns.has(name)) await new Promise((resolve, reject) => this.db.run(
+                `ALTER TABLE cartesia_campaign_recipients ADD COLUMN ${name} ${type}`, (error) => error ? reject(error) : resolve(),
+            ));
+        }
+        const campaignColumns = await new Promise((resolve, reject) => this.db.all(
+            'PRAGMA table_info(cartesia_campaigns)', (error, rows) => error ? reject(error) : resolve(new Set((rows || []).map((row) => row.name))),
+        ));
+        if (!campaignColumns.has('provider_retry_count')) await new Promise((resolve, reject) => this.db.run(
+            'ALTER TABLE cartesia_campaigns ADD COLUMN provider_retry_count INTEGER NOT NULL DEFAULT 0', (error) => error ? reject(error) : resolve(),
+        ));
+    }
+
+    async ensureCartesiaVoiceGovernanceColumns() {
+        const columns = await new Promise((resolve, reject) => this.db.all(
+            'PRAGMA table_info(cartesia_voice_governance)', (error, rows) => error ? reject(error) : resolve(new Set((rows || []).map((row) => row.name))),
+        ));
+        if (!columns.has('active_operations')) await new Promise((resolve, reject) => this.db.run(
+            'ALTER TABLE cartesia_voice_governance ADD COLUMN active_operations INTEGER NOT NULL DEFAULT 0', (error) => error ? reject(error) : resolve(),
+        ));
+        if (!columns.has('operation_token')) await new Promise((resolve, reject) => this.db.run(
+            'ALTER TABLE cartesia_voice_governance ADD COLUMN operation_token TEXT', (error) => error ? reject(error) : resolve(),
+        ));
+        if (!columns.has('operation_started_at')) await new Promise((resolve, reject) => this.db.run(
+            'ALTER TABLE cartesia_voice_governance ADD COLUMN operation_started_at DATETIME', (error) => error ? reject(error) : resolve(),
+        ));
+    }
+
     async ensureCallEContactPolicyColumns() {
         const columns = await new Promise((resolve, reject) => {
             this.db.all('PRAGMA table_info(call_e_contact_policy_events)', (error, rows) => {
@@ -1086,6 +1760,48 @@ class EnhancedDatabase {
         });
     }
 
+    async ensureCallESensitiveDataColumns() {
+        for (const table of ['call_e_campaign_missions', 'call_e_goal_run_requests']) {
+            const columns = await new Promise((resolve, reject) => {
+                this.db.all(`PRAGMA table_info(${table})`, (error, rows) => error ? reject(error) : resolve(new Set((rows || []).map((row) => row.name))));
+            });
+            for (const [name, definition] of [['sensitive_data_expires_at', 'DATETIME'], ['sensitive_data_purged_at', 'DATETIME']]) {
+                if (columns.has(name)) continue;
+                await new Promise((resolve, reject) => this.db.run(`ALTER TABLE ${table} ADD COLUMN ${name} ${definition}`, (error) => {
+                    if (error && !String(error.message || '').toLowerCase().includes('duplicate')) return reject(error);
+                    resolve();
+                }));
+            }
+            await new Promise((resolve, reject) => this.db.run(
+                `UPDATE ${table} SET sensitive_data_expires_at = datetime(created_at, '+90 days') WHERE sensitive_data_expires_at IS NULL`,
+                (error) => error ? reject(error) : resolve(),
+            ));
+        }
+    }
+
+    async ensureCallEMissionEnhancementColumns() {
+        const additions = [
+            ['call_e_campaign_missions', 'scheduled_at', 'DATETIME'],
+            ['call_e_campaign_missions', 'budget_limit_minor', 'INTEGER'],
+            ['call_e_campaign_missions', 'per_call_cost_ceiling_minor', 'INTEGER'],
+            ['call_e_campaign_missions', 'budget_currency', 'TEXT'],
+            ['call_e_business_safety_policies', 'contact_cooldown_hours', 'INTEGER NOT NULL DEFAULT 0'],
+            ['call_e_business_mission_policies', 'review_sla_minutes', 'INTEGER NOT NULL DEFAULT 0'],
+            ['call_e_business_mission_policies', 'review_repeat_minutes', 'INTEGER NOT NULL DEFAULT 0'],
+            ['call_e_mission_escalation_actions', 'request_hash', 'TEXT'],
+        ];
+        for (const [table, name, definition] of additions) {
+            const columns = await new Promise((resolve, reject) => this.db.all(
+                `PRAGMA table_info(${table})`, (error, rows) => error ? reject(error) : resolve(new Set((rows || []).map((row) => row.name))),
+            ));
+            if (columns.has(name)) continue;
+            await new Promise((resolve, reject) => this.db.run(
+                `ALTER TABLE ${table} ADD COLUMN ${name} ${definition}`,
+                (error) => error && !String(error.message || '').toLowerCase().includes('duplicate') ? reject(error) : resolve(),
+            ));
+        }
+    }
+
     async ensureCallEReconciliationBusinessColumn() {
         const columns = await new Promise((resolve, reject) => {
             this.db.all('PRAGMA table_info(call_e_reconciliation)', (error, rows) => {
@@ -1096,6 +1812,22 @@ class EnhancedDatabase {
         if (columns.has('business_id')) return;
         await new Promise((resolve, reject) => {
             this.db.run('ALTER TABLE call_e_reconciliation ADD COLUMN business_id TEXT', (error) => {
+                if (error && !String(error.message || '').toLowerCase().includes('duplicate')) return reject(error);
+                resolve();
+            });
+        });
+    }
+
+    async ensureCallEReconciliationIvrColumn() {
+        const columns = await new Promise((resolve, reject) => {
+            this.db.all('PRAGMA table_info(call_e_reconciliation)', (error, rows) => {
+                if (error) return reject(error);
+                resolve(new Set((rows || []).map((row) => row.name)));
+            });
+        });
+        if (columns.has('ivr_dtmf_observed')) return;
+        await new Promise((resolve, reject) => {
+            this.db.run('ALTER TABLE call_e_reconciliation ADD COLUMN ivr_dtmf_observed INTEGER NOT NULL DEFAULT 0', (error) => {
                 if (error && !String(error.message || '').toLowerCase().includes('duplicate')) return reject(error);
                 resolve();
             });
@@ -2057,6 +2789,32 @@ class EnhancedDatabase {
         });
     }
 
+    async listVapiTemplateMappingsByAssistantId(assistantId) {
+        const normalizedId = String(assistantId || "").trim();
+        if (!normalizedId || normalizedId.length > 200) {
+            throw new Error("A valid Vapi assistant ID is required");
+        }
+        return new Promise((resolve, reject) => {
+            this.db.all(
+                `SELECT id, template_id, template_version, config_fingerprint,
+                        compatibility_status, mapping_status, sync_status,
+                        vapi_assistant_id, vapi_assistant_version, summary_json,
+                        reviewed_by, last_sync_started_at, last_synced_at,
+                        last_sync_error, created_at, updated_at
+                 FROM vapi_template_mappings WHERE vapi_assistant_id = ? ORDER BY template_version DESC, updated_at DESC, id DESC`,
+                [normalizedId],
+                (err, rows) => {
+                    if (err) return reject(err);
+                    resolve((rows || []).map((row) => {
+                        let summary = {};
+                        try { summary = JSON.parse(row.summary_json || "{}"); } catch (_) {}
+                        return { ...row, summary };
+                    }));
+                },
+            );
+        });
+    }
+
     async getVapiTemplateMappingById(mappingId) {
         const normalizedId = Number(mappingId);
         if (!Number.isSafeInteger(normalizedId) || normalizedId <= 0) {
@@ -2784,6 +3542,23 @@ class EnhancedDatabase {
         });
     }
 
+    async listCallTemplatePromotionEvents(templateId, limit = 20) {
+        const safeLimit = Number.isFinite(Number(limit))
+            ? Math.max(1, Math.min(100, Math.floor(Number(limit))))
+            : 20;
+        return new Promise((resolve, reject) => this.db.all(
+            `SELECT event_id, template_id, template_version, actor_label, simulation_run_id,
+                    simulation_score, config_fingerprint, previous_live_template_id,
+                    previous_live_version, created_at
+             FROM call_template_promotion_events
+             WHERE template_id = ?
+             ORDER BY event_id DESC
+             LIMIT ?`,
+            [templateId, safeLimit],
+            (error, rows) => error ? reject(error) : resolve(rows || []),
+        ));
+    }
+
     async saveCallTemplateVersion(templateId, version, snapshot, options = {}) {
         const safeVersion = Number.isFinite(Number(version))
             ? Math.max(1, Math.floor(Number(version)))
@@ -2817,6 +3592,206 @@ class EnhancedDatabase {
                 },
             );
         });
+    }
+
+    async getLatestCallAgentSimulationRun(templateId, templateVersion = null) {
+        const normalizedTemplateId = Number(templateId);
+        if (!Number.isSafeInteger(normalizedTemplateId) || normalizedTemplateId < 1) return null;
+        const normalizedVersion = templateVersion == null ? null : Number(templateVersion);
+        if (normalizedVersion !== null && (!Number.isSafeInteger(normalizedVersion) || normalizedVersion < 1)) return null;
+        const versionClause = normalizedVersion === null ? '' : ' AND template_version = ?';
+        const parameters = normalizedVersion === null ? [normalizedTemplateId] : [normalizedTemplateId, normalizedVersion];
+        return new Promise((resolve, reject) => this.db.get(
+            `SELECT run_id, template_id, template_version, created_by, idempotency_key, request_hash,
+                    config_fingerprint, scenario_ids_json, results_json, score, passed_count, failed_count, created_at
+             FROM call_agent_simulation_runs WHERE template_id = ?${versionClause} ORDER BY created_at DESC, rowid DESC LIMIT 1`,
+            parameters, (error, row) => error ? reject(error) : resolve(row || null),
+        ));
+    }
+
+    async recordCallAgentSimulationRun(input = {}) {
+        const runId = String(input.run_id || '').trim();
+        const templateId = Number(input.template_id);
+        const templateVersion = Number(input.template_version);
+        const createdBy = String(input.created_by || '').trim().slice(0, 120) || 'admin';
+        const idempotencyKey = String(input.idempotency_key || '').trim();
+        const requestHash = String(input.request_hash || '').trim().toLowerCase();
+        const configFingerprint = String(input.config_fingerprint || '').trim().toLowerCase();
+        const scenarioIds = Array.isArray(input.scenario_ids) ? input.scenario_ids : [];
+        const resultsJson = JSON.stringify(input.results || {});
+        const score = Number(input.score);
+        const passedCount = Number(input.passed_count) || 0;
+        const failedCount = Number(input.failed_count) || 0;
+        const createdAt = String(input.created_at || new Date().toISOString());
+        if (!/^simrun_[a-f0-9-]{36}$/.test(runId) || !Number.isSafeInteger(templateId) || templateId < 1 ||
+            !Number.isSafeInteger(templateVersion) || templateVersion < 1 || !/^[A-Za-z0-9._:-]{8,180}$/.test(idempotencyKey) ||
+            !/^[a-f0-9]{64}$/.test(requestHash) || !/^[a-f0-9]{64}$/.test(configFingerprint) ||
+            scenarioIds.length < 1 || scenarioIds.length > 11 || !Number.isSafeInteger(score) || score < 0 || score > 100 ||
+            !Number.isSafeInteger(passedCount) || passedCount < 0 || !Number.isSafeInteger(failedCount) || failedCount < 0 ||
+            !Number.isFinite(Date.parse(createdAt)) || Buffer.byteLength(resultsJson, 'utf8') > 100000) {
+            throw Object.assign(new Error('Call agent simulation run is invalid'), { code: 'call_agent_simulation_invalid' });
+        }
+        const loadExisting = () => new Promise((resolve, reject) => this.db.get(
+            `SELECT run_id, template_id, template_version, created_by, request_hash, config_fingerprint,
+                    results_json, score, passed_count, failed_count, created_at
+             FROM call_agent_simulation_runs WHERE template_id = ? AND idempotency_key = ?`,
+            [templateId, idempotencyKey], (error, row) => error ? reject(error) : resolve(row || null),
+        ));
+        const serialize = (row, idempotentReplay, conflict = false) => {
+            let results = {};
+            try { results = JSON.parse(row.results_json || '{}'); } catch (_) {}
+            return { run_id: row.run_id, template_id: Number(row.template_id), template_version: Number(row.template_version),
+                created_by: row.created_by, config_fingerprint: row.config_fingerprint, results,
+                score: Number(row.score) || 0, passed_count: Number(row.passed_count) || 0,
+                failed_count: Number(row.failed_count) || 0, created_at: row.created_at,
+                idempotent_replay: idempotentReplay, conflict };
+        };
+        const existing = await loadExisting();
+        if (existing) return serialize(existing, existing.request_hash === requestHash, existing.request_hash !== requestHash);
+        try {
+            await new Promise((resolve, reject) => this.db.run(
+                `INSERT INTO call_agent_simulation_runs (
+                    run_id, template_id, template_version, created_by, idempotency_key, request_hash,
+                    config_fingerprint, scenario_ids_json, results_json, score, passed_count, failed_count, created_at
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                [runId, templateId, templateVersion, createdBy, idempotencyKey, requestHash, configFingerprint,
+                    JSON.stringify(scenarioIds), resultsJson, score, passedCount, failedCount, createdAt],
+                (error) => error ? reject(error) : resolve(),
+            ));
+            return serialize({ run_id: runId, template_id: templateId, template_version: templateVersion,
+                created_by: createdBy, config_fingerprint: configFingerprint, results_json: resultsJson,
+                score, passed_count: passedCount, failed_count: failedCount, created_at: createdAt }, false);
+        } catch (error) {
+            if (!/unique|constraint/i.test(String(error?.message || ''))) throw error;
+            const raced = await loadExisting();
+            if (raced) return serialize(raced, raced.request_hash === requestHash, raced.request_hash !== requestHash);
+            throw error;
+        }
+    }
+
+    async listCallAgentSimulationRuns(templateId, limit = 10) {
+        const normalizedTemplateId = Number(templateId);
+        const safeLimit = Math.max(1, Math.min(50, Math.floor(Number(limit) || 10)));
+        if (!Number.isSafeInteger(normalizedTemplateId) || normalizedTemplateId < 1) return [];
+        return new Promise((resolve, reject) => this.db.all(
+            `SELECT run_id, template_id, template_version, created_by, config_fingerprint,
+                    results_json, score, passed_count, failed_count, created_at
+             FROM call_agent_simulation_runs WHERE template_id = ? ORDER BY created_at DESC, rowid DESC LIMIT ?`,
+            [normalizedTemplateId, safeLimit], (error, rows) => error ? reject(error) : resolve(rows || []),
+        ));
+    }
+
+    async getLatestVapiSimulationRun(templateId, templateVersion = null) {
+        const id = Number(templateId);
+        if (!Number.isSafeInteger(id) || id < 1) return null;
+        const version = templateVersion == null ? null : Number(templateVersion);
+        if (version !== null && (!Number.isSafeInteger(version) || version < 1)) return null;
+        const whereVersion = version === null ? '' : ' AND template_version = ?';
+        const params = version === null ? [id] : [id, version];
+        return new Promise((resolve, reject) => this.db.get(
+            `SELECT vapi_run_id AS run_id, template_id, template_version, mapping_id, assistant_id,
+                    suite_id, idempotency_key, actor_id, summary_json, safety_status, created_at
+             FROM vapi_simulation_runs WHERE template_id = ?${whereVersion} ORDER BY created_at DESC, rowid DESC LIMIT 1`,
+            params, (error, row) => {
+                if (error) return reject(error);
+                if (!row) return resolve(null);
+                let summary = {};
+                try { summary = JSON.parse(row.summary_json || '{}'); } catch (_) {}
+                resolve({ ...row, summary });
+            },
+        ));
+    }
+
+    async recordVapiSimulationRun(input = {}) {
+        const runId = String(input.run_id || '').trim();
+        const templateId = Number(input.template_id);
+        const templateVersion = Number(input.template_version);
+        const mappingId = Number(input.mapping_id);
+        const assistantId = String(input.assistant_id || '').trim();
+        const suiteId = String(input.suite_id || '').trim();
+        const idempotencyKey = String(input.idempotency_key || '').trim();
+        const actorId = String(input.actor_id || 'admin').trim().slice(0, 120) || 'admin';
+        const summaryJson = JSON.stringify(input.summary || {});
+        const safety = String(input.safety || '').trim();
+        if (!runId || runId.length > 200 || !Number.isSafeInteger(templateId) || templateId < 1 ||
+            !Number.isSafeInteger(templateVersion) || templateVersion < 1 || !Number.isSafeInteger(mappingId) || mappingId < 1 ||
+            !assistantId || assistantId.length > 200 || !suiteId || suiteId.length > 200 ||
+            !/^[A-Za-z0-9._:-]{8,200}$/.test(idempotencyKey) || !safety || safety.length > 100 ||
+            Buffer.byteLength(summaryJson, 'utf8') > 10000) {
+            throw Object.assign(new Error('Vapi simulation run record is invalid'), { code: 'vapi_simulation_record_invalid' });
+        }
+        const findByKey = () => new Promise((resolve, reject) => this.db.get(
+            `SELECT vapi_run_id AS run_id, template_id, template_version, mapping_id, assistant_id,
+                    suite_id, idempotency_key, actor_id, summary_json, safety_status, created_at
+             FROM vapi_simulation_runs WHERE template_id = ? AND idempotency_key = ?`,
+            [templateId, idempotencyKey], (error, row) => {
+                if (error) return reject(error);
+                if (!row) return resolve(null);
+                let summary = {};
+                try { summary = JSON.parse(row.summary_json || '{}'); } catch (_) {}
+                resolve({ ...row, summary });
+            },
+        ));
+        const existing = await findByKey();
+        if (existing) return { ...existing, idempotent_replay: existing.run_id === runId, conflict: existing.run_id !== runId };
+        try {
+            await new Promise((resolve, reject) => this.db.run(
+                `INSERT INTO vapi_simulation_runs (
+                    vapi_run_id, template_id, template_version, mapping_id, assistant_id, suite_id,
+                    idempotency_key, actor_id, summary_json, safety_status
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                [runId, templateId, templateVersion, mappingId, assistantId, suiteId, idempotencyKey, actorId, summaryJson, safety],
+                (error) => error ? reject(error) : resolve(),
+            ));
+            return { run_id: runId, template_id: templateId, template_version: templateVersion,
+                mapping_id: mappingId, assistant_id: assistantId, suite_id: suiteId,
+                idempotency_key: idempotencyKey, actor_id: actorId, summary: input.summary || {}, safety_status: safety,
+                idempotent_replay: false, conflict: false };
+        } catch (error) {
+            if (!/unique|constraint/i.test(String(error?.message || ''))) throw error;
+            const raced = await findByKey();
+            if (raced) return { ...raced, idempotent_replay: raced.run_id === runId, conflict: raced.run_id !== runId };
+            throw error;
+        }
+    }
+
+    async listVapiSimulationRuns(templateId, limit = 10, templateVersion = null) {
+        const id = Number(templateId);
+        const safeLimit = Math.max(1, Math.min(20, Math.floor(Number(limit) || 10)));
+        if (!Number.isSafeInteger(id) || id < 1) return [];
+        const version = templateVersion == null ? null : Number(templateVersion);
+        if (version !== null && (!Number.isSafeInteger(version) || version < 1)) return [];
+        const whereVersion = version === null ? '' : ' AND template_version = ?';
+        const params = version === null ? [id, safeLimit] : [id, version, safeLimit];
+        return new Promise((resolve, reject) => this.db.all(
+            `SELECT vapi_run_id AS run_id, template_id, template_version, mapping_id, suite_id,
+                    actor_id, summary_json, safety_status, created_at
+             FROM vapi_simulation_runs WHERE template_id = ?${whereVersion} ORDER BY created_at DESC, rowid DESC LIMIT ?`,
+            params, (error, rows) => {
+                if (error) return reject(error);
+                resolve((rows || []).map((row) => {
+                    let summary = {};
+                    try { summary = JSON.parse(row.summary_json || '{}'); } catch (_) {}
+                    return { ...row, summary };
+                }));
+            },
+        ));
+    }
+
+    async updateVapiSimulationRunSummary(templateId, runId, summary = {}) {
+        const id = Number(templateId);
+        const remoteId = String(runId || '').trim();
+        const json = JSON.stringify(summary || {});
+        if (!Number.isSafeInteger(id) || id < 1 || !remoteId || remoteId.length > 200 || Buffer.byteLength(json, 'utf8') > 10000) {
+            throw Object.assign(new Error('Vapi simulation summary update is invalid'), { code: 'vapi_simulation_record_invalid' });
+        }
+        return new Promise((resolve, reject) => this.db.run(
+            `UPDATE vapi_simulation_runs SET summary_json = ? WHERE template_id = ? AND vapi_run_id = ?`,
+            [json, id, remoteId], function (error) {
+                if (error) return reject(error);
+                resolve(this.changes === 1);
+            },
+        ));
     }
 
     async setCallTemplateLifecycle(templateId, updates = {}) {
@@ -2866,56 +3841,89 @@ class EnhancedDatabase {
         });
     }
 
-    async promoteCallTemplateLive(templateId, actor = null) {
+    async promoteCallTemplateLive(templateId, actor = null, expectedVersion = null, audit = null) {
         const safeActor = actor === null || actor === undefined ? null : String(actor).slice(0, 120);
+        const normalizedExpectedVersion = expectedVersion == null ? null : Number(expectedVersion);
+        if (normalizedExpectedVersion !== null && (!Number.isSafeInteger(normalizedExpectedVersion) || normalizedExpectedVersion < 1)) return 0;
+        const auditRunId = String(audit?.simulation_run_id || '').trim();
+        const auditScore = Number(audit?.simulation_score);
+        const auditFingerprint = String(audit?.config_fingerprint || '').trim().toLowerCase();
+        if (!audit || normalizedExpectedVersion === null ||
+            !/^simrun_[a-f0-9-]{36}$/.test(auditRunId) ||
+            !Number.isSafeInteger(auditScore) || auditScore < 90 || auditScore > 100 ||
+            !/^[a-f0-9]{64}$/.test(auditFingerprint)) {
+            throw Object.assign(new Error('Promotion audit evidence is invalid'), { code: 'call_template_promotion_audit_invalid' });
+        }
         return new Promise((resolve, reject) => {
             const dbConn = this.db;
             dbConn.serialize(() => {
                 dbConn.run('BEGIN TRANSACTION');
-                dbConn.run(
-                    `UPDATE call_templates
-                     SET lifecycle_state = 'approved',
-                         live_at = NULL,
-                         live_by = NULL,
-                         updated_at = CURRENT_TIMESTAMP
-                     WHERE lifecycle_state = 'live' AND id != ?`,
+                dbConn.get(
+                    `SELECT id, version FROM call_templates WHERE lifecycle_state = 'live' AND id != ? ORDER BY id LIMIT 1`,
                     [templateId],
-                    (demoteErr) => {
-                        if (demoteErr) {
-                            dbConn.run('ROLLBACK');
-                            reject(demoteErr);
+                    (previousErr, previousLive) => {
+                        if (previousErr) {
+                            dbConn.run('ROLLBACK', (rollbackErr) => reject(previousErr || rollbackErr));
                             return;
                         }
                         dbConn.run(
+                            `UPDATE call_templates
+                             SET lifecycle_state = 'approved', live_at = NULL, live_by = NULL,
+                                 updated_at = CURRENT_TIMESTAMP
+                             WHERE lifecycle_state = 'live' AND id != ?`,
+                            [templateId],
+                            (demoteErr) => {
+                                if (demoteErr) {
+                                    dbConn.run('ROLLBACK', (rollbackErr) => reject(demoteErr || rollbackErr));
+                                    return;
+                                }
+                                dbConn.run(
                             `UPDATE call_templates
                              SET lifecycle_state = 'live',
                                  live_at = CURRENT_TIMESTAMP,
                                  live_by = ?,
                                  updated_at = CURRENT_TIMESTAMP
-                             WHERE id = ?`,
-                            [safeActor, templateId],
+                             WHERE id = ?${normalizedExpectedVersion === null ? '' : ' AND version = ?'}`,
+                            normalizedExpectedVersion === null
+                                ? [safeActor, templateId]
+                                : [safeActor, templateId, normalizedExpectedVersion],
                             function(promoteErr) {
                                 if (promoteErr) {
-                                    dbConn.run('ROLLBACK');
-                                    reject(promoteErr);
+                                    dbConn.run('ROLLBACK', (rollbackErr) => reject(promoteErr || rollbackErr));
                                     return;
                                 }
                                 if (this.changes === 0) {
-                                    dbConn.run('ROLLBACK');
-                                    resolve(0);
+                                    dbConn.run('ROLLBACK', (rollbackErr) => rollbackErr ? reject(rollbackErr) : resolve(0));
                                     return;
                                 }
                                 const promotedChanges = this.changes;
-                                dbConn.run('COMMIT', (commitErr) => {
-                                    if (commitErr) {
-                                        dbConn.run('ROLLBACK');
-                                        reject(commitErr);
-                                    } else {
-                                        resolve(promotedChanges);
-                                    }
-                                });
+                                dbConn.run(
+                                    `INSERT INTO call_template_promotion_events
+                                     (template_id, template_version, actor_label, simulation_run_id,
+                                      simulation_score, config_fingerprint, previous_live_template_id,
+                                      previous_live_version, created_at)
+                                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`,
+                                    [templateId, normalizedExpectedVersion, safeActor || 'admin_token', auditRunId,
+                                        auditScore, auditFingerprint, previousLive?.id || null,
+                                        previousLive?.version || null],
+                                    (auditErr) => {
+                                        if (auditErr) {
+                                            dbConn.run('ROLLBACK', (rollbackErr) => reject(auditErr || rollbackErr));
+                                            return;
+                                        }
+                                        dbConn.run('COMMIT', (commitErr) => {
+                                            if (commitErr) {
+                                                dbConn.run('ROLLBACK', (rollbackErr) => reject(commitErr || rollbackErr));
+                                            } else {
+                                                resolve(promotedChanges);
+                                            }
+                                        });
+                                    },
+                                );
                             },
                         );
+                    },
+                );
                     },
                 );
             });
@@ -4036,6 +5044,78 @@ class EnhancedDatabase {
         });
     }
 
+    async recordCartesiaWebhookEvent(event = {}) {
+        const fields = [event.webhook_request_id, event.call_id, event.agent_id, event.webhook_id,
+            event.event_type, event.event_timestamp, event.payload_hash].map((value) => String(value || '').trim());
+        if (fields.some((value) => !value) || !/^[a-f0-9]{64}$/.test(fields[6])) {
+            throw Object.assign(new Error('Cartesia webhook event metadata is invalid'), { code: 'cartesia_webhook_event_invalid' });
+        }
+        const [requestId, callId, agentId, webhookId, eventType, timestamp, payloadHash] = fields;
+        const database = this.db;
+        return new Promise((resolve, reject) => {
+            database.run("DELETE FROM cartesia_webhook_events WHERE received_at < datetime('now', '-30 days')", (cleanupError) => {
+                if (cleanupError) return reject(cleanupError);
+                database.run(
+                    `INSERT OR IGNORE INTO cartesia_webhook_events
+                    (webhook_request_id, call_id, agent_id, webhook_id, event_type, event_timestamp, payload_hash)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)`,
+                    [requestId, callId, agentId, webhookId, eventType, timestamp, payloadHash],
+                    function(insertError) {
+                        if (insertError) return reject(insertError);
+                        if (this.changes > 0) return resolve({ inserted: true, duplicate: false });
+                        database.get('SELECT payload_hash FROM cartesia_webhook_events WHERE webhook_request_id = ?', [requestId], (selectError, row) => {
+                            if (selectError) return reject(selectError);
+                            if (String(row?.payload_hash || '') !== payloadHash) {
+                                return resolve({ inserted: false, duplicate: false, conflict: true });
+                            }
+                            return resolve({ inserted: false, duplicate: true });
+                        });
+                    },
+                );
+            });
+        });
+    }
+
+    async listCartesiaWebhookEvents(options = {}) {
+        const limit = Math.max(1, Math.min(100, Math.floor(Number(options.limit) || 25)));
+        return new Promise((resolve, reject) => {
+            this.db.all(
+                `SELECT webhook_request_id, call_id, agent_id, webhook_id, event_type, event_timestamp, received_at
+                 FROM cartesia_webhook_events WHERE received_at >= datetime('now', '-30 days')
+                 ORDER BY received_at DESC LIMIT ?`,
+                [limit],
+                (error, rows) => error ? reject(error) : resolve(rows || []),
+            );
+        });
+    }
+
+    async summarizeCartesiaWebhookEvents() {
+        return new Promise((resolve, reject) => {
+            this.db.all(
+                `SELECT event_type, COUNT(*) AS event_count, MAX(received_at) AS latest_received_at
+                 FROM cartesia_webhook_events
+                 WHERE received_at >= datetime('now', '-30 days')
+                 GROUP BY event_type`,
+                [],
+                (error, rows) => {
+                    if (error) return reject(error);
+                    const eventTypes = {};
+                    let count = 0;
+                    let latestReceivedAt = null;
+                    for (const row of rows || []) {
+                        const eventType = String(row.event_type || '').trim();
+                        const eventCount = Math.max(0, Number(row.event_count) || 0);
+                        if (eventType) eventTypes[eventType] = eventCount;
+                        count += eventCount;
+                        const receivedAt = String(row.latest_received_at || '');
+                        if (receivedAt > String(latestReceivedAt || '')) latestReceivedAt = receivedAt;
+                    }
+                    resolve({ count, latestReceivedAt, eventTypes });
+                },
+            );
+        });
+    }
+
     async reserveProviderEventIdempotency(payload = {}) {
         const source = String(payload.source || '').trim();
         const payloadHash = String(payload.payload_hash || '').trim();
@@ -4145,6 +5225,567 @@ class EnhancedDatabase {
         });
     }
 
+    async recordCartesiaVoiceConsent(input = {}) {
+        const consentId = String(input.consent_id || '').trim();
+        const actorId = String(input.actor_id || '').trim();
+        const operation = String(input.operation || '').trim();
+        const resourceName = String(input.resource_name || '').trim().slice(0, 80);
+        if (!/^[a-f0-9]{32}$/.test(consentId) || !/^\d{1,20}$/.test(actorId) || !['instant_clone', 'pro_clone_dataset'].includes(operation) || !resourceName) {
+            throw Object.assign(new Error('Cartesia voice consent record is invalid'), { code: 'cartesia_voice_governance_invalid', status: 400 });
+        }
+        await new Promise((resolve, reject) => this.db.run(
+            `INSERT INTO cartesia_voice_governance (consent_id, actor_id, operation, resource_name, status, active_operations, operation_token, operation_started_at)
+             VALUES (?, ?, ?, ?, 'active', 1, ?, CURRENT_TIMESTAMP)`, [consentId, actorId, operation, resourceName, consentId],
+            (error) => error ? reject(error) : resolve(),
+        ));
+        return { consentId };
+    }
+
+    async linkCartesiaVoiceGovernanceResource(input = {}) {
+        const consentId = String(input.consent_id || '').trim();
+        const resourceId = String(input.resource_id || '').trim();
+        const resourceType = String(input.resource_type || '').trim();
+        if (!/^[a-f0-9]{32}$/.test(consentId) || !/^[A-Za-z0-9._:-]{1,200}$/.test(resourceId) || !['voice', 'dataset', 'fine_tune'].includes(resourceType)) {
+            throw Object.assign(new Error('Cartesia voice resource record is invalid'), { code: 'cartesia_voice_governance_invalid', status: 400 });
+        }
+        return new Promise((resolve, reject) => this.db.run(
+            `UPDATE cartesia_voice_governance SET resource_id = ?, resource_type = ?, updated_at = CURRENT_TIMESTAMP
+             WHERE consent_id = ? AND status = 'active'`, [resourceId, resourceType, consentId],
+            function(error) { if (error) reject(error); else resolve(this.changes === 1); },
+        ));
+    }
+
+    async finishCartesiaVoiceGovernanceCreation(consentId, operationToken = consentId) {
+        return new Promise((resolve, reject) => this.db.run(
+            `UPDATE cartesia_voice_governance SET active_operations = 0, operation_token = NULL, operation_started_at = NULL, updated_at = CURRENT_TIMESTAMP
+             WHERE consent_id = ? AND status = 'active' AND active_operations > 0 AND operation_token = ?`, [String(consentId || ''), String(operationToken || '')],
+            function(error) { if (error) reject(error); else resolve(this.changes === 1); },
+        ));
+    }
+
+    async beginCartesiaVoiceGovernanceOperation(consentId, datasetId, operationToken) {
+        return new Promise((resolve, reject) => this.db.run(
+            `UPDATE cartesia_voice_governance SET active_operations = 1, operation_token = ?, operation_started_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+             WHERE consent_id = ? AND operation = 'pro_clone_dataset' AND resource_type = 'dataset' AND resource_id = ? AND status = 'active'
+               AND (active_operations = 0 OR operation_started_at < datetime('now', '-15 minutes'))`,
+            [String(operationToken || ''), String(consentId || ''), String(datasetId || '')],
+            function(error) { if (error) reject(error); else resolve(this.changes === 1); },
+        ));
+    }
+
+    async finishCartesiaVoiceGovernanceOperation(consentId, operationToken, result = {}) {
+        const sets = ['active_operations = 0', 'operation_token = NULL', 'operation_started_at = NULL', 'updated_at = CURRENT_TIMESTAMP'];
+        const values = [];
+        if (result.sampleUploaded === true) sets.push('sample_count = sample_count + 1');
+        if (result.fineTuneId) { sets.push('fine_tune_id = ?'); values.push(String(result.fineTuneId)); }
+        values.push(String(consentId || ''), String(operationToken || ''));
+        return new Promise((resolve, reject) => this.db.run(
+            `UPDATE cartesia_voice_governance SET ${sets.join(', ')} WHERE consent_id = ? AND active_operations > 0 AND operation_token = ?`, values,
+            function(error) { if (error) reject(error); else resolve(this.changes === 1); },
+        ));
+    }
+
+    async claimCartesiaVoiceGovernanceResourceCleanup(consentId, resourceId, resourceType, operationToken) {
+        return new Promise((resolve, reject) => this.db.run(
+            `UPDATE cartesia_voice_governance SET active_operations = 1, operation_token = ?, operation_started_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+             WHERE consent_id = ? AND resource_type = ? AND resource_id = ?
+               AND status IN ('active', 'revoked', 'provider_failed')
+               AND (active_operations = 0 OR operation_started_at < datetime('now', '-15 minutes'))`,
+            [String(operationToken || ''), String(consentId || ''), String(resourceType || ''), String(resourceId || '')],
+            function(error) { if (error) reject(error); else resolve(this.changes === 1); },
+        ));
+    }
+
+    async claimCartesiaVoiceGovernanceCleanup(consentId, datasetId, operationToken) {
+        return this.claimCartesiaVoiceGovernanceResourceCleanup(consentId, datasetId, 'dataset', operationToken);
+    }
+
+    async markCartesiaVoiceGovernanceFailure(consentId, resource = {}, operationToken = consentId) {
+        const resourceId = String(resource.resource_id || '').trim();
+        const resourceType = String(resource.resource_type || '').trim();
+        const hasResource = /^[A-Za-z0-9._:-]{1,200}$/.test(resourceId) && ['voice', 'dataset'].includes(resourceType);
+        return new Promise((resolve, reject) => this.db.run(
+            `UPDATE cartesia_voice_governance SET status = 'provider_failed',
+                resource_id = COALESCE(?, resource_id), resource_type = COALESCE(?, resource_type),
+                fine_tune_id = COALESCE(?, fine_tune_id), active_operations = 0, operation_token = NULL, operation_started_at = NULL, updated_at = CURRENT_TIMESTAMP
+             WHERE consent_id = ? AND status IN ('active', 'provider_failed') AND operation_token = ?`,
+            [hasResource ? resourceId : null, hasResource ? resourceType : null, /^[A-Za-z0-9._:-]{1,200}$/.test(String(resource.fine_tune_id || '')) ? String(resource.fine_tune_id) : null, String(consentId || ''), String(operationToken || '')],
+            function(error) { if (error) reject(error); else resolve(this.changes === 1); },
+        ));
+    }
+
+    async listCartesiaVoiceGovernance(limit = 100) {
+        const bounded = Math.max(1, Math.min(200, Number(limit) || 100));
+        return new Promise((resolve, reject) => this.db.all(
+            `SELECT consent_id, actor_id, operation, resource_id, resource_type, resource_name, status, consented_at, updated_at, revoked_at, deleted_at
+             FROM cartesia_voice_governance ORDER BY consented_at DESC LIMIT ?`, [bounded],
+            (error, rows) => error ? reject(error) : resolve(rows || []),
+        ));
+    }
+
+    async getCartesiaVoiceGovernance(consentId) {
+        return new Promise((resolve, reject) => this.db.get(
+            `SELECT consent_id, actor_id, operation, resource_id, resource_type, fine_tune_id, sample_count, resource_name, status, consented_at, updated_at, revoked_at, deleted_at
+             FROM cartesia_voice_governance WHERE consent_id = ?`, [String(consentId || '')],
+            (error, row) => error ? reject(error) : resolve(row || null),
+        ));
+    }
+
+    async revokeCartesiaVoiceConsent(consentId) {
+        return new Promise((resolve, reject) => this.db.run(
+            `UPDATE cartesia_voice_governance SET status = 'revoked', active_operations = 0, operation_token = NULL, operation_started_at = NULL, revoked_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+             WHERE consent_id = ? AND status = 'active' AND (active_operations = 0 OR operation_started_at < datetime('now', '-15 minutes'))`, [String(consentId || '')],
+            function(error) { if (error) reject(error); else resolve(this.changes === 1); },
+        ));
+    }
+
+    async markCartesiaVoiceResourceDeleted(consentId, operationToken = '') {
+        return new Promise((resolve, reject) => this.db.run(
+            `UPDATE cartesia_voice_governance SET status = 'deleted', active_operations = 0, operation_token = NULL, operation_started_at = NULL, deleted_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+             WHERE consent_id = ? AND status IN ('active', 'revoked', 'provider_failed') AND (active_operations = 0 OR operation_token = ?)`, [String(consentId || ''), String(operationToken || '')],
+            function(error) { if (error) reject(error); else resolve(this.changes === 1); },
+        ));
+    }
+
+    async recordCartesiaVoiceSampleUpload(consentId) {
+        return new Promise((resolve, reject) => this.db.run(
+            `UPDATE cartesia_voice_governance SET sample_count = sample_count + 1, updated_at = CURRENT_TIMESTAMP
+             WHERE consent_id = ? AND operation = 'pro_clone_dataset' AND resource_type = 'dataset' AND status = 'active'`, [String(consentId || '')],
+            function(error) { if (error) reject(error); else resolve(this.changes === 1); },
+        ));
+    }
+
+    async clearCartesiaFineTuneLink(consentId, fineTuneId) {
+        return new Promise((resolve, reject) => this.db.run(
+            `UPDATE cartesia_voice_governance SET fine_tune_id = NULL, updated_at = CURRENT_TIMESTAMP
+             WHERE consent_id = ? AND fine_tune_id = ? AND status IN ('active', 'revoked', 'provider_failed')`,
+            [String(consentId || ''), String(fineTuneId || '')],
+            function(error) { if (error) reject(error); else resolve(this.changes === 1); },
+        ));
+    }
+
+    async linkCartesiaFineTune(consentId, fineTuneId) {
+        return new Promise((resolve, reject) => this.db.run(
+            `UPDATE cartesia_voice_governance SET fine_tune_id = ?, updated_at = CURRENT_TIMESTAMP
+             WHERE consent_id = ? AND operation = 'pro_clone_dataset' AND resource_type = 'dataset' AND status = 'active'`,
+            [String(fineTuneId || ''), String(consentId || '')],
+            function(error) { if (error) reject(error); else resolve(this.changes === 1); },
+        ));
+    }
+
+    async createCartesiaCampaignDraft(input = {}) {
+        const campaignId = String(input.campaign_id || '').trim();
+        const businessId = String(input.business_id || '').trim();
+        const createdBy = String(input.created_by || '').trim();
+        const requestKey = String(input.request_key || '').trim();
+        const requestHash = String(input.request_hash || '').trim();
+        const recipients = Array.isArray(input.recipients) ? input.recipients : [];
+        if (!/^cartesia_campaign_[a-f0-9]{64}$/.test(campaignId) || !/^[A-Za-z0-9._:-]{1,120}$/.test(businessId) ||
+            !/^\d{1,20}$/.test(createdBy) || !/^[A-Za-z0-9._:-]{8,180}$/.test(requestKey) || !/^[a-f0-9]{64}$/.test(requestHash) ||
+            !/^[A-Za-z0-9._:-]{1,200}$/.test(String(input.agent_id || '')) || !/^[A-Za-z0-9._:-]{1,200}$/.test(String(input.from_number_id || '')) ||
+            !Number.isSafeInteger(Number(input.target_concurrency_limit)) || Number(input.target_concurrency_limit) < 1 || Number(input.target_concurrency_limit) > 10 ||
+            !Number.isSafeInteger(Number(input.encryption_key_version)) || Number(input.encryption_key_version) < 1 || recipients.length < 1 || recipients.length > 25) {
+            throw Object.assign(new Error('Cartesia campaign draft is invalid'), { code: 'cartesia_campaign_invalid' });
+        }
+        let release;
+        const previous = this.callECampaignWriteChain;
+        this.callECampaignWriteChain = new Promise((resolve) => { release = resolve; });
+        await previous;
+        try {
+            await new Promise((resolve, reject) => this.db.run('BEGIN IMMEDIATE', (error) => error ? reject(error) : resolve()));
+            const existing = await new Promise((resolve, reject) => this.db.get(
+                'SELECT * FROM cartesia_campaigns WHERE business_id = ? AND request_key = ?', [businessId, requestKey],
+                (error, row) => error ? reject(error) : resolve(row || null),
+            ));
+            if (existing) {
+                const saved = await this.getCartesiaCampaign(existing.campaign_id, businessId);
+                await new Promise((resolve, reject) => this.db.run('COMMIT', (error) => error ? reject(error) : resolve()));
+                return { ...saved, idempotentReplay: true };
+            }
+            await new Promise((resolve, reject) => this.db.run(
+                `INSERT INTO cartesia_campaigns (campaign_id, business_id, created_by, request_key, request_hash, campaign_name,
+                    agent_id, from_number_id, target_concurrency_limit, scheduled_at, status, recipient_count, ready_count,
+                    blocked_count, encryption_key_version)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?, ?, ?)`,
+                [campaignId, businessId, createdBy, requestKey, requestHash, String(input.name || '').slice(0, 120),
+                    String(input.agent_id), String(input.from_number_id), Number(input.target_concurrency_limit), input.scheduled_at || null,
+                    recipients.length, recipients.filter((row) => row.readiness === 'ready').length,
+                    recipients.filter((row) => row.readiness !== 'ready').length, Number(input.encryption_key_version)],
+                (error) => error ? reject(error) : resolve(),
+            ));
+            for (const row of recipients) {
+                await new Promise((resolve, reject) => this.db.run(
+                    `INSERT INTO cartesia_campaign_recipients (campaign_id, position, encrypted_destination, encrypted_dynamic_variables, destination_masked, readiness, reason_code)
+                     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+                    [campaignId, Number(row.position), String(row.encrypted_destination), row.encrypted_dynamic_variables || null, String(row.destination_masked),
+                        row.readiness === 'ready' ? 'ready' : 'blocked', String(row.reason_code || 'policy_storage_unavailable')],
+                    (error) => error ? reject(error) : resolve(),
+                ));
+            }
+            const saved = await this.getCartesiaCampaign(campaignId, businessId);
+            await new Promise((resolve, reject) => this.db.run('COMMIT', (error) => error ? reject(error) : resolve()));
+            return { ...saved, idempotentReplay: false };
+        } catch (error) {
+            await new Promise((resolve) => this.db.run('ROLLBACK', () => resolve()));
+            throw error;
+        } finally { release(); }
+    }
+
+    async getCartesiaCampaign(campaignId, businessId) {
+        const id = String(campaignId || '').trim();
+        const business = String(businessId || '').trim();
+        if (!/^cartesia_campaign_[a-f0-9]{64}$/.test(id) || !/^[A-Za-z0-9._:-]{1,120}$/.test(business)) return null;
+        const campaign = await new Promise((resolve, reject) => this.db.get(
+            'SELECT * FROM cartesia_campaigns WHERE campaign_id = ? AND business_id = ?', [id, business],
+            (error, row) => error ? reject(error) : resolve(row || null),
+        ));
+        if (!campaign) return null;
+        const recipients = await new Promise((resolve, reject) => this.db.all(
+            'SELECT * FROM cartesia_campaign_recipients WHERE campaign_id = ? ORDER BY position', [id],
+            (error, rows) => error ? reject(error) : resolve(rows || []),
+        ));
+        return { campaign, recipients };
+    }
+
+    async getCartesiaCallReviewRules(businessId) {
+        const business = String(businessId || '').trim();
+        if (!/^[A-Za-z0-9._:-]{1,120}$/.test(business)) throw Object.assign(new Error('Cartesia business scope is invalid'), { code: 'cartesia_review_rules_invalid' });
+        const row = await new Promise((resolve, reject) => this.db.get(
+            'SELECT review_failed_calls, review_tool_calls, review_missing_summary, updated_at FROM cartesia_call_review_rules WHERE business_id = ?',
+            [business], (error, value) => error ? reject(error) : resolve(value || null),
+        ));
+        return row ? {
+            review_failed_calls: row.review_failed_calls === 1,
+            review_tool_calls: row.review_tool_calls === 1,
+            review_missing_summary: row.review_missing_summary === 1,
+            updated_at: row.updated_at || null,
+        } : { review_failed_calls: true, review_tool_calls: false, review_missing_summary: false, updated_at: null };
+    }
+
+    async saveCartesiaCallReviewRules(input = {}) {
+        const businessId = String(input.business_id || '').trim();
+        const actorId = String(input.updated_by || '').trim();
+        if (!/^[A-Za-z0-9._:-]{1,120}$/.test(businessId) || !/^\d{1,20}$/.test(actorId) || typeof input.review_failed_calls !== 'boolean' ||
+            typeof input.review_tool_calls !== 'boolean' || typeof input.review_missing_summary !== 'boolean') {
+            throw Object.assign(new Error('Cartesia call review rules are invalid'), { code: 'cartesia_review_rules_invalid' });
+        }
+        await new Promise((resolve, reject) => this.db.run(
+            `INSERT INTO cartesia_call_review_rules (business_id, review_failed_calls, review_tool_calls, review_missing_summary, updated_by, updated_at)
+             VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+             ON CONFLICT(business_id) DO UPDATE SET review_failed_calls = excluded.review_failed_calls,
+                review_tool_calls = excluded.review_tool_calls, review_missing_summary = excluded.review_missing_summary,
+                updated_by = excluded.updated_by, updated_at = CURRENT_TIMESTAMP`,
+            [businessId, input.review_failed_calls ? 1 : 0, input.review_tool_calls ? 1 : 0, input.review_missing_summary ? 1 : 0, actorId],
+            (error) => error ? reject(error) : resolve(),
+        ));
+        return this.getCartesiaCallReviewRules(businessId);
+    }
+
+    async getCartesiaCallBusinessScope(providerCallId) {
+        const callId = String(providerCallId || '').trim();
+        if (!/^[A-Za-z0-9._:-]{1,200}$/.test(callId)) return null;
+        const rows = await new Promise((resolve, reject) => this.db.all(
+            `SELECT business_id FROM outbound_call_idempotency WHERE provider = 'cartesia' AND call_sid = ? AND status = 'completed' AND business_id IS NOT NULL
+             UNION SELECT c.business_id FROM cartesia_campaign_recipients r JOIN cartesia_campaigns c ON c.campaign_id = r.campaign_id WHERE r.provider_call_id = ?`,
+            [callId, callId], (error, values) => error ? reject(error) : resolve(values || []),
+        ));
+        const businesses = [...new Set(rows.map((row) => String(row.business_id || '')).filter(Boolean))];
+        return businesses.length === 1 ? businesses[0] : null;
+    }
+
+    async listDueCartesiaCampaigns(input = {}) {
+        const nowIso = String(input.now_iso || new Date().toISOString());
+        const limit = Math.max(1, Math.min(50, Number(input.limit) || 10));
+        if (!Number.isFinite(Date.parse(nowIso))) return [];
+        return new Promise((resolve, reject) => this.db.all(
+            `SELECT campaign_id, business_id, approved_by, scheduled_at
+             FROM cartesia_campaigns
+             WHERE status = 'approved' AND scheduled_at IS NOT NULL AND scheduled_at <= ?
+             ORDER BY scheduled_at, created_at LIMIT ?`,
+            [nowIso, limit], (error, rows) => error ? reject(error) : resolve(rows || []),
+        ));
+    }
+
+    async syncCartesiaCampaignBatch(input = {}) {
+        const campaignId = String(input.campaign_id || '').trim();
+        const businessId = String(input.business_id || '').trim();
+        const batchId = String(input.provider_batch_id || '').trim();
+        const status = String(input.provider_status || '').trim().slice(0, 40);
+        const retryCount = Math.max(0, Math.min(100, Number(input.provider_retry_count) || 0));
+        const recipients = Array.isArray(input.recipients) ? input.recipients : [];
+        if (!/^cartesia_campaign_[a-f0-9]{64}$/.test(campaignId) || !/^[A-Za-z0-9._:-]{1,120}$/.test(businessId) ||
+            !/^[A-Za-z0-9._:-]{1,200}$/.test(batchId) || !/^[A-Za-z0-9_-]{1,40}$/.test(status) || recipients.length > 25 ||
+            recipients.some((row) => !Number.isSafeInteger(Number(row.position)) || Number(row.position) < 0)) return false;
+        let release;
+        const previous = this.callECampaignWriteChain;
+        this.callECampaignWriteChain = new Promise((resolve) => { release = resolve; });
+        await previous;
+        try {
+            await new Promise((resolve, reject) => this.db.run('BEGIN IMMEDIATE', (error) => error ? reject(error) : resolve()));
+            const campaign = await new Promise((resolve, reject) => this.db.get(
+                'SELECT status, provider_batch_id FROM cartesia_campaigns WHERE campaign_id = ? AND business_id = ?', [campaignId, businessId],
+                (error, row) => error ? reject(error) : resolve(row || null),
+            ));
+            if (!campaign || (campaign.provider_batch_id && campaign.provider_batch_id !== batchId)) {
+                await new Promise((resolve, reject) => this.db.run('ROLLBACK', (error) => error ? reject(error) : resolve()));
+                return false;
+            }
+            await new Promise((resolve, reject) => this.db.run(
+                `UPDATE cartesia_campaigns SET status = CASE WHEN status IN ('unknown','submitting') THEN 'submitted' ELSE status END,
+                provider_batch_id = ?, provider_status = ?, provider_retry_count = ?, error_code = NULL, updated_at = CURRENT_TIMESTAMP
+                 WHERE campaign_id = ? AND business_id = ?`, [batchId, status, retryCount, campaignId, businessId],
+                (error) => error ? reject(error) : resolve(),
+            ));
+            for (const row of recipients) {
+                const providerRecipientId = /^[A-Za-z0-9._:-]{1,200}$/.test(String(row.provider_recipient_id || '')) ? String(row.provider_recipient_id) : null;
+                const providerCallId = /^[A-Za-z0-9._:-]{1,200}$/.test(String(row.provider_call_id || '')) ? String(row.provider_call_id) : null;
+                const providerStatus = /^[A-Za-z0-9_-]{1,40}$/.test(String(row.provider_status || '')) ? String(row.provider_status) : null;
+                const endReason = /^[A-Za-z0-9_-]{1,80}$/.test(String(row.provider_end_reason || '')) ? String(row.provider_end_reason) : null;
+                await new Promise((resolve, reject) => this.db.run(
+                    `UPDATE cartesia_campaign_recipients SET provider_recipient_id = COALESCE(?, provider_recipient_id),
+                        provider_call_id = COALESCE(?, provider_call_id), provider_status = ?, provider_end_reason = ?, updated_at = CURRENT_TIMESTAMP
+                     WHERE campaign_id = ? AND position = ?`,
+                    [providerRecipientId, providerCallId, providerStatus, endReason, campaignId, Number(row.position)],
+                    function (error) { error ? reject(error) : resolve(this.changes === 1); },
+                ));
+            }
+            await new Promise((resolve, reject) => this.db.run('COMMIT', (error) => error ? reject(error) : resolve()));
+            return true;
+        } catch (error) {
+            await new Promise((resolve) => this.db.run('ROLLBACK', () => resolve()));
+            throw error;
+        } finally { release(); }
+    }
+
+    async claimCartesiaCampaignRetry(input = {}) {
+        const campaignId = String(input.campaign_id || '');
+        const retryNumber = Number(input.retry_number);
+        const businessId = String(input.business_id || '');
+        const positions = Array.isArray(input.recipient_positions) ? input.recipient_positions.map(Number) : [];
+        const usageDate = String(input.usage_date || '');
+        if (!/^cartesia_campaign_[a-f0-9]{64}$/.test(campaignId) || !/^[A-Za-z0-9._:-]{1,120}$/.test(businessId) || !/^\d{4}-\d{2}-\d{2}$/.test(usageDate) ||
+            !Number.isSafeInteger(retryNumber) || retryNumber < 0 || retryNumber > 100 || !/^\d{1,20}$/.test(String(input.actor_id || '')) ||
+            positions.length < 1 || positions.length > 25 || positions.some((position) => !Number.isSafeInteger(position) || position < 0) || new Set(positions).size !== positions.length) return false;
+        let release;
+        const previous = this.callECampaignWriteChain;
+        this.callECampaignWriteChain = new Promise((resolve) => { release = resolve; });
+        try {
+            await previous;
+            await new Promise((resolve, reject) => this.db.run('BEGIN IMMEDIATE', (error) => error ? reject(error) : resolve()));
+            const campaign = await new Promise((resolve, reject) => this.db.get(
+                'SELECT status, recipient_count FROM cartesia_campaigns WHERE campaign_id = ? AND business_id = ?', [campaignId, businessId],
+                (error, row) => error ? reject(error) : resolve(row || null),
+            ));
+            const policy = await new Promise((resolve, reject) => this.db.get(
+                'SELECT max_calls_per_day, emergency_stop, quiet_hours_start, quiet_hours_end, timezone FROM call_e_business_safety_policies WHERE business_id = ?', [businessId],
+                (error, row) => error ? reject(error) : resolve(row || null),
+            ));
+            if (!campaign || !['submitted', 'unknown'].includes(String(campaign.status)) || !policy || Number(policy.emergency_stop) === 1 || Number(policy.max_calls_per_day) < 1) {
+                await new Promise((resolve, reject) => this.db.run('COMMIT', (error) => error ? reject(error) : resolve()));
+                return { claimed: false, reason: !campaign ? 'campaign_not_found' : !policy ? 'safety_policy_required' : Number(policy.emergency_stop) === 1 ? 'emergency_stop' : 'daily_limit_disabled' };
+            }
+            const now = new Date(input.now_iso || Date.now());
+            let parts;
+            try { if (!Number.isFinite(now.getTime())) throw new Error(); parts = new Intl.DateTimeFormat('en-CA', { timeZone: String(policy.timezone || 'UTC'), year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).formatToParts(now).reduce((out, p) => (out[p.type] = p.value, out), {}); }
+            catch { await new Promise((resolve, reject) => this.db.run('COMMIT', (error) => error ? reject(error) : resolve())); return { claimed: false, reason: 'safety_policy_invalid' }; }
+            const localDate = `${parts.year}-${parts.month}-${parts.day}`;
+            if (localDate !== usageDate) { await new Promise((resolve, reject) => this.db.run('COMMIT', (error) => error ? reject(error) : resolve())); return { claimed: false, reason: 'safety_policy_changed' }; }
+            const validTime = (value) => /^(?:[01]\d|2[0-3]):[0-5]\d$/.test(String(value || ''));
+            if (validTime(policy.quiet_hours_start) && validTime(policy.quiet_hours_end)) {
+                const minute = Number(parts.hour) * 60 + Number(parts.minute);
+                const start = Number(policy.quiet_hours_start.slice(0, 2)) * 60 + Number(policy.quiet_hours_start.slice(3));
+                const end = Number(policy.quiet_hours_end.slice(0, 2)) * 60 + Number(policy.quiet_hours_end.slice(3));
+                if (start < end ? minute >= start && minute < end : minute >= start || minute < end) {
+                    await new Promise((resolve, reject) => this.db.run('COMMIT', (error) => error ? reject(error) : resolve())); return { claimed: false, reason: 'quiet_hours_active' };
+                }
+            }
+            const used = await new Promise((resolve, reject) => this.db.get(
+                `SELECT (SELECT COUNT(*) FROM call_e_business_dispatch_reservations WHERE business_id = ? AND usage_date = ? AND status = 'reserved') +
+                        (SELECT COUNT(*) FROM cartesia_campaign_daily_reservations WHERE business_id = ? AND usage_date = ? AND status = 'reserved') +
+                        (SELECT COUNT(*) FROM cartesia_campaign_retry_daily_reservations WHERE business_id = ? AND usage_date = ? AND status = 'reserved') AS used`,
+                [businessId, usageDate, businessId, usageDate, businessId, usageDate], (error, row) => error ? reject(error) : resolve(Number(row?.used) || 0),
+            ));
+            if (used + positions.length > Number(policy.max_calls_per_day)) { await new Promise((resolve, reject) => this.db.run('COMMIT', (error) => error ? reject(error) : resolve())); return { claimed: false, reason: 'daily_limit_reached' }; }
+            await new Promise((resolve, reject) => this.db.run(
+                `INSERT INTO cartesia_campaign_retry_attempts (campaign_id, retry_number, status, candidate_count, actor_id) VALUES (?, ?, 'submitting', ?, ?)`,
+                [campaignId, retryNumber, positions.length, String(input.actor_id)], (error) => error ? reject(error) : resolve(),
+            ));
+            for (const position of positions) await new Promise((resolve, reject) => this.db.run(
+                `INSERT INTO cartesia_campaign_retry_daily_reservations (campaign_id, retry_number, business_id, recipient_position, usage_date, status) VALUES (?, ?, ?, ?, ?, 'reserved')`,
+                [campaignId, retryNumber, businessId, position, usageDate], (error) => error ? reject(error) : resolve(),
+            ));
+            await new Promise((resolve, reject) => this.db.run('COMMIT', (error) => error ? reject(error) : resolve()));
+            return { claimed: true, usage_date: usageDate };
+        } catch (error) {
+            await new Promise((resolve) => this.db.run('ROLLBACK', () => resolve()));
+            if (String(error?.code || '').includes('SQLITE_CONSTRAINT')) return { claimed: false, reason: 'retry_already_attempted' };
+            throw error;
+        } finally { release(); }
+    }
+
+    async finishCartesiaCampaignRetry(campaignId, retryNumber, status) {
+        if (!['accepted', 'unknown', 'rejected'].includes(String(status))) return false;
+        return new Promise((resolve, reject) => this.db.run(
+            `UPDATE cartesia_campaign_retry_attempts SET status = ?, updated_at = CURRENT_TIMESTAMP
+             WHERE campaign_id = ? AND retry_number = ? AND status = 'submitting'`, [status, campaignId, retryNumber],
+            (error) => {
+                if (error) return reject(error);
+                if (status !== 'rejected') return resolve(true);
+                this.db.run(`UPDATE cartesia_campaign_retry_daily_reservations SET status = 'released', released_at = CURRENT_TIMESTAMP WHERE campaign_id = ? AND retry_number = ? AND status = 'reserved'`,
+                    [campaignId, retryNumber], (releaseError) => releaseError ? reject(releaseError) : resolve(true));
+            },
+        ));
+    }
+
+    async getCartesiaCampaignRetryAttempts(campaignId) {
+        const id = String(campaignId || '');
+        if (!/^cartesia_campaign_[a-f0-9]{64}$/.test(id)) return [];
+        return new Promise((resolve, reject) => this.db.all(
+            `SELECT a.retry_number, a.status, r.recipient_position
+             FROM cartesia_campaign_retry_attempts a
+             LEFT JOIN cartesia_campaign_retry_daily_reservations r
+               ON r.campaign_id = a.campaign_id AND r.retry_number = a.retry_number
+             WHERE a.campaign_id = ? ORDER BY a.retry_number, r.recipient_position`,
+            [id], (error, rows) => {
+                if (error) return reject(error);
+                const attempts = new Map();
+                for (const row of rows || []) {
+                    if (!attempts.has(Number(row.retry_number))) attempts.set(Number(row.retry_number), { retry_number: Number(row.retry_number), status: row.status, recipient_positions: [] });
+                    if (row.recipient_position !== null && row.recipient_position !== undefined) attempts.get(Number(row.retry_number)).recipient_positions.push(Number(row.recipient_position));
+                }
+                resolve([...attempts.values()]);
+            },
+        ));
+    }
+
+    async resolveCartesiaCampaignRetry(campaignId, retryNumber) {
+        return new Promise((resolve, reject) => this.db.run(
+            `UPDATE cartesia_campaign_retry_attempts SET status = 'accepted', updated_at = CURRENT_TIMESTAMP
+             WHERE campaign_id = ? AND retry_number = ? AND status IN ('submitting', 'unknown')`, [campaignId, retryNumber],
+            function (error) { error ? reject(error) : resolve(this.changes === 1); },
+        ));
+    }
+
+    async transitionCartesiaCampaign(input = {}) {
+        const campaignId = String(input.campaign_id || '').trim();
+        const businessId = String(input.business_id || '').trim();
+        const expected = Array.isArray(input.expected_status) ? input.expected_status : [String(input.expected_status || '')];
+        const status = String(input.status || '').trim();
+        if (!/^cartesia_campaign_[a-f0-9]{64}$/.test(campaignId) || !/^[A-Za-z0-9._:-]{1,120}$/.test(businessId) ||
+            !['draft', 'approved', 'submitting', 'submitted', 'unknown', 'blocked'].includes(status) ||
+            expected.some((value) => !['draft', 'approved', 'submitting', 'submitted', 'unknown', 'blocked'].includes(value))) return false;
+        const placeholders = expected.map(() => '?').join(',');
+        const values = [status, input.approved_by || null, input.provider_batch_id || null, input.provider_status || null,
+            input.error_code || null, campaignId, businessId, ...expected];
+        return new Promise((resolve, reject) => this.db.run(
+            `UPDATE cartesia_campaigns SET status = ?, approved_by = COALESCE(?, approved_by), provider_batch_id = COALESCE(?, provider_batch_id),
+                provider_status = COALESCE(?, provider_status), error_code = ?, updated_at = CURRENT_TIMESTAMP
+             WHERE campaign_id = ? AND business_id = ? AND status IN (${placeholders})`,
+            values, function (error) { error ? reject(error) : resolve(this.changes === 1); },
+        ));
+    }
+
+    async claimCartesiaCampaignSubmission(input = {}) {
+        const campaignId = String(input.campaign_id || '').trim();
+        const businessId = String(input.business_id || '').trim();
+        const requestHash = String(input.request_hash || '').trim();
+        const usageDate = String(input.usage_date || '').trim();
+        let release;
+        const previous = this.callECampaignWriteChain;
+        this.callECampaignWriteChain = new Promise((resolve) => { release = resolve; });
+        await previous;
+        try {
+            await new Promise((resolve, reject) => this.db.run('BEGIN IMMEDIATE', (error) => error ? reject(error) : resolve()));
+            const campaign = await new Promise((resolve, reject) => this.db.get(
+                'SELECT status, request_hash, recipient_count, ready_count FROM cartesia_campaigns WHERE campaign_id = ? AND business_id = ?',
+                [campaignId, businessId], (error, row) => error ? reject(error) : resolve(row || null),
+            ));
+            if (!campaign || campaign.status !== 'approved' || campaign.request_hash !== requestHash || Number(campaign.ready_count) !== Number(campaign.recipient_count)) {
+                await new Promise((resolve, reject) => this.db.run('COMMIT', (error) => error ? reject(error) : resolve()));
+                return { claimed: false, reason: 'campaign_not_approvable' };
+            }
+            const policy = await new Promise((resolve, reject) => this.db.get(
+                'SELECT max_calls_per_day, emergency_stop, quiet_hours_start, quiet_hours_end, timezone FROM call_e_business_safety_policies WHERE business_id = ?',
+                [businessId], (error, row) => error ? reject(error) : resolve(row || null),
+            ));
+            if (!policy || Number(policy.emergency_stop) === 1 || Number(policy.max_calls_per_day) < 1) {
+                await new Promise((resolve, reject) => this.db.run('COMMIT', (error) => error ? reject(error) : resolve()));
+                return { claimed: false, reason: !policy ? 'safety_policy_required' : Number(policy.emergency_stop) === 1 ? 'emergency_stop' : 'daily_limit_disabled' };
+            }
+            const dispatchTime = new Date(input.scheduled_at || input.now_iso || Date.now());
+            let localParts;
+            try {
+                if (!Number.isFinite(dispatchTime.getTime())) throw new Error('invalid time');
+                localParts = new Intl.DateTimeFormat('en-CA', {
+                    timeZone: String(policy.timezone || 'UTC'), year: 'numeric', month: '2-digit', day: '2-digit',
+                    hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
+                }).formatToParts(dispatchTime).reduce((parts, part) => (parts[part.type] = part.value, parts), {});
+            } catch (_) {
+                await new Promise((resolve, reject) => this.db.run('COMMIT', (error) => error ? reject(error) : resolve()));
+                return { claimed: false, reason: 'safety_policy_invalid' };
+            }
+            const localDate = `${localParts.year}-${localParts.month}-${localParts.day}`;
+            if (usageDate !== localDate) {
+                await new Promise((resolve, reject) => this.db.run('COMMIT', (error) => error ? reject(error) : resolve()));
+                return { claimed: false, reason: 'safety_policy_changed' };
+            }
+            const timePattern = /^(?:[01]\d|2[0-3]):[0-5]\d$/;
+            if (timePattern.test(String(policy.quiet_hours_start || '')) && timePattern.test(String(policy.quiet_hours_end || ''))) {
+                const minute = Number(localParts.hour) * 60 + Number(localParts.minute);
+                const start = Number(policy.quiet_hours_start.slice(0, 2)) * 60 + Number(policy.quiet_hours_start.slice(3));
+                const end = Number(policy.quiet_hours_end.slice(0, 2)) * 60 + Number(policy.quiet_hours_end.slice(3));
+                const quiet = start < end ? minute >= start && minute < end : minute >= start || minute < end;
+                if (quiet) {
+                    await new Promise((resolve, reject) => this.db.run('COMMIT', (error) => error ? reject(error) : resolve()));
+                    return { claimed: false, reason: 'quiet_hours_active' };
+                }
+            }
+            const used = await new Promise((resolve, reject) => this.db.get(
+                `SELECT (SELECT COUNT(*) FROM call_e_business_dispatch_reservations WHERE business_id = ? AND usage_date = ? AND status = 'reserved') +
+                        (SELECT COUNT(*) FROM cartesia_campaign_daily_reservations WHERE business_id = ? AND usage_date = ? AND status = 'reserved') AS used`,
+                [businessId, usageDate, businessId, usageDate], (error, row) => error ? reject(error) : resolve(Number(row?.used) || 0),
+            ));
+            const count = Number(campaign.recipient_count);
+            if (used + count > Number(policy.max_calls_per_day)) {
+                await new Promise((resolve, reject) => this.db.run('COMMIT', (error) => error ? reject(error) : resolve()));
+                return { claimed: false, reason: 'daily_limit_reached', remaining: Math.max(0, Number(policy.max_calls_per_day) - used) };
+            }
+            const recipients = await new Promise((resolve, reject) => this.db.all(
+                'SELECT position FROM cartesia_campaign_recipients WHERE campaign_id = ? AND readiness = \'ready\' ORDER BY position',
+                [campaignId], (error, rows) => error ? reject(error) : resolve(rows || []),
+            ));
+            if (recipients.length !== count) {
+                await new Promise((resolve, reject) => this.db.run('COMMIT', (error) => error ? reject(error) : resolve()));
+                return { claimed: false, reason: 'recipient_state_invalid' };
+            }
+            for (const recipient of recipients) {
+                await new Promise((resolve, reject) => this.db.run(
+                    `INSERT INTO cartesia_campaign_daily_reservations (campaign_id, business_id, recipient_position, usage_date, status)
+                     VALUES (?, ?, ?, ?, 'reserved')`, [campaignId, businessId, Number(recipient.position), usageDate],
+                    (error) => error ? reject(error) : resolve(),
+                ));
+            }
+            await new Promise((resolve, reject) => this.db.run(
+                `UPDATE cartesia_campaigns SET status = 'submitting', updated_at = CURRENT_TIMESTAMP
+                 WHERE campaign_id = ? AND business_id = ? AND status = 'approved'`, [campaignId, businessId],
+                (error) => error ? reject(error) : resolve(),
+            ));
+            await new Promise((resolve, reject) => this.db.run('COMMIT', (error) => error ? reject(error) : resolve()));
+            return { claimed: true, reserved: count, usage_date: usageDate };
+        } catch (error) {
+            await new Promise((resolve) => this.db.run('ROLLBACK', () => resolve()));
+            throw error;
+        } finally { release(); }
+    }
+
+    async releaseCartesiaCampaignDailyReservations(campaignId) {
+        return new Promise((resolve, reject) => this.db.run(
+            `UPDATE cartesia_campaign_daily_reservations SET status = 'released', released_at = CURRENT_TIMESTAMP
+             WHERE campaign_id = ? AND status = 'reserved'`, [String(campaignId || '')],
+            function (error) { error ? reject(error) : resolve(this.changes || 0); },
+        ));
+    }
+
     async reserveOutboundCallIdempotency(payload = {}) {
         const idempotencyKey = String(payload.idempotency_key || '').trim();
         const provider = String(payload.provider || '').trim().toLowerCase();
@@ -4155,11 +5796,11 @@ class EnhancedDatabase {
         return new Promise((resolve, reject) => {
             const sql = `
                 INSERT OR IGNORE INTO outbound_call_idempotency (
-                    idempotency_key, provider, request_hash, status, updated_at
+                    idempotency_key, provider, business_id, request_hash, status, updated_at
                 )
-                VALUES (?, ?, ?, 'pending', CURRENT_TIMESTAMP)
+                VALUES (?, ?, ?, ?, 'pending', CURRENT_TIMESTAMP)
             `;
-            this.db.run(sql, [idempotencyKey, provider, requestHash], function(err) {
+            this.db.run(sql, [idempotencyKey, provider, String(payload.business_id || '').trim() || null, requestHash], function(err) {
                 if (err) {
                     reject(err);
                 } else {
@@ -4332,6 +5973,79 @@ class EnhancedDatabase {
         });
     }
 
+    async createBusinessIntegrationConnection(input = {}) {
+        const values = [
+            input.connection_id,
+            input.business_id,
+            input.provider,
+            input.secret_reference,
+            input.created_by || 'admin_token',
+            input.created_by || 'admin_token',
+        ];
+        const changed = await new Promise((resolve, reject) => {
+            this.db.run(
+                `INSERT OR IGNORE INTO business_integration_connections (
+                    connection_id, business_id, provider, secret_reference, status,
+                    created_by, updated_by, created_at, updated_at
+                 ) VALUES (?, ?, ?, ?, 'active', ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+                values,
+                function (error) { error ? reject(error) : resolve(this.changes === 1); },
+            );
+        });
+        const row = await new Promise((resolve, reject) => {
+            this.db.get(
+                `SELECT connection_id, business_id, provider, secret_reference, status,
+                        created_by, updated_by, created_at, updated_at, revoked_by, revoked_at
+                 FROM business_integration_connections WHERE secret_reference = ?`,
+                [input.secret_reference],
+                (error, result) => error ? reject(error) : resolve(result || null),
+            );
+        });
+        return { row, created: changed };
+    }
+
+    async listBusinessIntegrationConnections(businessId, status) {
+        const where = ['business_id = ?'];
+        const params = [businessId];
+        if (status) { where.push('status = ?'); params.push(status); }
+        return new Promise((resolve, reject) => {
+            this.db.all(
+                `SELECT connection_id, business_id, provider, status, created_by,
+                        updated_by, created_at, updated_at, revoked_by, revoked_at
+                 FROM business_integration_connections WHERE ${where.join(' AND ')}
+                 ORDER BY created_at DESC, connection_id ASC`,
+                params,
+                (error, rows) => error ? reject(error) : resolve(rows || []),
+            );
+        });
+    }
+
+    async getBusinessIntegrationConnection(businessId, connectionId) {
+        return new Promise((resolve, reject) => {
+            this.db.get(
+                `SELECT connection_id, business_id, provider, secret_reference, status,
+                        created_by, updated_by, created_at, updated_at, revoked_by, revoked_at
+                 FROM business_integration_connections WHERE business_id = ? AND connection_id = ?`,
+                [businessId, connectionId],
+                (error, row) => error ? reject(error) : resolve(row || null),
+            );
+        });
+    }
+
+    async revokeBusinessIntegrationConnection(businessId, connectionId, actor = 'admin_token') {
+        await new Promise((resolve, reject) => {
+            this.db.run(
+                `UPDATE business_integration_connections
+                 SET status = 'revoked', revoked_by = ?, revoked_at = CURRENT_TIMESTAMP,
+                     updated_by = ?, updated_at = CURRENT_TIMESTAMP
+                 WHERE business_id = ? AND connection_id = ? AND status = 'active'`,
+                [actor, actor, businessId, connectionId],
+                (error) => error ? reject(error) : resolve(),
+            );
+        });
+        return this.getBusinessIntegrationConnection(businessId, connectionId);
+    }
+
     async recordCallEOperatorConfirmation(input = {}) {
         const confirmationKey = String(input.confirmation_key || '').trim();
         const requestHash = String(input.request_hash || '').trim();
@@ -4441,12 +6155,30 @@ class EnhancedDatabase {
         });
     }
 
+    async listCallEContactPolicyEvents(input = {}) {
+        const businessId = String(input.business_id || '').trim();
+        const destination = String(input.destination || '').trim();
+        const limit = Math.max(1, Math.min(25, Math.floor(Number(input.limit) || 10)));
+        if (!/^[A-Za-z0-9._:-]{1,120}$/.test(businessId) || !/^\+[1-9]\d{7,14}$/.test(destination)) {
+            throw Object.assign(new Error('CALL-E contact policy scope is invalid'), { code: 'call_e_contact_policy_invalid' });
+        }
+        return new Promise((resolve, reject) => this.db.all(
+            `SELECT event_type, source, occurred_at, expires_at, created_at
+             FROM call_e_contact_policy_events WHERE business_id = ? AND destination = ?
+             ORDER BY occurred_at DESC, id DESC LIMIT ?`,
+            [businessId, destination, limit], (error, rows) => error ? reject(error) : resolve(rows || []),
+        ));
+    }
+
     async getCallEContactPolicyEligibility(input = {}) {
         const businessId = String(input.business_id || "").trim();
         const destination = String(input.destination || "").trim();
         if (!/^[A-Za-z0-9._:-]{1,120}$/.test(businessId) || !/^\+[1-9]\d{7,14}$/.test(destination)) {
             return { eligible: false, reason: "scope_or_destination_invalid" };
         }
+        const eligibilityAt = input.at ? new Date(input.at) : new Date();
+        if (!Number.isFinite(eligibilityAt.getTime())) return { eligible: false, reason: "policy_storage_unavailable" };
+        const eligibilityAtIso = eligibilityAt.toISOString();
         return new Promise((resolve, reject) => {
             this.db.get(
                 `SELECT
@@ -4463,20 +6195,2541 @@ class EnhancedDatabase {
                     EXISTS(
                         SELECT 1 FROM call_e_contact_policy_events
                         WHERE business_id = ? AND destination = ? AND event_type = 'consent_granted'
-                    ) AS has_consent`,
-                [businessId, destination, businessId, destination, businessId, destination, businessId, destination],
+                    ) AS has_consent,
+                    COALESCE((SELECT contact_cooldown_hours FROM call_e_business_safety_policies WHERE business_id = ?), 0) AS cooldown_hours,
+                    (EXISTS(
+                        SELECT 1 FROM call_e_contact_dispatch_history
+                        WHERE business_id = ? AND destination_hash = ? AND status IN ('reserved', 'accepted')
+                          AND datetime(attempted_at) >= datetime(?, '-' ||
+                            (SELECT contact_cooldown_hours FROM call_e_business_safety_policies WHERE business_id = ?) || ' hours')
+                    ) OR EXISTS(
+                        SELECT 1 FROM outbound_contact_dispatch_history
+                        WHERE business_id = ? AND destination_hash = ? AND status IN ('reserved', 'accepted')
+                          AND datetime(attempted_at) >= datetime(?, '-' ||
+                            (SELECT contact_cooldown_hours FROM call_e_business_safety_policies WHERE business_id = ?) || ' hours')
+                    )) AS cooldown_active`,
+                [businessId, destination, businessId, destination, businessId, destination, businessId, destination,
+                    businessId, businessId, String(input.destination_hash || ''), eligibilityAtIso, businessId,
+                    businessId, String(input.destination_hash || ''), eligibilityAtIso, businessId],
                 (error, row) => {
                     if (error) return reject(error);
                     if (Number(row?.opted_out) === 1) return resolve({ eligible: false, reason: "opted_out" });
                     if (Number(row?.has_consent) !== 1) return resolve({ eligible: false, reason: "consent_missing" });
-                    if (Date.parse(row.latest_consent_at) > Date.now()) return resolve({ eligible: false, reason: "consent_not_effective" });
-                    if (row.latest_consent_expiry && Date.parse(row.latest_consent_expiry) <= Date.now()) {
+                    if (Date.parse(row.latest_consent_at) > eligibilityAt.getTime()) return resolve({ eligible: false, reason: "consent_not_effective" });
+                    if (row.latest_consent_expiry && Date.parse(row.latest_consent_expiry) <= eligibilityAt.getTime()) {
                         return resolve({ eligible: false, reason: "consent_expired" });
+                    }
+                    if (Number(row.cooldown_hours) > 0 && (!/^[a-f0-9]{64}$/.test(String(input.destination_hash || '')) || Number(row.cooldown_active) === 1)) {
+                        return resolve({ eligible: false, reason: Number(row.cooldown_active) === 1 ? 'cooldown_active' : 'policy_storage_unavailable' });
                     }
                     resolve({ eligible: true, reason: null });
                 },
             );
         });
+    }
+
+    async createCallECampaignReviewDraft(input = {}) {
+        const campaignId = String(input.campaign_id || '').trim();
+        const businessId = String(input.business_id || '').trim();
+        const templateId = Number(input.template_id);
+        const templateVersion = Number(input.template_version);
+        const schemaFingerprint = String(input.schema_fingerprint || '').trim();
+        const requestHash = String(input.request_hash || '').trim();
+        const createdBy = String(input.created_by || '').trim();
+        const recipients = Array.isArray(input.recipients) ? input.recipients : [];
+        if (!/^campaign_[a-f0-9]{64}$/.test(campaignId) || !/^[A-Za-z0-9._:-]{1,120}$/.test(businessId) ||
+            !Number.isSafeInteger(templateId) || templateId < 1 || !Number.isSafeInteger(templateVersion) || templateVersion < 1 ||
+            !/^[a-f0-9]{64}$/.test(schemaFingerprint) || !/^[a-f0-9]{64}$/.test(requestHash) ||
+            !/^\d{1,20}$/.test(createdBy) || recipients.length < 1 || recipients.length > 25) {
+            throw Object.assign(new Error('CALL-E campaign review draft is invalid'), { code: 'call_e_campaign_invalid' });
+        }
+        for (const [index, recipient] of recipients.entries()) {
+            if (Number(recipient?.position) !== index || !/^\+?[•]{4,14}\d{4}$/.test(String(recipient?.phone_masked || '')) ||
+                !['ready', 'blocked'].includes(recipient?.status) ||
+                !['compatible', 'invalid_destination', 'duplicate_destination', 'consent_missing', 'consent_expired',
+                    'consent_not_effective', 'opted_out', 'policy_storage_unavailable', 'template_incompatible', 'preview_failed'].includes(recipient?.reason_code)) {
+                throw Object.assign(new Error('CALL-E campaign review recipient is invalid'), { code: 'call_e_campaign_invalid' });
+            }
+            if ((recipient.status === 'ready') !== (recipient.reason_code === 'compatible')) {
+                throw Object.assign(new Error('CALL-E campaign review recipient state is inconsistent'), { code: 'call_e_campaign_invalid' });
+            }
+        }
+        const readyCount = recipients.filter((recipient) => recipient.status === 'ready').length;
+        const blockedCount = recipients.length - readyCount;
+        let release;
+        const previous = this.callECampaignWriteChain;
+        this.callECampaignWriteChain = new Promise((resolve) => { release = resolve; });
+        await previous;
+        try {
+            await new Promise((resolve, reject) => this.db.run('BEGIN IMMEDIATE', (error) => error ? reject(error) : resolve()));
+            const existing = await new Promise((resolve, reject) => this.db.get(
+                'SELECT * FROM call_e_campaign_reviews WHERE campaign_id = ? AND business_id = ?',
+                [campaignId, businessId], (error, row) => error ? reject(error) : resolve(row || null),
+            ));
+            if (existing) {
+                if (existing.request_hash !== requestHash || existing.created_by !== createdBy) {
+                    throw Object.assign(new Error('Campaign idempotency key was reused for different input'), { code: 'call_e_campaign_idempotency_conflict' });
+                }
+                const savedRecipients = await new Promise((resolve, reject) => this.db.all(
+                    'SELECT position, destination_masked, readiness AS status, reason_code FROM call_e_campaign_review_recipients WHERE campaign_id = ? ORDER BY position',
+                    [campaignId], (error, rows) => error ? reject(error) : resolve(rows || []),
+                ));
+                await new Promise((resolve, reject) => this.db.run('COMMIT', (error) => error ? reject(error) : resolve()));
+                return { campaign: existing, recipients: savedRecipients, idempotentReplay: true };
+            }
+            const counts = await new Promise((resolve, reject) => this.db.get(
+                "SELECT COUNT(*) AS count FROM call_e_campaign_reviews WHERE business_id = ? AND status = 'draft'",
+                [businessId], (error, row) => error ? reject(error) : resolve(row || { count: 0 }),
+            ));
+            if (Number(counts.count) >= 10) {
+                throw Object.assign(new Error('This business already has the maximum number of pending campaign reviews'), { code: 'call_e_campaign_review_cap_reached' });
+            }
+            const now = new Date().toISOString();
+            await new Promise((resolve, reject) => this.db.run(
+                `INSERT INTO call_e_campaign_reviews (
+                    campaign_id, business_id, template_id, template_version, schema_fingerprint, request_hash,
+                    created_by, status, recipient_count, ready_count, blocked_count, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?, ?, ?)`,
+                [campaignId, businessId, templateId, templateVersion, schemaFingerprint, requestHash,
+                    createdBy, recipients.length, readyCount, blockedCount, now],
+                (error) => error ? reject(error) : resolve(),
+            ));
+            for (const recipient of recipients) {
+                await new Promise((resolve, reject) => this.db.run(
+                    `INSERT INTO call_e_campaign_review_recipients (
+                        campaign_id, position, destination_masked, readiness, reason_code
+                    ) VALUES (?, ?, ?, ?, ?)`,
+                    [campaignId, recipient.position, recipient.phone_masked, recipient.status, recipient.reason_code],
+                    (error) => error ? reject(error) : resolve(),
+                ));
+            }
+            const saved = await this.getCallECampaignReviewForBusiness(campaignId, businessId);
+            await new Promise((resolve, reject) => this.db.run('COMMIT', (error) => error ? reject(error) : resolve()));
+            return { ...saved, idempotentReplay: false };
+        } catch (error) {
+            await new Promise((resolve) => this.db.run('ROLLBACK', () => resolve()));
+            throw error;
+        } finally {
+            release();
+        }
+    }
+
+    async listCallECampaignReviewsForBusiness(businessId, options = {}) {
+        const normalizedBusinessId = String(businessId || '').trim();
+        const limit = Math.max(1, Math.min(50, Math.floor(Number(options.limit) || 20)));
+        const offset = Math.max(0, Math.min(5000, Math.floor(Number(options.offset) || 0)));
+        if (!/^[A-Za-z0-9._:-]{1,120}$/.test(normalizedBusinessId)) return [];
+        const status = ['draft', 'approved', 'rejected'].includes(options.status) ? options.status : null;
+        return new Promise((resolve, reject) => this.db.all(
+            `SELECT * FROM call_e_campaign_reviews WHERE business_id = ? AND (? IS NULL OR status = ?)
+             ORDER BY created_at DESC, campaign_id DESC LIMIT ? OFFSET ?`,
+            [normalizedBusinessId, status, status, limit, offset], (error, rows) => error ? reject(error) : resolve(rows || []),
+        ));
+    }
+
+    async getCallECampaignReviewForBusiness(campaignId, businessId) {
+        const normalizedCampaignId = String(campaignId || '').trim();
+        const normalizedBusinessId = String(businessId || '').trim();
+        if (!/^campaign_[a-f0-9]{64}$/.test(normalizedCampaignId) || !/^[A-Za-z0-9._:-]{1,120}$/.test(normalizedBusinessId)) return null;
+        const campaign = await new Promise((resolve, reject) => this.db.get(
+            'SELECT * FROM call_e_campaign_reviews WHERE campaign_id = ? AND business_id = ?',
+            [normalizedCampaignId, normalizedBusinessId], (error, row) => error ? reject(error) : resolve(row || null),
+        ));
+        if (!campaign) return null;
+        const recipients = await new Promise((resolve, reject) => this.db.all(
+            'SELECT position, destination_masked, readiness AS status, reason_code FROM call_e_campaign_review_recipients WHERE campaign_id = ? ORDER BY position',
+            [normalizedCampaignId], (error, rows) => error ? reject(error) : resolve(rows || []),
+        ));
+        const reviewHistory = await new Promise((resolve, reject) => this.db.all(
+            `SELECT reviewed_by, decision, request_hash, created_at FROM call_e_approval_decisions
+             WHERE entity_type = 'campaign' AND entity_id = ? AND business_id = ? ORDER BY decision_id`,
+            [normalizedCampaignId, normalizedBusinessId], (error, rows) => error ? reject(error) : resolve(rows || []),
+        ));
+        return { campaign, recipients, reviewHistory };
+    }
+
+    async reviewCallECampaignForBusiness(input = {}) {
+        const campaignId = String(input.campaign_id || '').trim();
+        const businessId = String(input.business_id || '').trim();
+        const reviewer = String(input.reviewed_by || '').trim();
+        const decision = String(input.decision || '').trim();
+        if (!/^campaign_[a-f0-9]{64}$/.test(campaignId) || !/^[A-Za-z0-9._:-]{1,120}$/.test(businessId) ||
+            !/^\d{1,20}$/.test(reviewer) || !['approve', 'reject'].includes(decision)) {
+            throw Object.assign(new Error('CALL-E campaign review decision is invalid'), { code: 'call_e_campaign_invalid' });
+        }
+        const nextStatus = decision === 'approve' ? 'approved' : 'rejected';
+        let release;
+        const previous = this.callECampaignWriteChain;
+        this.callECampaignWriteChain = new Promise((resolve) => { release = resolve; });
+        await previous;
+        try {
+            await new Promise((resolve, reject) => this.db.run('BEGIN IMMEDIATE', (error) => error ? reject(error) : resolve()));
+            const campaign = await new Promise((resolve, reject) => this.db.get(
+                'SELECT * FROM call_e_campaign_reviews WHERE campaign_id = ? AND business_id = ?',
+                [campaignId, businessId], (error, row) => error ? reject(error) : resolve(row || null),
+            ));
+            if (!campaign) {
+                await new Promise((resolve, reject) => this.db.run('COMMIT', (error) => error ? reject(error) : resolve()));
+                return null;
+            }
+            const savedDecision = await new Promise((resolve, reject) => this.db.get(
+                `SELECT reviewed_by, decision, request_hash FROM call_e_approval_decisions
+                 WHERE entity_type = 'campaign' AND entity_id = ? AND business_id = ?`,
+                [campaignId, businessId], (error, row) => error ? reject(error) : resolve(row || null),
+            ));
+            if (savedDecision) {
+                if (savedDecision.reviewed_by !== reviewer || savedDecision.decision !== decision || savedDecision.request_hash !== campaign.request_hash) {
+                    throw Object.assign(new Error('Campaign review is already final'), { code: 'call_e_campaign_review_final' });
+                }
+                const replay = await this.getCallECampaignReviewForBusiness(campaignId, businessId);
+                await new Promise((resolve, reject) => this.db.run('COMMIT', (error) => error ? reject(error) : resolve()));
+                return { ...replay, idempotentReplay: true };
+            }
+            if (campaign.status !== 'draft') {
+                if (campaign.status === nextStatus && campaign.reviewed_by === reviewer) {
+                    await new Promise((resolve, reject) => this.db.run(
+                        `INSERT OR IGNORE INTO call_e_approval_decisions
+                         (entity_type, entity_id, business_id, reviewed_by, decision, request_hash, created_at)
+                         VALUES ('campaign', ?, ?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP))`,
+                        [campaignId, businessId, reviewer, decision, campaign.request_hash, campaign.reviewed_at],
+                        (error) => error ? reject(error) : resolve(),
+                    ));
+                    const replay = await this.getCallECampaignReviewForBusiness(campaignId, businessId);
+                    await new Promise((resolve, reject) => this.db.run('COMMIT', (error) => error ? reject(error) : resolve()));
+                    return { ...replay, idempotentReplay: true };
+                }
+                throw Object.assign(new Error('Campaign review is already final'), { code: 'call_e_campaign_review_final' });
+            }
+            if (campaign.created_by === reviewer) {
+                throw Object.assign(new Error('A different business operator must review this campaign'), { code: 'call_e_campaign_four_eyes_required' });
+            }
+            if (decision === 'approve' && Number(campaign.ready_count) !== Number(campaign.recipient_count)) {
+                throw Object.assign(new Error('Campaign cannot be approved while any destination is blocked'), { code: 'call_e_campaign_blocked_recipients' });
+            }
+            await new Promise((resolve, reject) => this.db.run(
+                `UPDATE call_e_campaign_reviews SET status = ?, reviewed_by = ?, reviewed_at = CURRENT_TIMESTAMP
+                 WHERE campaign_id = ? AND business_id = ? AND status = 'draft'`,
+                [nextStatus, reviewer, campaignId, businessId], (error) => error ? reject(error) : resolve(),
+            ));
+            await new Promise((resolve, reject) => this.db.run(
+                `INSERT INTO call_e_approval_decisions
+                 (entity_type, entity_id, business_id, reviewed_by, decision, request_hash)
+                 VALUES ('campaign', ?, ?, ?, ?, ?)`,
+                [campaignId, businessId, reviewer, decision, campaign.request_hash],
+                (error) => error ? reject(error) : resolve(),
+            ));
+            const saved = await this.getCallECampaignReviewForBusiness(campaignId, businessId);
+            await new Promise((resolve, reject) => this.db.run('COMMIT', (error) => error ? reject(error) : resolve()));
+            return { ...saved, idempotentReplay: false };
+        } catch (error) {
+            await new Promise((resolve) => this.db.run('ROLLBACK', () => resolve()));
+            throw error;
+        } finally {
+            release();
+        }
+    }
+
+    async createCallECampaignExecutionRehearsal(input = {}) {
+        const rehearsalId = String(input.rehearsal_id || '').trim();
+        const campaignId = String(input.campaign_id || '').trim();
+        const businessId = String(input.business_id || '').trim();
+        const requestHash = String(input.request_hash || '').trim();
+        const startedBy = String(input.started_by || '').trim();
+        const recipients = Array.isArray(input.recipients) ? input.recipients : [];
+        if (!/^rehearsal_[a-f0-9]{64}$/.test(rehearsalId) || !/^campaign_[a-f0-9]{64}$/.test(campaignId) ||
+            !/^[A-Za-z0-9._:-]{1,120}$/.test(businessId) || !/^[a-f0-9]{64}$/.test(requestHash) ||
+            !/^\d{1,20}$/.test(startedBy) || recipients.length < 1 || recipients.length > 25 ||
+            recipients.some((row, index) => Number(row?.position) !== index ||
+                !['simulated_ready', 'blocked'].includes(row?.state) ||
+                !['compatible', 'invalid_destination', 'duplicate_destination', 'consent_missing', 'consent_expired',
+                    'consent_not_effective', 'opted_out', 'policy_storage_unavailable', 'template_incompatible', 'preview_failed'].includes(row?.reason_code) ||
+                ((row.state === 'simulated_ready') !== (row.reason_code === 'compatible')))) {
+            throw Object.assign(new Error('CALL-E execution rehearsal is invalid'), { code: 'call_e_campaign_rehearsal_invalid' });
+        }
+        let release;
+        const previous = this.callECampaignWriteChain;
+        this.callECampaignWriteChain = new Promise((resolve) => { release = resolve; });
+        await previous;
+        try {
+        await new Promise((resolve, reject) => this.db.run('BEGIN IMMEDIATE', (error) => error ? reject(error) : resolve()));
+        const existing = await new Promise((resolve, reject) => this.db.get(
+            'SELECT * FROM call_e_campaign_execution_rehearsals WHERE rehearsal_id = ? OR (campaign_id = ? AND request_hash = ?)',
+            [rehearsalId, campaignId, requestHash], (error, row) => error ? reject(error) : resolve(row || null),
+        ));
+        if (existing) {
+            if (existing.request_hash !== requestHash || existing.started_by !== startedBy) {
+                throw Object.assign(new Error('Rehearsal idempotency key conflicts with an existing request'), { code: 'call_e_campaign_rehearsal_conflict' });
+            }
+            const rows = await new Promise((resolve, reject) => this.db.all(
+                'SELECT position, state, reason_code FROM call_e_campaign_execution_rehearsal_rows WHERE rehearsal_id = ? ORDER BY position',
+                [existing.rehearsal_id], (error, result) => error ? reject(error) : resolve(result || []),
+            ));
+            await new Promise((resolve, reject) => this.db.run('COMMIT', (error) => error ? reject(error) : resolve()));
+            return { rehearsal: existing, recipients: rows, idempotentReplay: true };
+        }
+        const readyCount = recipients.filter((row) => row.state === 'simulated_ready').length;
+        const blockedCount = recipients.length - readyCount;
+        await new Promise((resolve, reject) => this.db.run(
+            `INSERT INTO call_e_campaign_execution_rehearsals (
+                rehearsal_id, campaign_id, business_id, request_hash, started_by, status,
+                recipient_count, ready_count, blocked_count
+            ) VALUES (?, ?, ?, ?, ?, 'completed', ?, ?, ?)`,
+            [rehearsalId, campaignId, businessId, requestHash, startedBy, recipients.length, readyCount, blockedCount],
+            (error) => error ? reject(error) : resolve(),
+        ));
+        for (const row of recipients) {
+            await new Promise((resolve, reject) => this.db.run(
+                `INSERT INTO call_e_campaign_execution_rehearsal_rows (rehearsal_id, position, state, reason_code)
+                 VALUES (?, ?, ?, ?)`,
+                [rehearsalId, row.position, row.state, row.reason_code],
+                (error) => error ? reject(error) : resolve(),
+            ));
+        }
+        const rehearsal = await new Promise((resolve, reject) => this.db.get(
+            'SELECT * FROM call_e_campaign_execution_rehearsals WHERE rehearsal_id = ?',
+            [rehearsalId], (error, row) => error ? reject(error) : resolve(row || null),
+        ));
+        await new Promise((resolve, reject) => this.db.run('COMMIT', (error) => error ? reject(error) : resolve()));
+        return { rehearsal, recipients, idempotentReplay: false };
+        } catch (error) {
+            await new Promise((resolve) => this.db.run('ROLLBACK', () => resolve()));
+            throw error;
+        } finally {
+            release();
+        }
+    }
+
+    async listCallECampaignExecutionRehearsalsForBusiness(businessId, limit = 20) {
+        const scope = String(businessId || '').trim();
+        const boundedLimit = Math.max(1, Math.min(50, Math.floor(Number(limit) || 20)));
+        if (!/^[A-Za-z0-9._:-]{1,120}$/.test(scope)) return [];
+        return new Promise((resolve, reject) => this.db.all(
+            `SELECT r.rehearsal_id, r.campaign_id, r.status, r.recipient_count, r.ready_count, r.blocked_count, r.created_at
+             FROM call_e_campaign_execution_rehearsals r
+             JOIN call_e_campaign_reviews c ON c.campaign_id = r.campaign_id
+             WHERE r.business_id = ? AND c.status = 'approved'
+             AND r.rehearsal_id = (
+               SELECT latest.rehearsal_id FROM call_e_campaign_execution_rehearsals latest
+               WHERE latest.campaign_id = r.campaign_id AND latest.business_id = r.business_id
+               ORDER BY latest.created_at DESC, latest.rehearsal_id DESC LIMIT 1
+             )
+             ORDER BY r.created_at DESC LIMIT ?`,
+            [scope, boundedLimit], (error, rows) => error ? reject(error) : resolve(rows || []),
+        ));
+    }
+
+    async getCallEGoalRunRequestByIdempotency(businessId, idempotencyHash) {
+        return new Promise((resolve, reject) => this.db.get(
+            'SELECT * FROM call_e_goal_run_requests WHERE business_id = ? AND idempotency_hash = ?',
+            [businessId, idempotencyHash], (error, row) => error ? reject(error) : resolve(row || null),
+        ));
+    }
+
+    async createCallEGoalRunRequest(input = {}) {
+        const requestId = String(input.goal_run_request_id || '').trim();
+        const businessId = String(input.business_id || '').trim();
+        const requestHash = String(input.request_hash || '').trim();
+        const idempotencyHash = String(input.idempotency_hash || '').trim();
+        const status = String(input.status || '').trim();
+        const expiresAt = String(input.sensitive_data_expires_at || new Date(Date.now() + 90 * 86400000).toISOString());
+        if (!/^goalrun_[a-f0-9-]{36}$/i.test(requestId) || !/^[A-Za-z0-9._:-]{1,120}$/.test(businessId) ||
+            !/^[a-f0-9]{64}$/i.test(requestHash) || !/^[a-f0-9]{64}$/i.test(idempotencyHash) || status !== 'pending_approval' ||
+            !String(input.encrypted_payload || '').trim() || !String(input.result_schema_json || '').trim() || !Number.isFinite(Date.parse(expiresAt))) {
+            throw Object.assign(new Error('CALL-E Goal Run request is invalid'), { code: 'call_e_goal_run_invalid' });
+        }
+        let release;
+        const previous = this.callECampaignWriteChain;
+        this.callECampaignWriteChain = new Promise((resolve) => { release = resolve; });
+        await previous;
+        try {
+            await new Promise((resolve, reject) => this.db.run('BEGIN IMMEDIATE', (error) => error ? reject(error) : resolve()));
+            const existing = await new Promise((resolve, reject) => this.db.get(
+                'SELECT * FROM call_e_goal_run_requests WHERE business_id = ? AND idempotency_hash = ?',
+                [businessId, idempotencyHash], (error, row) => error ? reject(error) : resolve(row || null),
+            ));
+            if (existing) {
+                await new Promise((resolve, reject) => this.db.run('COMMIT', (error) => error ? reject(error) : resolve()));
+                return { ...existing, idempotentReplay: true };
+            }
+            await new Promise((resolve, reject) => this.db.run(
+                `INSERT INTO call_e_goal_run_requests (
+                    goal_run_request_id, business_id, goal_id, goal_title, published_run_spec_id,
+                    published_run_spec_version, destination_masked, encrypted_payload, encryption_key_version,
+                    request_hash, idempotency_hash, result_schema_json, status, created_by, sensitive_data_expires_at
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending_approval', ?, ?)`,
+                [requestId, businessId, input.goal_id, input.goal_title, input.published_run_spec_id,
+                    input.published_run_spec_version, input.destination_masked, input.encrypted_payload,
+                    input.encryption_key_version, requestHash, idempotencyHash, input.result_schema_json, input.created_by, expiresAt],
+                (error) => error ? reject(error) : resolve(),
+            ));
+            const row = await new Promise((resolve, reject) => this.db.get(
+                'SELECT * FROM call_e_goal_run_requests WHERE goal_run_request_id = ?', [requestId],
+                (error, result) => error ? reject(error) : resolve(result || null),
+            ));
+            await new Promise((resolve, reject) => this.db.run('COMMIT', (error) => error ? reject(error) : resolve()));
+            return { ...row, idempotentReplay: false };
+        } catch (error) {
+            await new Promise((resolve) => this.db.run('ROLLBACK', () => resolve()));
+            throw error;
+        } finally { release(); }
+    }
+
+    async getCallEGoalRunRequest(requestId, businessId) {
+        return new Promise((resolve, reject) => this.db.get(
+            `SELECT * FROM call_e_goal_run_requests WHERE goal_run_request_id = ? AND business_id = ?`,
+            [requestId, businessId], (error, row) => error ? reject(error) : resolve(row || null),
+        ));
+    }
+
+    async listCallEGoalRunRequests(businessId, options = {}) {
+        const limit = Math.max(1, Math.min(50, Math.floor(Number(options.limit) || 20)));
+        const allowed = new Set(['pending_approval', 'approved', 'rejected', 'submitting', 'recovery_required', 'running', 'completed', 'failed', 'canceled', 'needs_review']);
+        const status = allowed.has(String(options.status || '')) ? String(options.status) : null;
+        return new Promise((resolve, reject) => this.db.all(
+            `SELECT * FROM call_e_goal_run_requests WHERE business_id = ? AND (? IS NULL OR status = ?)
+             ORDER BY created_at DESC, goal_run_request_id DESC LIMIT ?`,
+            [businessId, status, status, limit], (error, rows) => error ? reject(error) : resolve(rows || []),
+        ));
+    }
+
+    async reviewCallEGoalRunRequest(input = {}) {
+        const requestId = String(input.goal_run_request_id || '').trim();
+        const businessId = String(input.business_id || '').trim();
+        const reviewer = String(input.reviewed_by || '').trim();
+        const decision = String(input.decision || '').trim();
+        if (!/^goalrun_[a-f0-9-]{36}$/i.test(requestId) || !/^[A-Za-z0-9._:-]{1,120}$/.test(businessId) ||
+            !/^\d{1,20}$/.test(reviewer) || !['approve', 'reject'].includes(decision)) {
+            throw Object.assign(new Error('CALL-E Goal Run review decision is invalid'), { code: 'call_e_goal_run_invalid' });
+        }
+        let release;
+        const previous = this.callECampaignWriteChain;
+        this.callECampaignWriteChain = new Promise((resolve) => { release = resolve; });
+        await previous;
+        try {
+            await new Promise((resolve, reject) => this.db.run('BEGIN IMMEDIATE', (error) => error ? reject(error) : resolve()));
+            const row = await new Promise((resolve, reject) => this.db.get(
+                `SELECT * FROM call_e_goal_run_requests WHERE goal_run_request_id = ? AND business_id = ?`,
+                [requestId, businessId], (error, result) => error ? reject(error) : resolve(result || null),
+            ));
+            if (!row || row.status !== 'pending_approval' || row.created_by === reviewer) {
+                await new Promise((resolve, reject) => this.db.run('COMMIT', (error) => error ? reject(error) : resolve()));
+                return null;
+            }
+            await new Promise((resolve, reject) => this.db.run(
+                `INSERT INTO call_e_goal_run_reviews (goal_run_request_id, business_id, reviewed_by, decision, request_hash)
+                 VALUES (?, ?, ?, ?, ?)`, [requestId, businessId, reviewer, decision, row.request_hash],
+                (error) => error ? reject(error) : resolve(),
+            ));
+            await new Promise((resolve, reject) => this.db.run(
+                `UPDATE call_e_goal_run_requests SET status = ?, reviewed_by = ?, reviewed_at = CURRENT_TIMESTAMP,
+                    updated_at = CURRENT_TIMESTAMP WHERE goal_run_request_id = ? AND status = 'pending_approval'`,
+                [decision === 'approve' ? 'approved' : 'rejected', reviewer, requestId],
+                (error) => error ? reject(error) : resolve(),
+            ));
+            const saved = await new Promise((resolve, reject) => this.db.get(
+                `SELECT * FROM call_e_goal_run_requests WHERE goal_run_request_id = ? AND business_id = ?`,
+                [requestId, businessId], (error, result) => error ? reject(error) : resolve(result || null),
+            ));
+            await new Promise((resolve, reject) => this.db.run('COMMIT', (error) => error ? reject(error) : resolve()));
+            return saved;
+        } catch (error) {
+            await new Promise((resolve) => this.db.run('ROLLBACK', () => resolve()));
+            throw error;
+        } finally { release(); }
+    }
+
+    async markCallEGoalRunSubmitting(requestId, businessId) {
+        await new Promise((resolve, reject) => this.db.run(
+            `UPDATE call_e_goal_run_requests SET status = 'submitting', error_code = NULL, updated_at = CURRENT_TIMESTAMP
+             WHERE goal_run_request_id = ? AND business_id = ? AND provider_goal_run_id IS NULL
+               AND status IN ('approved', 'submitting', 'recovery_required')`,
+            [requestId, businessId], (error) => error ? reject(error) : resolve(),
+        ));
+        return this.getCallEGoalRunRequest(requestId, businessId);
+    }
+
+    async saveCallEGoalRunProviderState(input = {}) {
+        const statuses = new Set(['submitting', 'recovery_required', 'running', 'completed', 'failed', 'canceled', 'needs_review']);
+        const status = String(input.status || 'needs_review');
+        const providerId = String(input.provider_goal_run_id || '').trim() || null;
+        if (!statuses.has(status) || (providerId && (providerId.length > 255 || /[\u0000-\u001f\u007f]/.test(providerId)))) {
+            throw Object.assign(new Error('CALL-E Goal Run provider state is invalid'), { code: 'call_e_goal_run_invalid' });
+        }
+        await new Promise((resolve, reject) => this.db.run(
+            `UPDATE call_e_goal_run_requests SET status = ?, provider_goal_run_id = COALESCE(?, provider_goal_run_id),
+                execution_status = ?, call_outcome = ?, result_status = ?, error_code = ?,
+                encrypted_result = COALESCE(?, encrypted_result), updated_at = CURRENT_TIMESTAMP
+             WHERE goal_run_request_id = ? AND business_id = ?`,
+            [status, providerId, input.execution_status || null, input.call_outcome || null, input.result_status || null,
+                input.error_code || null, input.encrypted_result || null, input.goal_run_request_id, input.business_id],
+            (error) => error ? reject(error) : resolve(),
+        ));
+        return this.getCallEGoalRunRequest(input.goal_run_request_id, input.business_id);
+    }
+
+    async getCallEGoalRunReview(requestId, businessId) {
+        return new Promise((resolve, reject) => this.db.get(
+            `SELECT reviewed_by, decision, request_hash, created_at FROM call_e_goal_run_reviews
+             WHERE goal_run_request_id = ? AND business_id = ?`,
+            [requestId, businessId], (error, row) => error ? reject(error) : resolve(row || null),
+        ));
+    }
+
+    async createCallECampaignMission(input = {}) {
+        const missionId = String(input.mission_id || '').trim();
+        const businessId = String(input.business_id || '').trim();
+        const campaignId = String(input.campaign_id || '').trim();
+        const templateId = Number(input.template_id);
+        const templateVersion = Number(input.template_version);
+        const resultSchemaJson = String(input.result_schema_json || '');
+        const createdBy = String(input.created_by || '').trim();
+        const requestHash = String(input.request_hash || '').trim().toLowerCase();
+        const encryptionKeyVersion = Number(input.encryption_key_version ?? 1);
+        const sensitiveDataExpiresAt = String(input.sensitive_data_expires_at || new Date(Date.now() + 90 * 86400000).toISOString());
+        const scheduledAt = input.scheduled_at == null ? null : String(input.scheduled_at);
+        const budgetLimitMinor = input.budget_limit_minor == null ? null : Number(input.budget_limit_minor);
+        const perCallCostCeilingMinor = input.per_call_cost_ceiling_minor == null ? null : Number(input.per_call_cost_ceiling_minor);
+        const budgetCurrency = input.budget_currency == null ? null : String(input.budget_currency).trim().toUpperCase();
+        const recipients = Array.isArray(input.recipients) ? input.recipients : [];
+        if (!/^mission_[a-f0-9]{64}$/.test(missionId) || !/^[A-Za-z0-9._:-]{1,120}$/.test(businessId) ||
+            !/^campaign_[a-f0-9]{64}$/.test(campaignId) || !Number.isSafeInteger(templateId) || templateId < 1 ||
+            !Number.isSafeInteger(templateVersion) || templateVersion < 1 || !resultSchemaJson ||
+            Buffer.byteLength(resultSchemaJson, 'utf8') > 16000 || !/^\d{1,20}$/.test(createdBy) ||
+            !/^[a-f0-9]{64}$/.test(requestHash) || !Number.isSafeInteger(encryptionKeyVersion) || encryptionKeyVersion < 1 || !Number.isFinite(Date.parse(sensitiveDataExpiresAt)) ||
+            (scheduledAt !== null && (!Number.isFinite(Date.parse(scheduledAt)) || !/(?:Z|[+-]\d{2}:\d{2})$/i.test(scheduledAt))) ||
+            ((budgetLimitMinor === null) !== (perCallCostCeilingMinor === null)) ||
+            ((budgetLimitMinor === null) !== (budgetCurrency === null)) || (budgetCurrency !== null && !/^[A-Z]{3}$/.test(budgetCurrency)) ||
+            (budgetLimitMinor !== null && (!Number.isSafeInteger(budgetLimitMinor) || budgetLimitMinor < 1 || budgetLimitMinor > 1000000000 ||
+                !Number.isSafeInteger(perCallCostCeilingMinor) || perCallCostCeilingMinor < 1 || perCallCostCeilingMinor > budgetLimitMinor)) ||
+            recipients.length < 1 || recipients.length > 25) {
+            throw Object.assign(new Error('CALL-E mission input is invalid'), { code: 'call_e_mission_invalid' });
+        }
+        let resultSchema;
+        try { resultSchema = JSON.parse(resultSchemaJson); } catch (_) { resultSchema = null; }
+        if (!resultSchema || typeof resultSchema !== 'object' || Array.isArray(resultSchema)) {
+            throw Object.assign(new Error('CALL-E mission result schema is invalid'), { code: 'call_e_mission_invalid' });
+        }
+        const recipientIdempotencyKeys = new Set();
+        for (const [index, recipient] of recipients.entries()) {
+            const encryptedDestination = String(recipient?.encrypted_destination || '');
+            const masked = String(recipient?.destination_masked || '');
+            const idempotencyKey = String(recipient?.idempotency_key || '').trim();
+            if (Number(recipient?.position) !== index || !encryptedDestination || encryptedDestination.length > 4096 ||
+                /^\+[1-9]\d{7,14}$/.test(encryptedDestination) || !/^\+?[•]{4,14}\d{4}$/.test(masked) ||
+                !/^[A-Za-z0-9._:-]{8,180}$/.test(idempotencyKey) ||
+                recipientIdempotencyKeys.has(idempotencyKey) ||
+                (recipient.status !== undefined && recipient.status !== 'queued')) {
+                throw Object.assign(new Error('CALL-E mission recipient is invalid'), { code: 'call_e_mission_invalid' });
+            }
+            recipientIdempotencyKeys.add(idempotencyKey);
+        }
+
+        let release;
+        const previous = this.callECampaignWriteChain;
+        this.callECampaignWriteChain = new Promise((resolve) => { release = resolve; });
+        await previous;
+        try {
+            await new Promise((resolve, reject) => this.db.run('BEGIN IMMEDIATE', (error) => error ? reject(error) : resolve()));
+            const existing = await new Promise((resolve, reject) => this.db.get(
+                'SELECT * FROM call_e_campaign_missions WHERE mission_id = ?',
+                [missionId], (error, row) => error ? reject(error) : resolve(row || null),
+            ));
+            if (existing) {
+                if (existing.business_id !== businessId || existing.request_hash !== requestHash || existing.created_by !== createdBy ||
+                    existing.campaign_id !== campaignId || Number(existing.template_id) !== templateId ||
+                    Number(existing.template_version) !== templateVersion || existing.result_schema_json !== resultSchemaJson ||
+                    Number(existing.recipient_count) !== recipients.length || (existing.scheduled_at || null) !== scheduledAt ||
+                    (existing.budget_limit_minor == null ? null : Number(existing.budget_limit_minor)) !== budgetLimitMinor ||
+                    (existing.per_call_cost_ceiling_minor == null ? null : Number(existing.per_call_cost_ceiling_minor)) !== perCallCostCeilingMinor ||
+                    (existing.budget_currency || null) !== budgetCurrency) {
+                    throw Object.assign(new Error('Mission idempotency key conflicts with an existing request'), { code: 'call_e_mission_idempotency_conflict' });
+                }
+                const savedRecipients = await new Promise((resolve, reject) => this.db.all(
+                    'SELECT mission_id, position, encrypted_destination, destination_masked, idempotency_key, status, local_call_id, error_code, updated_at FROM call_e_campaign_mission_recipients WHERE mission_id = ? ORDER BY position',
+                    [missionId], (error, rows) => error ? reject(error) : resolve(rows || []),
+                ));
+                await new Promise((resolve, reject) => this.db.run('COMMIT', (error) => error ? reject(error) : resolve()));
+                return { mission: existing, recipients: savedRecipients, idempotentReplay: true };
+            }
+            const campaign = await new Promise((resolve, reject) => this.db.get(
+                `SELECT campaign_id, business_id, template_id, template_version, status, ready_count, recipient_count
+                 FROM call_e_campaign_reviews WHERE campaign_id = ? AND business_id = ?`,
+                [campaignId, businessId], (error, row) => error ? reject(error) : resolve(row || null),
+            ));
+            if (!campaign || campaign.status !== 'approved' || Number(campaign.ready_count) !== Number(campaign.recipient_count) ||
+                Number(campaign.template_id) !== templateId || Number(campaign.template_version) !== templateVersion ||
+                Number(campaign.recipient_count) !== recipients.length) {
+                throw Object.assign(new Error('Mission requires the matching approved campaign and recipient set'), { code: 'call_e_mission_campaign_not_approved' });
+            }
+            const now = new Date().toISOString();
+            await new Promise((resolve, reject) => this.db.run(
+                `INSERT INTO call_e_campaign_missions (
+                    mission_id, business_id, campaign_id, template_id, template_version, result_schema_json, created_by,
+                    request_hash, status, recipient_count, encryption_key_version, created_at, updated_at, sensitive_data_expires_at,
+                    scheduled_at, budget_limit_minor, per_call_cost_ceiling_minor, budget_currency
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending_approval', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                [missionId, businessId, campaignId, templateId, templateVersion, resultSchemaJson, createdBy, requestHash,
+                    recipients.length, encryptionKeyVersion, now, now, sensitiveDataExpiresAt, scheduledAt, budgetLimitMinor, perCallCostCeilingMinor, budgetCurrency],
+                (error) => error ? reject(error) : resolve(),
+            ));
+            for (const recipient of recipients) {
+                await new Promise((resolve, reject) => this.db.run(
+                    `INSERT INTO call_e_campaign_mission_recipients (
+                        mission_id, position, encrypted_destination, destination_masked, idempotency_key, status
+                    ) VALUES (?, ?, ?, ?, ?, 'queued')`,
+                    [missionId, recipient.position, String(recipient.encrypted_destination), String(recipient.destination_masked), String(recipient.idempotency_key)],
+                    (error) => error ? reject(error) : resolve(),
+                ));
+            }
+            await new Promise((resolve, reject) => this.db.run(
+                `INSERT OR IGNORE INTO call_e_mission_activity (business_id, mission_id, event_key, actor_id, event_type, state)
+                 VALUES (?, ?, ?, ?, 'mission_created', 'pending_approval')`,
+                [businessId, missionId, `mission_created:${missionId}`, createdBy], (error) => error ? reject(error) : resolve(),
+            ));
+            const saved = await this.getCallECampaignMissionForBusiness(missionId, businessId);
+            await new Promise((resolve, reject) => this.db.run('COMMIT', (error) => error ? reject(error) : resolve()));
+            return { ...saved, idempotentReplay: false };
+        } catch (error) {
+            await new Promise((resolve) => this.db.run('ROLLBACK', () => resolve()));
+            throw error;
+        } finally {
+            release();
+        }
+    }
+
+    async getCallECampaignMissionForBusiness(missionId, businessId) {
+        const normalizedId = String(missionId || '').trim();
+        const normalizedBusinessId = String(businessId || '').trim();
+        if (!/^mission_[a-f0-9]{64}$/.test(normalizedId) || !/^[A-Za-z0-9._:-]{1,120}$/.test(normalizedBusinessId)) return null;
+        const mission = await new Promise((resolve, reject) => this.db.get(
+            'SELECT * FROM call_e_campaign_missions WHERE mission_id = ? AND business_id = ?',
+            [normalizedId, normalizedBusinessId], (error, row) => error ? reject(error) : resolve(row || null),
+        ));
+        if (!mission) return null;
+        const recipients = await new Promise((resolve, reject) => this.db.all(
+            'SELECT mission_id, position, encrypted_destination, destination_masked, idempotency_key, status, local_call_id, error_code, updated_at FROM call_e_campaign_mission_recipients WHERE mission_id = ? ORDER BY position',
+            [normalizedId], (error, rows) => error ? reject(error) : resolve(rows || []),
+        ));
+        const budgetReserved = await new Promise((resolve, reject) => this.db.get(
+            `SELECT COALESCE(SUM(reserved_minor), 0) AS reserved_minor FROM call_e_mission_budget_reservations WHERE mission_id = ? AND status = 'reserved'`,
+            [normalizedId], (error, row) => error ? reject(error) : resolve(Number(row?.reserved_minor) || 0),
+        ));
+        const resolutions = await new Promise((resolve, reject) => this.db.all(
+            'SELECT resolved_by, decision, created_at FROM call_e_campaign_mission_resolutions WHERE mission_id = ? AND business_id = ? ORDER BY created_at, idempotency_key',
+            [normalizedId, normalizedBusinessId], (error, rows) => error ? reject(error) : resolve(rows || []),
+        ));
+        const reviewHistory = await new Promise((resolve, reject) => this.db.all(
+            `SELECT reviewed_by, decision, request_hash, created_at FROM call_e_approval_decisions
+             WHERE entity_type = 'mission' AND entity_id = ? AND business_id = ?
+             UNION ALL
+             SELECT reviewed_by, decision, request_hash, created_at FROM call_e_mission_secondary_approvals
+             WHERE mission_id = ? AND business_id = ? ORDER BY created_at`,
+            [normalizedId, normalizedBusinessId, normalizedId, normalizedBusinessId], (error, rows) => error ? reject(error) : resolve(rows || []),
+        ));
+        const activity = await new Promise((resolve, reject) => this.db.all(
+            `SELECT event_id, actor_id, event_type, recipient_position, state, error_code, created_at
+             FROM call_e_mission_activity WHERE business_id = ? AND mission_id = ? ORDER BY event_id DESC LIMIT 200`,
+            [normalizedBusinessId, normalizedId], (error, rows) => error ? reject(error) : resolve(rows || []),
+        ));
+        return { mission: { ...mission, budget_reserved_minor: budgetReserved }, recipients, resolutions, reviewHistory, activity };
+    }
+
+    async getCallECampaignMission(missionId, businessId) {
+        const saved = await this.getCallECampaignMissionForBusiness(missionId, businessId);
+        return saved ? { ...saved.mission, recipients: saved.recipients, reviewHistory: saved.reviewHistory, activity: saved.activity } : null;
+    }
+
+    async listCallECampaignMissionsForBusiness(businessId, limit = 20) {
+        const normalizedBusinessId = String(businessId || '').trim();
+        const boundedLimit = Math.max(1, Math.min(50, Math.floor(Number(limit) || 20)));
+        if (!/^[A-Za-z0-9._:-]{1,120}$/.test(normalizedBusinessId)) return [];
+        return new Promise((resolve, reject) => this.db.all(
+            `SELECT m.mission_id, m.business_id, m.campaign_id, m.request_hash, m.status, m.recipient_count,
+                    m.scheduled_at, m.budget_limit_minor, m.per_call_cost_ceiling_minor, m.budget_currency,
+                    (SELECT COALESCE(SUM(b.reserved_minor), 0) FROM call_e_mission_budget_reservations b WHERE b.mission_id = m.mission_id AND b.status = 'reserved') AS budget_reserved_minor,
+                    m.created_by, m.reviewed_by, m.created_at, m.updated_at,
+                    SUM(CASE WHEN r.status = 'queued' THEN 1 ELSE 0 END) AS queued_count,
+                    SUM(CASE WHEN r.status IN ('in_progress', 'accepted') THEN 1 ELSE 0 END) AS active_count,
+                    SUM(CASE WHEN r.status = 'completed' THEN 1 ELSE 0 END) AS completed_count,
+                    SUM(CASE WHEN r.status IN ('failed', 'blocked', 'needs_review', 'canceled') THEN 1 ELSE 0 END) AS attention_count
+             FROM call_e_campaign_missions m
+             JOIN call_e_campaign_mission_recipients r ON r.mission_id = m.mission_id
+             WHERE m.business_id = ?
+             GROUP BY m.mission_id
+             ORDER BY m.created_at DESC, m.mission_id DESC LIMIT ?`,
+            [normalizedBusinessId, boundedLimit], (error, rows) => error ? reject(error) : resolve(rows || []),
+        ));
+    }
+
+    async listCallEMissionRecoveryInbox(businessId, limit = 50, staleBefore = new Date(Date.now() - 15 * 60000).toISOString()) {
+        const normalizedBusinessId = String(businessId || '').trim();
+        const safeLimit = Math.max(1, Math.min(100, Math.floor(Number(limit) || 50)));
+        if (!/^[A-Za-z0-9._:-]{1,120}$/.test(normalizedBusinessId)) return [];
+        return new Promise((resolve, reject) => this.db.all(
+            `SELECT m.mission_id, m.status AS mission_status, m.updated_at AS mission_updated_at,
+                    r.position, r.status AS recipient_status, r.local_call_id, r.error_code, r.updated_at AS recipient_updated_at,
+                    r.destination_masked
+             FROM call_e_campaign_missions m JOIN call_e_campaign_mission_recipients r ON r.mission_id = m.mission_id
+             WHERE m.business_id = ? AND (
+               r.status IN ('needs_review', 'failed', 'blocked') OR
+               (r.status IN ('accepted', 'in_progress') AND datetime(r.updated_at) <= datetime(?))
+             )
+             ORDER BY CASE WHEN r.status IN ('accepted', 'in_progress') THEN 0 ELSE 1 END,
+                      r.updated_at ASC, m.mission_id, r.position LIMIT ?`,
+            [normalizedBusinessId, staleBefore, safeLimit], (error, rows) => error ? reject(error) : resolve(rows || []),
+        ));
+    }
+
+    async listDueCallECampaignMissions(nowIso = new Date().toISOString(), limit = 25) {
+        const safeLimit = Math.max(1, Math.min(100, Math.floor(Number(limit) || 25)));
+        return new Promise((resolve, reject) => this.db.all(
+            `SELECT mission_id, business_id, COALESCE(reviewed_by, created_by) AS actor_id, scheduled_at
+             FROM call_e_campaign_missions
+             WHERE status IN ('approved', 'running') AND scheduled_at IS NOT NULL AND scheduled_at <= ?
+             ORDER BY scheduled_at, mission_id LIMIT ?`,
+            [nowIso, safeLimit], (error, rows) => error ? reject(error) : resolve(rows || []),
+        ));
+    }
+
+    async listDueCallEMissionEscalations(nowIso = new Date().toISOString(), limit = 100) {
+        const safeLimit = Math.max(1, Math.min(500, Math.floor(Number(limit) || 100)));
+        return new Promise((resolve, reject) => this.db.all(
+            `SELECT m.mission_id, m.business_id, m.created_by, m.created_at, p.review_sla_minutes, p.review_repeat_minutes,
+                    e.escalation_count, e.deadline_at, e.next_escalation_at
+             FROM call_e_campaign_missions m
+             JOIN call_e_business_mission_policies p ON p.business_id = m.business_id
+             LEFT JOIN call_e_mission_escalations e ON e.mission_id = m.mission_id
+             WHERE m.status = 'pending_approval' AND p.review_sla_minutes > 0
+               AND (e.mission_id IS NULL OR e.next_escalation_at IS NOT NULL)
+               AND datetime(COALESCE(e.next_escalation_at, datetime(m.created_at, '+' || p.review_sla_minutes || ' minutes'))) <= datetime(?)
+             ORDER BY COALESCE(e.next_escalation_at, datetime(m.created_at, '+' || p.review_sla_minutes || ' minutes')), m.mission_id LIMIT ?`,
+            [nowIso, safeLimit], (error, rows) => error ? reject(error) : resolve(rows || []),
+        ));
+    }
+
+    async recordCallEMissionEscalation(input = {}) {
+        const missionId = String(input.mission_id || '').trim();
+        const businessId = String(input.business_id || '').trim();
+        if (!/^mission_[a-f0-9]{64}$/.test(missionId) || !/^[A-Za-z0-9._:-]{1,120}$/.test(businessId)) return false;
+        let release;
+        const previous = this.callECampaignWriteChain;
+        this.callECampaignWriteChain = new Promise((resolve) => { release = resolve; });
+        await previous;
+        const run = (sql, params = []) => new Promise((resolve, reject) => this.db.run(sql, params, function (error) {
+            if (error) return reject(error);
+            resolve({ changes: this.changes || 0 });
+        }));
+        let transactionStarted = false;
+        try {
+            await run('BEGIN IMMEDIATE');
+            transactionStarted = true;
+            const mission = await new Promise((resolve, reject) => this.db.get(
+                `SELECT m.created_at, p.review_sla_minutes, p.review_repeat_minutes FROM call_e_campaign_missions m
+                 JOIN call_e_business_mission_policies p ON p.business_id = m.business_id
+                 WHERE m.mission_id = ? AND m.business_id = ? AND m.status = 'pending_approval'`,
+                [missionId, businessId], (error, row) => error ? reject(error) : resolve(row || null),
+            ));
+            if (!mission || Number(mission.review_sla_minutes) <= 0) {
+                await run('COMMIT');
+                transactionStarted = false;
+                return false;
+            }
+            const prior = await new Promise((resolve, reject) => this.db.get(
+                'SELECT escalation_count, deadline_at, next_escalation_at FROM call_e_mission_escalations WHERE mission_id = ? AND business_id = ?',
+                [missionId, businessId], (error, row) => error ? reject(error) : resolve(row || null),
+            ));
+            if (prior && !prior.next_escalation_at) {
+                await run('COMMIT'); transactionStarted = false; return false;
+            }
+            if (prior && Date.parse(prior.next_escalation_at) > Date.parse(String(input.now_iso || new Date().toISOString()))) {
+                await run('COMMIT'); transactionStarted = false; return false;
+            }
+            const count = Number(prior?.escalation_count || 0) + 1;
+            const repeatMinutes = Number(mission.review_repeat_minutes) || 0;
+            const missionCreatedAt = String(mission.created_at || '');
+            const parsedCreatedAt = Date.parse(missionCreatedAt) || Date.parse(`${missionCreatedAt.replace(' ', 'T')}Z`);
+            if (!prior && !Number.isFinite(parsedCreatedAt)) throw new Error('Mission creation timestamp is invalid');
+            const deadline = prior?.deadline_at || new Date(parsedCreatedAt + Number(mission.review_sla_minutes) * 60000).toISOString();
+            const cycleAt = Date.parse(String(input.now_iso || new Date().toISOString()));
+            const nextEscalationAt = repeatMinutes > 0 && Number.isFinite(cycleAt) ? new Date(cycleAt + repeatMinutes * 60000).toISOString() : null;
+            if (!prior) await run(`INSERT INTO call_e_mission_escalations (mission_id, business_id, deadline_at, next_escalation_at, escalation_count)
+                VALUES (?, ?, ?, ?, 1)`, [missionId, businessId, deadline, nextEscalationAt]);
+            else await run(`UPDATE call_e_mission_escalations SET next_escalation_at = ?, escalation_count = escalation_count + 1
+                WHERE mission_id = ? AND business_id = ?`, [nextEscalationAt, missionId, businessId]);
+            await run(
+                `INSERT OR IGNORE INTO call_e_mission_activity (business_id, mission_id, event_key, event_type, state)
+                 VALUES (?, ?, ?, 'mission_advanced', 'review_escalated')`,
+                [businessId, missionId, `review-escalated:${missionId}:${count}`],
+            );
+            if (prior) await run(`INSERT INTO call_e_mission_escalation_actions (business_id, mission_id, action, actor_id, idempotency_key)
+                VALUES (?, ?, 'repeat_escalated', 'system', ?)`, [businessId, missionId, `repeat-escalation:${missionId}:${count}`]);
+            await run('COMMIT');
+            transactionStarted = false;
+            return true;
+        } catch (error) {
+            if (transactionStarted) {
+                try { await run('ROLLBACK'); } catch (_) { /* Preserve the original transaction failure. */ }
+            }
+            throw error;
+        } finally {
+            release();
+        }
+    }
+
+    async recordCallEMissionEscalationAction(input = {}) {
+        const businessId = String(input.business_id || '').trim();
+        const missionId = String(input.mission_id || '').trim();
+        const action = String(input.action || '').trim();
+        const actorId = String(input.actor_id || '').trim();
+        const assignedTo = input.assigned_to == null ? null : String(input.assigned_to).trim();
+        const idempotencyKey = String(input.idempotency_key || '').trim();
+        const deadlineAt = input.deadline_at == null ? null : String(input.deadline_at).trim();
+        const requestHash = String(input.request_hash || '').trim().toLowerCase();
+        if (!/^[A-Za-z0-9._:-]{1,120}$/.test(businessId) || !/^mission_[a-f0-9]{64}$/.test(missionId) ||
+            !['reassigned', 'deadline_extended'].includes(action) || !/^\d{1,20}$/.test(actorId) ||
+            (action === 'reassigned' && (!assignedTo || !/^\d{1,20}$/.test(assignedTo))) ||
+            (action === 'deadline_extended' && (!deadlineAt || !Number.isFinite(Date.parse(deadlineAt)) || !/(?:Z|[+-]\d{2}:\d{2})$/i.test(deadlineAt))) ||
+            !/^[A-Za-z0-9._:-]{8,180}$/.test(idempotencyKey) || (requestHash && !/^[a-f0-9]{64}$/.test(requestHash))) {
+            throw Object.assign(new Error('CALL-E escalation action is invalid'), { code: 'call_e_mission_escalation_action_invalid' });
+        }
+        let release;
+        const previous = this.callECampaignWriteChain;
+        this.callECampaignWriteChain = new Promise((resolve) => { release = resolve; });
+        await previous;
+        const run = (sql, params = []) => new Promise((resolve, reject) => this.db.run(sql, params, function (error) {
+            if (error) return reject(error); resolve({ changes: this.changes || 0 });
+        }));
+        const get = (sql, params = []) => new Promise((resolve, reject) => this.db.get(sql, params, (error, row) => error ? reject(error) : resolve(row || null)));
+        let transactionStarted = false;
+        try {
+            await run('BEGIN IMMEDIATE'); transactionStarted = true;
+            const prior = await get('SELECT business_id, mission_id, action, actor_id, assigned_to, deadline_at, request_hash FROM call_e_mission_escalation_actions WHERE idempotency_key = ?', [idempotencyKey]);
+            if (prior) {
+                const same = prior.business_id === businessId && prior.mission_id === missionId && prior.action === action &&
+                    prior.actor_id === actorId && (prior.assigned_to || null) === assignedTo &&
+                    (requestHash ? prior.request_hash === requestHash : (prior.deadline_at || null) === deadlineAt);
+                await run('COMMIT'); transactionStarted = false;
+                return { recorded: false, idempotent_replay: same, conflict: !same, deadline_at: prior.deadline_at || null };
+            }
+            const mission = await get(`SELECT status FROM call_e_campaign_missions WHERE mission_id = ? AND business_id = ?`, [missionId, businessId]);
+            if (!mission || mission.status !== 'pending_approval') {
+                await run('COMMIT'); transactionStarted = false; return { not_pending: true };
+            }
+            const escalation = await get('SELECT deadline_at FROM call_e_mission_escalations WHERE mission_id = ? AND business_id = ?', [missionId, businessId]);
+            if (!escalation) { await run('COMMIT'); transactionStarted = false; return { not_escalated: true }; }
+            await run(`INSERT INTO call_e_mission_escalation_actions (business_id, mission_id, action, actor_id, assigned_to, deadline_at, request_hash, idempotency_key)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, [businessId, missionId, action, actorId, assignedTo, deadlineAt, requestHash || null, idempotencyKey]);
+            if (action === 'deadline_extended') {
+                await run('UPDATE call_e_mission_escalations SET deadline_at = ?, next_escalation_at = ? WHERE mission_id = ? AND business_id = ?',
+                    [deadlineAt, deadlineAt, missionId, businessId]);
+            }
+            if (action === 'reassigned') {
+                await run(`INSERT INTO call_e_mission_review_actions (business_id, mission_id, action, actor_id, assigned_to, idempotency_key)
+                    VALUES (?, ?, 'assigned', ?, ?, ?)`, [businessId, missionId, actorId, assignedTo, `escalation-assignment:${idempotencyKey}`]);
+            }
+            await run(`INSERT OR IGNORE INTO call_e_mission_activity (business_id, mission_id, event_key, actor_id, event_type, state)
+                VALUES (?, ?, ?, ?, 'mission_advanced', ?)`, [businessId, missionId, `escalation-action:${idempotencyKey}`, actorId, action]);
+            await run('COMMIT'); transactionStarted = false;
+            return { recorded: true, idempotent_replay: false, deadline_at: action === 'deadline_extended' ? deadlineAt : escalation.deadline_at };
+        } catch (error) {
+            if (transactionStarted) { try { await run('ROLLBACK'); } catch (_) { /* Preserve original error. */ } }
+            throw error;
+        } finally { release(); }
+    }
+
+    async listCallEMissionReviewInbox(businessId, limit = 50) {
+        const normalizedBusinessId = String(businessId || '').trim();
+        const safeLimit = Math.max(1, Math.min(100, Math.floor(Number(limit) || 50)));
+        if (!/^[A-Za-z0-9._:-]{1,120}$/.test(normalizedBusinessId)) return [];
+        return new Promise((resolve, reject) => this.db.all(
+            `SELECT m.mission_id, m.business_id, m.created_by, m.created_at, m.recipient_count,
+                    e.escalated_at, e.deadline_at, e.escalation_count, latest.action AS latest_review_action,
+                    latest.actor_id AS latest_review_actor, COALESCE(owner.assigned_to, latest.assigned_to) AS assigned_to,
+                    latest.created_at AS review_action_at
+             FROM call_e_campaign_missions m
+             LEFT JOIN call_e_mission_escalations e ON e.mission_id = m.mission_id
+             LEFT JOIN call_e_mission_review_actions latest ON latest.action_id = (
+                 SELECT MAX(a.action_id) FROM call_e_mission_review_actions a WHERE a.mission_id = m.mission_id AND a.business_id = m.business_id
+             )
+             LEFT JOIN call_e_mission_review_actions owner ON owner.action_id = (
+                 SELECT MAX(a.action_id) FROM call_e_mission_review_actions a
+                 WHERE a.mission_id = m.mission_id AND a.business_id = m.business_id AND a.action = 'assigned'
+             )
+             WHERE m.business_id = ? AND m.status = 'pending_approval'
+             ORDER BY CASE WHEN e.mission_id IS NULL THEN 1 ELSE 0 END, e.escalated_at, m.created_at LIMIT ?`,
+            [normalizedBusinessId, safeLimit], (error, rows) => error ? reject(error) : resolve(rows || []),
+        ));
+    }
+
+    async recordCallEMissionReviewAction(input = {}) {
+        const businessId = String(input.business_id || '').trim();
+        const missionId = String(input.mission_id || '').trim();
+        const action = String(input.action || '').trim();
+        const actorId = String(input.actor_id || '').trim();
+        const assignedTo = input.assigned_to == null ? null : String(input.assigned_to).trim();
+        const idempotencyKey = String(input.idempotency_key || '').trim();
+        if (!/^[A-Za-z0-9._:-]{1,120}$/.test(businessId) || !/^mission_[a-f0-9]{64}$/.test(missionId) ||
+            !['assigned', 'acknowledged'].includes(action) || !/^\d{1,20}$/.test(actorId) ||
+            (assignedTo !== null && !/^\d{1,20}$/.test(assignedTo)) || !/^[A-Za-z0-9._:-]{8,180}$/.test(idempotencyKey) ||
+            (action === 'assigned' && !assignedTo) || (action === 'acknowledged' && assignedTo !== actorId)) {
+            throw Object.assign(new Error('CALL-E mission review action is invalid'), { code: 'call_e_mission_review_action_invalid' });
+        }
+        let release;
+        const previous = this.callECampaignWriteChain;
+        this.callECampaignWriteChain = new Promise((resolve) => { release = resolve; });
+        await previous;
+        const run = (sql, params = []) => new Promise((resolve, reject) => this.db.run(sql, params, function (error) {
+            if (error) return reject(error);
+            resolve({ changes: this.changes || 0 });
+        }));
+        const get = (sql, params = []) => new Promise((resolve, reject) => this.db.get(sql, params, (error, row) => error ? reject(error) : resolve(row || null)));
+        let transactionStarted = false;
+        try {
+            await run('BEGIN IMMEDIATE');
+            transactionStarted = true;
+            const replay = await get('SELECT business_id, mission_id, action, actor_id, assigned_to FROM call_e_mission_review_actions WHERE idempotency_key = ?', [idempotencyKey]);
+            if (replay) {
+                const matches = replay.business_id === businessId && replay.mission_id === missionId && replay.action === action &&
+                    replay.actor_id === actorId && (replay.assigned_to || null) === assignedTo;
+                await run('COMMIT');
+                transactionStarted = false;
+                return { recorded: false, idempotent_replay: matches, conflict: !matches };
+            }
+            const mission = await get('SELECT status FROM call_e_campaign_missions WHERE mission_id = ? AND business_id = ?', [missionId, businessId]);
+            if (!mission || mission.status !== 'pending_approval') {
+                await run('COMMIT');
+                transactionStarted = false;
+                return { recorded: false, not_pending: true };
+            }
+            if (action === 'acknowledged') {
+                const latest = await get(`SELECT assigned_to FROM call_e_mission_review_actions
+                    WHERE business_id = ? AND mission_id = ? AND action = 'assigned' ORDER BY action_id DESC LIMIT 1`, [businessId, missionId]);
+                if (!latest || latest.assigned_to !== actorId) {
+                    await run('COMMIT');
+                    transactionStarted = false;
+                    return { recorded: false, assignment_required: true };
+                }
+            }
+            await run(`INSERT INTO call_e_mission_review_actions (business_id, mission_id, action, actor_id, assigned_to, idempotency_key)
+                VALUES (?, ?, ?, ?, ?, ?)`, [businessId, missionId, action, actorId, assignedTo, idempotencyKey]);
+            await run(`INSERT OR IGNORE INTO call_e_mission_activity (business_id, mission_id, event_key, actor_id, event_type, state)
+                VALUES (?, ?, ?, ?, 'mission_advanced', ?)`, [businessId, missionId, `review-action:${idempotencyKey}`, actorId,
+                action === 'assigned' ? 'review_assigned' : 'review_acknowledged']);
+            await run('COMMIT');
+            transactionStarted = false;
+            return { recorded: true, idempotent_replay: false, conflict: false };
+        } catch (error) {
+            if (transactionStarted) {
+                try { await run('ROLLBACK'); } catch (_) { /* Preserve original transaction failure. */ }
+            }
+            throw error;
+        } finally { release(); }
+    }
+
+    async reserveCallECampaignMissionBudget(input = {}) {
+        const missionId = String(input.mission_id || '').trim();
+        const businessId = String(input.business_id || '').trim();
+        const position = Number(input.recipient_position);
+        if (!/^mission_[a-f0-9]{64}$/.test(missionId) || !/^[A-Za-z0-9._:-]{1,120}$/.test(businessId) ||
+            !Number.isSafeInteger(position) || position < 0) throw new Error('CALL-E mission budget reservation scope is invalid');
+        let release;
+        const previous = this.callECampaignWriteChain;
+        this.callECampaignWriteChain = new Promise((resolve) => { release = resolve; });
+        await previous;
+        try {
+            await new Promise((resolve, reject) => this.db.run('BEGIN IMMEDIATE', (error) => error ? reject(error) : resolve()));
+            const mission = await new Promise((resolve, reject) => this.db.get(
+                'SELECT budget_limit_minor, per_call_cost_ceiling_minor FROM call_e_campaign_missions WHERE mission_id = ? AND business_id = ?',
+                [missionId, businessId], (error, row) => error ? reject(error) : resolve(row || null),
+            ));
+            if (!mission || mission.budget_limit_minor == null || mission.per_call_cost_ceiling_minor == null) {
+                await new Promise((resolve, reject) => this.db.run('COMMIT', (error) => error ? reject(error) : resolve()));
+                return { allowed: false, reason: 'budget_not_configured' };
+            }
+            const existing = await new Promise((resolve, reject) => this.db.get(
+                `SELECT status FROM call_e_mission_budget_reservations WHERE mission_id = ? AND recipient_position = ?`,
+                [missionId, position], (error, row) => error ? reject(error) : resolve(row || null),
+            ));
+            if (existing?.status === 'reserved') {
+                await new Promise((resolve, reject) => this.db.run('COMMIT', (error) => error ? reject(error) : resolve()));
+                return { allowed: true, idempotent_replay: true };
+            }
+            const reserved = await new Promise((resolve, reject) => this.db.get(
+                `SELECT COALESCE(SUM(reserved_minor), 0) AS reserved_minor FROM call_e_mission_budget_reservations
+                 WHERE mission_id = ? AND status = 'reserved'`,
+                [missionId], (error, row) => error ? reject(error) : resolve(Number(row?.reserved_minor) || 0),
+            ));
+            const amount = Number(mission.per_call_cost_ceiling_minor);
+            if (reserved + amount > Number(mission.budget_limit_minor)) {
+                await new Promise((resolve, reject) => this.db.run('COMMIT', (error) => error ? reject(error) : resolve()));
+                return { allowed: false, reason: 'budget_exhausted', reserved_minor: reserved };
+            }
+            await new Promise((resolve, reject) => this.db.run(
+                `INSERT INTO call_e_mission_budget_reservations (mission_id, recipient_position, reserved_minor, status, created_at, released_at)
+                 VALUES (?, ?, ?, 'reserved', CURRENT_TIMESTAMP, NULL)
+                 ON CONFLICT(mission_id, recipient_position) DO UPDATE SET reserved_minor = excluded.reserved_minor,
+                   status = 'reserved', created_at = CURRENT_TIMESTAMP, released_at = NULL`,
+                [missionId, position, amount], (error) => error ? reject(error) : resolve(),
+            ));
+            await new Promise((resolve, reject) => this.db.run('COMMIT', (error) => error ? reject(error) : resolve()));
+            return { allowed: true, reserved_minor: reserved + amount, budget_limit_minor: Number(mission.budget_limit_minor) };
+        } catch (error) {
+            await new Promise((resolve) => this.db.run('ROLLBACK', () => resolve()));
+            throw error;
+        } finally { release(); }
+    }
+
+    async updateCallECampaignMissionBudgetReservation(input = {}) {
+        const status = input.status === 'released' ? 'released' : 'reserved';
+        await new Promise((resolve, reject) => this.db.run(
+            `UPDATE call_e_mission_budget_reservations SET status = ?, released_at = CASE WHEN ? = 'released' THEN CURRENT_TIMESTAMP ELSE NULL END
+             WHERE mission_id = ? AND recipient_position = ?`,
+            [status, status, String(input.mission_id || ''), Number(input.recipient_position)], (error) => error ? reject(error) : resolve(),
+        ));
+    }
+
+    async recordCallEMissionUsageRecord(input = {}) {
+        const businessId = String(input.business_id || '').trim();
+        const missionId = String(input.mission_id || '').trim();
+        const position = Number(input.recipient_position);
+        const provider = String(input.provider || '').trim().toLowerCase();
+        const providerCallId = String(input.provider_call_id || '').trim();
+        const amountMinor = Number(input.amount_minor);
+        const currency = String(input.currency || '').trim().toUpperCase();
+        const duration = input.billed_duration_seconds == null ? null : Number(input.billed_duration_seconds);
+        const sourceType = String(input.source_type || '').trim();
+        const sourceReference = String(input.source_reference || '').trim();
+        const recordedBy = String(input.recorded_by || '').trim();
+        const idempotencyKey = String(input.idempotency_key || '').trim();
+        const requestHash = String(input.request_hash || '').trim().toLowerCase();
+        const occurredAt = String(input.occurred_at || '').trim();
+        if (!/^[A-Za-z0-9._:-]{1,120}$/.test(businessId) || !/^mission_[a-f0-9]{64}$/.test(missionId) ||
+            !Number.isSafeInteger(position) || position < 0 || position > 24 || !['twilio', 'plivo', 'vonage', 'other'].includes(provider) ||
+            !/^[A-Za-z0-9._:-]{1,180}$/.test(providerCallId) || !Number.isSafeInteger(amountMinor) || amountMinor < 0 || amountMinor > 1000000000000 ||
+            !/^[A-Z]{3}$/.test(currency) || (duration !== null && (!Number.isSafeInteger(duration) || duration < 0 || duration > 86400)) ||
+            !['provider_cdr', 'invoice', 'operator_estimate'].includes(sourceType) || !/^[A-Za-z0-9._:-]{8,180}$/.test(sourceReference) ||
+            !/^\d{1,20}$/.test(recordedBy) || !/^[A-Za-z0-9._:-]{8,180}$/.test(idempotencyKey) || !/^[a-f0-9]{64}$/.test(requestHash) ||
+            !Number.isFinite(Date.parse(occurredAt)) || !/(?:Z|[+-]\d{2}:\d{2})$/i.test(occurredAt)) {
+            throw Object.assign(new Error('CALL-E mission usage record is invalid'), { code: 'call_e_mission_usage_invalid' });
+        }
+        let release;
+        const previous = this.callECampaignWriteChain;
+        this.callECampaignWriteChain = new Promise((resolve) => { release = resolve; });
+        await previous;
+        const run = (sql, params = []) => new Promise((resolve, reject) => this.db.run(sql, params, function (error) {
+            if (error) return reject(error);
+            resolve({ changes: this.changes || 0 });
+        }));
+        const get = (sql, params = []) => new Promise((resolve, reject) => this.db.get(sql, params, (error, row) => error ? reject(error) : resolve(row || null)));
+        let transactionStarted = false;
+        try {
+            await run('BEGIN IMMEDIATE');
+            transactionStarted = true;
+            const prior = await get('SELECT request_hash FROM call_e_mission_usage_records WHERE business_id = ? AND idempotency_key = ?', [businessId, idempotencyKey]);
+            if (prior) {
+                await run('COMMIT');
+                transactionStarted = false;
+                return { recorded: false, idempotent_replay: prior.request_hash === requestHash, conflict: prior.request_hash !== requestHash };
+            }
+            const mission = await get(`SELECT budget_limit_minor, budget_currency FROM call_e_campaign_missions
+                WHERE mission_id = ? AND business_id = ?`, [missionId, businessId]);
+            if (!mission) {
+                await run('COMMIT'); transactionStarted = false;
+                return { recorded: false, not_found: true };
+            }
+            await run(`INSERT INTO call_e_mission_usage_records (
+                business_id, mission_id, recipient_position, provider, provider_call_id, amount_minor, currency,
+                billed_duration_seconds, source_type, source_reference, recorded_by, idempotency_key, request_hash, occurred_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [
+                businessId, missionId, position, provider, providerCallId, amountMinor, currency, duration,
+                sourceType, sourceReference, recordedBy, idempotencyKey, requestHash, new Date(Date.parse(occurredAt)).toISOString(),
+            ]);
+            const totals = await get(`SELECT COALESCE(SUM(amount_minor), 0) AS actual_minor, COUNT(*) AS record_count
+                FROM call_e_mission_usage_records WHERE business_id = ? AND mission_id = ? AND currency = ?`, [businessId, missionId, currency]);
+            const exceedsBudget = mission.budget_currency === currency && mission.budget_limit_minor != null &&
+                Number(totals?.actual_minor) > Number(mission.budget_limit_minor);
+            if (exceedsBudget) {
+                await run(`INSERT OR IGNORE INTO call_e_mission_activity (business_id, mission_id, event_key, actor_id, event_type, state)
+                    VALUES (?, ?, ?, ?, 'mission_advanced', 'budget_exceeded')`, [businessId, missionId,
+                    `usage-budget-exceeded:${missionId}:${currency}`, recordedBy]);
+            }
+            await run('COMMIT'); transactionStarted = false;
+            return { recorded: true, idempotent_replay: false, currency, actual_minor: Number(totals?.actual_minor) || 0,
+                record_count: Number(totals?.record_count) || 0, budget_limit_minor: mission.budget_currency === currency ? Number(mission.budget_limit_minor) || null : null,
+                budget_exceeded: exceedsBudget, budget_currency: mission.budget_currency || null };
+        } catch (error) {
+            if (transactionStarted) { try { await run('ROLLBACK'); } catch (_) { /* Preserve original transaction failure. */ } }
+            if (String(error?.message || '').includes('UNIQUE constraint failed: call_e_mission_usage_records.business_id, call_e_mission_usage_records.provider, call_e_mission_usage_records.provider_call_id')) {
+                return { recorded: false, conflict: true };
+            }
+            throw error;
+        } finally { release(); }
+    }
+
+    async getCallEMissionUsageReport(businessId, missionId) {
+        const normalizedBusinessId = String(businessId || '').trim();
+        const normalizedMissionId = String(missionId || '').trim();
+        if (!/^[A-Za-z0-9._:-]{1,120}$/.test(normalizedBusinessId) || !/^mission_[a-f0-9]{64}$/.test(normalizedMissionId)) return null;
+        const mission = await new Promise((resolve, reject) => this.db.get(
+            `SELECT budget_limit_minor, per_call_cost_ceiling_minor, budget_currency FROM call_e_campaign_missions
+             WHERE business_id = ? AND mission_id = ?`, [normalizedBusinessId, normalizedMissionId],
+            (error, row) => error ? reject(error) : resolve(row || null),
+        ));
+        if (!mission) return null;
+        const [reservations, totalsRows, usage] = await Promise.all([
+            new Promise((resolve, reject) => this.db.get(`SELECT COALESCE(SUM(reserved_minor), 0) AS reserved_minor
+                FROM call_e_mission_budget_reservations WHERE mission_id = ? AND status = 'reserved'`, [normalizedMissionId],
+            (error, row) => error ? reject(error) : resolve(Number(row?.reserved_minor) || 0))),
+            new Promise((resolve, reject) => this.db.all(`SELECT currency, COALESCE(SUM(amount_minor), 0) AS amount_minor
+                FROM call_e_mission_usage_records WHERE business_id = ? AND mission_id = ? GROUP BY currency`,
+            [normalizedBusinessId, normalizedMissionId], (error, rows) => error ? reject(error) : resolve(rows || []))),
+            new Promise((resolve, reject) => this.db.all(`SELECT provider, amount_minor, currency, billed_duration_seconds, source_type, occurred_at
+                FROM call_e_mission_usage_records WHERE business_id = ? AND mission_id = ? ORDER BY usage_id DESC LIMIT 100`,
+            [normalizedBusinessId, normalizedMissionId], (error, rows) => error ? reject(error) : resolve(rows || []))),
+        ]);
+        const totals = {};
+        for (const row of totalsRows) totals[row.currency] = Number(row.amount_minor) || 0;
+        return { budget_limit_minor: mission.budget_limit_minor == null ? null : Number(mission.budget_limit_minor),
+            per_call_cost_ceiling_minor: mission.per_call_cost_ceiling_minor == null ? null : Number(mission.per_call_cost_ceiling_minor),
+            budget_currency: mission.budget_currency || null, reserved_minor: reservations, actual_by_currency: totals,
+            budget_exceeded: Boolean(mission.budget_currency && mission.budget_limit_minor != null &&
+                (totals[mission.budget_currency] || 0) > Number(mission.budget_limit_minor)),
+            records: usage.map((row) => ({ provider: row.provider, amount_minor: Number(row.amount_minor), currency: row.currency,
+                billed_duration_seconds: row.billed_duration_seconds == null ? null : Number(row.billed_duration_seconds),
+                source_type: row.source_type, occurred_at: row.occurred_at })) };
+    }
+
+    async stageCallEMissionCdrImport(input = {}) {
+        const businessId = String(input.business_id || '').trim();
+        const missionId = String(input.mission_id || '').trim();
+        const actorId = String(input.created_by || '').trim();
+        const idempotencyKey = String(input.idempotency_key || '').trim();
+        const requestHash = String(input.request_hash || '').trim().toLowerCase();
+        const records = Array.isArray(input.records) ? input.records : [];
+        if (!/^[A-Za-z0-9._:-]{1,120}$/.test(businessId) || !/^mission_[a-f0-9]{64}$/.test(missionId) ||
+            !/^\d{1,20}$/.test(actorId) || !/^[A-Za-z0-9._:-]{8,180}$/.test(idempotencyKey) ||
+            !/^[a-f0-9]{64}$/.test(requestHash) || records.length < 1 || records.length > 100) {
+            throw Object.assign(new Error('CALL-E CDR import is invalid'), { code: 'call_e_cdr_import_invalid' });
+        }
+        const mission = await new Promise((resolve, reject) => this.db.get(
+            'SELECT budget_limit_minor, budget_currency FROM call_e_campaign_missions WHERE business_id = ? AND mission_id = ?',
+            [businessId, missionId], (error, row) => error ? reject(error) : resolve(row || null)));
+        if (!mission) return { not_found: true };
+        const existingImport = await new Promise((resolve, reject) => this.db.get(
+            'SELECT import_id, request_hash FROM call_e_mission_cdr_imports WHERE business_id = ? AND idempotency_key = ?',
+            [businessId, idempotencyKey], (error, row) => error ? reject(error) : resolve(row || null)));
+        if (existingImport) {
+            if (existingImport.request_hash !== requestHash) return { conflict: true };
+            return { ...(await this.getCallEMissionCdrImport(businessId, existingImport.import_id)), idempotent_replay: true };
+        }
+        const normalizedRecords = records.map((record) => ({ ...record }));
+        const seen = new Set();
+        const previewRecords = [];
+        const newTotals = {};
+        for (const record of normalizedRecords) {
+            const key = `${record.provider}:${record.provider_call_id}`;
+            const intraBatchDuplicate = seen.has(key);
+            seen.add(key);
+            const existing = await new Promise((resolve, reject) => this.db.get(
+                'SELECT usage_id FROM call_e_mission_usage_records WHERE business_id = ? AND provider = ? AND provider_call_id = ?',
+                [businessId, record.provider, record.provider_call_id], (error, row) => error ? reject(error) : resolve(row || null)));
+            const duplicate = Boolean(intraBatchDuplicate || existing);
+            previewRecords.push({ recipient_position: Number(record.recipient_position), provider: record.provider,
+                duplicate, duplicate_reason: intraBatchDuplicate ? 'duplicate_in_import' : existing ? 'already_imported' : null,
+                amount_minor: Number(record.amount_minor), currency: record.currency });
+            if (!duplicate) newTotals[record.currency] = (newTotals[record.currency] || 0) + Number(record.amount_minor);
+        }
+        const report = await this.getCallEMissionUsageReport(businessId, missionId);
+        const projectedByCurrency = { ...(report?.actual_by_currency || {}) };
+        for (const [currency, amount] of Object.entries(newTotals)) projectedByCurrency[currency] = (projectedByCurrency[currency] || 0) + amount;
+        const preview = { record_count: normalizedRecords.length, duplicate_count: previewRecords.filter((row) => row.duplicate).length,
+            new_record_count: previewRecords.filter((row) => !row.duplicate).length, new_totals_by_currency: newTotals,
+            projected_actual_by_currency: projectedByCurrency,
+            budget_exceeded: Boolean(mission.budget_currency && mission.budget_limit_minor != null &&
+                Number(projectedByCurrency[mission.budget_currency] || 0) > Number(mission.budget_limit_minor)),
+            records: previewRecords };
+        const importId = `cdrimp_${crypto.randomUUID()}`;
+        await new Promise((resolve, reject) => this.db.run(
+            `INSERT INTO call_e_mission_cdr_imports (import_id, business_id, mission_id, created_by, idempotency_key, request_hash, records_json, preview_json, status)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'staged')`,
+            [importId, businessId, missionId, actorId, idempotencyKey, requestHash, JSON.stringify(normalizedRecords), JSON.stringify(preview)],
+            (error) => error ? reject(error) : resolve()));
+        return { import_id: importId, status: 'staged', preview, idempotent_replay: false };
+    }
+
+    async getCallEMissionCdrImport(businessId, importId) {
+        const row = await new Promise((resolve, reject) => this.db.get(
+            `SELECT import_id, business_id, mission_id, created_by, status, records_json, preview_json, created_at, committed_at
+             FROM call_e_mission_cdr_imports WHERE business_id = ? AND import_id = ?`,
+            [String(businessId || ''), String(importId || '')], (error, result) => error ? reject(error) : resolve(result || null)));
+        if (!row) return null;
+        let records = []; let preview = {};
+        try { records = JSON.parse(row.records_json || '[]'); } catch (_) {}
+        try { preview = JSON.parse(row.preview_json || '{}'); } catch (_) {}
+        return { import_id: row.import_id, business_id: row.business_id, mission_id: row.mission_id,
+            created_by: row.created_by, status: row.status, records, preview, created_at: row.created_at, committed_at: row.committed_at };
+    }
+
+    async markCallEMissionCdrImportCommitted(businessId, importId, actorId) {
+        const result = await new Promise((resolve, reject) => this.db.run(
+            `UPDATE call_e_mission_cdr_imports SET status = 'committed', committed_at = COALESCE(committed_at, CURRENT_TIMESTAMP)
+             WHERE business_id = ? AND import_id = ? AND created_by = ?`,
+            [String(businessId || ''), String(importId || ''), String(actorId || '')],
+            function (error) { error ? reject(error) : resolve(this.changes || 0); }));
+        return result;
+    }
+
+    async reserveCallEContactCooldown(input = {}) {
+        const businessId = String(input.business_id || '').trim();
+        const destinationHash = String(input.destination_hash || '').toLowerCase();
+        const missionId = String(input.mission_id || '').trim();
+        const position = Number(input.recipient_position);
+        if (!/^[A-Za-z0-9._:-]{1,120}$/.test(businessId) || !/^[a-f0-9]{64}$/.test(destinationHash) ||
+            !/^mission_[a-f0-9]{64}$/.test(missionId) || !Number.isSafeInteger(position) || position < 0) {
+            throw new Error('CALL-E contact cooldown reservation scope is invalid');
+        }
+        let release;
+        const previous = this.callECampaignWriteChain;
+        this.callECampaignWriteChain = new Promise((resolve) => { release = resolve; });
+        await previous;
+        try {
+            await new Promise((resolve, reject) => this.db.run('BEGIN IMMEDIATE', (error) => error ? reject(error) : resolve()));
+            const policy = await new Promise((resolve, reject) => this.db.get(
+                'SELECT contact_cooldown_hours FROM call_e_business_safety_policies WHERE business_id = ?',
+                [businessId], (error, row) => error ? reject(error) : resolve(row || null),
+            ));
+            const prior = await new Promise((resolve, reject) => this.db.get(
+                `SELECT status FROM call_e_contact_dispatch_history WHERE mission_id = ? AND recipient_position = ?`,
+                [missionId, position], (error, row) => error ? reject(error) : resolve(row || null),
+            ));
+            if (prior && prior.status !== 'released') {
+                await new Promise((resolve, reject) => this.db.run('COMMIT', (error) => error ? reject(error) : resolve()));
+                return { allowed: true, idempotent_replay: true };
+            }
+            const cooldownHours = Number(policy?.contact_cooldown_hours) || 0;
+            if (cooldownHours > 0) {
+                const recent = await new Promise((resolve, reject) => this.db.get(
+                    `SELECT 1 AS found FROM call_e_contact_dispatch_history
+                     WHERE business_id = ? AND destination_hash = ? AND status IN ('reserved', 'accepted')
+                       AND NOT (mission_id = ? AND recipient_position = ?)
+                       AND datetime(attempted_at) >= datetime('now', '-' || ? || ' hours') LIMIT 1`,
+                    [businessId, destinationHash, missionId, position, cooldownHours], (error, row) => error ? reject(error) : resolve(Boolean(row)),
+                ));
+                if (recent) {
+                    await new Promise((resolve, reject) => this.db.run('COMMIT', (error) => error ? reject(error) : resolve()));
+                    return { allowed: false, reason: 'cooldown_active' };
+                }
+            }
+            await new Promise((resolve, reject) => this.db.run(
+                `INSERT INTO call_e_contact_dispatch_history (business_id, destination_hash, mission_id, recipient_position, status, attempted_at)
+                 VALUES (?, ?, ?, ?, 'reserved', CURRENT_TIMESTAMP)
+                 ON CONFLICT(mission_id, recipient_position) DO UPDATE SET business_id = excluded.business_id,
+                   destination_hash = excluded.destination_hash, status = 'reserved', attempted_at = CURRENT_TIMESTAMP`,
+                [businessId, destinationHash, missionId, position], (error) => error ? reject(error) : resolve(),
+            ));
+            await new Promise((resolve, reject) => this.db.run('COMMIT', (error) => error ? reject(error) : resolve()));
+            return { allowed: true, cooldown_hours: cooldownHours };
+        } catch (error) {
+            await new Promise((resolve) => this.db.run('ROLLBACK', () => resolve()));
+            throw error;
+        } finally { release(); }
+    }
+
+    async updateCallEContactCooldownReservation(input = {}) {
+        const status = ['accepted', 'released'].includes(input.status) ? input.status : 'reserved';
+        await new Promise((resolve, reject) => this.db.run(
+            `UPDATE call_e_contact_dispatch_history SET status = ? WHERE mission_id = ? AND recipient_position = ?`,
+            [status, String(input.mission_id || ''), Number(input.recipient_position)], (error) => error ? reject(error) : resolve(),
+        ));
+    }
+
+    async reserveOutboundContactDispatch(input = {}) {
+        const reservationKey = String(input.reservation_key || '').trim();
+        const businessId = String(input.business_id || '').trim();
+        const destinationHash = String(input.destination_hash || '').toLowerCase();
+        const provider = String(input.provider || '').trim().toLowerCase();
+        if (!/^[A-Za-z0-9._:-]{8,180}$/.test(reservationKey) || !/^[A-Za-z0-9._:-]{1,120}$/.test(businessId) ||
+            !/^[a-f0-9]{64}$/.test(destinationHash) || !['twilio', 'plivo', 'vonage', 'vapi', 'call_e', 'cartesia'].includes(provider)) {
+            throw Object.assign(new Error('Outbound contact dispatch reservation is invalid'), { code: 'outbound_contact_policy_invalid' });
+        }
+        let release;
+        const previous = this.callECampaignWriteChain;
+        this.callECampaignWriteChain = new Promise((resolve) => { release = resolve; });
+        await previous;
+        try {
+            await new Promise((resolve, reject) => this.db.run('BEGIN IMMEDIATE', (error) => error ? reject(error) : resolve()));
+            const policy = await new Promise((resolve, reject) => this.db.get(
+                'SELECT contact_cooldown_hours FROM call_e_business_safety_policies WHERE business_id = ?',
+                [businessId], (error, row) => error ? reject(error) : resolve(row || null),
+            ));
+            if (!policy) {
+                await new Promise((resolve, reject) => this.db.run('COMMIT', (error) => error ? reject(error) : resolve()));
+                return { allowed: false, reason: 'safety_policy_required' };
+            }
+            const prior = await new Promise((resolve, reject) => this.db.get(
+                'SELECT business_id, destination_hash, status FROM outbound_contact_dispatch_history WHERE reservation_key = ?',
+                [reservationKey], (error, row) => error ? reject(error) : resolve(row || null),
+            ));
+            if (prior) {
+                const sameRequest = prior.business_id === businessId && prior.destination_hash === destinationHash;
+                if (!sameRequest) {
+                    await new Promise((resolve, reject) => this.db.run('COMMIT', (error) => error ? reject(error) : resolve()));
+                    return { allowed: false, reason: 'idempotency_conflict' };
+                }
+                if (prior.status !== 'released') {
+                    await new Promise((resolve, reject) => this.db.run('COMMIT', (error) => error ? reject(error) : resolve()));
+                    return { allowed: true, idempotent_replay: true };
+                }
+            }
+            const cooldownHours = Number(policy.contact_cooldown_hours) || 0;
+            if (cooldownHours > 0) {
+                const recent = await new Promise((resolve, reject) => this.db.get(
+                    `SELECT 1 AS found FROM (
+                        SELECT business_id, destination_hash, status, attempted_at FROM call_e_contact_dispatch_history
+                        UNION ALL
+                        SELECT business_id, destination_hash, status, attempted_at FROM outbound_contact_dispatch_history
+                     )
+                     WHERE business_id = ? AND destination_hash = ? AND status IN ('reserved', 'accepted')
+                       AND datetime(attempted_at) >= datetime('now', '-' || ? || ' hours') LIMIT 1`,
+                    [businessId, destinationHash, cooldownHours], (error, row) => error ? reject(error) : resolve(Boolean(row)),
+                ));
+                if (recent) {
+                    await new Promise((resolve, reject) => this.db.run('COMMIT', (error) => error ? reject(error) : resolve()));
+                    return { allowed: false, reason: 'cooldown_active' };
+                }
+            }
+            await new Promise((resolve, reject) => this.db.run(
+                `INSERT INTO outbound_contact_dispatch_history (reservation_key, business_id, destination_hash, provider, status, attempted_at, updated_at)
+                 VALUES (?, ?, ?, ?, 'reserved', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                 ON CONFLICT(reservation_key) DO UPDATE SET provider = excluded.provider, status = 'reserved',
+                   attempted_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP`,
+                [reservationKey, businessId, destinationHash, provider], (error) => error ? reject(error) : resolve(),
+            ));
+            await new Promise((resolve, reject) => this.db.run('COMMIT', (error) => error ? reject(error) : resolve()));
+            return { allowed: true, idempotent_replay: false, cooldown_hours: cooldownHours };
+        } catch (error) {
+            await new Promise((resolve) => this.db.run('ROLLBACK', () => resolve()));
+            throw error;
+        } finally { release(); }
+    }
+
+    async updateOutboundContactDispatch(input = {}) {
+        const reservationKey = String(input.reservation_key || '').trim();
+        const status = String(input.status || '').trim().toLowerCase();
+        if (!/^[A-Za-z0-9._:-]{8,180}$/.test(reservationKey) || !['accepted', 'released'].includes(status)) return false;
+        return new Promise((resolve, reject) => this.db.run(
+            `UPDATE outbound_contact_dispatch_history SET status = ?, updated_at = CURRENT_TIMESTAMP
+             WHERE reservation_key = ? AND status = 'reserved'`,
+            [status, reservationKey], function (error) { error ? reject(error) : resolve(this.changes === 1); },
+        ));
+    }
+
+    async reviewCallECampaignMission(input = {}) {
+        const missionId = String(input.mission_id || '').trim();
+        const businessId = String(input.business_id || '').trim();
+        const reviewer = String(input.reviewed_by || '').trim();
+        const decision = String(input.decision || '').trim().toLowerCase();
+        if (!/^mission_[a-f0-9]{64}$/.test(missionId) || !/^[A-Za-z0-9._:-]{1,120}$/.test(businessId) ||
+            !/^\d{1,20}$/.test(reviewer) || !['approve', 'reject'].includes(decision)) {
+            throw Object.assign(new Error('CALL-E mission review decision is invalid'), { code: 'call_e_mission_invalid' });
+        }
+        const nextStatus = decision === 'approve' ? 'approved' : 'rejected';
+        let release;
+        const previous = this.callECampaignWriteChain;
+        this.callECampaignWriteChain = new Promise((resolve) => { release = resolve; });
+        await previous;
+        try {
+            await new Promise((resolve, reject) => this.db.run('BEGIN IMMEDIATE', (error) => error ? reject(error) : resolve()));
+            const mission = await new Promise((resolve, reject) => this.db.get(
+                'SELECT * FROM call_e_campaign_missions WHERE mission_id = ? AND business_id = ?',
+                [missionId, businessId], (error, row) => error ? reject(error) : resolve(row || null),
+            ));
+            if (!mission) {
+                await new Promise((resolve, reject) => this.db.run('COMMIT', (error) => error ? reject(error) : resolve()));
+                return null;
+            }
+            const savedDecision = await new Promise((resolve, reject) => this.db.get(
+                `SELECT reviewed_by, decision, request_hash FROM call_e_approval_decisions
+                 WHERE entity_type = 'mission' AND entity_id = ? AND business_id = ?`,
+                [missionId, businessId], (error, row) => error ? reject(error) : resolve(row || null),
+            ));
+            const policy = await new Promise((resolve, reject) => this.db.get(
+                'SELECT secondary_approval_threshold FROM call_e_business_mission_policies WHERE business_id = ?',
+                [businessId], (error, row) => error ? reject(error) : resolve(row || null),
+            ));
+            const needsSecondary = Number(mission.recipient_count) >= Number(policy?.secondary_approval_threshold || 26);
+            const secondaryDecision = needsSecondary ? await new Promise((resolve, reject) => this.db.get(
+                'SELECT reviewed_by, decision, request_hash FROM call_e_mission_secondary_approvals WHERE mission_id = ? AND business_id = ?',
+                [missionId, businessId], (error, row) => error ? reject(error) : resolve(row || null),
+            )) : null;
+            if (savedDecision) {
+                if (!needsSecondary && savedDecision.decision === 'approve' && mission.status === 'pending_approval' && savedDecision.reviewed_by === reviewer) {
+                    await new Promise((resolve, reject) => this.db.run(
+                        `UPDATE call_e_campaign_missions SET status = 'approved', updated_at = CURRENT_TIMESTAMP
+                         WHERE mission_id = ? AND business_id = ? AND status = 'pending_approval'`,
+                        [missionId, businessId], (error) => error ? reject(error) : resolve(),
+                    ));
+                    await new Promise((resolve, reject) => this.db.run(
+                        `INSERT OR IGNORE INTO call_e_mission_activity (business_id, mission_id, event_key, actor_id, event_type, state)
+                         VALUES (?, ?, ?, ?, 'approval_recorded', 'approved')`,
+                        [businessId, missionId, `approval-policy-finalize:${missionId}`, reviewer], (error) => error ? reject(error) : resolve(),
+                    ));
+                    const finalized = await this.getCallECampaignMissionForBusiness(missionId, businessId);
+                    await new Promise((resolve, reject) => this.db.run('COMMIT', (error) => error ? reject(error) : resolve()));
+                    return { ...finalized, idempotentReplay: false, awaitingSecondaryApproval: false };
+                }
+                if (needsSecondary && savedDecision.decision === 'approve' && !secondaryDecision) {
+                    if (savedDecision.request_hash !== mission.request_hash) {
+                        throw Object.assign(new Error('Mission approval fingerprint changed'), { code: 'call_e_mission_review_final' });
+                    }
+                    if (savedDecision.reviewed_by === reviewer) {
+                        const replay = await this.getCallECampaignMissionForBusiness(missionId, businessId);
+                        await new Promise((resolve, reject) => this.db.run('COMMIT', (error) => error ? reject(error) : resolve()));
+                        return { ...replay, idempotentReplay: true, awaitingSecondaryApproval: true };
+                    }
+                    if (decision !== 'approve' || String(mission.created_by) === reviewer) {
+                        throw Object.assign(new Error('A separate policy manager must provide the second approval'), { code: 'call_e_mission_second_approval_required' });
+                    }
+                    await new Promise((resolve, reject) => this.db.run(
+                        `INSERT INTO call_e_mission_secondary_approvals (mission_id, business_id, reviewed_by, decision, request_hash)
+                         VALUES (?, ?, ?, 'approve', ?)`,
+                        [missionId, businessId, reviewer, mission.request_hash], (error) => error ? reject(error) : resolve(),
+                    ));
+                    await new Promise((resolve, reject) => this.db.run(
+                        `INSERT OR IGNORE INTO call_e_mission_activity (business_id, mission_id, event_key, actor_id, event_type, state)
+                         VALUES (?, ?, ?, ?, 'approval_recorded', 'approved')`,
+                        [businessId, missionId, `approval-secondary:${missionId}:${reviewer}`, reviewer], (error) => error ? reject(error) : resolve(),
+                    ));
+                    await new Promise((resolve, reject) => this.db.run(
+                        `UPDATE call_e_campaign_missions SET status = 'approved', updated_at = CURRENT_TIMESTAMP
+                         WHERE mission_id = ? AND business_id = ? AND status = 'pending_approval'`,
+                        [missionId, businessId], (error) => error ? reject(error) : resolve(),
+                    ));
+                    const replay = await this.getCallECampaignMissionForBusiness(missionId, businessId);
+                    await new Promise((resolve, reject) => this.db.run('COMMIT', (error) => error ? reject(error) : resolve()));
+                    return { ...replay, idempotentReplay: false, awaitingSecondaryApproval: false };
+                }
+                if (secondaryDecision && secondaryDecision.reviewed_by === reviewer && secondaryDecision.decision === decision && savedDecision.decision === 'approve') {
+                    const replay = await this.getCallECampaignMissionForBusiness(missionId, businessId);
+                    await new Promise((resolve, reject) => this.db.run('COMMIT', (error) => error ? reject(error) : resolve()));
+                    return { ...replay, idempotentReplay: true, awaitingSecondaryApproval: false };
+                }
+                if (savedDecision.reviewed_by !== reviewer || savedDecision.decision !== decision || savedDecision.request_hash !== mission.request_hash) {
+                    throw Object.assign(new Error('Mission approval is already final'), { code: 'call_e_mission_review_final' });
+                }
+                const replay = await this.getCallECampaignMissionForBusiness(missionId, businessId);
+                await new Promise((resolve, reject) => this.db.run('COMMIT', (error) => error ? reject(error) : resolve()));
+                return { ...replay, idempotentReplay: true };
+            }
+            if (mission.status !== 'pending_approval') {
+                const priorDecision = mission.status === 'rejected' ? 'reject' : 'approve';
+                if (mission.reviewed_by === reviewer && priorDecision === decision) {
+                    await new Promise((resolve, reject) => this.db.run(
+                        `INSERT OR IGNORE INTO call_e_approval_decisions
+                         (entity_type, entity_id, business_id, reviewed_by, decision, request_hash, created_at)
+                         VALUES ('mission', ?, ?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP))`,
+                        [missionId, businessId, reviewer, decision, mission.request_hash, mission.reviewed_at],
+                        (error) => error ? reject(error) : resolve(),
+                    ));
+                    const replay = await this.getCallECampaignMissionForBusiness(missionId, businessId);
+                    await new Promise((resolve, reject) => this.db.run('COMMIT', (error) => error ? reject(error) : resolve()));
+                    return { ...replay, idempotentReplay: true };
+                }
+                throw Object.assign(new Error('Mission approval is already final'), { code: 'call_e_mission_review_final' });
+            }
+            if (String(mission.created_by) === reviewer) {
+                throw Object.assign(new Error('A different operator must review this mission'), { code: 'call_e_mission_four_eyes_required' });
+            }
+            const initialStatus = decision === 'approve' && needsSecondary ? 'pending_approval' : nextStatus;
+            await new Promise((resolve, reject) => this.db.run(
+                `UPDATE call_e_campaign_missions SET status = ?, reviewed_by = ?, reviewed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+                 WHERE mission_id = ? AND business_id = ? AND status = 'pending_approval'`,
+                [initialStatus, reviewer, missionId, businessId], (error) => error ? reject(error) : resolve(),
+            ));
+            await new Promise((resolve, reject) => this.db.run(
+                `INSERT INTO call_e_approval_decisions
+                 (entity_type, entity_id, business_id, reviewed_by, decision, request_hash)
+                 VALUES ('mission', ?, ?, ?, ?, ?)`,
+                [missionId, businessId, reviewer, decision, mission.request_hash],
+                (error) => error ? reject(error) : resolve(),
+            ));
+            await new Promise((resolve, reject) => this.db.run(
+                `INSERT OR IGNORE INTO call_e_mission_activity (business_id, mission_id, event_key, actor_id, event_type, state)
+                 VALUES (?, ?, ?, ?, 'approval_recorded', ?)`,
+                [businessId, missionId, `approval-primary:${missionId}:${reviewer}`, reviewer, initialStatus], (error) => error ? reject(error) : resolve(),
+            ));
+            const saved = await this.getCallECampaignMissionForBusiness(missionId, businessId);
+            await new Promise((resolve, reject) => this.db.run('COMMIT', (error) => error ? reject(error) : resolve()));
+            return { ...saved, idempotentReplay: false, awaitingSecondaryApproval: initialStatus === 'pending_approval' && decision === 'approve' && needsSecondary };
+        } catch (error) {
+            await new Promise((resolve) => this.db.run('ROLLBACK', () => resolve()));
+            throw error;
+        } finally {
+            release();
+        }
+    }
+
+    async resolveCallECampaignMission(input = {}) {
+        const missionId = String(input.mission_id || '').trim();
+        const businessId = String(input.business_id || '').trim();
+        const reviewer = String(input.resolved_by || '').trim();
+        const decision = String(input.decision || '').trim().toLowerCase();
+        const idempotencyKey = String(input.idempotency_key || '').trim();
+        if (!/^mission_[a-f0-9]{64}$/.test(missionId) || !/^[A-Za-z0-9._:-]{1,120}$/.test(businessId) ||
+            !/^\d{1,20}$/.test(reviewer) || !['continue', 'cancel'].includes(decision) ||
+            !/^[A-Za-z0-9._:-]{8,180}$/.test(idempotencyKey)) {
+            throw Object.assign(new Error('CALL-E mission resolution is invalid'), { code: 'call_e_mission_invalid' });
+        }
+        let release;
+        const previous = this.callECampaignWriteChain;
+        this.callECampaignWriteChain = new Promise((resolve) => { release = resolve; });
+        await previous;
+        try {
+            await new Promise((resolve, reject) => this.db.run('BEGIN IMMEDIATE', (error) => error ? reject(error) : resolve()));
+            const mission = await new Promise((resolve, reject) => this.db.get(
+                'SELECT * FROM call_e_campaign_missions WHERE mission_id = ? AND business_id = ?',
+                [missionId, businessId], (error, row) => error ? reject(error) : resolve(row || null),
+            ));
+            if (!mission) {
+                await new Promise((resolve, reject) => this.db.run('COMMIT', (error) => error ? reject(error) : resolve()));
+                return null;
+            }
+            const replay = await new Promise((resolve, reject) => this.db.get(
+                `SELECT decision, resolved_by FROM call_e_campaign_mission_resolutions
+                 WHERE mission_id = ? AND business_id = ? AND idempotency_key = ?`,
+                [missionId, businessId, idempotencyKey], (error, row) => error ? reject(error) : resolve(row || null),
+            ));
+            if (replay) {
+                if (replay.decision !== decision || replay.resolved_by !== reviewer) {
+                    throw Object.assign(new Error('Mission resolution key conflicts with an existing decision'), { code: 'call_e_mission_idempotency_conflict' });
+                }
+                const savedReplay = await this.getCallECampaignMissionForBusiness(missionId, businessId);
+                await new Promise((resolve, reject) => this.db.run('COMMIT', (error) => error ? reject(error) : resolve()));
+                return { ...savedReplay, idempotentReplay: true };
+            }
+            if (mission.status !== 'needs_review' || String(mission.created_by) === reviewer ||
+                (mission.reviewed_by && String(mission.reviewed_by) === reviewer)) {
+                throw Object.assign(new Error('A different policy manager must resolve a paused mission'), { code: 'call_e_mission_four_eyes_required' });
+            }
+            const active = await new Promise((resolve, reject) => this.db.get(
+                `SELECT COUNT(*) AS count FROM call_e_campaign_mission_recipients
+                 WHERE mission_id = ? AND status IN ('in_progress', 'accepted')`,
+                [missionId], (error, row) => error ? reject(error) : resolve(Number(row?.count) || 0),
+            ));
+            if (active > 0) throw Object.assign(new Error('An active CALL-E recipient must be reconciled before mission resolution'), { code: 'call_e_mission_active_recipient' });
+            const queued = await new Promise((resolve, reject) => this.db.get(
+                `SELECT COUNT(*) AS count FROM call_e_campaign_mission_recipients WHERE mission_id = ? AND status = 'queued'`,
+                [missionId], (error, row) => error ? reject(error) : resolve(Number(row?.count) || 0),
+            ));
+            if (decision === 'continue' && queued === 0) {
+                throw Object.assign(new Error('No queued recipients remain to continue'), { code: 'call_e_mission_no_queued_recipients' });
+            }
+            await new Promise((resolve, reject) => this.db.run(
+                `INSERT INTO call_e_campaign_mission_resolutions
+                 (mission_id, idempotency_key, business_id, resolved_by, decision)
+                 VALUES (?, ?, ?, ?, ?)`,
+                [missionId, idempotencyKey, businessId, reviewer, decision], (error) => error ? reject(error) : resolve(),
+            ));
+            const nextStatus = decision === 'continue' ? 'running' : 'canceled';
+            if (decision === 'cancel') {
+                await new Promise((resolve, reject) => this.db.run(
+                    `UPDATE call_e_campaign_mission_recipients SET status = 'canceled', updated_at = CURRENT_TIMESTAMP
+                     WHERE mission_id = ? AND status = 'queued'`,
+                    [missionId], (error) => error ? reject(error) : resolve(),
+                ));
+            }
+            await new Promise((resolve, reject) => this.db.run(
+                `UPDATE call_e_campaign_missions SET status = ?, updated_at = CURRENT_TIMESTAMP
+                 WHERE mission_id = ? AND business_id = ? AND status = 'needs_review'`,
+                [nextStatus, missionId, businessId], (error) => error ? reject(error) : resolve(),
+            ));
+            await new Promise((resolve, reject) => this.db.run(
+                `INSERT OR IGNORE INTO call_e_mission_activity (business_id, mission_id, event_key, actor_id, event_type, state)
+                 VALUES (?, ?, ?, ?, 'mission_resolved', ?)`,
+                [businessId, missionId, `resolution:${missionId}:${idempotencyKey}`, reviewer, nextStatus], (error) => error ? reject(error) : resolve(),
+            ));
+            const saved = await this.getCallECampaignMissionForBusiness(missionId, businessId);
+            await new Promise((resolve, reject) => this.db.run('COMMIT', (error) => error ? reject(error) : resolve()));
+            return { ...saved, idempotentReplay: false };
+        } catch (error) {
+            await new Promise((resolve) => this.db.run('ROLLBACK', () => resolve()));
+            throw error;
+        } finally {
+            release();
+        }
+    }
+
+    async validateCallECampaignMissionRecipientDispatch(input = {}) {
+        const missionId = String(input.mission_id || '').trim();
+        const businessId = String(input.business_id || '').trim();
+        const requestHash = String(input.request_hash || '').trim();
+        const position = Number(input.position);
+        const idempotencyKey = String(input.idempotency_key || '').trim();
+        if (!/^mission_[a-f0-9]{64}$/.test(missionId) || !/^[A-Za-z0-9._:-]{1,120}$/.test(businessId) ||
+            !/^[a-f0-9]{64}$/.test(requestHash) || !Number.isSafeInteger(position) || position < 0 ||
+            !/^voicednut:call-e:[A-Za-z0-9._:-]{8,180}$/.test(idempotencyKey)) return false;
+        const row = await new Promise((resolve, reject) => this.db.get(
+            `SELECT m.request_hash, m.status AS mission_status, r.status AS recipient_status, r.idempotency_key,
+                    COALESCE(p.emergency_stop, 1) AS emergency_stop,
+                    COALESCE(w.paused, 0) AS worker_paused,
+                    COALESCE(d.status, '') AS reservation_status
+             FROM call_e_campaign_missions m JOIN call_e_campaign_mission_recipients r ON r.mission_id = m.mission_id
+             LEFT JOIN call_e_business_safety_policies p ON p.business_id = m.business_id
+             LEFT JOIN call_e_mission_worker_controls w ON w.mission_id = m.mission_id AND w.business_id = m.business_id
+             LEFT JOIN call_e_business_dispatch_reservations d ON d.mission_id = r.mission_id AND d.recipient_position = r.position AND d.business_id = m.business_id
+             WHERE m.mission_id = ? AND m.business_id = ? AND r.position = ?`,
+            [missionId, businessId, position], (error, result) => error ? reject(error) : resolve(result || null),
+        ));
+        if (!row || row.request_hash !== requestHash || !['approved', 'running'].includes(row.mission_status) ||
+            row.recipient_status !== 'in_progress' || row.idempotency_key !== idempotencyKey || Number(row.emergency_stop) === 1 || row.reservation_status !== 'reserved' ||
+            (input.worker_managed === true && Number(row.worker_paused) === 1)) return false;
+        const otherActive = await new Promise((resolve, reject) => this.db.get(
+            `SELECT 1 AS active FROM call_e_campaign_mission_recipients
+             WHERE mission_id = ? AND status = 'accepted' LIMIT 1`,
+            [missionId], (error, result) => error ? reject(error) : resolve(Boolean(result)),
+        ));
+        return !otherActive;
+    }
+
+    async acquireCallECampaignMissionWorkerLease(input = {}) {
+        const missionId = String(input.mission_id || '').trim();
+        const businessId = String(input.business_id || '').trim();
+        const workerId = String(input.worker_id || '').trim();
+        const leaseToken = String(input.lease_token || '').trim();
+        const leaseMs = Math.max(1000, Math.min(300000, Number(input.lease_ms) || 60000));
+        if (!/^mission_[a-f0-9]{64}$/.test(missionId) || !/^[A-Za-z0-9._:-]{1,120}$/.test(businessId) ||
+            !/^[A-Za-z0-9._:-]{1,120}$/.test(workerId) || !/^[A-Za-z0-9_-]{16,128}$/.test(leaseToken)) {
+            throw Object.assign(new Error('CALL-E mission worker lease input is invalid'), { code: 'call_e_mission_worker_lease_invalid' });
+        }
+        let release;
+        const previous = this.callECampaignWriteChain;
+        this.callECampaignWriteChain = new Promise((resolve) => { release = resolve; });
+        await previous;
+        try {
+            await new Promise((resolve, reject) => this.db.run('BEGIN IMMEDIATE', (error) => error ? reject(error) : resolve()));
+            const mission = await new Promise((resolve, reject) => this.db.get(
+                `SELECT status FROM call_e_campaign_missions WHERE mission_id = ? AND business_id = ?`,
+                [missionId, businessId], (error, row) => error ? reject(error) : resolve(row || null),
+            ));
+            if (!mission || !['approved', 'running'].includes(String(mission.status))) {
+                await new Promise((resolve, reject) => this.db.run('COMMIT', (error) => error ? reject(error) : resolve()));
+                return false;
+            }
+            const existing = await new Promise((resolve, reject) => this.db.get(
+                `SELECT lease_expires_at > CURRENT_TIMESTAMP AS active
+                 FROM call_e_campaign_mission_worker_leases WHERE mission_id = ? AND business_id = ?`,
+                [missionId, businessId], (error, row) => error ? reject(error) : resolve(row || null),
+            ));
+            if (existing && Number(existing.active) === 1) {
+                await new Promise((resolve, reject) => this.db.run('COMMIT', (error) => error ? reject(error) : resolve()));
+                return false;
+            }
+            const modifier = `+${Math.ceil(leaseMs / 1000)} seconds`;
+            await new Promise((resolve, reject) => this.db.run(
+                `INSERT INTO call_e_campaign_mission_worker_leases (
+                    mission_id, business_id, lease_owner, lease_token, lease_expires_at,
+                    last_state, last_error_code, updated_at
+                 ) VALUES (?, ?, ?, ?, datetime('now', ?), 'leased', NULL, CURRENT_TIMESTAMP)
+                 ON CONFLICT(mission_id) DO UPDATE SET
+                    business_id = excluded.business_id,
+                    lease_owner = excluded.lease_owner,
+                    lease_token = excluded.lease_token,
+                    lease_expires_at = excluded.lease_expires_at,
+                    last_state = 'leased',
+                    last_error_code = NULL,
+                    updated_at = CURRENT_TIMESTAMP`,
+                [missionId, businessId, workerId, leaseToken, modifier],
+                (error) => error ? reject(error) : resolve(),
+            ));
+            await new Promise((resolve, reject) => this.db.run('COMMIT', (error) => error ? reject(error) : resolve()));
+            return true;
+        } catch (error) {
+            await new Promise((resolve) => this.db.run('ROLLBACK', () => resolve()));
+            throw error;
+        } finally {
+            release();
+        }
+    }
+
+    async releaseCallECampaignMissionWorkerLease(input = {}) {
+        const missionId = String(input.mission_id || '').trim();
+        const businessId = String(input.business_id || '').trim();
+        const leaseToken = String(input.lease_token || '').trim();
+        const stateValues = new Set(['call_accepted', 'waiting_for_call', 'waiting_for_result', 'recovery_required', 'needs_review', 'completed', 'canceled', 'error']);
+        const state = stateValues.has(String(input.state || '').trim()) ? String(input.state).trim() : 'error';
+        const rawErrorCode = String(input.error_code || '').trim().toLowerCase();
+        const errorCode = /^[a-z][a-z0-9_]{0,79}$/.test(rawErrorCode) ? rawErrorCode : null;
+        if (!/^mission_[a-f0-9]{64}$/.test(missionId) || !/^[A-Za-z0-9._:-]{1,120}$/.test(businessId) ||
+            !/^[A-Za-z0-9._:-]{1,120}$/.test(String(input.worker_id || '').trim()) || !/^[A-Za-z0-9_-]{16,128}$/.test(leaseToken)) {
+            throw Object.assign(new Error('CALL-E mission worker lease input is invalid'), { code: 'call_e_mission_worker_lease_invalid' });
+        }
+        const result = await new Promise((resolve, reject) => this.db.run(
+            `UPDATE call_e_campaign_mission_worker_leases
+             SET lease_owner = NULL, lease_token = NULL, lease_expires_at = CURRENT_TIMESTAMP,
+                 last_state = ?, last_error_code = ?, updated_at = CURRENT_TIMESTAMP
+             WHERE mission_id = ? AND business_id = ? AND lease_owner = ? AND lease_token = ?`,
+            [state, errorCode, missionId, businessId, String(input.worker_id).trim(), leaseToken],
+            function (error) { error ? reject(error) : resolve(this.changes === 1); },
+        ));
+        return result;
+    }
+
+    async getCallECampaignMissionWorkerLeaseStatus(missionId, businessId) {
+        const normalizedId = String(missionId || '').trim();
+        const normalizedBusinessId = String(businessId || '').trim();
+        if (!/^mission_[a-f0-9]{64}$/.test(normalizedId) || !/^[A-Za-z0-9._:-]{1,120}$/.test(normalizedBusinessId)) {
+            throw Object.assign(new Error('CALL-E mission worker lease scope is invalid'), { code: 'call_e_mission_worker_lease_invalid' });
+        }
+        const row = await new Promise((resolve, reject) => this.db.get(
+            `SELECT business_id, lease_owner, lease_expires_at,
+                    CASE WHEN lease_expires_at > CURRENT_TIMESTAMP THEN 1 ELSE 0 END AS active,
+                    last_state, last_error_code, updated_at
+             FROM call_e_campaign_mission_worker_leases
+             WHERE mission_id = ? AND business_id = ?`,
+            [normalizedId, normalizedBusinessId], (error, result) => error ? reject(error) : resolve(result || null),
+        ));
+        return row ? {
+            business_id: row.business_id,
+            lease_owner: row.lease_owner || null,
+            lease_expires_at: row.lease_expires_at || null,
+            active: Number(row.active) === 1,
+            last_state: row.last_state,
+            last_error_code: row.last_error_code || null,
+            updated_at: row.updated_at || null,
+        } : null;
+    }
+
+    async renewCallECampaignMissionWorkerLease(input = {}) {
+        const missionId = String(input.mission_id || '').trim();
+        const businessId = String(input.business_id || '').trim();
+        const workerId = String(input.worker_id || '').trim();
+        const leaseToken = String(input.lease_token || '').trim();
+        const leaseMs = Math.max(1000, Math.min(300000, Number(input.lease_ms) || 60000));
+        if (!/^mission_[a-f0-9]{64}$/.test(missionId) || !/^[A-Za-z0-9._:-]{1,120}$/.test(businessId) ||
+            !/^[A-Za-z0-9._:-]{1,120}$/.test(workerId) || !/^[A-Za-z0-9_-]{16,128}$/.test(leaseToken)) return false;
+        const modifier = `+${Math.ceil(leaseMs / 1000)} seconds`;
+        const renewed = await new Promise((resolve, reject) => this.db.run(
+            `UPDATE call_e_campaign_mission_worker_leases SET lease_expires_at = datetime('now', ?),
+                last_state = 'leased', updated_at = CURRENT_TIMESTAMP
+             WHERE mission_id = ? AND business_id = ? AND lease_owner = ? AND lease_token = ? AND lease_expires_at > CURRENT_TIMESTAMP`,
+            [modifier, missionId, businessId, workerId, leaseToken], function (error) { error ? reject(error) : resolve(this.changes === 1); },
+        ));
+        return renewed;
+    }
+
+    async getCallECampaignMissionWorkerControl(missionId, businessId) {
+        const row = await new Promise((resolve, reject) => this.db.get(
+            `SELECT paused, updated_by, updated_at FROM call_e_mission_worker_controls WHERE mission_id = ? AND business_id = ?`,
+            [missionId, businessId], (error, result) => error ? reject(error) : resolve(result || null),
+        ));
+        return row ? { paused: Number(row.paused) === 1, updated_by: row.updated_by || null, updated_at: row.updated_at || null } : { paused: false, updated_by: null, updated_at: null };
+    }
+
+    async setCallECampaignMissionWorkerControl(input = {}) {
+        const missionId = String(input.mission_id || '').trim();
+        const businessId = String(input.business_id || '').trim();
+        const actorId = String(input.actor_id || '').trim();
+        const paused = input.paused === true;
+        if (!/^mission_[a-f0-9]{64}$/.test(missionId) || !/^[A-Za-z0-9._:-]{1,120}$/.test(businessId) || !/^\d{1,20}$/.test(actorId)) {
+            throw Object.assign(new Error('CALL-E worker control scope is invalid'), { code: 'call_e_mission_worker_control_invalid' });
+        }
+        const mission = await new Promise((resolve, reject) => this.db.get(
+            `SELECT 1 AS found FROM call_e_campaign_missions WHERE mission_id = ? AND business_id = ?`,
+            [missionId, businessId], (error, row) => error ? reject(error) : resolve(row || null),
+        ));
+        if (!mission) return null;
+        await new Promise((resolve, reject) => this.db.run(
+            `INSERT INTO call_e_mission_worker_controls (business_id, mission_id, paused, updated_by, updated_at)
+             VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+             ON CONFLICT(business_id, mission_id) DO UPDATE SET paused = excluded.paused, updated_by = excluded.updated_by, updated_at = CURRENT_TIMESTAMP`,
+            [businessId, missionId, paused ? 1 : 0, actorId], (error) => error ? reject(error) : resolve(),
+        ));
+        await this.insertCallEOperationsAudit({ business_id: businessId, actor_id: actorId, action: paused ? 'worker_paused' : 'worker_resumed', mission_id: missionId });
+        return this.getCallECampaignMissionWorkerControl(missionId, businessId);
+    }
+
+    async getCallEBusinessSafetyPolicy(businessId) {
+        return new Promise((resolve, reject) => this.db.get(
+            `SELECT business_id, max_calls_per_day, quiet_hours_start, quiet_hours_end, timezone, emergency_stop, contact_cooldown_hours, updated_by, updated_at
+             FROM call_e_business_safety_policies WHERE business_id = ?`,
+            [businessId], (error, row) => error ? reject(error) : resolve(row ? { ...row, emergency_stop: Number(row.emergency_stop) === 1 } : null),
+        ));
+    }
+
+    async setCallEBusinessSafetyPolicy(input = {}) {
+        const businessId = String(input.business_id || '').trim();
+        const actorId = String(input.actor_id || '').trim();
+        const maxCalls = Number(input.max_calls_per_day);
+        const timezone = String(input.timezone || '').trim();
+        const start = input.quiet_hours_start == null ? null : String(input.quiet_hours_start);
+        const end = input.quiet_hours_end == null ? null : String(input.quiet_hours_end);
+        const contactCooldownHours = Number(input.contact_cooldown_hours ?? 0);
+        if (!/^[A-Za-z0-9._:-]{1,120}$/.test(businessId) || !/^\d{1,20}$/.test(actorId) || !Number.isSafeInteger(maxCalls) || maxCalls < 0 || maxCalls > 1000 ||
+            !Number.isSafeInteger(contactCooldownHours) || contactCooldownHours < 0 || contactCooldownHours > 8760 ||
+            !timezone || timezone.length > 100 || (start !== null && !/^([01]\d|2[0-3]):[0-5]\d$/.test(start)) || (end !== null && !/^([01]\d|2[0-3]):[0-5]\d$/.test(end)) ||
+            ((start === null) !== (end === null)) || typeof input.emergency_stop !== 'boolean') {
+            throw Object.assign(new Error('CALL-E safety policy is invalid'), { code: 'call_e_safety_policy_invalid' });
+        }
+        await new Promise((resolve, reject) => this.db.run(
+            `INSERT INTO call_e_business_safety_policies (business_id, max_calls_per_day, quiet_hours_start, quiet_hours_end, timezone, emergency_stop, contact_cooldown_hours, updated_by, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+             ON CONFLICT(business_id) DO UPDATE SET max_calls_per_day = excluded.max_calls_per_day,
+                quiet_hours_start = excluded.quiet_hours_start, quiet_hours_end = excluded.quiet_hours_end,
+                timezone = excluded.timezone, emergency_stop = excluded.emergency_stop,
+                contact_cooldown_hours = excluded.contact_cooldown_hours,
+                updated_by = excluded.updated_by, updated_at = CURRENT_TIMESTAMP`,
+            [businessId, maxCalls, start, end, timezone, input.emergency_stop ? 1 : 0, contactCooldownHours, actorId], (error) => error ? reject(error) : resolve(),
+        ));
+        await this.insertCallEOperationsAudit({ business_id: businessId, actor_id: actorId, action: 'safety_policy_updated', metadata: {
+            max_calls_per_day: maxCalls, quiet_hours_start: start, quiet_hours_end: end, timezone, emergency_stop: input.emergency_stop,
+            contact_cooldown_hours: contactCooldownHours,
+        } });
+        return this.getCallEBusinessSafetyPolicy(businessId);
+    }
+
+    async reserveCallEBusinessDispatch(input = {}) {
+        const businessId = String(input.business_id || '').trim();
+        const missionId = String(input.mission_id || '').trim();
+        const position = Number(input.recipient_position);
+        const usageDate = String(input.usage_date || '').trim();
+        const workerManaged = input.worker_managed === true;
+        if (!/^[A-Za-z0-9._:-]{1,120}$/.test(businessId) || !/^mission_[a-f0-9]{64}$/.test(missionId) || !Number.isSafeInteger(position) || position < 0 || !/^\d{4}-\d{2}-\d{2}$/.test(usageDate)) {
+            throw Object.assign(new Error('CALL-E daily dispatch reservation is invalid'), { code: 'call_e_safety_reservation_invalid' });
+        }
+        let release;
+        const previous = this.callECampaignWriteChain;
+        this.callECampaignWriteChain = new Promise((resolve) => { release = resolve; });
+        await previous;
+        try {
+            await new Promise((resolve, reject) => this.db.run('BEGIN IMMEDIATE', (error) => error ? reject(error) : resolve()));
+            const policy = await new Promise((resolve, reject) => this.db.get(
+                `SELECT max_calls_per_day, emergency_stop FROM call_e_business_safety_policies WHERE business_id = ?`,
+                [businessId], (error, row) => error ? reject(error) : resolve(row || null),
+            ));
+            if (!policy || Number(policy.emergency_stop) === 1 || Number(policy.max_calls_per_day) < 1) {
+                await new Promise((resolve, reject) => this.db.run('COMMIT', (error) => error ? reject(error) : resolve()));
+                return { allowed: false, reason: !policy ? 'safety_policy_required' : Number(policy.emergency_stop) === 1 ? 'emergency_stop' : 'daily_limit_disabled', calls_remaining: 0 };
+            }
+            const recipient = await new Promise((resolve, reject) => this.db.get(
+                `SELECT m.status AS mission_status, r.status AS recipient_status, COALESCE(w.paused, 0) AS worker_paused
+                 FROM call_e_campaign_missions m JOIN call_e_campaign_mission_recipients r ON r.mission_id = m.mission_id
+                 LEFT JOIN call_e_mission_worker_controls w ON w.mission_id = m.mission_id AND w.business_id = m.business_id
+                 WHERE m.mission_id = ? AND m.business_id = ? AND r.position = ?`,
+                [missionId, businessId, position], (error, row) => error ? reject(error) : resolve(row || null),
+            ));
+            if (!recipient || !['approved', 'running'].includes(recipient.mission_status) || recipient.recipient_status !== 'in_progress' || (workerManaged && Number(recipient.worker_paused) === 1)) {
+                await new Promise((resolve, reject) => this.db.run('COMMIT', (error) => error ? reject(error) : resolve()));
+                return { allowed: false, reason: workerManaged && Number(recipient?.worker_paused) === 1 ? 'mission_worker_paused' : 'mission_not_dispatchable', calls_remaining: 0 };
+            }
+            const prior = await new Promise((resolve, reject) => this.db.get(
+                `SELECT usage_date, status FROM call_e_business_dispatch_reservations WHERE mission_id = ? AND recipient_position = ? AND business_id = ?`,
+                [missionId, position, businessId], (error, row) => error ? reject(error) : resolve(row || null),
+            ));
+            if (prior?.status === 'reserved') {
+                const remaining = await new Promise((resolve, reject) => this.db.get(
+                    `SELECT MAX(0, ? - COUNT(*)) AS remaining FROM call_e_business_dispatch_reservations WHERE business_id = ? AND usage_date = ? AND status = 'reserved'`,
+                    [Number(policy.max_calls_per_day), businessId, usageDate], (error, row) => error ? reject(error) : resolve(Number(row?.remaining) || 0),
+                ));
+                await new Promise((resolve, reject) => this.db.run('COMMIT', (error) => error ? reject(error) : resolve()));
+                return { allowed: true, reason: null, calls_remaining: remaining, idempotent: true };
+            }
+            const usage = await new Promise((resolve, reject) => this.db.get(
+                `SELECT COUNT(*) AS used FROM call_e_business_dispatch_reservations WHERE business_id = ? AND usage_date = ? AND status = 'reserved'`,
+                [businessId, usageDate], (error, row) => error ? reject(error) : resolve(Number(row?.used) || 0),
+            ));
+            if (usage >= Number(policy.max_calls_per_day)) {
+                await new Promise((resolve, reject) => this.db.run('COMMIT', (error) => error ? reject(error) : resolve()));
+                return { allowed: false, reason: 'daily_limit_reached', calls_remaining: 0 };
+            }
+            await new Promise((resolve, reject) => this.db.run(
+                `INSERT INTO call_e_business_dispatch_reservations (business_id, mission_id, recipient_position, usage_date, status, created_at, released_at)
+                 VALUES (?, ?, ?, ?, 'reserved', CURRENT_TIMESTAMP, NULL)
+                 ON CONFLICT(mission_id, recipient_position) DO UPDATE SET usage_date = excluded.usage_date, status = 'reserved', created_at = CURRENT_TIMESTAMP, released_at = NULL`,
+                [businessId, missionId, position, usageDate], (error) => error ? reject(error) : resolve(),
+            ));
+            await new Promise((resolve, reject) => this.db.run('COMMIT', (error) => error ? reject(error) : resolve()));
+            return { allowed: true, reason: null, calls_remaining: Math.max(0, Number(policy.max_calls_per_day) - usage - 1), idempotent: false };
+        } catch (error) {
+            await new Promise((resolve) => this.db.run('ROLLBACK', () => resolve()));
+            throw error;
+        } finally { release(); }
+    }
+
+    async releaseCallEBusinessDispatch(input = {}) {
+        const missionId = String(input.mission_id || '').trim();
+        const businessId = String(input.business_id || '').trim();
+        const position = Number(input.recipient_position);
+        if (!/^mission_[a-f0-9]{64}$/.test(missionId) || !/^[A-Za-z0-9._:-]{1,120}$/.test(businessId) || !Number.isSafeInteger(position) || position < 0) return false;
+        return new Promise((resolve, reject) => this.db.run(
+            `UPDATE call_e_business_dispatch_reservations SET status = 'released', released_at = CURRENT_TIMESTAMP
+             WHERE mission_id = ? AND business_id = ? AND recipient_position = ? AND status = 'reserved'`,
+            [missionId, businessId, position], function (error) { error ? reject(error) : resolve(this.changes === 1); },
+        ));
+    }
+
+    async releaseCallECampaignMissionRecipientClaim(input = {}) {
+        const missionId = String(input.mission_id || '').trim();
+        const businessId = String(input.business_id || '').trim();
+        const position = Number(input.position);
+        if (!/^mission_[a-f0-9]{64}$/.test(missionId) || !/^[A-Za-z0-9._:-]{1,120}$/.test(businessId) || !Number.isSafeInteger(position) || position < 0) return false;
+        return new Promise((resolve, reject) => this.db.run(
+            `UPDATE call_e_campaign_mission_recipients SET status = 'queued', error_code = NULL, updated_at = CURRENT_TIMESTAMP
+             WHERE mission_id = ? AND position = ? AND status = 'in_progress' AND local_call_id IS NULL`,
+            [missionId, position], function (error) { error ? reject(error) : resolve(this.changes === 1); },
+        ));
+    }
+
+    async getCallEBusinessDispatchUsage(businessId, usageDate) {
+        return new Promise((resolve, reject) => this.db.get(
+            `SELECT COUNT(*) AS used FROM call_e_business_dispatch_reservations
+             WHERE business_id = ? AND usage_date = ? AND status = 'reserved'`,
+            [businessId, usageDate], (error, row) => error ? reject(error) : resolve({ used: Number(row?.used) || 0 }),
+        ));
+    }
+
+    async insertCallEOperationsAudit(input = {}) {
+        const businessId = String(input.business_id || '').trim();
+        const actorId = String(input.actor_id || '').trim();
+        const action = String(input.action || '').trim();
+        const missionId = input.mission_id == null ? null : String(input.mission_id).trim();
+        const metadata = input.metadata && typeof input.metadata === 'object' && !Array.isArray(input.metadata) ? JSON.stringify(input.metadata) : '{}';
+        if (!/^[A-Za-z0-9._:-]{1,120}$/.test(businessId) || !/^\d{1,20}$/.test(actorId) ||
+            !['safety_policy_updated', 'worker_paused', 'worker_resumed', 'sensitive_data_purged'].includes(action) || metadata.length > 4000 ||
+            (missionId && !/^mission_[a-f0-9]{64}$/.test(missionId))) throw new Error('CALL-E operations audit input is invalid');
+        return new Promise((resolve, reject) => this.db.run(
+            `INSERT INTO call_e_operations_audit (business_id, actor_id, action, mission_id, metadata_json) VALUES (?, ?, ?, ?, ?)`,
+            [businessId, actorId, action, missionId, metadata], function (error) { error ? reject(error) : resolve(this.lastID); },
+        ));
+    }
+
+    async listCallEOperationsAudit(businessId, limit = 50) {
+        const safeLimit = Math.max(1, Math.min(100, Math.floor(Number(limit) || 50)));
+        return new Promise((resolve, reject) => this.db.all(
+            `SELECT business_id, actor_id, action, mission_id, metadata_json, created_at
+             FROM call_e_operations_audit WHERE business_id = ? ORDER BY audit_id DESC LIMIT ?`,
+            [businessId, safeLimit], (error, rows) => error ? reject(error) : resolve((rows || []).map((row) => {
+                let metadata = {};
+                try { metadata = JSON.parse(row.metadata_json || '{}'); } catch { metadata = {}; }
+                return { business_id: row.business_id, actor_id: row.actor_id, action: row.action, mission_id: row.mission_id || null, metadata, created_at: row.created_at };
+            })),
+        ));
+    }
+
+    async getCallESensitiveRetentionPreview(businessId, cutoff = new Date().toISOString()) {
+        const [goals, missions] = await Promise.all([
+            new Promise((resolve, reject) => this.db.get(
+                `SELECT COUNT(*) AS count FROM call_e_goal_run_requests WHERE business_id = ? AND sensitive_data_expires_at <= datetime(?) AND sensitive_data_purged_at IS NULL`,
+                [businessId, cutoff], (error, row) => error ? reject(error) : resolve(Number(row?.count) || 0),
+            )),
+            new Promise((resolve, reject) => this.db.get(
+                `SELECT COUNT(*) AS count FROM call_e_campaign_missions WHERE business_id = ? AND sensitive_data_expires_at <= datetime(?) AND sensitive_data_purged_at IS NULL`,
+                [businessId, cutoff], (error, row) => error ? reject(error) : resolve(Number(row?.count) || 0),
+            )),
+        ]);
+        return { expired_goal_runs: goals, expired_missions: missions, cutoff };
+    }
+
+    async listCallESensitiveRetentionScopes(cutoff = new Date().toISOString(), limit = 100) {
+        const safeLimit = Math.max(1, Math.min(500, Math.floor(Number(limit) || 100)));
+        const scopes = await new Promise((resolve, reject) => this.db.all(
+            `SELECT business_id FROM call_e_goal_run_requests WHERE sensitive_data_expires_at <= datetime(?) AND sensitive_data_purged_at IS NULL
+             UNION SELECT business_id FROM call_e_campaign_missions WHERE sensitive_data_expires_at <= datetime(?) AND sensitive_data_purged_at IS NULL
+             ORDER BY business_id LIMIT ?`,
+            [cutoff, cutoff, safeLimit], (error, rows) => error ? reject(error) : resolve(rows || []),
+        ));
+        return scopes.map((row) => String(row.business_id || '')).filter((value) => /^[A-Za-z0-9._:-]{1,120}$/.test(value));
+    }
+
+    async purgeCallESensitiveData(input = {}) {
+        const businessId = String(input.business_id || '').trim();
+        const actorId = String(input.actor_id || '').trim();
+        const cutoff = String(input.cutoff || new Date().toISOString());
+        if (!/^[A-Za-z0-9._:-]{1,120}$/.test(businessId) || !/^\d{1,20}$/.test(actorId) || !Number.isFinite(Date.parse(cutoff))) throw new Error('CALL-E retention scope is invalid');
+        let release;
+        const previous = this.callECampaignWriteChain;
+        this.callECampaignWriteChain = new Promise((resolve) => { release = resolve; });
+        await previous;
+        try {
+            await new Promise((resolve, reject) => this.db.run('BEGIN IMMEDIATE', (error) => error ? reject(error) : resolve()));
+            const preview = await this.getCallESensitiveRetentionPreview(businessId, cutoff);
+            await new Promise((resolve, reject) => this.db.run(
+                `UPDATE call_e_goal_run_requests SET encrypted_payload = '', encrypted_result = NULL, result_schema_json = '',
+                    sensitive_data_purged_at = CURRENT_TIMESTAMP,
+                    status = CASE WHEN status IN ('pending_approval', 'approved', 'submitting', 'recovery_required', 'running') THEN 'needs_review' ELSE status END,
+                    error_code = CASE WHEN status IN ('pending_approval', 'approved', 'submitting', 'recovery_required', 'running') THEN 'sensitive_data_retention_expired' ELSE error_code END,
+                    updated_at = CURRENT_TIMESTAMP
+                 WHERE business_id = ? AND sensitive_data_expires_at <= datetime(?) AND sensitive_data_purged_at IS NULL`,
+                [businessId, cutoff], (error) => error ? reject(error) : resolve(),
+            ));
+            await new Promise((resolve, reject) => this.db.run(
+                `UPDATE call_e_campaign_mission_recipients SET encrypted_destination = '',
+                    status = CASE WHEN status IN ('queued', 'in_progress') THEN 'needs_review' ELSE status END,
+                    error_code = CASE WHEN status IN ('queued', 'in_progress') THEN 'sensitive_data_retention_expired' ELSE error_code END,
+                    updated_at = CURRENT_TIMESTAMP
+                 WHERE mission_id IN (SELECT mission_id FROM call_e_campaign_missions WHERE business_id = ? AND sensitive_data_expires_at <= datetime(?) AND sensitive_data_purged_at IS NULL)`,
+                [businessId, cutoff], (error) => error ? reject(error) : resolve(),
+            ));
+            await new Promise((resolve, reject) => this.db.run(
+                `UPDATE call_e_campaign_missions SET sensitive_data_purged_at = CURRENT_TIMESTAMP,
+                    status = CASE WHEN status IN ('pending_approval', 'approved', 'running', 'paused') THEN 'needs_review' ELSE status END,
+                    updated_at = CURRENT_TIMESTAMP
+                 WHERE business_id = ? AND sensitive_data_expires_at <= datetime(?) AND sensitive_data_purged_at IS NULL`,
+                [businessId, cutoff], (error) => error ? reject(error) : resolve(),
+            ));
+            await new Promise((resolve, reject) => this.db.run(
+                `INSERT INTO call_e_operations_audit (business_id, actor_id, action, metadata_json)
+                 VALUES (?, ?, 'sensitive_data_purged', ?)`,
+                [businessId, actorId, JSON.stringify(preview)], (error) => error ? reject(error) : resolve(),
+            ));
+            await new Promise((resolve, reject) => this.db.run('COMMIT', (error) => error ? reject(error) : resolve()));
+            return preview;
+        } catch (error) {
+            await new Promise((resolve) => this.db.run('ROLLBACK', () => resolve()));
+            throw error;
+        } finally { release(); }
+    }
+
+    async claimNextCallECampaignMissionRecipient(missionId, businessId) {
+        const normalizedId = String(missionId || '').trim();
+        const normalizedBusinessId = String(businessId || '').trim();
+        if (!/^mission_[a-f0-9]{64}$/.test(normalizedId) || !/^[A-Za-z0-9._:-]{1,120}$/.test(normalizedBusinessId)) {
+            throw Object.assign(new Error('CALL-E mission scope is invalid'), { code: 'call_e_mission_invalid' });
+        }
+        let release;
+        const previous = this.callECampaignWriteChain;
+        this.callECampaignWriteChain = new Promise((resolve) => { release = resolve; });
+        await previous;
+        try {
+            await new Promise((resolve, reject) => this.db.run('BEGIN IMMEDIATE', (error) => error ? reject(error) : resolve()));
+            const mission = await new Promise((resolve, reject) => this.db.get(
+                'SELECT status FROM call_e_campaign_missions WHERE mission_id = ? AND business_id = ?',
+                [normalizedId, normalizedBusinessId], (error, row) => error ? reject(error) : resolve(row || null),
+            ));
+            if (!mission) {
+                await new Promise((resolve, reject) => this.db.run('COMMIT', (error) => error ? reject(error) : resolve()));
+                return null;
+            }
+            if (!['approved', 'running'].includes(mission.status)) {
+                throw Object.assign(new Error('Mission is not approved for execution'), { code: 'call_e_mission_not_approved' });
+            }
+            const accepted = await new Promise((resolve, reject) => this.db.get(
+                `SELECT position FROM call_e_campaign_mission_recipients WHERE mission_id = ? AND status = 'accepted' ORDER BY position LIMIT 1`,
+                [normalizedId], (error, row) => error ? reject(error) : resolve(row || null),
+            ));
+            if (accepted) {
+                const saved = await this.getCallECampaignMissionForBusiness(normalizedId, normalizedBusinessId);
+                await new Promise((resolve, reject) => this.db.run('COMMIT', (error) => error ? reject(error) : resolve()));
+                return saved ? { mission: saved.mission, recipient: null, recovery: false, waitingForAccepted: true } : null;
+            }
+            let recipient = await new Promise((resolve, reject) => this.db.get(
+                `SELECT * FROM call_e_campaign_mission_recipients WHERE mission_id = ? AND status = 'in_progress' ORDER BY position LIMIT 1`,
+                [normalizedId], (error, row) => error ? reject(error) : resolve(row || null),
+            ));
+            const recovery = Boolean(recipient);
+            if (!recipient) {
+                const next = await new Promise((resolve, reject) => this.db.get(
+                    `SELECT * FROM call_e_campaign_mission_recipients WHERE mission_id = ? AND status = 'queued' ORDER BY position LIMIT 1`,
+                    [normalizedId], (error, row) => error ? reject(error) : resolve(row || null),
+                ));
+                if (next) {
+                    await new Promise((resolve, reject) => this.db.run(
+                        `UPDATE call_e_campaign_mission_recipients SET status = 'in_progress', updated_at = CURRENT_TIMESTAMP
+                         WHERE mission_id = ? AND position = ? AND status = 'queued'`,
+                        [normalizedId, next.position], (error) => error ? reject(error) : resolve(),
+                    ));
+                    recipient = await new Promise((resolve, reject) => this.db.get(
+                        'SELECT * FROM call_e_campaign_mission_recipients WHERE mission_id = ? AND position = ?',
+                        [normalizedId, next.position], (error, row) => error ? reject(error) : resolve(row || null),
+                    ));
+                }
+            }
+            if (recipient) {
+                await new Promise((resolve, reject) => this.db.run(
+                    `UPDATE call_e_campaign_missions SET status = 'running', updated_at = CURRENT_TIMESTAMP
+                     WHERE mission_id = ? AND status IN ('approved', 'running')`,
+                    [normalizedId], (error) => error ? reject(error) : resolve(),
+                ));
+            } else {
+                const remaining = await new Promise((resolve, reject) => this.db.get(
+                    `SELECT COUNT(*) AS count FROM call_e_campaign_mission_recipients
+                     WHERE mission_id = ? AND status IN ('queued', 'in_progress', 'accepted')`,
+                    [normalizedId], (error, row) => error ? reject(error) : resolve(Number(row?.count) || 0),
+                ));
+                const needsReview = await new Promise((resolve, reject) => this.db.get(
+                    `SELECT COUNT(*) AS count FROM call_e_campaign_mission_recipients
+                     WHERE mission_id = ? AND status IN ('needs_review', 'failed', 'blocked', 'canceled')`,
+                    [normalizedId], (error, row) => error ? reject(error) : resolve(Number(row?.count) || 0),
+                ));
+                if (remaining === 0) {
+                    const nextStatus = needsReview > 0 ? 'needs_review' : 'completed';
+                    await new Promise((resolve, reject) => this.db.run(
+                        'UPDATE call_e_campaign_missions SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE mission_id = ?',
+                        [nextStatus, normalizedId], (error) => error ? reject(error) : resolve(),
+                    ));
+                }
+            }
+            const saved = recipient ? await this.getCallECampaignMissionForBusiness(normalizedId, normalizedBusinessId) : null;
+            await new Promise((resolve, reject) => this.db.run('COMMIT', (error) => error ? reject(error) : resolve()));
+            return saved ? { mission: saved.mission, recipient: saved.recipients.find((row) => row.position === recipient.position), recovery } : null;
+        } catch (error) {
+            await new Promise((resolve) => this.db.run('ROLLBACK', () => resolve()));
+            throw error;
+        } finally {
+            release();
+        }
+    }
+
+    async updateCallECampaignMissionRecipient(input = {}) {
+        const missionId = String(input.mission_id || '').trim();
+        const businessId = String(input.business_id || '').trim();
+        const position = Number(input.position);
+        const nextStatus = String(input.status || '').trim();
+        const localCallId = input.local_call_id == null ? null : String(input.local_call_id).trim();
+        const errorCode = input.error_code == null ? null : String(input.error_code).trim().toLowerCase();
+        const transitions = {
+            queued: new Set(['in_progress', 'blocked', 'canceled']),
+            in_progress: new Set(['accepted', 'failed', 'blocked', 'needs_review']),
+            accepted: new Set(['completed', 'failed', 'canceled', 'needs_review']),
+            failed: new Set(), blocked: new Set(), needs_review: new Set(), completed: new Set(), canceled: new Set(),
+        };
+        if (!/^mission_[a-f0-9]{64}$/.test(missionId) || !/^[A-Za-z0-9._:-]{1,120}$/.test(businessId) ||
+            !Number.isSafeInteger(position) || position < 0 || !Object.prototype.hasOwnProperty.call(transitions, nextStatus) ||
+            (localCallId !== null && !/^call_e_[0-9a-f-]{36}$/i.test(localCallId)) ||
+            (errorCode !== null && !/^[a-z][a-z0-9_]{0,79}$/.test(errorCode))) {
+            throw Object.assign(new Error('CALL-E mission recipient update is invalid'), { code: 'call_e_mission_invalid' });
+        }
+        let release;
+        const previous = this.callECampaignWriteChain;
+        this.callECampaignWriteChain = new Promise((resolve) => { release = resolve; });
+        await previous;
+        try {
+            await new Promise((resolve, reject) => this.db.run('BEGIN IMMEDIATE', (error) => error ? reject(error) : resolve()));
+            const existing = await new Promise((resolve, reject) => this.db.get(
+                `SELECT r.status, r.local_call_id FROM call_e_campaign_mission_recipients r
+                 JOIN call_e_campaign_missions m ON m.mission_id = r.mission_id
+                 WHERE r.mission_id = ? AND r.position = ? AND m.business_id = ?`,
+                [missionId, position, businessId], (error, row) => error ? reject(error) : resolve(row || null),
+            ));
+            if (!existing) {
+                await new Promise((resolve, reject) => this.db.run('COMMIT', (error) => error ? reject(error) : resolve()));
+                return null;
+            }
+            if (existing.status === nextStatus && (localCallId === null || existing.local_call_id === localCallId)) {
+                const savedReplay = await this.getCallECampaignMissionForBusiness(missionId, businessId);
+                await new Promise((resolve, reject) => this.db.run('COMMIT', (error) => error ? reject(error) : resolve()));
+                return { ...savedReplay, idempotentReplay: true };
+            }
+            if (!transitions[existing.status]?.has(nextStatus)) {
+                throw Object.assign(new Error('CALL-E mission recipient transition is not allowed'), { code: 'call_e_mission_transition_invalid' });
+            }
+            if (nextStatus === 'accepted' && !localCallId) {
+                throw Object.assign(new Error('An accepted mission recipient requires a local call ID'), { code: 'call_e_mission_invalid' });
+            }
+            await new Promise((resolve, reject) => this.db.run(
+                `UPDATE call_e_campaign_mission_recipients SET status = ?, local_call_id = COALESCE(?, local_call_id),
+                        error_code = ?, updated_at = CURRENT_TIMESTAMP
+                 WHERE mission_id = ? AND position = ? AND status = ?`,
+                [nextStatus, localCallId, errorCode, missionId, position, existing.status], (error) => error ? reject(error) : resolve(),
+            ));
+            const counts = await new Promise((resolve, reject) => this.db.get(
+                `SELECT SUM(CASE WHEN status IN ('queued', 'in_progress', 'accepted') THEN 1 ELSE 0 END) AS active_count,
+                        SUM(CASE WHEN status IN ('needs_review', 'failed', 'blocked', 'canceled') THEN 1 ELSE 0 END) AS attention_count
+                 FROM call_e_campaign_mission_recipients WHERE mission_id = ?`,
+                [missionId], (error, row) => error ? reject(error) : resolve(row || {}),
+            ));
+            const parentStatus = Number(counts.attention_count) > 0 ? 'needs_review'
+                : Number(counts.active_count) > 0 ? 'running' : 'completed';
+            await new Promise((resolve, reject) => this.db.run(
+                `UPDATE call_e_campaign_missions SET status = ?, updated_at = CURRENT_TIMESTAMP
+                 WHERE mission_id = ? AND business_id = ? AND status NOT IN ('rejected', 'canceled')`,
+                [parentStatus, missionId, businessId], (error) => error ? reject(error) : resolve(),
+            ));
+            const eventKey = `recipient:${missionId}:${position}:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`;
+            await new Promise((resolve, reject) => this.db.run(
+                `INSERT OR IGNORE INTO call_e_mission_activity (business_id, mission_id, event_key, event_type, recipient_position, state, error_code)
+                 VALUES (?, ?, ?, 'recipient_transition', ?, ?, ?)`,
+                [businessId, missionId, eventKey, position, nextStatus, errorCode], (error) => error ? reject(error) : resolve(),
+            ));
+            const saved = await this.getCallECampaignMissionForBusiness(missionId, businessId);
+            await new Promise((resolve, reject) => this.db.run('COMMIT', (error) => error ? reject(error) : resolve()));
+            return { ...saved, idempotentReplay: false };
+        } catch (error) {
+            await new Promise((resolve) => this.db.run('ROLLBACK', () => resolve()));
+            throw error;
+        } finally {
+            release();
+        }
+    }
+
+    async getCallEBusinessMissionPolicy(businessId) {
+        return new Promise((resolve, reject) => this.db.get(
+            'SELECT business_id, secondary_approval_threshold, approval_ttl_hours, review_sla_minutes, review_repeat_minutes, updated_by, updated_at FROM call_e_business_mission_policies WHERE business_id = ?',
+            [String(businessId || '').trim()], (error, row) => error ? reject(error) : resolve(row || null),
+        ));
+    }
+
+    async validateCallECampaignMissionApproval(missionId, businessId) {
+        const rows = await new Promise((resolve, reject) => this.db.all(
+            `SELECT reviewed_by, decision, created_at FROM call_e_approval_decisions
+             WHERE entity_type = 'mission' AND entity_id = ? AND business_id = ?
+             UNION ALL
+             SELECT reviewed_by, decision, created_at FROM call_e_mission_secondary_approvals
+             WHERE mission_id = ? AND business_id = ? ORDER BY created_at`,
+            [missionId, businessId, missionId, businessId], (error, result) => error ? reject(error) : resolve(result || []),
+        ));
+        const policy = await this.getCallEBusinessMissionPolicy(businessId);
+        const threshold = Number(policy?.secondary_approval_threshold || 26);
+        const ttlHours = Number(policy?.approval_ttl_hours || 24);
+        const approvals = rows.filter((row) => row.decision === 'approve');
+        const mission = await new Promise((resolve, reject) => this.db.get(
+            'SELECT recipient_count FROM call_e_campaign_missions WHERE mission_id = ? AND business_id = ?',
+            [missionId, businessId], (error, row) => error ? reject(error) : resolve(row || null),
+        ));
+        const expected = Number(mission?.recipient_count) >= threshold ? 2 : 1;
+        if (approvals.length < expected || (expected === 2 && new Set(approvals.map((row) => row.reviewed_by)).size < 2)) {
+            return { valid: false, reason: 'approval_incomplete' };
+        }
+        const approvalTimestamp = String(approvals[approvals.length - 1]?.created_at || '');
+        const lastApprovalAt = Date.parse(/(?:Z|[+-]\d{2}:\d{2})$/i.test(approvalTimestamp)
+            ? approvalTimestamp : `${approvalTimestamp.replace(' ', 'T')}Z`);
+        return { valid: Number.isFinite(lastApprovalAt) && Date.now() - lastApprovalAt <= ttlHours * 60 * 60 * 1000,
+            reason: 'approval_expired', approval_expires_at: Number.isFinite(lastApprovalAt) ? new Date(lastApprovalAt + ttlHours * 60 * 60 * 1000).toISOString() : null };
+    }
+
+    async setCallEBusinessMissionPolicy(input = {}) {
+        const businessId = String(input.business_id || '').trim();
+        const actorId = String(input.actor_id || '').trim();
+        const threshold = Number(input.secondary_approval_threshold);
+        const ttl = Number(input.approval_ttl_hours);
+        const reviewSlaMinutes = Number(input.review_sla_minutes ?? 0);
+        const reviewRepeatMinutes = Number(input.review_repeat_minutes ?? 0);
+        if (!/^[A-Za-z0-9._:-]{1,120}$/.test(businessId) || !/^\d{1,20}$/.test(actorId) ||
+            !Number.isSafeInteger(threshold) || threshold < 2 || threshold > 26 ||
+            !Number.isSafeInteger(ttl) || ttl < 1 || ttl > 720 || !Number.isSafeInteger(reviewSlaMinutes) || reviewSlaMinutes < 0 || reviewSlaMinutes > 10080 ||
+            !Number.isSafeInteger(reviewRepeatMinutes) || reviewRepeatMinutes < 0 || reviewRepeatMinutes > 10080 || (reviewRepeatMinutes > 0 && reviewSlaMinutes === 0)) {
+            throw Object.assign(new Error('CALL-E mission approval policy is invalid'), { code: 'call_e_mission_policy_invalid' });
+        }
+        await new Promise((resolve, reject) => this.db.run(
+            `INSERT INTO call_e_business_mission_policies (business_id, secondary_approval_threshold, approval_ttl_hours, review_sla_minutes, review_repeat_minutes, updated_by, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+             ON CONFLICT(business_id) DO UPDATE SET secondary_approval_threshold = excluded.secondary_approval_threshold,
+               approval_ttl_hours = excluded.approval_ttl_hours, review_sla_minutes = excluded.review_sla_minutes,
+               review_repeat_minutes = excluded.review_repeat_minutes,
+               updated_by = excluded.updated_by, updated_at = CURRENT_TIMESTAMP`,
+            [businessId, threshold, ttl, reviewSlaMinutes, reviewRepeatMinutes, actorId], (error) => error ? reject(error) : resolve(),
+        ));
+        return this.getCallEBusinessMissionPolicy(businessId);
+    }
+
+    async getCallEBusinessProviderRouting(businessId) {
+        const row = await new Promise((resolve, reject) => this.db.get(
+            'SELECT provider_order_json, updated_by, updated_at FROM call_e_business_provider_routing WHERE business_id = ?',
+            [String(businessId || '').trim()], (error, result) => error ? reject(error) : resolve(result || null),
+        ));
+        if (!row) return null;
+        let order = [];
+        try { order = JSON.parse(row.provider_order_json); } catch (_) {}
+        return { provider_order: Array.isArray(order) ? order : [], updated_by: row.updated_by, updated_at: row.updated_at };
+    }
+
+    async setCallEBusinessProviderRouting(input = {}) {
+        const businessId = String(input.business_id || '').trim();
+        const actorId = String(input.actor_id || '').trim();
+        const order = Array.isArray(input.provider_order) ? input.provider_order : [];
+        if (!/^[A-Za-z0-9._:-]{1,120}$/.test(businessId) || !/^\d{1,20}$/.test(actorId) ||
+            order.length < 1 || order.length > 3 || order.some((provider) => !['twilio', 'plivo', 'vonage'].includes(provider)) || new Set(order).size !== order.length) {
+            throw Object.assign(new Error('CALL-E business provider routing policy is invalid'), { code: 'call_e_provider_routing_invalid' });
+        }
+        await new Promise((resolve, reject) => this.db.run(
+            `INSERT INTO call_e_business_provider_routing (business_id, provider_order_json, updated_by, updated_at)
+             VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+             ON CONFLICT(business_id) DO UPDATE SET provider_order_json = excluded.provider_order_json,
+               updated_by = excluded.updated_by, updated_at = CURRENT_TIMESTAMP`,
+            [businessId, JSON.stringify(order), actorId], (error) => error ? reject(error) : resolve(),
+        ));
+        return this.getCallEBusinessProviderRouting(businessId);
+    }
+
+    async recordCallEMissionActivity(input = {}) {
+        const businessId = String(input.business_id || '').trim();
+        const missionId = String(input.mission_id || '').trim();
+        const eventKey = String(input.event_key || '').trim();
+        const actorId = input.actor_id == null ? null : String(input.actor_id).trim();
+        const eventType = String(input.event_type || '').trim();
+        const position = input.recipient_position == null ? null : Number(input.recipient_position);
+        const state = String(input.state || '').trim();
+        const errorCode = input.error_code == null ? null : String(input.error_code).trim();
+        if (!/^[A-Za-z0-9._:-]{1,120}$/.test(businessId) || !/^mission_[a-f0-9]{64}$/.test(missionId) ||
+            !/^[A-Za-z0-9._:-]{8,180}$/.test(eventKey) || (actorId !== null && !/^\d{1,20}$/.test(actorId)) ||
+            !['mission_created', 'approval_recorded', 'mission_resolved', 'recipient_transition', 'recipient_retry_requested', 'mission_advanced'].includes(eventType) ||
+            (position !== null && (!Number.isSafeInteger(position) || position < 0 || position > 24)) ||
+            !/^[a-z_]{1,40}$/.test(state) || (errorCode !== null && !/^[a-z][a-z0-9_]{0,79}$/.test(errorCode))) {
+            throw Object.assign(new Error('CALL-E mission activity event is invalid'), { code: 'call_e_mission_activity_invalid' });
+        }
+        await new Promise((resolve, reject) => this.db.run(
+            `INSERT OR IGNORE INTO call_e_mission_activity (business_id, mission_id, event_key, actor_id, event_type, recipient_position, state, error_code)
+             SELECT ?, ?, ?, ?, ?, ?, ?, ? WHERE EXISTS (
+               SELECT 1 FROM call_e_campaign_missions WHERE mission_id = ? AND business_id = ?
+             )`,
+            [businessId, missionId, eventKey, actorId, eventType, position, state, errorCode, missionId, businessId],
+            function done(error) { if (error) reject(error); else resolve(this.changes > 0); },
+        ));
+    }
+
+    async listCallEMissionActivity(businessId, missionId, limit = 100) {
+        const safeLimit = Math.max(1, Math.min(200, Math.floor(Number(limit) || 100)));
+        return new Promise((resolve, reject) => this.db.all(
+            `SELECT event_id, actor_id, event_type, recipient_position, state, error_code, created_at
+             FROM call_e_mission_activity WHERE business_id = ? AND mission_id = ? ORDER BY event_id DESC LIMIT ?`,
+            [String(businessId || '').trim(), String(missionId || '').trim(), safeLimit],
+            (error, rows) => error ? reject(error) : resolve(rows || []),
+        ));
+    }
+
+    async retryCallECampaignMissionRecipient(input = {}) {
+        const missionId = String(input.mission_id || '').trim();
+        const businessId = String(input.business_id || '').trim();
+        const actorId = String(input.actor_id || '').trim();
+        const position = Number(input.position);
+        const eventKey = String(input.idempotency_key || '').trim();
+        if (!/^mission_[a-f0-9]{64}$/.test(missionId) || !/^[A-Za-z0-9._:-]{1,120}$/.test(businessId) ||
+            !/^\d{1,20}$/.test(actorId) || !Number.isSafeInteger(position) || position < 0 || position > 24 ||
+            !/^[A-Za-z0-9._:-]{8,180}$/.test(eventKey)) {
+            throw Object.assign(new Error('CALL-E mission retry request is invalid'), { code: 'call_e_mission_retry_invalid' });
+        }
+        let release;
+        const previous = this.callECampaignWriteChain;
+        this.callECampaignWriteChain = new Promise((resolve) => { release = resolve; });
+        await previous;
+        try {
+            await new Promise((resolve, reject) => this.db.run('BEGIN IMMEDIATE', (error) => error ? reject(error) : resolve()));
+            const row = await new Promise((resolve, reject) => this.db.get(
+                `SELECT m.status AS mission_status, r.status, r.error_code FROM call_e_campaign_missions m
+                 JOIN call_e_campaign_mission_recipients r ON r.mission_id = m.mission_id
+                 WHERE m.mission_id = ? AND m.business_id = ? AND r.position = ?`,
+                [missionId, businessId, position], (error, result) => error ? reject(error) : resolve(result || null),
+            ));
+            if (!row) {
+                await new Promise((resolve, reject) => this.db.run('COMMIT', (error) => error ? reject(error) : resolve()));
+                return null;
+            }
+            if (row.status === 'queued') {
+                const replay = await this.getCallECampaignMissionForBusiness(missionId, businessId);
+                await new Promise((resolve, reject) => this.db.run('COMMIT', (error) => error ? reject(error) : resolve()));
+                return { ...replay, idempotentReplay: true };
+            }
+            if (row.status !== 'failed' || row.error_code !== 'call_e_request_rejected' ||
+                !['running', 'needs_review'].includes(row.mission_status)) {
+                throw Object.assign(new Error('Only a provider-confirmed rejected submission can be retried'), { code: 'call_e_mission_retry_not_safe' });
+            }
+            const active = await new Promise((resolve, reject) => this.db.get(
+                `SELECT COUNT(*) AS count FROM call_e_campaign_mission_recipients
+                 WHERE mission_id = ? AND status IN ('in_progress', 'accepted')`,
+                [missionId], (error, result) => error ? reject(error) : resolve(Number(result?.count) || 0),
+            ));
+            if (active > 0) throw Object.assign(new Error('Reconcile active recipients before retrying'), { code: 'call_e_mission_active_recipient' });
+            await new Promise((resolve, reject) => this.db.run(
+                `UPDATE call_e_campaign_mission_recipients SET status = 'queued', error_code = NULL, updated_at = CURRENT_TIMESTAMP
+                 WHERE mission_id = ? AND position = ? AND status = 'failed' AND error_code = 'call_e_request_rejected'`,
+                [missionId, position], (error) => error ? reject(error) : resolve(),
+            ));
+            await new Promise((resolve, reject) => this.db.run(
+                `UPDATE call_e_campaign_missions SET status = 'running', updated_at = CURRENT_TIMESTAMP
+                 WHERE mission_id = ? AND business_id = ? AND status IN ('running', 'needs_review')`,
+                [missionId, businessId], (error) => error ? reject(error) : resolve(),
+            ));
+            await new Promise((resolve, reject) => this.db.run(
+                `INSERT OR IGNORE INTO call_e_mission_activity (business_id, mission_id, event_key, actor_id, event_type, recipient_position, state)
+                 VALUES (?, ?, ?, ?, 'recipient_retry_requested', ?, 'queued')`,
+                [businessId, missionId, `recipient-retry:${missionId}:${eventKey}`, actorId, position], (error) => error ? reject(error) : resolve(),
+            ));
+            const saved = await this.getCallECampaignMissionForBusiness(missionId, businessId);
+            await new Promise((resolve, reject) => this.db.run('COMMIT', (error) => error ? reject(error) : resolve()));
+            return { ...saved, idempotentReplay: false };
+        } catch (error) {
+            await new Promise((resolve) => this.db.run('ROLLBACK', () => resolve()));
+            throw error;
+        } finally {
+            release();
+        }
+    }
+
+    async getCallECampaignMissionReport(businessId, fromDate, toDate) {
+        return new Promise((resolve, reject) => this.db.get(
+            `SELECT COUNT(DISTINCT m.mission_id) AS mission_count,
+                    COUNT(DISTINCT CASE WHEN m.status = 'completed' THEN m.mission_id END) AS completed_missions,
+                    COUNT(DISTINCT CASE WHEN m.status IN ('needs_review', 'paused') THEN m.mission_id END) AS attention_missions,
+                    SUM(CASE WHEN r.status = 'completed' THEN 1 ELSE 0 END) AS completed_recipients,
+                    SUM(CASE WHEN r.status = 'failed' THEN 1 ELSE 0 END) AS failed_recipients,
+                    SUM(CASE WHEN r.status IN ('blocked', 'needs_review') THEN 1 ELSE 0 END) AS review_recipients,
+                    SUM(CASE WHEN r.status = 'canceled' THEN 1 ELSE 0 END) AS canceled_recipients,
+                    SUM(CASE WHEN r.status IN ('queued', 'in_progress', 'accepted') THEN 1 ELSE 0 END) AS open_recipients
+             FROM call_e_campaign_missions m JOIN call_e_campaign_mission_recipients r ON r.mission_id = m.mission_id
+             WHERE m.business_id = ? AND m.created_at >= ? AND m.created_at < datetime(?, '+1 day')`,
+            [String(businessId || '').trim(), fromDate, toDate], (error, row) => error ? reject(error) : resolve(row || {}),
+        ));
+    }
+
+    async setCallEMissionAlertSubscription(input = {}) {
+        const businessId = String(input.business_id || '').trim();
+        const actorId = String(input.actor_id || '').trim();
+        const enabled = input.enabled === true;
+        if (!/^[A-Za-z0-9._:-]{1,120}$/.test(businessId) || !/^\d{1,20}$/.test(actorId)) {
+            throw Object.assign(new Error('CALL-E alert subscription is invalid'), { code: 'call_e_alert_subscription_invalid' });
+        }
+        await new Promise((resolve, reject) => this.db.run(
+            `INSERT INTO call_e_mission_alert_subscriptions (business_id, actor_id, enabled, last_notified_event_id, updated_at)
+             VALUES (?, ?, ?, CASE WHEN ? = 1 THEN COALESCE((SELECT MAX(event_id) FROM call_e_mission_activity WHERE business_id = ?), 0) ELSE 0 END, CURRENT_TIMESTAMP)
+             ON CONFLICT(business_id, actor_id) DO UPDATE SET
+               enabled = excluded.enabled,
+               last_notified_event_id = CASE WHEN call_e_mission_alert_subscriptions.enabled = 0 AND excluded.enabled = 1
+                 THEN excluded.last_notified_event_id ELSE call_e_mission_alert_subscriptions.last_notified_event_id END,
+               updated_at = CURRENT_TIMESTAMP`,
+            [businessId, actorId, enabled ? 1 : 0, enabled ? 1 : 0, businessId], (error) => error ? reject(error) : resolve(),
+        ));
+        return { business_id: businessId, actor_id: actorId, enabled };
+    }
+
+    async getCallEMissionAlertSubscription(businessId, actorId) {
+        const row = await new Promise((resolve, reject) => this.db.get(
+            'SELECT business_id, actor_id, enabled, updated_at FROM call_e_mission_alert_subscriptions WHERE business_id = ? AND actor_id = ?',
+            [String(businessId || '').trim(), String(actorId || '').trim()], (error, result) => error ? reject(error) : resolve(result || null),
+        ));
+        return row ? { ...row, enabled: Number(row.enabled) === 1 } : { business_id: businessId, actor_id: actorId, enabled: false };
+    }
+
+    async setCallEMissionReportDigestSubscription(input = {}) {
+        const businessId = String(input.business_id || '').trim();
+        const actorId = String(input.actor_id || '').trim();
+        const intervalHours = Number(input.interval_hours);
+        const enabled = input.enabled === true;
+        if (!/^[A-Za-z0-9._:-]{1,120}$/.test(businessId) || !/^\d{1,20}$/.test(actorId) ||
+            ![24, 168].includes(intervalHours) || typeof input.enabled !== 'boolean') {
+            throw Object.assign(new Error('CALL-E report digest subscription is invalid'), { code: 'call_e_report_digest_invalid' });
+        }
+        await new Promise((resolve, reject) => this.db.run(
+            `INSERT INTO call_e_mission_report_digest_subscriptions (business_id, actor_id, interval_hours, enabled, next_delivery_at, updated_at)
+             VALUES (?, ?, ?, ?, datetime('now', '+' || ? || ' hours'), CURRENT_TIMESTAMP)
+             ON CONFLICT(business_id, actor_id) DO UPDATE SET interval_hours = excluded.interval_hours, enabled = excluded.enabled,
+               next_delivery_at = CASE WHEN call_e_mission_report_digest_subscriptions.interval_hours != excluded.interval_hours
+                 OR call_e_mission_report_digest_subscriptions.enabled = 0 OR excluded.enabled = 0
+                 THEN excluded.next_delivery_at ELSE call_e_mission_report_digest_subscriptions.next_delivery_at END,
+               updated_at = CURRENT_TIMESTAMP`,
+            [businessId, actorId, intervalHours, enabled ? 1 : 0, intervalHours], (error) => error ? reject(error) : resolve(),
+        ));
+        return this.getCallEMissionReportDigestSubscription(businessId, actorId);
+    }
+
+    async getCallEMissionReportDigestSubscription(businessId, actorId) {
+        const row = await new Promise((resolve, reject) => this.db.get(
+            `SELECT business_id, actor_id, interval_hours, enabled, next_delivery_at FROM call_e_mission_report_digest_subscriptions
+             WHERE business_id = ? AND actor_id = ?`,
+            [String(businessId || '').trim(), String(actorId || '').trim()], (error, result) => error ? reject(error) : resolve(result || null),
+        ));
+        return row ? { ...row, enabled: Number(row.enabled) === 1 } : { business_id: businessId, actor_id: actorId, interval_hours: 24, enabled: false, next_delivery_at: null };
+    }
+
+    async listDueCallEMissionReportDigests(nowIso = new Date().toISOString(), limit = 100) {
+        const safeLimit = Math.max(1, Math.min(500, Math.floor(Number(limit) || 100)));
+        return new Promise((resolve, reject) => this.db.all(
+            `SELECT s.business_id, s.actor_id, s.interval_hours, s.next_delivery_at
+             FROM call_e_mission_report_digest_subscriptions s
+             WHERE s.enabled = 1 AND datetime(s.next_delivery_at) <= datetime(?)
+               AND datetime(s.updated_at) <= datetime(?, '-5 minutes')
+               AND EXISTS (
+                 SELECT 1 FROM call_e_business_operator_events access
+                 WHERE access.business_id = s.business_id AND access.telegram_id = s.actor_id
+                   AND access.event_type = 'access_granted' AND access.id = (
+                     SELECT MAX(latest.id) FROM call_e_business_operator_events latest
+                     WHERE latest.business_id = s.business_id AND latest.telegram_id = s.actor_id
+                   )
+               )
+             ORDER BY s.next_delivery_at LIMIT ?`,
+            [nowIso, nowIso, safeLimit], (error, rows) => error ? reject(error) : resolve(rows || []),
+        ));
+    }
+
+    async advanceCallEMissionReportDigest(input = {}) {
+        const businessId = String(input.business_id || '').trim();
+        const actorId = String(input.actor_id || '').trim();
+        const previousDue = String(input.previous_due_at || '').trim();
+        return new Promise((resolve, reject) => this.db.run(
+            `UPDATE call_e_mission_report_digest_subscriptions SET
+               next_delivery_at = datetime(next_delivery_at, '+' || interval_hours || ' hours'), updated_at = CURRENT_TIMESTAMP
+             WHERE business_id = ? AND actor_id = ? AND enabled = 1 AND next_delivery_at = ?`,
+            [businessId, actorId, previousDue], function (error) { error ? reject(error) : resolve(this.changes > 0); },
+        ));
+    }
+
+    async claimCallEMissionReportDigest(input = {}) {
+        const businessId = String(input.business_id || '').trim();
+        const actorId = String(input.actor_id || '').trim();
+        const previousDue = String(input.previous_due_at || '').trim();
+        const nowIso = String(input.now || new Date().toISOString());
+        return new Promise((resolve, reject) => this.db.run(
+            `UPDATE call_e_mission_report_digest_subscriptions SET updated_at = ?
+             WHERE business_id = ? AND actor_id = ? AND enabled = 1 AND next_delivery_at = ?
+               AND datetime(next_delivery_at) <= datetime(?) AND datetime(updated_at) <= datetime(?, '-5 minutes')`,
+            [nowIso, businessId, actorId, previousDue, nowIso, nowIso], function (error) { error ? reject(error) : resolve(this.changes > 0); },
+        ));
+    }
+
+    async touchCallEMissionReportDigest(input = {}) {
+        return new Promise((resolve, reject) => this.db.run(
+            `UPDATE call_e_mission_report_digest_subscriptions SET updated_at = CURRENT_TIMESTAMP
+             WHERE business_id = ? AND actor_id = ? AND enabled = 1`,
+            [String(input.business_id || '').trim(), String(input.actor_id || '').trim()], (error) => error ? reject(error) : resolve(),
+        ));
+    }
+
+    async listCallEMissionAlertSubscriptions() {
+        return new Promise((resolve, reject) => this.db.all(
+            `SELECT s.business_id, s.actor_id, s.last_notified_event_id
+             FROM call_e_mission_alert_subscriptions s
+             WHERE s.enabled = 1
+               AND EXISTS (
+                 SELECT 1 FROM call_e_business_operator_events current_access
+                 WHERE current_access.business_id = s.business_id
+                   AND current_access.telegram_id = s.actor_id
+                   AND current_access.event_type = 'access_granted'
+                   AND current_access.id = (
+                     SELECT MAX(latest_access.id) FROM call_e_business_operator_events latest_access
+                     WHERE latest_access.business_id = s.business_id AND latest_access.telegram_id = s.actor_id
+                   )
+               )
+             ORDER BY s.updated_at LIMIT 500`,
+            (error, rows) => error ? reject(error) : resolve(rows || []),
+        ));
+    }
+
+    async listCallEMissionAlertsForSubscription(input = {}, limit = 20) {
+        const afterId = Math.max(0, Number(input.after_event_id) || 0);
+        const safeLimit = Math.max(1, Math.min(50, Math.floor(Number(limit) || 20)));
+        return new Promise((resolve, reject) => this.db.all(
+            `SELECT event_id, mission_id, event_type, recipient_position, state, error_code, created_at
+             FROM call_e_mission_activity WHERE business_id = ? AND event_id > ?
+             ORDER BY event_id ASC LIMIT ?`,
+            [String(input.business_id || '').trim(), afterId, safeLimit], (error, rows) => error ? reject(error) : resolve(rows || []),
+        ));
+    }
+
+    async advanceCallEMissionAlertCursor(input = {}) {
+        const eventId = Math.max(0, Number(input.event_id) || 0);
+        return new Promise((resolve, reject) => this.db.run(
+            `UPDATE call_e_mission_alert_subscriptions SET last_notified_event_id = MAX(last_notified_event_id, ?), updated_at = CURRENT_TIMESTAMP
+             WHERE business_id = ? AND actor_id = ? AND enabled = 1`,
+            [eventId, String(input.business_id || '').trim(), String(input.actor_id || '').trim()],
+            function done(error) { if (error) reject(error); else resolve(this.changes > 0); },
+        ));
+    }
+
+    async touchCallEMissionAlertSubscription(input = {}) {
+        return new Promise((resolve, reject) => this.db.run(
+            `UPDATE call_e_mission_alert_subscriptions SET updated_at = CURRENT_TIMESTAMP
+             WHERE business_id = ? AND actor_id = ? AND enabled = 1`,
+            [String(input.business_id || '').trim(), String(input.actor_id || '').trim()],
+            function done(error) { if (error) reject(error); else resolve(this.changes > 0); },
+        ));
     }
 
     async resetCallERejectedOutboundCall(payload = {}) {
@@ -4672,10 +8925,14 @@ class EnhancedDatabase {
         const id = String(providerCallId || '').trim();
         if (!/^call_[A-Za-z0-9_-]{1,190}$/.test(id)) return null;
         return new Promise((resolve, reject) => {
-            this.db.get('SELECT local_call_id FROM call_e_reconciliation WHERE provider_call_id = ?', [id], (err, row) => {
+            this.db.get(
+                'SELECT local_call_id, business_id, template_id, template_version FROM call_e_reconciliation WHERE provider_call_id = ?',
+                [id],
+                (err, row) => {
                 if (err) return reject(err);
                 resolve(row || null);
-            });
+                },
+            );
         });
     }
 
@@ -4714,14 +8971,14 @@ class EnhancedDatabase {
         if (!/^call_[A-Za-z0-9_-]{1,190}$/.test(id)) return null;
         return new Promise((resolve, reject) => {
             this.db.get(
-                `SELECT event_cursor, last_event_id, seen_event_ids_json FROM call_e_reconciliation WHERE provider_call_id = ?`,
+                `SELECT event_cursor, last_event_id, seen_event_ids_json, ivr_dtmf_observed FROM call_e_reconciliation WHERE provider_call_id = ?`,
                 [id],
                 (err, row) => {
                     if (err) return reject(err);
                     if (!row) return resolve(null);
                     let seenEventIds = [];
                     try { seenEventIds = JSON.parse(row.seen_event_ids_json || '[]'); } catch (_) {}
-                    resolve({ nextCursor: row.event_cursor || null, lastEventId: row.last_event_id || null, seenEventIds: Array.isArray(seenEventIds) ? seenEventIds : [] });
+                    resolve({ nextCursor: row.event_cursor || null, lastEventId: row.last_event_id || null, seenEventIds: Array.isArray(seenEventIds) ? seenEventIds : [], ivrDtmfObserved: row.ivr_dtmf_observed === 1 });
                 },
             );
         });
@@ -4739,8 +8996,8 @@ class EnhancedDatabase {
         }
         return new Promise((resolve, reject) => {
             this.db.run(
-                `UPDATE call_e_reconciliation SET event_cursor = ?, last_event_id = ?, seen_event_ids_json = ?, updated_at = CURRENT_TIMESTAMP WHERE provider_call_id = ?`,
-                [cursor, lastEventId, JSON.stringify(seen), id],
+                `UPDATE call_e_reconciliation SET event_cursor = ?, last_event_id = ?, seen_event_ids_json = ?, ivr_dtmf_observed = ?, updated_at = CURRENT_TIMESTAMP WHERE provider_call_id = ?`,
+                [cursor, lastEventId, JSON.stringify(seen), state.ivrDtmfObserved === true ? 1 : 0, id],
                 function (err) { if (err) return reject(err); resolve({ saved: this.changes > 0 }); },
             );
         });
@@ -4835,12 +9092,13 @@ class EnhancedDatabase {
         return new Promise((resolve, reject) => {
             const sql = `
                 INSERT INTO outbound_call_idempotency (
-                    idempotency_key, provider, request_hash, call_sid,
+                    idempotency_key, provider, business_id, request_hash, call_sid,
                     status, response_payload, error_message, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                 ON CONFLICT(idempotency_key) DO UPDATE SET
                     provider = excluded.provider,
+                    business_id = COALESCE(excluded.business_id, outbound_call_idempotency.business_id),
                     request_hash = COALESCE(excluded.request_hash, outbound_call_idempotency.request_hash),
                     call_sid = COALESCE(excluded.call_sid, outbound_call_idempotency.call_sid),
                     status = excluded.status,
@@ -4853,6 +9111,7 @@ class EnhancedDatabase {
                 [
                     idempotencyKey,
                     provider,
+                    String(payload.business_id || '').trim() || null,
                     requestHash,
                     callSid,
                     status,
@@ -5641,6 +9900,38 @@ class EnhancedDatabase {
                 }
             });
             stmt.finalize();
+        });
+    }
+
+    async logProviderDiagnosticsSnapshot(entries = []) {
+        const safeEntries = (Array.isArray(entries) ? entries : []).filter((entry) =>
+            ['twilio', 'plivo', 'vonage'].includes(String(entry?.provider || '').toLowerCase()));
+        for (const entry of safeEntries) {
+            const details = {
+                provider: String(entry.provider).toLowerCase(), ready: entry.ready === true,
+                circuit_state: ['closed', 'open', 'half_open'].includes(entry.circuit_state) ? entry.circuit_state : 'unknown',
+                score: Math.max(0, Math.min(100, Math.floor(Number(entry.score) || 0))),
+                reason_code: /^[a-z][a-z0-9_]{0,79}$/.test(String(entry.reason_code || '')) ? String(entry.reason_code) : null,
+            };
+            await this.logServiceHealth('provider_diagnostics', details.circuit_state, details);
+        }
+        return safeEntries.length;
+    }
+
+    async listProviderDiagnosticsHistory(limit = 50) {
+        const safeLimit = Math.max(1, Math.min(200, Math.floor(Number(limit) || 50)));
+        const rows = await new Promise((resolve, reject) => this.db.all(
+            `SELECT id, status, details, timestamp FROM service_health_logs
+             WHERE service_name = 'provider_diagnostics' ORDER BY id DESC LIMIT ?`,
+            [safeLimit], (error, result) => error ? reject(error) : resolve(result || [])));
+        return rows.map((row) => {
+            let details = {};
+            try { details = JSON.parse(row.details || '{}'); } catch (_) {}
+            return { id: Number(row.id), provider: ['twilio', 'plivo', 'vonage'].includes(details.provider) ? details.provider : 'unknown',
+                status: ['closed', 'open', 'half_open'].includes(row.status) ? row.status : 'unknown',
+                ready: details.ready === true, score: Math.max(0, Math.min(100, Math.floor(Number(details.score) || 0))),
+                reason_code: /^[a-z][a-z0-9_]{0,79}$/.test(String(details.reason_code || '')) ? details.reason_code : null,
+                recorded_at: row.timestamp };
         });
     }
 
@@ -7519,6 +11810,7 @@ class EnhancedDatabase {
            `CREATE TABLE IF NOT EXISTS post_call_workflow_definitions (
                workflow_id TEXT NOT NULL,
                version INTEGER NOT NULL,
+               business_id TEXT,
                name TEXT NOT NULL,
                trigger_event TEXT NOT NULL,
                schema_version INTEGER NOT NULL,
@@ -7529,6 +11821,60 @@ class EnhancedDatabase {
                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                approved_at DATETIME,
                PRIMARY KEY(workflow_id, version)
+           )`,
+           `CREATE TABLE IF NOT EXISTS call_e_result_workflow_action_approvals (
+               workflow_id TEXT NOT NULL,
+               version INTEGER NOT NULL,
+               business_id TEXT NOT NULL,
+               approved_by TEXT NOT NULL,
+               request_hash TEXT NOT NULL CHECK(length(request_hash) = 64),
+               created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+               PRIMARY KEY(workflow_id, version),
+               FOREIGN KEY(workflow_id, version) REFERENCES post_call_workflow_definitions(workflow_id, version) ON DELETE CASCADE
+           )`,
+           `CREATE TRIGGER IF NOT EXISTS call_e_result_workflow_action_approvals_no_update
+            BEFORE UPDATE ON call_e_result_workflow_action_approvals
+            BEGIN SELECT RAISE(ABORT, 'CALL-E result workflow approvals are append-only'); END`,
+           `CREATE TRIGGER IF NOT EXISTS call_e_result_workflow_action_approvals_no_delete
+            BEFORE DELETE ON call_e_result_workflow_action_approvals
+            BEGIN SELECT RAISE(ABORT, 'CALL-E result workflow approvals are append-only'); END`,
+           `CREATE TABLE IF NOT EXISTS post_call_workflow_runs (
+               run_id TEXT PRIMARY KEY,
+               workflow_id TEXT NOT NULL,
+               workflow_version INTEGER NOT NULL,
+               business_id TEXT,
+               trigger_event TEXT NOT NULL,
+               trigger_reference TEXT,
+               idempotency_key TEXT NOT NULL UNIQUE,
+               status TEXT NOT NULL CHECK(status IN ('queued', 'running', 'waiting', 'waiting_approval', 'completed', 'failed', 'canceled', 'needs_review')),
+               current_step_id TEXT NOT NULL,
+               payload_json TEXT NOT NULL,
+               error_code TEXT,
+               next_run_at DATETIME,
+               runner_id TEXT,
+               lease_expires_at DATETIME,
+               canceled_by TEXT,
+               expires_at DATETIME,
+               started_at DATETIME,
+               completed_at DATETIME,
+               created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+               updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+           )`,
+           `CREATE TABLE IF NOT EXISTS post_call_workflow_step_runs (
+               run_id TEXT NOT NULL,
+               step_id TEXT NOT NULL,
+               next_step_id TEXT,
+               step_type TEXT NOT NULL,
+               action_type TEXT,
+               status TEXT NOT NULL CHECK(status IN ('running', 'waiting', 'waiting_approval', 'completed', 'failed', 'approved', 'needs_review', 'canceled')),
+               idempotency_key TEXT,
+               result_json TEXT,
+               error_code TEXT,
+               approved_by TEXT,
+               started_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+               completed_at DATETIME,
+               PRIMARY KEY(run_id, step_id),
+               FOREIGN KEY(run_id) REFERENCES post_call_workflow_runs(run_id) ON DELETE CASCADE
            )`,
            `CREATE TABLE IF NOT EXISTS crm_contact_sync_records (
                id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -7558,6 +11904,9 @@ class EnhancedDatabase {
            'CREATE INDEX IF NOT EXISTS idx_post_call_runs_call_sid ON post_call_automation_runs(call_sid)',
            'CREATE INDEX IF NOT EXISTS idx_post_call_runs_idempotency ON post_call_automation_runs(idempotency_key)',
            'CREATE INDEX IF NOT EXISTS idx_post_call_workflow_status ON post_call_workflow_definitions(status, created_at)',
+           'CREATE INDEX IF NOT EXISTS idx_post_call_workflow_runs_due ON post_call_workflow_runs(status, next_run_at, created_at)',
+           'CREATE INDEX IF NOT EXISTS idx_post_call_workflow_runs_workflow ON post_call_workflow_runs(workflow_id, created_at)',
+           'CREATE INDEX IF NOT EXISTS idx_post_call_workflow_steps_status ON post_call_workflow_step_runs(run_id, status)',
            'CREATE INDEX IF NOT EXISTS idx_crm_contact_sync_email ON crm_contact_sync_records(email)',
            'CREATE INDEX IF NOT EXISTS idx_crm_activity_sync_contact ON crm_activity_sync_events(external_contact_id)',
        ];
@@ -7569,8 +11918,99 @@ class EnhancedDatabase {
                });
            });
        }
+       await this.ensurePostCallWorkflowRunColumns();
+       await this.ensurePostCallWorkflowStepColumns();
+       await new Promise((resolve, reject) => {
+           this.db.run(
+               'CREATE INDEX IF NOT EXISTS idx_post_call_workflow_runs_expiry ON post_call_workflow_runs(status, expires_at)',
+               (err) => err ? reject(err) : resolve(),
+           );
+       });
+       await this.ensurePostCallWorkflowTriggers();
        await this.ensurePostCallAutomationRunColumns();
        console.log('✅ Post-call automation tables created successfully');
+   }
+
+   async ensurePostCallWorkflowRunColumns() {
+       for (const table of ['post_call_workflow_definitions', 'post_call_workflow_runs']) {
+           const tableRows = await new Promise((resolve, reject) => {
+               this.db.all(`PRAGMA table_info(${table})`, (err, result) => err ? reject(err) : resolve(result || []));
+           });
+           if (!tableRows.some((row) => row.name === 'business_id')) {
+               await new Promise((resolve, reject) => {
+                   this.db.run(`ALTER TABLE ${table} ADD COLUMN business_id TEXT`, (err) => err ? reject(err) : resolve());
+               });
+           }
+       }
+       const rows = await new Promise((resolve, reject) => {
+           this.db.all('PRAGMA table_info(post_call_workflow_runs)', (err, result) => err ? reject(err) : resolve(result || []));
+       });
+       const names = new Set(rows.map((row) => row.name));
+       if (!names.has('trigger_reference')) {
+           await new Promise((resolve, reject) => {
+               this.db.run('ALTER TABLE post_call_workflow_runs ADD COLUMN trigger_reference TEXT', (err) => err ? reject(err) : resolve());
+           });
+       }
+       if (!names.has('expires_at')) {
+           await new Promise((resolve, reject) => {
+               this.db.run('ALTER TABLE post_call_workflow_runs ADD COLUMN expires_at DATETIME', (err) => err ? reject(err) : resolve());
+           });
+       }
+       await new Promise((resolve, reject) => {
+           this.db.run(
+               `UPDATE post_call_workflow_runs SET expires_at = datetime(created_at, '+90 days') WHERE expires_at IS NULL`,
+               (err) => err ? reject(err) : resolve(),
+           );
+       });
+   }
+
+   async ensurePostCallWorkflowStepColumns() {
+       const rows = await new Promise((resolve, reject) => {
+           this.db.all('PRAGMA table_info(post_call_workflow_step_runs)', (err, result) => err ? reject(err) : resolve(result || []));
+       });
+       const names = new Set(rows.map((row) => row.name));
+       if (!names.has('next_step_id')) {
+           await new Promise((resolve, reject) => {
+               this.db.run('ALTER TABLE post_call_workflow_step_runs ADD COLUMN next_step_id TEXT', (err) => err ? reject(err) : resolve());
+           });
+       }
+   }
+
+   async ensurePostCallWorkflowTriggers() {
+       const statements = [
+           `CREATE TRIGGER IF NOT EXISTS post_call_workflow_business_scope_immutable
+            BEFORE INSERT ON post_call_workflow_definitions
+            WHEN EXISTS (
+                SELECT 1 FROM post_call_workflow_definitions prior
+                WHERE prior.workflow_id = NEW.workflow_id
+                  AND COALESCE(prior.business_id, '') != COALESCE(NEW.business_id, '')
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'post-call workflow business scope is immutable');
+            END`,
+           `CREATE TRIGGER IF NOT EXISTS post_call_workflow_resume_after_approval
+            AFTER UPDATE OF status ON post_call_workflow_step_runs
+            WHEN NEW.status = 'approved' AND OLD.status = 'waiting_approval'
+            BEGIN
+                UPDATE post_call_workflow_runs
+                SET status = 'queued', current_step_id = NEW.next_step_id, next_run_at = NULL,
+                    runner_id = NULL, lease_expires_at = NULL, error_code = NULL,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE run_id = NEW.run_id AND status = 'waiting_approval' AND current_step_id = OLD.step_id;
+            END`,
+           `CREATE TRIGGER IF NOT EXISTS post_call_workflow_audit_cancel
+            AFTER UPDATE OF status ON post_call_workflow_runs
+            WHEN NEW.status = 'canceled' AND OLD.status != 'canceled'
+            BEGIN
+                UPDATE post_call_workflow_step_runs
+                SET status = 'canceled', completed_at = CURRENT_TIMESTAMP
+                WHERE run_id = NEW.run_id AND step_id = NEW.current_step_id
+                  AND status IN ('waiting', 'waiting_approval');
+            END`,
+       ];
+       for (const sql of statements) {
+           await new Promise((resolve, reject) => this.db.run(sql, (err) => err ? reject(err) : resolve()));
+       }
    }
 
    async ensurePostCallAutomationRunColumns() {
@@ -8508,16 +12948,17 @@ class EnhancedDatabase {
        return new Promise((resolve, reject) => {
            const sql = `
                INSERT INTO post_call_workflow_definitions (
-                   workflow_id, version, name, trigger_event, schema_version, status,
+                   workflow_id, version, business_id, name, trigger_event, schema_version, status,
                    definition_json, created_by, created_at
                )
-               SELECT ?, COALESCE(MAX(version), 0) + 1, ?, ?, ?, 'draft', ?, ?, CURRENT_TIMESTAMP
+               SELECT ?, COALESCE(MAX(version), 0) + 1, ?, ?, ?, ?, 'draft', ?, ?, CURRENT_TIMESTAMP
                FROM post_call_workflow_definitions
                WHERE workflow_id = ?
                RETURNING *
            `;
            this.db.get(sql, [
                definition.workflow_id,
+               definition.business_id || null,
                definition.name,
                definition.trigger_event,
                definition.schema_version,
@@ -8585,6 +13026,355 @@ class EnhancedDatabase {
                    if (err) reject(err);
                    else resolve(this.changes || 0);
                },
+           );
+       });
+   }
+
+   async approveCallEResultWorkflowActions(input = {}) {
+       const workflowId = String(input.workflow_id || '').trim();
+       const version = Number(input.version);
+       const businessId = String(input.business_id || '').trim();
+       const actorId = String(input.approved_by || '').trim();
+       const requestHash = String(input.request_hash || '').trim().toLowerCase();
+       if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,119}$/.test(workflowId) || !Number.isSafeInteger(version) || version < 1 ||
+           !/^[A-Za-z0-9._:-]{1,120}$/.test(businessId) || !/^\d{1,20}$/.test(actorId) || !/^[a-f0-9]{64}$/.test(requestHash)) {
+           throw Object.assign(new Error('CALL-E result workflow approval is invalid'), { code: 'call_e_result_workflow_approval_invalid' });
+       }
+       let release;
+       const previous = this.callECampaignWriteChain;
+       this.callECampaignWriteChain = new Promise((resolve) => { release = resolve; });
+       await previous;
+       const run = (sql, params = []) => new Promise((resolve, reject) => this.db.run(sql, params, function (error) {
+           if (error) return reject(error);
+           resolve({ changes: this.changes || 0 });
+       }));
+       const get = (sql, params = []) => new Promise((resolve, reject) => this.db.get(sql, params, (error, row) => error ? reject(error) : resolve(row || null)));
+       let transactionStarted = false;
+       try {
+           await run('BEGIN IMMEDIATE'); transactionStarted = true;
+           const definition = await get('SELECT * FROM post_call_workflow_definitions WHERE workflow_id = ? AND version = ?', [workflowId, version]);
+           if (!definition || definition.trigger_event !== 'call_e_result_ready' || definition.business_id !== businessId) {
+               await run('COMMIT'); transactionStarted = false;
+               return { approved: false, not_found: true };
+           }
+           const existing = await get('SELECT approved_by, request_hash FROM call_e_result_workflow_action_approvals WHERE workflow_id = ? AND version = ?', [workflowId, version]);
+           if (existing) {
+               const replay = existing.approved_by === actorId && existing.request_hash === requestHash;
+               await run('COMMIT'); transactionStarted = false;
+               return { approved: replay, idempotent_replay: replay, conflict: !replay };
+           }
+           if (definition.status !== 'draft' && definition.status !== 'approved') {
+               await run('COMMIT'); transactionStarted = false;
+               return { approved: false, not_draft: true };
+           }
+           if (definition.status === 'draft') {
+               await run(`UPDATE post_call_workflow_definitions SET status = 'approved', approved_by = ?, approved_at = CURRENT_TIMESTAMP
+                   WHERE workflow_id = ? AND version = ? AND status = 'draft'`, [actorId, workflowId, version]);
+           }
+           await run(`INSERT INTO call_e_result_workflow_action_approvals (workflow_id, version, business_id, approved_by, request_hash)
+               VALUES (?, ?, ?, ?, ?)`, [workflowId, version, businessId, actorId, requestHash]);
+           await run('COMMIT'); transactionStarted = false;
+           return { approved: true, idempotent_replay: false };
+       } catch (error) {
+           if (transactionStarted) { try { await run('ROLLBACK'); } catch (_) { /* Preserve original transaction failure. */ } }
+           throw error;
+       } finally { release(); }
+   }
+
+   async getCallEResultWorkflowActionApproval(workflowId, version, businessId) {
+       return new Promise((resolve, reject) => this.db.get(
+           `SELECT workflow_id, version, business_id, approved_by, created_at FROM call_e_result_workflow_action_approvals
+            WHERE workflow_id = ? AND version = ? AND business_id = ?`,
+           [String(workflowId || ''), Number(version), String(businessId || '')],
+           (error, row) => error ? reject(error) : resolve(row || null),
+       ));
+   }
+
+   async listApprovedPostCallWorkflowDefinitions(triggerEvent, businessId = null) {
+       const scoped = triggerEvent === 'call_e_result_ready';
+       if ((scoped && !businessId) || (!scoped && businessId)) return [];
+       const scopeClause = scoped ? 'business_id = ?' : 'business_id IS NULL';
+       const params = scoped
+           ? [triggerEvent, businessId, triggerEvent, businessId]
+           : [triggerEvent, triggerEvent];
+       const rows = await new Promise((resolve, reject) => {
+           this.db.all(
+               `SELECT d.* FROM post_call_workflow_definitions d
+                INNER JOIN (
+                    SELECT workflow_id, MAX(version) AS version
+                    FROM post_call_workflow_definitions
+                    WHERE status = 'approved' AND trigger_event = ? AND ${scopeClause}
+                    GROUP BY workflow_id
+                ) latest ON latest.workflow_id = d.workflow_id AND latest.version = d.version
+                WHERE d.status = 'approved' AND d.trigger_event = ? AND d.${scopeClause}
+                ORDER BY d.workflow_id ASC`,
+               params,
+               (err, rows) => err ? reject(err) : resolve(rows || []),
+           );
+       });
+       if (!scoped) return rows;
+       const eligible = [];
+       for (const row of rows) {
+           let hasActions = false;
+           try { hasActions = JSON.parse(row.definition_json || '{}').steps?.some((step) => step.type === 'action') === true; } catch (_) { hasActions = true; }
+           if (!hasActions || await this.getCallEResultWorkflowActionApproval(row.workflow_id, row.version, businessId)) eligible.push(row);
+       }
+       return eligible;
+   }
+
+   async createPostCallWorkflowRun(run = {}) {
+       const insertSql = `INSERT OR IGNORE INTO post_call_workflow_runs (
+           run_id, workflow_id, workflow_version, business_id, trigger_event, trigger_reference, idempotency_key,
+           status, current_step_id, payload_json, expires_at, created_at, updated_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`;
+       await new Promise((resolve, reject) => {
+           this.db.run(insertSql, [
+               run.run_id,
+               run.workflow_id,
+               run.workflow_version,
+               run.business_id || null,
+               run.trigger_event,
+               run.trigger_reference || null,
+               run.idempotency_key,
+               run.current_step_id,
+               run.payload_json,
+               run.expires_at,
+           ], function (err) { err ? reject(err) : resolve(); });
+       });
+       const row = await new Promise((resolve, reject) => {
+           this.db.get(
+               'SELECT * FROM post_call_workflow_runs WHERE idempotency_key = ?',
+               [run.idempotency_key],
+               (err, result) => err ? reject(err) : resolve(result || null),
+           );
+       });
+       return { row, created: row?.run_id === run.run_id };
+   }
+
+   async getPostCallWorkflowRun(runId) {
+       return new Promise((resolve, reject) => {
+           this.db.get(
+               'SELECT * FROM post_call_workflow_runs WHERE run_id = ?',
+               [runId],
+               (err, row) => err ? reject(err) : resolve(row || null),
+           );
+       });
+   }
+
+   async listPostCallWorkflowRuns(filters = {}) {
+       const where = [];
+       const params = [];
+       if (filters.business_id) { where.push('business_id = ?'); params.push(String(filters.business_id)); }
+       if (filters.trigger_event) { where.push('trigger_event = ?'); params.push(String(filters.trigger_event)); }
+       if (filters.workflow_id) { where.push('workflow_id = ?'); params.push(filters.workflow_id); }
+       if (filters.trigger_reference) { where.push('trigger_reference = ?'); params.push(filters.trigger_reference); }
+       if (filters.status) { where.push('status = ?'); params.push(filters.status); }
+       const limit = Number.isSafeInteger(Number(filters.limit))
+           ? Math.max(1, Math.min(200, Number(filters.limit)))
+           : 50;
+       params.push(limit);
+       return new Promise((resolve, reject) => {
+           this.db.all(
+               `SELECT run_id, workflow_id, workflow_version, business_id, trigger_event, trigger_reference, status,
+                       current_step_id, error_code, next_run_at, started_at, completed_at,
+                       canceled_by, expires_at, created_at, updated_at
+                FROM post_call_workflow_runs
+                ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
+                ORDER BY created_at DESC LIMIT ?`,
+               params,
+               (err, rows) => err ? reject(err) : resolve(rows || []),
+           );
+       });
+   }
+
+   async listPostCallWorkflowStepRuns(runId) {
+       return new Promise((resolve, reject) => {
+           this.db.all(
+               `SELECT step_id, step_type, action_type, status, error_code, approved_by,
+                       started_at, completed_at
+                FROM post_call_workflow_step_runs WHERE run_id = ? ORDER BY started_at ASC`,
+               [runId],
+               (err, rows) => err ? reject(err) : resolve(rows || []),
+           );
+       });
+   }
+
+   async updatePostCallWorkflowRun(runId, patch = {}, options = {}) {
+       const allowed = new Set([
+           'status', 'current_step_id', 'error_code', 'next_run_at', 'runner_id', 'payload_json',
+           'lease_expires_at', 'started_at', 'completed_at',
+       ]);
+       const entries = Object.entries(patch).filter(([key]) => allowed.has(key));
+       if (!entries.length) return 0;
+       const fields = entries.map(([key]) => `${key} = ?`);
+       fields.push('updated_at = CURRENT_TIMESTAMP');
+       const values = entries.map(([, value]) => value ?? null);
+       let where = 'run_id = ?';
+       values.push(runId);
+       if (options.runner_id) {
+           where += ' AND status = \'running\' AND runner_id = ?';
+           values.push(options.runner_id);
+       }
+       return new Promise((resolve, reject) => {
+           this.db.run(
+               `UPDATE post_call_workflow_runs SET ${fields.join(', ')} WHERE ${where}`,
+               values,
+               function (err) { err ? reject(err) : resolve(this.changes || 0); },
+           );
+       });
+   }
+
+   async claimNextPostCallWorkflowRun(runnerId, leaseSeconds = 90) {
+       const candidates = await new Promise((resolve, reject) => {
+           this.db.all(
+               `SELECT run_id FROM post_call_workflow_runs
+                WHERE status IN ('queued', 'waiting')
+                  AND (next_run_at IS NULL OR next_run_at <= CURRENT_TIMESTAMP)
+                ORDER BY created_at ASC LIMIT 20`,
+               (err, rows) => err ? reject(err) : resolve(rows || []),
+           );
+       });
+       for (const candidate of candidates) {
+           const changed = await new Promise((resolve, reject) => {
+               this.db.run(
+                   `UPDATE post_call_workflow_runs
+                    SET status = 'running', runner_id = ?,
+                        lease_expires_at = datetime('now', ?),
+                        started_at = COALESCE(started_at, CURRENT_TIMESTAMP),
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE run_id = ? AND status IN ('queued', 'waiting')
+                      AND (next_run_at IS NULL OR next_run_at <= CURRENT_TIMESTAMP)`,
+                   [runnerId, `+${Math.max(30, Math.min(300, Number(leaseSeconds) || 90))} seconds`, candidate.run_id],
+                   function (err) { err ? reject(err) : resolve(this.changes || 0); },
+               );
+           });
+           if (!changed) continue;
+           return this.getPostCallWorkflowRun(candidate.run_id);
+       }
+       return null;
+   }
+
+   async heartbeatPostCallWorkflowRun(runId, runnerId, leaseSeconds = 90) {
+       return new Promise((resolve, reject) => {
+           this.db.run(
+               `UPDATE post_call_workflow_runs
+                SET lease_expires_at = datetime('now', ?), updated_at = CURRENT_TIMESTAMP
+                WHERE run_id = ? AND status = 'running' AND runner_id = ?`,
+               [`+${Math.max(30, Math.min(300, Number(leaseSeconds) || 90))} seconds`, runId, runnerId],
+               function (err) { err ? reject(err) : resolve(this.changes || 0); },
+           );
+       });
+   }
+
+   async recoverStalePostCallWorkflowRuns() {
+       const changed = await new Promise((resolve, reject) => {
+           this.db.run(
+               `UPDATE post_call_workflow_runs
+                SET status = 'needs_review', error_code = 'worker_interrupted',
+                    payload_json = '{}', runner_id = NULL, lease_expires_at = NULL,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE status = 'running' AND lease_expires_at <= CURRENT_TIMESTAMP`,
+               function (err) { err ? reject(err) : resolve(this.changes || 0); },
+           );
+       });
+       await new Promise((resolve, reject) => {
+           this.db.run(
+               `UPDATE post_call_workflow_step_runs
+                SET status = 'needs_review', error_code = COALESCE(error_code, 'worker_interrupted')
+                WHERE status = 'running' AND run_id IN (
+                    SELECT run_id FROM post_call_workflow_runs WHERE status = 'needs_review'
+                )`,
+               (err) => err ? reject(err) : resolve(),
+           );
+       });
+       return changed;
+   }
+
+   async expirePostCallWorkflowRuns() {
+       const changed = await new Promise((resolve, reject) => {
+           this.db.run(
+               `UPDATE post_call_workflow_runs
+                SET status = 'needs_review', error_code = 'workflow_run_expired',
+                    payload_json = '{}', runner_id = NULL, lease_expires_at = NULL,
+                    completed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+                WHERE status IN ('queued', 'waiting', 'waiting_approval')
+                  AND expires_at <= CURRENT_TIMESTAMP`,
+               function (err) { err ? reject(err) : resolve(this.changes || 0); },
+           );
+       });
+       if (changed) {
+           await new Promise((resolve, reject) => {
+               this.db.run(
+                   `UPDATE post_call_workflow_step_runs
+                    SET status = 'needs_review', error_code = 'workflow_run_expired', completed_at = CURRENT_TIMESTAMP
+                    WHERE status IN ('waiting', 'waiting_approval') AND run_id IN (
+                        SELECT run_id FROM post_call_workflow_runs
+                        WHERE status = 'needs_review' AND error_code = 'workflow_run_expired'
+                    )`,
+                   (err) => err ? reject(err) : resolve(),
+               );
+           });
+       }
+       return changed;
+   }
+
+   async startPostCallWorkflowStep(step = {}) {
+       return new Promise((resolve, reject) => {
+           this.db.run(
+               `INSERT OR IGNORE INTO post_call_workflow_step_runs (
+                   run_id, step_id, next_step_id, step_type, action_type, status, idempotency_key,
+                   started_at
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`,
+               [step.run_id, step.step_id, step.next_step_id || null, step.step_type, step.action_type || null, step.status || 'running', step.idempotency_key || null],
+               function (err) { err ? reject(err) : resolve(this.changes === 1); },
+           );
+       });
+   }
+
+   async finishPostCallWorkflowStep(runId, stepId, patch = {}) {
+       const allowed = new Set(['status', 'result_json', 'error_code', 'approved_by']);
+       const entries = Object.entries(patch).filter(([key]) => allowed.has(key));
+       if (!entries.length) return 0;
+       const assignments = entries.map(([key]) => `${key} = ?`);
+       assignments.push('completed_at = CURRENT_TIMESTAMP');
+       const values = entries.map(([, value]) => value ?? null);
+       values.push(runId, stepId);
+       return new Promise((resolve, reject) => {
+           this.db.run(
+               `UPDATE post_call_workflow_step_runs SET ${assignments.join(', ')} WHERE run_id = ? AND step_id = ?`,
+               values,
+               function (err) { err ? reject(err) : resolve(this.changes || 0); },
+           );
+       });
+   }
+
+   async approvePostCallWorkflowRunStep(runId, stepId, approvedBy, nextStepId) {
+       return new Promise((resolve, reject) => {
+           this.db.run(
+               `UPDATE post_call_workflow_step_runs
+                SET status = 'approved', approved_by = ?, completed_at = CURRENT_TIMESTAMP
+                WHERE run_id = ? AND step_id = ? AND status = 'waiting_approval'
+                  AND next_step_id = ?
+                  AND EXISTS (
+                    SELECT 1 FROM post_call_workflow_runs
+                    WHERE run_id = ? AND status = 'waiting_approval' AND current_step_id = ?
+                  )`,
+               [approvedBy, runId, stepId, nextStepId, runId, stepId],
+               function (err) { err ? reject(err) : resolve(this.changes || 0); },
+           );
+       });
+   }
+
+   async cancelPostCallWorkflowRun(runId, actor) {
+       return new Promise((resolve, reject) => {
+           this.db.run(
+               `UPDATE post_call_workflow_runs
+                SET status = 'canceled', error_code = NULL, payload_json = '{}', canceled_by = ?, runner_id = NULL,
+                    lease_expires_at = NULL, completed_at = CURRENT_TIMESTAMP,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE run_id = ? AND status IN ('queued', 'waiting', 'waiting_approval')`,
+               [actor || 'admin_token', runId],
+               function (err) { err ? reject(err) : resolve(this.changes || 0); },
            );
        });
    }

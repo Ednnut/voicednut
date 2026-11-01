@@ -39,9 +39,13 @@ const CAPABILITY_RULES = {
   scripts_manage: ['admin'],
   persona_manage: ['admin'],
   provider_manage: ['admin'],
+  vapi_manage: ['admin'],
+  cartesia_manage: ['admin'],
   users_manage: ['admin'],
   status_admin: ['admin'],
   caller_flags_manage: ['admin'],
+  call_e_plan: ['user', 'admin'],
+  call_e_admin: ['admin'],
   admin_panel: ['admin']
 };
 
@@ -64,6 +68,8 @@ const COMMAND_CAPABILITIES = {
   scripts: 'scripts_manage',
   persona: 'persona_manage',
   provider: 'provider_manage',
+  vapi: 'vapi_manage',
+  cartesia: 'cartesia_manage',
   users: 'users_manage',
   callerflags: 'caller_flags_manage',
   admin: 'admin_panel',
@@ -72,7 +78,8 @@ const COMMAND_CAPABILITIES = {
   reviewcases: 'status_admin',
   domainstats: 'status_admin',
   health: 'health',
-  ping: 'health'
+  ping: 'health',
+  calle: 'call_e_plan'
 };
 
 const ACTION_CAPABILITIES = [
@@ -101,6 +108,8 @@ const ACTION_CAPABILITIES = [
   { match: (action) => action === 'ADMIN_PANEL', cap: 'admin_panel' },
   { match: (action) => action === 'PERSONA', cap: 'persona_manage' },
   { match: (action) => action === 'PROVIDER_STATUS', cap: 'provider_manage' },
+  { match: (action) => action === 'VAPI_CENTER' || action.startsWith('VAPI_'), cap: 'vapi_manage' },
+  { match: (action) => action === 'CARTESIA_CENTER' || action.startsWith('CARTESIA_'), cap: 'cartesia_manage' },
   { match: (action) => action.startsWith('PROVIDER_SET:'), cap: 'provider_manage' },
   { match: (action) => action.startsWith('PROVIDER_CONFIRM:'), cap: 'provider_manage' },
   { match: (action) => action.startsWith('PROVIDER_APPLY:'), cap: 'provider_manage' },
@@ -109,6 +118,9 @@ const ACTION_CAPABILITIES = [
   { match: (action) => action.startsWith('SMS_RECENT_PAGE:'), cap: 'sms_admin' },
   { match: (action) => action.startsWith('BULK_EMAIL_PAGE:'), cap: 'bulk_email' },
   { match: (action) => ['CALLER_FLAGS', 'CALLER_FLAGS_LIST', 'CALLER_FLAGS_ALLOW', 'CALLER_FLAGS_BLOCK', 'CALLER_FLAGS_SPAM'].includes(action), cap: 'caller_flags_manage' },
+  { match: (action) => action === 'CALL_E_PLAN', cap: 'call_e_plan' },
+  { match: (action) => action === 'CALL_E_CENTER', cap: 'call_e_plan' },
+  { match: (action) => action.startsWith('CALL_E_'), cap: 'call_e_admin' },
   { match: (action) => action.startsWith('CALL_DETAILS:'), cap: 'calllog_view' },
   { match: (action) => action.startsWith('EMAIL_STATUS:'), cap: 'email_status' },
   { match: (action) => action.startsWith('EMAIL_TIMELINE:'), cap: 'email_status' },

@@ -49,9 +49,10 @@ describe("PostCallWorkflowDefinitionService", () => {
   it("normalizes versioned workflow definitions with bounded branch, wait, approval, action, and end steps", () => {
     const definition = normalizeWorkflowDefinition(validDefinition());
     assert.equal(definition.schema_version, 1);
-    assert.equal(definition.trigger_event, "post_call.completed");
+    assert.equal(definition.trigger_event, "post_call_completed");
     assert.equal(definition.steps.find((step) => step.type === "wait").seconds, 60);
     assert.equal(definition.steps.length, 6);
+    assert.equal(normalizeWorkflowDefinition(definition).trigger_event, "post_call_completed");
   });
 
   it("rejects cycles, unsupported steps, excessive waits, and credential-shaped fields", () => {
@@ -79,7 +80,96 @@ describe("PostCallWorkflowDefinitionService", () => {
     assert.throws(() => normalizeWorkflowDefinition(secret), /cannot contain credential or token fields/);
   });
 
-  it("persists immutable draft versions and records approval without enabling execution", async () => {
+  it("rejects trigger types without an implemented execution adapter", () => {
+    const classification = normalizeWorkflowDefinition(validDefinition({
+      trigger_event: "post_call_outcome_classified",
+    }));
+    assert.equal(classification.trigger_event, "post_call_outcome_classified");
+    assert.throws(
+      () => normalizeWorkflowDefinition(validDefinition({ trigger_event: "payment_succeeded" })),
+      /not supported for workflow execution/,
+    );
+  });
+
+  it("accepts bounded enum-index classifications only on a business and template-version scope", () => {
+    const definition = normalizeWorkflowDefinition(validDefinition({
+      workflow_id: "result_classifier",
+      business_id: "biz-42",
+      template_id: 19,
+      template_version: 3,
+      trigger_event: "call_e_result_ready",
+      start_step_id: "finish",
+      steps: [{ id: "finish", type: "end" }],
+      result_classifications: [
+        { id: "booking_outcome", field: "booking_status", enum_index: 1, label: "requires_review" },
+      ],
+    }));
+    assert.deepEqual(definition.result_classifications, [
+      { id: "booking_outcome", field: "booking_status", enum_index: 1, label: "requires_review" },
+    ]);
+    assert.equal(definition.template_id, 19);
+    assert.equal(definition.template_version, 3);
+
+    assert.throws(() => normalizeWorkflowDefinition(validDefinition({
+      business_id: "biz-42",
+      trigger_event: "call_e_result_ready",
+      result_classifications: [{ id: "result", field: "status", enum_index: 0, label: "raw-provider-value" }],
+    })), /pinned template_id/);
+    assert.throws(() => normalizeWorkflowDefinition(validDefinition({
+      trigger_event: "post_call_completed",
+      template_id: 1,
+      template_version: 1,
+    })), /only supported for CALL-E result-ready/);
+    assert.throws(() => normalizeWorkflowDefinition(validDefinition({
+      business_id: "biz-42",
+      template_id: 19,
+      template_version: 3,
+      trigger_event: "call_e_result_ready",
+      result_classifications: [
+        { id: "result", field: "status", enum_index: 0, label: "positive", equals: "secret raw result" },
+      ],
+    })), /unsupported field/);
+  });
+
+  it('allows only approval-gated create-ticket actions for scoped CALL-E result workflows', () => {
+    const base = {
+      workflow_id: 'result_followup_ticket', business_id: 'biz-42', template_id: 19, template_version: 3,
+      trigger_event: 'call_e_result_ready', start_step_id: 'review',
+      steps: [
+        { id: 'review', type: 'approval', next_step_id: 'ticket' },
+      { id: 'ticket', type: 'action', action_type: 'create_ticket', config: { provider: 'hubspot' }, next_step_id: 'done' },
+        { id: 'done', type: 'end' },
+      ],
+    };
+    assert.equal(normalizeWorkflowDefinition(validDefinition(base)).steps[1].action_type, 'create_ticket');
+    assert.throws(() => normalizeWorkflowDefinition(validDefinition({ ...base, start_step_id: 'ticket', steps: base.steps.slice(1) })), /per-run human approval/);
+    assert.throws(() => normalizeWorkflowDefinition(validDefinition({ ...base, steps: base.steps.map((step) => step.id === 'ticket' ? { ...step, action_type: 'send_email', config: { subject: 'x' } } : step) })), /only the create_ticket action/);
+  });
+
+  it('requires an immutable policy approval before listing result actions as executable', async () => {
+    const resultDefinition = normalizeWorkflowDefinition(validDefinition({
+      workflow_id: 'result_ticket_rule', business_id: 'biz-result', template_id: 7, template_version: 2,
+      trigger_event: 'call_e_result_ready', start_step_id: 'review',
+      steps: [
+        { id: 'review', type: 'approval', next_step_id: 'ticket' },
+        { id: 'ticket', type: 'action', action_type: 'create_ticket', config: { provider: 'hubspot' }, next_step_id: 'done' },
+        { id: 'done', type: 'end' },
+      ],
+    }));
+    await service.createDraft(resultDefinition, '111');
+    assert.equal((await db.listApprovedPostCallWorkflowDefinitions('call_e_result_ready', 'biz-result')).length, 0);
+    const approved = await db.approveCallEResultWorkflowActions({
+      workflow_id: 'result_ticket_rule', version: 1, business_id: 'biz-result', approved_by: '222', request_hash: 'a'.repeat(64),
+    });
+    assert.equal(approved.approved, true);
+    assert.equal((await db.listApprovedPostCallWorkflowDefinitions('call_e_result_ready', 'biz-result')).length, 1);
+    await assert.rejects(new Promise((resolve, reject) => db.db.run(
+      'UPDATE call_e_result_workflow_action_approvals SET approved_by = ? WHERE workflow_id = ?', ['333', 'result_ticket_rule'],
+      (error) => error ? reject(error) : resolve(),
+    )), /append-only/);
+  });
+
+  it("persists immutable draft versions and records approval without starting a run", async () => {
     const first = await service.createDraft(validDefinition(), "admin_token");
     assert.equal(first.version, 1);
     assert.equal(first.status, "draft");

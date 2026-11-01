@@ -119,6 +119,10 @@ class VoiceProviderRegistry {
     return Array.from(this.providers.keys());
   }
 
+  listDescriptors() {
+    return this.list().map((provider) => this.getDescriptor(provider));
+  }
+
   getCapabilities(providerName) {
     const provider = normalizeProviderName(providerName);
     const adapter = this.providers.get(provider);

@@ -37,7 +37,23 @@ function createCallEWebhookHandler(options = {}) {
       if (!service || typeof service.reconcileLocalCall !== "function") {
         return res.status(503).json({ success: false, code: "call_e_not_configured" });
       }
-      const state = await service.reconcileLocalCall(linkedCall.local_call_id);
+      const businessId = String(linkedCall.business_id || "");
+      const workflowService = /^[A-Za-z0-9._:-]{1,120}$/.test(businessId) &&
+        typeof options.getWorkflowService === "function" ? options.getWorkflowService() : null;
+      const state = await service.reconcileLocalCall(linkedCall.local_call_id, {
+        onValidatedResult: workflowService && typeof workflowService.triggerCallEResultReady === "function"
+          ? ({ resultSchema, result, executionStatus, callOutcome }) => workflowService.triggerCallEResultReady({
+            idempotency_key: event.providerCallId,
+            business_id: businessId,
+            local_call_id: linkedCall.local_call_id,
+            template_id: linkedCall.template_id,
+            template_version: linkedCall.template_version,
+            execution_status: executionStatus,
+            call_outcome: callOutcome,
+            result_status: "available",
+          }, resultSchema, result)
+          : undefined,
+      });
       if (state.resultStatus === "pending") {
         return res.status(503).json({ success: false, code: "call_e_webhook_snapshot_not_ready" });
       }

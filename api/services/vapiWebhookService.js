@@ -1,5 +1,6 @@
 const crypto = require("node:crypto");
 const { MAPPING_METADATA_KEY } = require("./vapiTemplateSyncService");
+const { VapiToolRegistry } = require("./vapiToolRegistry");
 
 const TRACKED_EVENT_TYPES = new Set([
   "assistant.started",
@@ -25,7 +26,7 @@ function createUnsupportedToolCallResponse(message = {}) {
     results.push({
       name,
       toolCallId,
-      result: "This tool is not enabled in VOICEDNUT.",
+      error: "This function is not enabled for this assistant.",
     });
   }
   return { toolCallResponse: true, results };
@@ -89,12 +90,13 @@ function normalizeVapiCallEvent(payload = {}) {
 class VapiWebhookService {
   constructor(options = {}) {
     this.db = options.db;
+    this.toolRegistry = options.toolRegistry || new VapiToolRegistry({ db: this.db });
   }
 
   async processEvent(payload) {
     const message = payload?.message;
     if (message?.type === "tool-calls") {
-      const response = createUnsupportedToolCallResponse(message);
+      const response = await this.toolRegistry.processMessage(message);
       if (!response) {
         const error = new Error("Vapi tool-call request is invalid");
         error.code = "vapi_tool_calls_invalid";

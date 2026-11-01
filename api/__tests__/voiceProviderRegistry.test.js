@@ -101,6 +101,7 @@ describe("VoiceProviderRegistry", () => {
         "call.active_terminate": false,
       },
     });
+    assert.deepStrictEqual(registry.listDescriptors(), [registry.getDescriptor("create-only")]);
   });
 
   it("routes task calls through a separate capability and rejects generic calls and active termination", async () => {

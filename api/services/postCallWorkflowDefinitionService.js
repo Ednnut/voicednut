@@ -3,6 +3,9 @@ const MAX_STEPS = 50;
 const MAX_DEFINITION_BYTES = 64 * 1024;
 const MAX_TOTAL_WAIT_SECONDS = 30 * 24 * 60 * 60;
 const SUPPORTED_ACTIONS = new Set(["send_email", "crm_sync", "create_ticket"]);
+const BUSINESS_SCOPED_TRIGGER_EVENTS = new Set(["call_e_result_ready"]);
+const SUPPORTED_TRIGGER_EVENTS = new Set(["post_call_completed", "post_call_outcome_classified", ...BUSINESS_SCOPED_TRIGGER_EVENTS]);
+const RESULT_CLASSIFICATION_LABELS = new Set(["positive", "negative", "neutral", "requires_review", "unknown"]);
 const ACTION_CONFIG_KEYS = Object.freeze({
   send_email: new Set([
     "to", "from", "provider", "subject", "text", "html", "script_id", "template_id",
@@ -15,6 +18,10 @@ const SENSITIVE_KEY_PATTERN = /(?:secret|password|credential|token|api[_-]?key|a
 const ROOT_KEYS = new Set([
   "schema_version",
   "workflow_id",
+  "business_id",
+  "template_id",
+  "template_version",
+  "result_classifications",
   "name",
   "trigger_event",
   "start_step_id",
@@ -97,8 +104,59 @@ function normalizeWorkflowDefinition(input = {}) {
   if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,119}$/.test(workflowId)) fail("workflow_id is invalid");
   const name = String(input.name || "").trim();
   if (!name || name.length > 160) fail("Workflow name is required and must be 160 characters or fewer");
-  const triggerEvent = String(input.trigger_event || "").trim().toLowerCase().replace(/[\s-]+/g, "_");
+  const triggerEvent = String(input.trigger_event || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[\s-]+/g, "_")
+    .replace(/^post_call\.completed$/, "post_call_completed");
   if (!/^[a-z][a-z0-9_.]{0,79}$/.test(triggerEvent)) fail("trigger_event is invalid");
+  if (!SUPPORTED_TRIGGER_EVENTS.has(triggerEvent)) fail("trigger_event is not supported for workflow execution");
+  const businessId = input.business_id == null ? "" : String(input.business_id).trim();
+  if (BUSINESS_SCOPED_TRIGGER_EVENTS.has(triggerEvent)) {
+    if (!/^[A-Za-z0-9._:-]{1,120}$/.test(businessId)) fail("business_id is required for this workflow trigger");
+  } else if (businessId) {
+    fail("business_id is only supported for business-scoped workflow triggers");
+  }
+  if (!BUSINESS_SCOPED_TRIGGER_EVENTS.has(triggerEvent) &&
+      (input.template_id != null || input.template_version != null ||
+        (Array.isArray(input.result_classifications) ? input.result_classifications.length > 0 : input.result_classifications != null))) {
+    fail("template pins and result classifications are only supported for CALL-E result-ready workflows");
+  }
+  const templateId = input.template_id == null || input.template_id === "" ? null : Number(input.template_id);
+  const templateVersion = input.template_version == null || input.template_version === "" ? null : Number(input.template_version);
+  const resultClassificationsInput = input.result_classifications == null ? [] : input.result_classifications;
+  if (!Array.isArray(resultClassificationsInput) || resultClassificationsInput.length > 16) {
+    fail("result_classifications must contain at most 16 entries");
+  }
+  if (resultClassificationsInput.length && !BUSINESS_SCOPED_TRIGGER_EVENTS.has(triggerEvent)) {
+    fail("result_classifications are only supported for business-scoped result-ready workflows");
+  }
+  if ((templateId === null) !== (templateVersion === null)) {
+    fail("template_id and template_version must be supplied together");
+  }
+  if (templateId !== null && (!Number.isSafeInteger(templateId) || templateId < 1 || !Number.isSafeInteger(templateVersion) || templateVersion < 1)) {
+    fail("template_id and template_version must be positive integers");
+  }
+  if (resultClassificationsInput.length && templateId === null) {
+    fail("result classifications require a pinned template_id and template_version");
+  }
+  const classificationIds = new Set();
+  const resultClassifications = resultClassificationsInput.map((entry) => {
+    if (!isObject(entry)) fail("Each result classification must be an object");
+    assertOnlyKeys(entry, new Set(["id", "field", "enum_index", "label"]), "Result classification");
+    const id = String(entry.id || "").trim();
+    const field = String(entry.field || "").trim();
+    const enumIndex = entry.enum_index;
+    const label = String(entry.label || "").trim().toLowerCase();
+    if (!/^[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(id) || classificationIds.has(id)) {
+      fail("Result classification IDs must be unique valid identifiers");
+    }
+    if (!/^[A-Za-z][A-Za-z0-9_]{0,79}$/.test(field)) fail("Result classification field is invalid");
+    if (!Number.isSafeInteger(enumIndex) || enumIndex < 0 || enumIndex > 31) fail("Result classification enum_index must be between 0 and 31");
+    if (!RESULT_CLASSIFICATION_LABELS.has(label)) fail("Result classification label is not supported");
+    classificationIds.add(id);
+    return { id, field, enum_index: enumIndex, label };
+  });
   if (!Array.isArray(input.steps) || input.steps.length < 1 || input.steps.length > MAX_STEPS) {
     fail(`Workflow steps must contain between 1 and ${MAX_STEPS} entries`);
   }
@@ -148,6 +206,9 @@ function normalizeWorkflowDefinition(input = {}) {
     }
     return normalized;
   });
+  if (triggerEvent === "call_e_result_ready" && steps.some((step) => step.type === "action" && step.action_type !== "create_ticket")) {
+    fail("CALL-E result follow-ups support only the create_ticket action");
+  }
 
   const ids = new Set();
   steps.forEach((step) => {
@@ -172,6 +233,25 @@ function normalizeWorkflowDefinition(input = {}) {
     if (step.type === "wait") totalWait += step.seconds;
     edges.set(step.id, targets);
   }
+  if (triggerEvent === "call_e_result_ready" && steps.some((step) => step.type === "action")) {
+    const seen = new Set();
+    const active = new Set();
+    const ensureHumanApprovalBeforeAction = (stepId, approved = false) => {
+      if (active.has(stepId)) fail("Workflow paths cannot contain loops");
+      const stateKey = `${stepId}:${approved ? 'approved' : 'unapproved'}`;
+      if (seen.has(stateKey)) return;
+      active.add(stepId);
+      const step = steps.find((candidate) => candidate.id === stepId);
+      const approvalReached = approved || step.type === 'approval';
+      if (step.type === 'action' && !approvalReached) {
+        fail("CALL-E result follow-up actions must be preceded by a per-run human approval step");
+      }
+      for (const target of edges.get(stepId) || []) ensureHumanApprovalBeforeAction(target, approvalReached);
+      active.delete(stepId);
+      seen.add(stateKey);
+    };
+    ensureHumanApprovalBeforeAction(startStepId);
+  }
   if (totalWait > MAX_TOTAL_WAIT_SECONDS) fail("Total workflow wait duration cannot exceed 30 days");
 
   const visited = new Set();
@@ -190,6 +270,10 @@ function normalizeWorkflowDefinition(input = {}) {
   const definition = {
     schema_version: WORKFLOW_SCHEMA_VERSION,
     workflow_id: workflowId,
+    business_id: businessId || null,
+    template_id: templateId,
+    template_version: templateVersion,
+    result_classifications: resultClassifications,
     name,
     trigger_event: triggerEvent,
     start_step_id: startStepId,
@@ -223,8 +307,15 @@ class PostCallWorkflowDefinitionService {
     if (!this.db || typeof this.db.createPostCallWorkflowDefinitionDraft !== "function") {
       fail("Workflow definition persistence is not available", "service_unavailable");
     }
+    if (typeof this.db.getLatestPostCallWorkflowDefinition === "function") {
+      const latest = await this.db.getLatestPostCallWorkflowDefinition(definition.workflow_id);
+      if (latest && String(latest.business_id || "") !== String(definition.business_id || "")) {
+        fail("Workflow business scope cannot change between immutable versions", "conflict");
+      }
+    }
     const row = await this.db.createPostCallWorkflowDefinitionDraft({
       workflow_id: definition.workflow_id,
+      business_id: definition.business_id,
       name: definition.name,
       trigger_event: definition.trigger_event,
       schema_version: definition.schema_version,
@@ -264,5 +355,8 @@ class PostCallWorkflowDefinitionService {
 module.exports = {
   PostCallWorkflowDefinitionService,
   WORKFLOW_SCHEMA_VERSION,
+  SUPPORTED_TRIGGER_EVENTS,
+  BUSINESS_SCOPED_TRIGGER_EVENTS,
+  RESULT_CLASSIFICATION_LABELS,
   normalizeWorkflowDefinition,
 };

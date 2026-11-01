@@ -15,6 +15,79 @@ function createOutboundCallHandler(ctx = {}) {
       const requestedProvider = String(
         req.body?.provider || req.body?.preferred_provider || req.body?.call_provider || "",
       ).trim().toLowerCase();
+      if (requestedProvider === "cartesia") {
+        const number = String(req.body?.number || "").trim();
+        const businessId = String(req.body?.business_id || "").trim();
+        const agentId = String(req.body?.agent_id || "").trim();
+        const fromNumberId = String(req.body?.from_number_id || "").trim();
+        const idempotencyKey = String(
+          req.body?.idempotency_key || req.headers?.["idempotency-key"] || req.headers?.["Idempotency-Key"] || "",
+        ).trim();
+        const approvalToken = String(req.body?.approval_token || "").trim();
+        const validationError = (status, code, message) => sendApiError(
+          res, status, code, message, req.requestId || null,
+        );
+        if (!businessId || businessId.length > 120 || !agentId || agentId.length > 200 ||
+            !fromNumberId || fromNumberId.length > 200) {
+          return validationError(400, "cartesia_call_configuration_required", "business_id, agent_id, and from_number_id are required for Cartesia calls");
+        }
+        if (!/^\+[1-9]\d{7,14}$/.test(number)) {
+          return validationError(400, "cartesia_destination_invalid", "Destination number must use E.164 format");
+        }
+        if (!/^[A-Za-z0-9._:-]{8,180}$/.test(idempotencyKey)) {
+          return validationError(400, "cartesia_idempotency_key_required", "A valid idempotency key is required for Cartesia calls");
+        }
+        if (!approvalToken || approvalToken.length > 4096) {
+          return validationError(403, "cartesia_approval_required", "A valid server-issued approval is required before a Cartesia call");
+        }
+        try {
+          if (typeof ctx.placeCartesiaOutboundCall !== "function") {
+            const error = new Error("Cartesia outbound calling is unavailable");
+            error.code = "cartesia_not_configured";
+            throw error;
+          }
+          const result = await ctx.placeCartesiaOutboundCall({
+            businessId,
+            actorId: req.callEActorId,
+            destination: number,
+            agentId,
+            fromNumberId,
+            idempotencyKey,
+            ...(req.body?.dynamic_variables !== undefined ? { dynamicVariables: req.body.dynamic_variables } : {}),
+            approvalToken,
+          });
+          const providerCallId = String(result?.providerCallId || "").trim();
+          if (!providerCallId) {
+            const error = new Error("Cartesia did not return a call ID");
+            error.code = "cartesia_call_outcome_unknown";
+            throw error;
+          }
+          return res.json({
+            success: true,
+            call_sid: providerCallId,
+            provider_call_id: providerCallId,
+            to: number,
+            status: result.status || "queued",
+            deduped: result.idempotentReplay === true,
+            provider: "cartesia",
+          });
+        } catch (error) {
+          const code = String(error?.code || "cartesia_call_failed");
+          const status = Number(error?.status) || (
+            code === "cartesia_not_configured" || code === "cartesia_approval_unavailable" || code === "cartesia_call_dependencies_missing" ? 503
+              : code.includes("approval") || code.includes("operator") || code.includes("consent") || code.includes("opted_out") ? 403
+                : code.includes("invalid") || code.includes("required") ? 400
+                  : code.includes("conflict") || code.includes("unresolved") || code.includes("previous") ? 409
+                    : 502
+          );
+          console.error("cartesia_outbound_call_route_error", { code, status });
+          return sendApiError(
+            res, status, code,
+            status === 502 ? "Cartesia outbound call outcome is unknown; reconcile before retrying" : error.message,
+            req.requestId || null,
+          );
+        }
+      }
       if (requestedProvider === "vapi") {
         const number = String(req.body?.number || "").trim();
         const templateId = Number(req.body?.script_id);
@@ -48,6 +121,7 @@ function createOutboundCallHandler(ctx = {}) {
             templateId,
             ...(req.body?.script_version !== undefined ? { templateVersion: req.body.script_version } : {}),
             mappingId, phoneNumberId, number, idempotencyKey,
+            actorId: req.callEActorId,
           });
           const providerCallId = String(result?.providerCallId || "").trim();
           if (!providerCallId) {
@@ -73,7 +147,8 @@ function createOutboundCallHandler(ctx = {}) {
           });
         } catch (error) {
           const code = String(error?.code || "vapi_call_failed");
-          const status = code === "vapi_not_configured" || code === "vapi_call_dependencies_missing" ? 503
+          const status = code.startsWith("outbound_") ? Number(error?.status) || 409
+            : code === "vapi_not_configured" || code === "vapi_call_dependencies_missing" ? 503
             : ["vapi_mapping_required", "vapi_phone_number_id_required", "vapi_destination_invalid", "vapi_idempotency_key_required"].includes(code) ? 400
               : ["vapi_mapping_not_found", "vapi_mapping_not_ready", "vapi_mapping_stale", "vapi_template_unsupported", "vapi_mapping_template_mismatch", "vapi_idempotency_conflict", "vapi_previous_call_failed", "vapi_call_outcome_unresolved"].includes(code) ? 409
                 : 502;
@@ -139,7 +214,7 @@ function createOutboundCallHandler(ctx = {}) {
           req.headers?.["idempotency-key"] ||
           req.headers?.["Idempotency-Key"] ||
           null,
-        user_chat_id: req.body?.user_chat_id,
+        user_chat_id: req.callEActorId,
         customer_name: resolvedCustomerName,
         business_id: req.body?.business_id,
         script: req.body?.script,
@@ -216,6 +291,7 @@ function createOutboundCallHandler(ctx = {}) {
       const idempotencyConflict = error?.code === "idempotency_conflict";
       const idempotencyInProgress = error?.code === "idempotency_in_progress";
       const providerOperationUnsupported = error?.code === "provider_operation_unsupported";
+      const outboundSafetyBlock = String(error?.code || "").startsWith("outbound_");
       const isValidation =
         paymentRequiresScript ||
         paymentPolicyRequiresScript ||
@@ -223,7 +299,9 @@ function createOutboundCallHandler(ctx = {}) {
         paymentValidationError ||
         message.includes("Missing required fields") ||
         message.includes("Invalid phone number format");
-      const status = idempotencyConflict || idempotencyInProgress || providerOperationUnsupported
+      const status = outboundSafetyBlock
+        ? Number(error?.status) || 409
+        : idempotencyConflict || idempotencyInProgress || providerOperationUnsupported
         ? 409
         : outboundPersistenceFailed
           ? 503
@@ -247,6 +325,8 @@ function createOutboundCallHandler(ctx = {}) {
         code = "outbound_persistence_failed";
       } else if (providerOperationUnsupported) {
         code = "provider_operation_unsupported";
+      } else if (outboundSafetyBlock) {
+        code = String(error.code);
       } else if (isValidation) {
         code = "validation_error";
       }
@@ -268,6 +348,8 @@ function createOutboundCallHandler(ctx = {}) {
             ? "Call provider accepted the request but persistence failed; retry with the same idempotency key."
           : providerOperationUnsupported
             ? message || "The selected provider does not support this call operation."
+          : outboundSafetyBlock
+            ? message || "Outbound safety policy blocked this call."
           : "Failed to create outbound call",
         req.requestId || null,
         { details: buildErrorDetails(error) },
@@ -1858,6 +1940,12 @@ function registerCallRoutes(app, ctx = {}) {
     typeof ctx.requireOutboundAuthorization === "function"
       ? ctx.requireOutboundAuthorization
       : (_req, _res, next) => next();
+  const requireCallEActorAssertion = typeof ctx.requireCallEActorAssertion === "function"
+    ? ctx.requireCallEActorAssertion
+    : (_req, _res, next) => next();
+  const cartesiaApprovalLimiter = typeof ctx.cartesiaApprovalLimiter === "function"
+    ? ctx.cartesiaApprovalLimiter
+    : (_req, _res, next) => next();
   const handleOutboundCall = createOutboundCallHandler(ctx);
   const handleGetCallDetails = createGetCallDetailsHandler(ctx);
   const handleGetTranscriptAudio = createGetTranscriptAudioHandler(ctx);
@@ -1879,8 +1967,324 @@ function registerCallRoutes(app, ctx = {}) {
   app.post(
     "/outbound-call",
     requireOutboundAuthorization,
+    requireCallEActorAssertion,
     handleOutboundCall,
   );
+  app.post("/api/cartesia/call-approval", cartesiaApprovalLimiter, requireOutboundAuthorization, requireCallEActorAssertion, async (req, res) => {
+    try {
+      if (typeof ctx.createCartesiaCallApproval !== "function") {
+        return sendRouteError(ctx, req, res, 503, "cartesia_not_configured", "Cartesia outbound calling is unavailable");
+      }
+      const result = await ctx.createCartesiaCallApproval({
+        ...(req.body || {}),
+        actorId: req.callEActorId,
+      });
+      return res.json({ success: true, approval_token: result.approvalToken, request_fingerprint: result.requestFingerprint, expires_at: result.expiresAt });
+    } catch (error) {
+      const code = String(error?.code || "cartesia_approval_failed");
+      const status = Number(error?.status) || (
+        code === "cartesia_not_configured" || code === "cartesia_approval_unavailable" ? 503
+          : code.includes("operator") ? 403
+            : code.includes("invalid") || code.includes("required") ? 400
+              : 502
+      );
+      console.error("cartesia_call_approval_route_error", { code, status });
+      return sendRouteError(ctx, req, res, status, code, status === 502 ? "Cartesia call approval could not be created" : error.message);
+    }
+  });
+  app.get("/api/cartesia/agents", cartesiaApprovalLimiter, requireOutboundAuthorization, requireCallEActorAssertion, async (req, res) => {
+    try {
+      if (typeof ctx.isCartesiaAdminActor !== "function" || !(await ctx.isCartesiaAdminActor(req.callEActorId))) {
+        return sendRouteError(ctx, req, res, 403, "cartesia_admin_required", "Cartesia agent inventory is restricted to administrators");
+      }
+      if (typeof ctx.listCartesiaAgents !== "function") {
+        return sendRouteError(ctx, req, res, 503, "cartesia_not_configured", "Cartesia agent inventory is unavailable");
+      }
+      const agents = await ctx.listCartesiaAgents();
+      return res.json({ success: true, agents });
+    } catch (error) {
+      const code = String(error?.code || "cartesia_agent_list_failed");
+      const status = Number(error?.status) || (
+        code.includes("not_configured") ? 503
+          : code.includes("invalid") ? 502
+            : 502
+      );
+      console.error("cartesia_agent_list_error", { code, status });
+      return sendRouteError(ctx, req, res, status, code, "Cartesia agent inventory could not be loaded");
+    }
+  });
+  app.get("/api/cartesia/agents/:agentId/health", cartesiaApprovalLimiter, requireOutboundAuthorization, requireCallEActorAssertion, async (req, res) => {
+    try {
+      if (typeof ctx.isCartesiaAdminActor !== "function" || !(await ctx.isCartesiaAdminActor(req.callEActorId))) {
+        return sendRouteError(ctx, req, res, 403, "cartesia_admin_required", "Cartesia agent health is restricted to administrators");
+      }
+      if (typeof ctx.getCartesiaAgentDeploymentHealth !== "function") {
+        return sendRouteError(ctx, req, res, 503, "cartesia_not_configured", "Cartesia agent health is unavailable");
+      }
+      const health = await ctx.getCartesiaAgentDeploymentHealth({ agent_id: req.params?.agentId, actor_id: req.callEActorId });
+      return res.json({ success: true, ...health });
+    } catch (error) {
+      const code = String(error?.code || "cartesia_agent_health_failed");
+      const status = Number(error?.status) || (code.includes("invalid") ? 400 : code.includes("not_configured") ? 503 : code.includes("not_found") ? 404 : 502);
+      console.error("cartesia_agent_health_error", { code, status });
+      return sendRouteError(ctx, req, res, status, code, status >= 500 ? "Cartesia agent health could not be loaded" : error.message);
+    }
+  });
+  app.post("/api/cartesia/campaigns", cartesiaApprovalLimiter, requireOutboundAuthorization, requireCallEActorAssertion, async (req, res) => {
+    try {
+      if (typeof ctx.isCartesiaAdminActor !== "function" || !(await ctx.isCartesiaAdminActor(req.callEActorId))) {
+        return sendRouteError(ctx, req, res, 403, "cartesia_admin_required", "Cartesia campaigns are restricted to administrators");
+      }
+      if (typeof ctx.createCartesiaCampaignDraft !== "function") {
+        return sendRouteError(ctx, req, res, 503, "cartesia_campaign_unavailable", "Cartesia campaign planning is unavailable");
+      }
+      const result = await ctx.createCartesiaCampaignDraft({ ...(req.body || {}), actor_id: req.callEActorId });
+      return res.status(201).json({ success: true, ...result });
+    } catch (error) {
+      const code = String(error?.code || "cartesia_campaign_draft_failed");
+      const status = Number(error?.status) || (code.includes("operator") ? 403 : code.includes("invalid") || code.includes("required") ? 400 : code.includes("unavailable") ? 503 : 502);
+      console.error("cartesia_campaign_draft_error", { code, status });
+      return sendRouteError(ctx, req, res, status, code, status >= 500 ? "Cartesia campaign draft could not be created" : error.message);
+    }
+  });
+  app.get("/api/cartesia/campaigns/:campaignId", cartesiaApprovalLimiter, requireOutboundAuthorization, requireCallEActorAssertion, async (req, res) => {
+    try {
+      if (typeof ctx.isCartesiaAdminActor !== "function" || !(await ctx.isCartesiaAdminActor(req.callEActorId))) {
+        return sendRouteError(ctx, req, res, 403, "cartesia_admin_required", "Cartesia campaigns are restricted to administrators");
+      }
+      if (typeof ctx.getCartesiaCampaign !== "function") {
+        return sendRouteError(ctx, req, res, 503, "cartesia_campaign_unavailable", "Cartesia campaign status is unavailable");
+      }
+      const result = await ctx.getCartesiaCampaign({ campaign_id: req.params?.campaignId, business_id: req.query?.business_id, actor_id: req.callEActorId });
+      return res.json({ success: true, ...result });
+    } catch (error) {
+      const code = String(error?.code || "cartesia_campaign_status_failed");
+      const status = Number(error?.status) || (code.includes("not_found") ? 404 : code.includes("operator") ? 403 : code.includes("invalid") || code.includes("required") ? 400 : 502);
+      console.error("cartesia_campaign_status_error", { code, status });
+      return sendRouteError(ctx, req, res, status, code, status >= 500 ? "Cartesia campaign status could not be loaded" : error.message);
+    }
+  });
+  app.post("/api/cartesia/campaigns/:campaignId/reconcile", cartesiaApprovalLimiter, requireOutboundAuthorization, requireCallEActorAssertion, async (req, res) => {
+    try {
+      if (typeof ctx.isCartesiaAdminActor !== "function" || !(await ctx.isCartesiaAdminActor(req.callEActorId))) return sendRouteError(ctx, req, res, 403, "cartesia_admin_required", "Cartesia campaigns are restricted to administrators");
+      if (typeof ctx.reconcileCartesiaCampaign !== "function") return sendRouteError(ctx, req, res, 503, "cartesia_campaign_unavailable", "Cartesia batch reconciliation is unavailable");
+      const result = await ctx.reconcileCartesiaCampaign({ campaign_id: req.params?.campaignId, business_id: req.body?.business_id, actor_id: req.callEActorId });
+      return res.json({ success: true, ...result });
+    } catch (error) {
+      const code = String(error?.code || "cartesia_campaign_reconcile_failed");
+      const status = Number(error?.status) || (code.includes("not_found") ? 404 : code.includes("operator") ? 403 : code.includes("invalid") ? 400 : code.includes("unresolved") || code.includes("mismatch") ? 409 : 502);
+      console.error("cartesia_campaign_reconcile_error", { code, status });
+      return sendRouteError(ctx, req, res, status, code, status >= 500 ? "Cartesia batch reconciliation could not be confirmed" : error.message);
+    }
+  });
+  app.post("/api/cartesia/campaigns/:campaignId/cancel", cartesiaApprovalLimiter, requireOutboundAuthorization, requireCallEActorAssertion, async (req, res) => {
+    try {
+      if (typeof ctx.isCartesiaAdminActor !== "function" || !(await ctx.isCartesiaAdminActor(req.callEActorId))) return sendRouteError(ctx, req, res, 403, "cartesia_admin_required", "Cartesia campaigns are restricted to administrators");
+      if (typeof ctx.cancelCartesiaCampaignBatch !== "function") return sendRouteError(ctx, req, res, 503, "cartesia_campaign_unavailable", "Cartesia batch cancellation is unavailable");
+      const result = await ctx.cancelCartesiaCampaignBatch({ ...req.body, campaign_id: req.params?.campaignId, actor_id: req.callEActorId });
+      return res.json({ success: true, campaign: result });
+    } catch (error) {
+      const code = String(error?.code || "cartesia_campaign_cancel_failed");
+      const status = Number(error?.status) || (code.includes("not_found") ? 404 : code.includes("operator") ? 403 : code.includes("invalid") || code.includes("confirmation") ? 400 : code.includes("conflict") || code.includes("mismatch") || code.includes("not_cancellable") ? 409 : 502);
+      console.error("cartesia_campaign_cancel_error", { code, status });
+      return sendRouteError(ctx, req, res, status, code, status >= 500 ? "Cartesia batch cancellation could not be confirmed" : error.message);
+    }
+  });
+  app.post("/api/cartesia/campaigns/:campaignId/retry", cartesiaApprovalLimiter, requireOutboundAuthorization, requireCallEActorAssertion, async (req, res) => {
+    try {
+      if (typeof ctx.isCartesiaAdminActor !== "function" || !(await ctx.isCartesiaAdminActor(req.callEActorId))) return sendRouteError(ctx, req, res, 403, "cartesia_admin_required", "Cartesia campaigns are restricted to administrators");
+      if (typeof ctx.retryCartesiaCampaignBatch !== "function") return sendRouteError(ctx, req, res, 503, "cartesia_campaign_unavailable", "Cartesia batch retry is unavailable");
+      const result = await ctx.retryCartesiaCampaignBatch({ ...req.body, campaign_id: req.params?.campaignId, actor_id: req.callEActorId });
+      return res.json({ success: true, ...result });
+    } catch (error) {
+      const code = String(error?.code || "cartesia_campaign_retry_failed");
+      const status = Number(error?.status) || (code.includes("not_found") ? 404 : code.includes("operator") ? 403 : code.includes("invalid") || code.includes("confirmation") ? 400 : code.includes("conflict") || code.includes("blocked") || code.includes("unknown") || code.includes("already") || code.includes("not_ready") || code.includes("empty") || code.includes("limit") ? 409 : 502);
+      console.error("cartesia_campaign_retry_error", { code, status });
+      return sendRouteError(ctx, req, res, status, code, status >= 500 ? "Cartesia retry could not be confirmed" : error.message);
+    }
+  });
+  app.post("/api/cartesia/campaigns/:campaignId/submit", cartesiaApprovalLimiter, requireOutboundAuthorization, requireCallEActorAssertion, async (req, res) => {
+    try {
+      if (typeof ctx.isCartesiaAdminActor !== "function" || !(await ctx.isCartesiaAdminActor(req.callEActorId))) {
+        return sendRouteError(ctx, req, res, 403, "cartesia_admin_required", "Cartesia campaigns are restricted to administrators");
+      }
+      if (typeof ctx.submitCartesiaCampaign !== "function") {
+        return sendRouteError(ctx, req, res, 503, "cartesia_campaign_unavailable", "Cartesia campaign submission is unavailable");
+      }
+      const result = await ctx.submitCartesiaCampaign({
+        ...(req.body || {}), campaign_id: req.params?.campaignId, actor_id: req.callEActorId,
+      });
+      return res.json({ success: true, ...result });
+    } catch (error) {
+      const code = String(error?.code || "cartesia_campaign_submit_failed");
+      const status = Number(error?.status) || (code.includes("not_found") ? 404 : code.includes("operator") ? 403 : code.includes("invalid") || code.includes("required") ? 400 : code.includes("conflict") || code.includes("blocked") || code.includes("unresolved") ? 409 : 502);
+      console.error("cartesia_campaign_submit_error", { code, status });
+      return sendRouteError(ctx, req, res, status, code, status >= 500 ? "Cartesia campaign submission could not be confirmed" : error.message);
+    }
+  });
+  app.get("/api/cartesia/calls", cartesiaApprovalLimiter, requireOutboundAuthorization, requireCallEActorAssertion, async (req, res) => {
+    try {
+      if (typeof ctx.isCartesiaAdminActor !== "function" || !(await ctx.isCartesiaAdminActor(req.callEActorId))) {
+        return sendRouteError(ctx, req, res, 403, "cartesia_admin_required", "Cartesia call operations are restricted to administrators");
+      }
+      if (typeof ctx.listCartesiaCalls !== "function") {
+        return sendRouteError(ctx, req, res, 503, "cartesia_not_configured", "Cartesia call history is unavailable");
+      }
+      const result = await ctx.listCartesiaCalls({
+        agentId: String(req.query?.agent_id || "").trim(),
+        businessId: String(req.query?.business_id || "").trim(),
+        actorId: req.callEActorId,
+        startTimeGte: String(req.query?.start_time_gte || "").trim(),
+        startTimeLte: String(req.query?.start_time_lte || "").trim(),
+        startingAfter: String(req.query?.starting_after || "").trim(),
+        reviewQueue: String(req.query?.review_queue || "").toLowerCase() === "true",
+        limit: req.query?.limit,
+      });
+      return res.json({ success: true, ...result });
+    } catch (error) {
+      const code = String(error?.code || "cartesia_call_list_failed");
+      const status = Number(error?.status) || (code.includes("invalid") || code.includes("scope_required") ? 400 : code.includes("operator") ? 403 : code.includes("not_configured") || code.includes("dependencies_missing") ? 503 : 502);
+      console.error("cartesia_call_list_error", { code, status });
+      return sendRouteError(ctx, req, res, status, code, status === 502 ? "Cartesia call history could not be loaded" : error.message);
+    }
+  });
+  app.get("/api/cartesia/calls/:callId", cartesiaApprovalLimiter, requireOutboundAuthorization, requireCallEActorAssertion, async (req, res) => {
+    try {
+      if (typeof ctx.isCartesiaAdminActor !== "function" || !(await ctx.isCartesiaAdminActor(req.callEActorId))) {
+        return sendRouteError(ctx, req, res, 403, "cartesia_admin_required", "Cartesia call operations are restricted to administrators");
+      }
+      if (typeof ctx.getCartesiaCall !== "function") {
+        return sendRouteError(ctx, req, res, 503, "cartesia_not_configured", "Cartesia call details are unavailable");
+      }
+      const includeTranscript = String(req.query?.include_transcript || "").toLowerCase() === "true";
+      const call = await ctx.getCartesiaCall(req.params?.callId, {
+        businessId: req.query?.business_id, actorId: req.callEActorId, includeReviewDetails: true, includeTranscript,
+      });
+      return res.json({ success: true, call });
+    } catch (error) {
+      const code = String(error?.code || "cartesia_call_lookup_failed");
+      const status = Number(error?.status) || (code.includes("not_found") ? 404 : code.includes("invalid") || code.includes("scope_required") ? 400 : code.includes("operator") ? 403 : code.includes("not_configured") || code.includes("dependencies_missing") ? 503 : 502);
+      console.error("cartesia_call_lookup_error", { code, status });
+      return sendRouteError(ctx, req, res, status, code, status === 502 ? "Cartesia call details could not be loaded" : error.message);
+    }
+  });
+  app.get("/api/cartesia/calls/:callId/audio", cartesiaApprovalLimiter, requireOutboundAuthorization, requireCallEActorAssertion, async (req, res) => {
+    try {
+      if (typeof ctx.isCartesiaAdminActor !== "function" || !(await ctx.isCartesiaAdminActor(req.callEActorId))) {
+        return sendRouteError(ctx, req, res, 403, "cartesia_admin_required", "Cartesia call recordings are restricted to administrators");
+      }
+      if (typeof ctx.getCartesiaCallAudio !== "function") return sendRouteError(ctx, req, res, 503, "cartesia_not_configured", "Cartesia call recordings are unavailable");
+      const result = await ctx.getCartesiaCallAudio(req.params?.callId, { businessId: req.query?.business_id, actorId: req.callEActorId });
+      res.set("Cache-Control", "private, no-store");
+      res.set("Content-Disposition", `attachment; filename="cartesia-call-${String(req.params?.callId).replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 120)}.wav"`);
+      return res.type(result.contentType || "audio/wav").send(result.bytes);
+    } catch (error) {
+      const code = String(error?.code || "cartesia_call_audio_failed");
+      const status = Number(error?.status) || (code.includes("not_found") ? 404 : code.includes("invalid") || code.includes("scope_required") ? 400 : code.includes("operator") ? 403 : code.includes("unavailable") ? 409 : code.includes("not_configured") || code.includes("dependencies_missing") ? 503 : 502);
+      console.error("cartesia_call_audio_error", { code, status });
+      return sendRouteError(ctx, req, res, status, code, status >= 500 ? "Cartesia call recording could not be loaded" : error.message);
+    }
+  });
+  app.post("/api/cartesia/calls/:callId/redact", cartesiaApprovalLimiter, requireOutboundAuthorization, requireCallEActorAssertion, async (req, res) => {
+    const callId = String(req.params?.callId || "");
+    if (String(req.body?.confirmation_phrase || "") !== `DELETE CARTESIA CALL DATA ${callId} CONSENT WITHDRAWN`) {
+      return sendRouteError(ctx, req, res, 400, "cartesia_call_redaction_confirmation_required", "An exact call-specific data-deletion confirmation is required");
+    }
+    try {
+      if (typeof ctx.isCartesiaAdminActor !== "function" || !(await ctx.isCartesiaAdminActor(req.callEActorId))) {
+        return sendRouteError(ctx, req, res, 403, "cartesia_admin_required", "Cartesia call-data deletion is restricted to administrators");
+      }
+      if (typeof ctx.redactCartesiaCallData !== "function") return sendRouteError(ctx, req, res, 503, "cartesia_not_configured", "Cartesia call-data deletion is unavailable");
+      const result = await ctx.redactCartesiaCallData(callId, { businessId: req.body?.business_id, actorId: req.callEActorId });
+      return res.json({ success: true, ...result });
+    } catch (error) {
+      const code = String(error?.code || "cartesia_call_redaction_failed");
+      const status = Number(error?.status) || (code.includes("not_found") ? 404 : code.includes("invalid") || code.includes("scope_required") ? 400 : code.includes("operator") ? 403 : code.includes("unavailable") ? 409 : code.includes("not_configured") || code.includes("dependencies_missing") ? 503 : 502);
+      console.error("cartesia_call_redaction_error", { code, status });
+      return sendRouteError(ctx, req, res, status, code, status >= 500 ? "Cartesia call data could not be deleted" : error.message);
+    }
+  });
+  app.get("/api/cartesia/review-rules", cartesiaApprovalLimiter, requireOutboundAuthorization, requireCallEActorAssertion, async (req, res) => {
+    try {
+      if (typeof ctx.isCartesiaAdminActor !== "function" || !(await ctx.isCartesiaAdminActor(req.callEActorId))) {
+        return sendRouteError(ctx, req, res, 403, "cartesia_admin_required", "Cartesia call review rules are restricted to administrators");
+      }
+      if (typeof ctx.getCartesiaCallReviewRules !== "function") return sendRouteError(ctx, req, res, 503, "cartesia_call_dependencies_missing", "Cartesia call review rules are unavailable");
+      return res.json({ success: true, rules: await ctx.getCartesiaCallReviewRules({ businessId: req.query?.business_id, actorId: req.callEActorId }) });
+    } catch (error) {
+      const code = String(error?.code || "cartesia_review_rules_load_failed");
+      console.error("cartesia_review_rules_load_error", { code });
+      return sendRouteError(ctx, req, res, Number(error?.status) || 503, code, "Cartesia call review rules could not be loaded");
+    }
+  });
+  app.post("/api/cartesia/review-rules", cartesiaApprovalLimiter, requireOutboundAuthorization, requireCallEActorAssertion, async (req, res) => {
+    try {
+      if (typeof ctx.isCartesiaAdminActor !== "function" || !(await ctx.isCartesiaAdminActor(req.callEActorId))) {
+        return sendRouteError(ctx, req, res, 403, "cartesia_admin_required", "Cartesia call review rules are restricted to administrators");
+      }
+      if (typeof ctx.saveCartesiaCallReviewRules !== "function") return sendRouteError(ctx, req, res, 503, "cartesia_call_dependencies_missing", "Cartesia call review rules are unavailable");
+      const rules = await ctx.saveCartesiaCallReviewRules({ rules: req.body?.rules, businessId: req.body?.business_id, actorId: req.callEActorId });
+      return res.json({ success: true, rules });
+    } catch (error) {
+      const code = String(error?.code || "cartesia_review_rules_save_failed");
+      const status = Number(error?.status) || (code.includes("invalid") ? 400 : 503);
+      console.error("cartesia_review_rules_save_error", { code, status });
+      return sendRouteError(ctx, req, res, status, code, status >= 500 ? "Cartesia call review rules could not be saved" : error.message);
+    }
+  });
+  app.post("/api/cartesia/calls/:callId/cancel", cartesiaApprovalLimiter, requireOutboundAuthorization, requireCallEActorAssertion, async (req, res) => {
+    try {
+      if (typeof ctx.isCartesiaAdminActor !== "function" || !(await ctx.isCartesiaAdminActor(req.callEActorId))) {
+        return sendRouteError(ctx, req, res, 403, "cartesia_admin_required", "Cartesia call operations are restricted to administrators");
+      }
+      const callId = String(req.params?.callId || "").trim();
+      if (!/^[A-Za-z0-9._:-]{1,200}$/.test(callId) || String(req.body?.confirmation_phrase || "") !== `CANCEL CARTESIA CALL ${callId}`) {
+        return sendRouteError(ctx, req, res, 400, "cartesia_call_cancel_confirmation_required", "An exact call-specific cancellation confirmation is required");
+      }
+      if (typeof ctx.cancelCartesiaCall !== "function") {
+        return sendRouteError(ctx, req, res, 503, "cartesia_not_configured", "Cartesia call cancellation is unavailable");
+      }
+      const result = await ctx.cancelCartesiaCall(callId, { businessId: req.body?.business_id, actorId: req.callEActorId });
+      return res.json({ success: true, ...result });
+    } catch (error) {
+      const code = String(error?.code || "cartesia_call_cancel_failed");
+      const status = Number(error?.status) || (code.includes("not_found") ? 404 : code.includes("invalid") || code.includes("confirmation") || code.includes("scope_required") ? 400 : code.includes("admin") || code.includes("operator") ? 403 : code.includes("not_cancellable") ? 409 : code.includes("not_configured") || code.includes("dependencies_missing") ? 503 : 502);
+      console.error("cartesia_call_cancel_error", { code, status });
+      return sendRouteError(ctx, req, res, status, code, status === 502 ? "Cartesia cancellation could not be confirmed; refresh status before retrying" : error.message);
+    }
+  });
+  app.post("/api/cartesia/call-reconcile", cartesiaApprovalLimiter, requireOutboundAuthorization, requireCallEActorAssertion, async (req, res) => {
+    try {
+      if (typeof ctx.reconcileCartesiaOutboundCall !== "function") {
+        return sendRouteError(ctx, req, res, 503, "cartesia_not_configured", "Cartesia call lookup is unavailable");
+      }
+      const result = await ctx.reconcileCartesiaOutboundCall({
+        ...(req.body || {}),
+        actorId: req.callEActorId,
+      });
+      const call = result?.call ? {
+        call_id: result.call.callId,
+        agent_id: result.call.agentId,
+        status: result.call.status,
+        start_time: result.call.startTime,
+        end_time: result.call.endTime,
+        end_reason: result.call.endReason,
+      } : null;
+      return res.json({ success: true, outcome: result?.outcome || "unresolved", reason: result?.reason || null, status: result?.status || "unknown", call });
+    } catch (error) {
+      const code = String(error?.code || "cartesia_call_reconciliation_failed");
+      const status = Number(error?.status) || (
+        code.includes("not_found") ? 404
+          : code.includes("operator") ? 403
+            : code.includes("invalid") || code.includes("required") ? 400
+              : code.includes("conflict") || code.includes("mismatch") ? 409
+                : code.includes("not_configured") || code.includes("dependencies_missing") ? 503
+                  : 502
+      );
+      console.error("cartesia_call_reconciliation_error", { code, status });
+      return sendRouteError(ctx, req, res, status, code, status === 502 ? "Cartesia call lookup failed" : error?.message || "Cartesia call lookup failed");
+    }
+  });
   app.get("/api/calls/:callSid", requireOutboundAuthorization, handleGetCallDetails);
   app.get(
     "/api/calls/:callSid/transcript/audio",

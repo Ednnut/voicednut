@@ -1,5 +1,13 @@
 const assert = require("node:assert/strict");
-const { VapiOutboundCallService } = require("../services/vapiOutboundCallService");
+const { VapiOutboundCallService: VapiOutboundCallServiceImpl } = require("../services/vapiOutboundCallService");
+const testOutboundSafety = {
+  async reserveDispatch() { return { reservationKey: 'test-reservation' }; },
+  async completeDispatch() { return true; },
+  async authorizeActor() { return { businessId: 'business_001', actorId: '123456789' }; },
+};
+class VapiOutboundCallService extends VapiOutboundCallServiceImpl {
+  constructor(options = {}) { super({ ...options, outboundSafety: options.outboundSafety || testOutboundSafety }); }
+}
 
 describe("VapiOutboundCallService", () => {
   const mapping = {
@@ -213,5 +221,48 @@ describe("VapiOutboundCallService", () => {
     await service.createOutboundCall({ mappingId: 12, idempotencyKey: "conflict-key-0001", phoneNumberId: "phone_789", number: "+14155550123" });
     await assert.rejects(service.createOutboundCall({ mappingId: 12, idempotencyKey: "conflict-key-0001", phoneNumberId: "phone_789", number: "+14155550124" }), (error) => error.code === "vapi_idempotency_conflict");
     assert.equal(providerCalls, 1);
+  });
+
+  it("authorizes the business operator before returning an idempotent replay", async () => {
+    const db = createIdempotencyDb();
+    let providerCalls = 0;
+    const safety = {
+      async reserveDispatch() { return { reservationKey: 'vapi-replay' }; },
+      async completeDispatch() { return true; },
+      async authorizeActor({ actor_id }) {
+        if (actor_id !== '7001') throw Object.assign(new Error('forbidden'), { code: 'outbound_business_operator_required', status: 403 });
+      },
+    };
+    const service = new VapiOutboundCallService({
+      db, outboundSafety: safety,
+      client: { isConfigured: () => true, createCall: async () => { providerCalls += 1; return { id: 'call_private' }; } },
+      getMapping: async () => mapping,
+      getTemplate: async () => ({ id: 5, version: 3, business_id: 'business_001' }),
+    });
+    const input = { mappingId: 12, idempotencyKey: 'private-replay-01', phoneNumberId: 'phone_789', number: '+14155550123', actorId: '7001' };
+    await service.createOutboundCall(input);
+    await assert.rejects(service.createOutboundCall({ ...input, actorId: '7002' }), (error) => error.code === 'outbound_business_operator_required');
+    assert.equal(providerCalls, 1);
+  });
+
+  it("releases its own contact reservation when durable idempotency reservation fails", async () => {
+    const db = createIdempotencyDb();
+    db.reserveOutboundCallIdempotency = async () => { throw new Error('sqlite unavailable'); };
+    let released = 0;
+    const service = new VapiOutboundCallService({
+      db,
+      outboundSafety: {
+        async reserveDispatch() { return { reservationKey: 'vapi-owned', idempotentReplay: false }; },
+        async completeDispatch(_reservation, status) { if (status === 'released') released += 1; return true; },
+        async authorizeActor() {},
+      },
+      client: { isConfigured: () => true, createCall: async () => ({ id: 'must_not_submit' }) },
+      getMapping: async () => mapping,
+      getTemplate: async () => ({ id: 5, version: 3, business_id: 'business_001' }),
+    });
+    await assert.rejects(service.createOutboundCall({
+      mappingId: 12, idempotencyKey: 'reservation-fail-01', phoneNumberId: 'phone_789', number: '+14155550123', actorId: '7001',
+    }), /sqlite unavailable/);
+    assert.equal(released, 1);
   });
 });

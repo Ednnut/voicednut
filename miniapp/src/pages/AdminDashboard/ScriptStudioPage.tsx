@@ -12,6 +12,7 @@ import {
 import { Link } from '@/components/Link/Link.tsx';
 import { AdminPageIntro } from '@/components/admin-dashboard/AdminPageIntro';
 import { DashboardWorkflowContractCard } from '@/components/admin-dashboard/DashboardWorkflowContractCard';
+import { CallECampaignRehearsalPanel } from './CallECampaignRehearsalPanel';
 import { useDashboardHaptic } from '@/hooks/admin-dashboard/useDashboardHaptic';
 import {
   UiActionBar,
@@ -276,6 +277,23 @@ export function ScriptStudioPage({ visible, vm, initialLane = 'call' }: ScriptSt
       setStudioBusy('');
     }
   };
+
+  const previewCallECampaignRecipient = async (
+    phone: string,
+    resultSchema: unknown,
+  ): Promise<Record<string, unknown>> => {
+    const data = asRecord(await invokeAction(DASHBOARD_ACTION_CONTRACTS.CALLSCRIPT_CALLE_PREVIEW, {
+      id: selectedCallScriptId,
+      phone,
+      result_schema: resultSchema,
+    }));
+    return asRecord(data.preview);
+  };
+
+  const runCallECampaignAction = async (
+    action: string,
+    payload: Record<string, unknown>,
+  ): Promise<Record<string, unknown>> => asRecord(await invokeAction(action, payload));
 
   const loadCallScriptVersions = async (): Promise<void> => {
     if (selectedCallScriptId <= 0) return;
@@ -1317,6 +1335,14 @@ export function ScriptStudioPage({ visible, vm, initialLane = 'call' }: ScriptSt
                 ) : null}
                 {callEPreview ? <pre aria-live="polite">{JSON.stringify(callEPreview, null, 2)}</pre> : null}
               </UiDisclosure>
+              <CallECampaignRehearsalPanel
+                templateId={selectedCallScriptId}
+                templateName={toText(selectedCallScript?.name, `Template ${selectedCallScriptId}`)}
+                businessId={toText(selectedCallScript?.business_id, '')}
+                resultSchemaJson={callEResultSchemaInput}
+                onPreview={previewCallECampaignRecipient}
+                onCampaignAction={runCallECampaignAction}
+              />
               <UiDisclosure
                 title="CALL-E call status"
                 subtitle="Refresh lifecycle and event metadata for a locally recorded CALL-E call. Queued calls can be canceled before provider submission; this cannot hang up an active call."

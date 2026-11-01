@@ -69,6 +69,10 @@ const AuditIncidentsPage = lazy(async () => {
   const mod = await import('@/pages/AdminDashboard/AuditIncidentsPage');
   return { default: mod.AuditIncidentsPage };
 });
+const PostCallWorkflowPage = lazy(async () => {
+  const mod = await import('@/pages/AdminDashboard/PostCallWorkflowPage');
+  return { default: mod.PostCallWorkflowPage };
+});
 
 const FocusedScriptsEntry: ModulePageComponent = (props) => (
   <ScriptStudioPage {...props} initialLane="sms" />
@@ -87,6 +91,7 @@ const MODULE_COMPONENTS: Record<DashboardModule, LazyExoticComponent<ModulePageC
   persona: PersonaManagerPage,
   users: UsersRolePage,
   audit: AuditIncidentsPage,
+  workflows: PostCallWorkflowPage,
 };
 
 interface DashboardFocusedModulePaneProps {
