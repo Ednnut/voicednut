@@ -2,6 +2,8 @@
 
 ## Frontend workflow
 
+- For every Mini App enhancement, default to the `miniapp-feature`, `frontend`, and `ui` skills. Keep routing lightweight: add `api-contract-change`, `security`, `performance`, `testing`, or `release` only when the change actually crosses that boundary or needs that verification.
+- Use a focused implementation loop: inspect the target page/component and its nearest reusable pattern, make the smallest change that meets the requested outcome, then run the narrowest relevant check. Avoid broad codebase surveys and unrelated test suites.
 - Preserve the existing React 18, TypeScript, Vite, Telegram UI, CSS/SCSS, routing, and data-fetching patterns. Reuse shared components; do not introduce another UI framework, component library, or styling system without a demonstrated gap and approval.
 - For meaningful UI changes, inspect responsive behavior at relevant desktop/tablet/mobile widths and check semantic labels, keyboard focus/order, form feedback, loading, empty, success, and error states. Use Playwright when a real user flow benefits from browser coverage; use only available/configured visual or accessibility tools.
 - Before editing, read applicable root instructions and check current worktree changes. Preserve API authentication, Telegram session handling, capability-gated actions, and tenant boundaries.

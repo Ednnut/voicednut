@@ -67,6 +67,69 @@ function normalizeCallEEventPage(page, expectedCallId, previous = {}) {
   });
 }
 
+const IVR_CUE_PATTERNS = Object.freeze([
+  /\b(?:press|dial|enter)\s+(?:the\s+)?(?:\d|one|two|three|four|five|six|seven|eight|nine|zero)\b/i,
+  /\bmain menu\b/i,
+  /\bif you know (?:your|the) extension\b/i,
+  /\bplease listen carefully\b/i,
+  /\bto repeat (?:these|the) options\b/i,
+  /\bfor (?:sales|billing|support|appointments?)\b.{0,80}\bpress\b/i,
+]);
+
+function evaluateCallEConversationQuality(call, resultSchema, ivrEvidence = {}) {
+  const transcript = Array.isArray(call?.transcript) ? call.transcript.slice(0, MAX_REVIEW_TRANSCRIPT_TURNS) : [];
+  let remainingCharacters = MAX_REVIEW_TRANSCRIPT_CHARACTERS;
+  let botTurns = 0;
+  let userTurns = 0;
+  let possibleIvrCueCount = 0;
+  let transcriptTurnCount = 0;
+  for (const turn of transcript) {
+    const text = typeof turn?.text === 'string' ? turn.text.slice(0, Math.min(MAX_REVIEW_TURN_CHARACTERS, remainingCharacters)) : '';
+    remainingCharacters -= text.length;
+    if (remainingCharacters <= 0) break;
+    if (!text.trim()) continue;
+    transcriptTurnCount += 1;
+    if (turn.speaker === 'bot') botTurns += 1;
+    if (turn.speaker === 'user') userTurns += 1;
+    if (IVR_CUE_PATTERNS.some((pattern) => pattern.test(text))) possibleIvrCueCount += 1;
+  }
+
+  const resultAvailable = call?.resultStatus === 'available';
+  const validation = resultAvailable ? validateCallEResult(resultSchema, call.result) : null;
+  const required = Array.isArray(resultSchema?.required) ? resultSchema.required : [];
+  const presentRequired = resultAvailable && call.result && typeof call.result === 'object' && !Array.isArray(call.result)
+    ? required.filter((name) => Object.prototype.hasOwnProperty.call(call.result, name)).length
+    : 0;
+  const resultCompleteness = resultAvailable && validation?.valid
+    ? (required.length === 0 ? 100 : Math.round((presentRequired / required.length) * 100))
+    : null;
+
+  return Object.freeze({
+    version: 'call_e_conversation_quality.v1',
+    transcript: Object.freeze({
+      turnCount: transcriptTurnCount,
+      botTurnCount: botTurns,
+      userTurnCount: userTurns,
+      shape: transcriptTurnCount === 0 ? 'no_transcript' : botTurns > 0 && userTurns > 0 ? 'two_sided' : 'one_sided',
+      truncatedForEvaluation: transcript.length < (Array.isArray(call?.transcript) ? call.transcript.length : 0) || remainingCharacters <= 0,
+    }),
+    structuredResult: Object.freeze({
+      status: String(call?.resultStatus || 'pending'),
+      schemaValid: validation ? validation.valid : null,
+      requiredFieldCount: required.length,
+      presentRequiredFieldCount: presentRequired,
+      requiredFieldCompletenessPercent: resultCompleteness,
+    }),
+    ivr: Object.freeze({
+      possibleMenuPromptDetected: possibleIvrCueCount > 0,
+      cueTurnCount: possibleIvrCueCount,
+      dtmfEventObserved: ivrEvidence.available === true ? ivrEvidence.observed === true : null,
+      dtmfEventEvidenceAvailable: ivrEvidence.available === true,
+      meaning: 'Menu prompt detection is a transcript heuristic. A DTMF event confirms keypad activity only; it does not expose the entered digit or prove successful navigation.',
+    }),
+  });
+}
+
 function createCallEReconciliationHandler(options = {}) {
   return async (req, res) => {
     const localCallId = String(req.params?.localCallId || "").trim();
@@ -92,6 +155,51 @@ function createCallEReconciliationHandler(options = {}) {
         success: false,
         code,
         error: status === 502 ? "CALL-E reconciliation failed" : error.message,
+      });
+    }
+  };
+}
+
+function createCallEOperatorReconciliationHandler(options = {}) {
+  return async (req, res) => {
+    const localCallId = String(req.params?.localCallId || '').trim();
+    const actorId = String(req.body?.actor_id || '').trim();
+    try {
+      const service = typeof options.createService === 'function' ? options.createService() : options.service;
+      if (!service || typeof service.reconcileLocalCallForOperator !== 'function') {
+        return res.status(503).json({ success: false, code: 'call_e_not_configured', error: 'CALL-E reconciliation is unavailable' });
+      }
+      const result = await service.reconcileLocalCallForOperator(localCallId, actorId);
+      return res.json({
+        success: true,
+        request_id: req.requestId || null,
+        result: {
+          localCallId: String(result.localCallId || localCallId),
+          provider: 'call_e',
+          executionStatus: result.executionStatus,
+          callOutcome: result.callOutcome ?? null,
+          resultStatus: result.resultStatus,
+          resultAvailable: result.resultAvailable === true,
+          errorCode: /^[a-z][a-z0-9_]{0,79}$/.test(String(result.errorCode || '')) ? result.errorCode : null,
+          eventCount: Array.isArray(result.events) ? result.events.length : 0,
+          eventPagesRead: Number(result.eventPagesRead) || 0,
+          eventsHaveMore: result.eventsHaveMore === true,
+          updatedAt: result.updatedAt || null,
+        },
+      });
+    } catch (error) {
+      const code = String(error?.code || 'call_e_reconciliation_failed');
+      const status = code === 'call_e_call_not_found' ? 404
+        : code === 'call_e_invalid_local_call_id' ? 400
+          : code === 'call_e_not_configured' || code === 'call_e_reconciliation_storage_unavailable' ? 503
+            : code === 'call_e_result_invalid' ? 409 : 502;
+      return res.status(status).json({
+        success: false,
+        code,
+        request_id: req.requestId || null,
+        error: status === 502 ? 'CALL-E reconciliation failed'
+          : status === 404 ? 'CALL-E call was not found in the current operator scope'
+            : error.message,
       });
     }
   };
@@ -156,6 +264,54 @@ class CallEReconciliationService {
     });
   }
 
+  async getConversationQualityForOperator(localCallId, telegramId) {
+    const localId = String(localCallId || '').trim();
+    const actorId = String(telegramId || '').trim();
+    if (!/^call_e_[0-9a-f-]{36}$/i.test(localId) || !/^\d{1,20}$/.test(actorId) ||
+        typeof this.db?.getCallEReconciliationRecord !== 'function' ||
+        typeof this.db?.getCallEBusinessOperator !== 'function') {
+      throw callEReconciliationError('call_e_call_not_found', 'CALL-E call was not found');
+    }
+    const record = await this.db.getCallEReconciliationRecord(localId);
+    const providerCallId = normalizeCallId(record?.provider_call_id);
+    const businessId = String(record?.business_id || '').trim();
+    if (!providerCallId || !businessId || !record?.result_schema) {
+      throw callEReconciliationError('call_e_call_not_found', 'CALL-E call was not found');
+    }
+    const membership = await this.db.getCallEBusinessOperator(businessId, actorId);
+    if (!OPERATOR_ROLES.has(membership?.role)) {
+      throw callEReconciliationError('call_e_call_not_found', 'CALL-E call was not found');
+    }
+    if (!this.client?.isConfigured?.() || typeof this.client.getCall !== 'function') {
+      throw callEReconciliationError('call_e_not_configured', 'CALL-E quality reads are disabled or unavailable');
+    }
+    const rawCall = this.providerRegistry
+      ? await this.providerRegistry.getCall('call_e', { providerCallId })
+      : await this.client.getCall(providerCallId);
+    const call = normalizeCallResource(rawCall, providerCallId);
+    if (call.resultStatus === 'available' && !validateCallEResult(record.result_schema, call.result).valid) {
+      throw callEReconciliationError('call_e_result_invalid', 'CALL-E returned a result that does not match the pinned local schema');
+    }
+    let ivrEvidence = { available: false, observed: null };
+    try {
+      const eventRead = await this.reconcileEventPages(providerCallId);
+      const observed = eventRead.ivrDtmfObserved === true;
+      ivrEvidence = { available: observed || eventRead.hasMore !== true, observed };
+    } catch (_) {
+      try {
+        const savedState = await this.loadState?.(providerCallId);
+        if (savedState?.ivrDtmfObserved === true) ivrEvidence = { available: true, observed: true };
+      } catch (_) {}
+    }
+    return Object.freeze({
+      localCallId: localId,
+      executionStatus: call.status,
+      callOutcome: call.callOutcome,
+      quality: evaluateCallEConversationQuality(call, record.result_schema, ivrEvidence),
+      evaluatedAt: new Date().toISOString(),
+    });
+  }
+
   async reconcileEventPages(callId, options = {}) {
     const normalizedCallId = normalizeCallId(callId);
     if (!normalizedCallId) throw callEReconciliationError("call_e_invalid_call_id", "CALL-E Call ID is invalid");
@@ -175,7 +331,10 @@ class CallEReconciliationService {
         ? await this.providerRegistry.listCallEvents("call_e", { providerCallId: normalizedCallId, cursor: requestCursor, limit })
         : await this.client.listCallEvents(normalizedCallId, { cursor: requestCursor, limit });
       const normalized = normalizeCallEEventPage(page, normalizedCallId, state);
-      state = normalized.state;
+      state = {
+        ...normalized.state,
+        ivrDtmfObserved: state.ivrDtmfObserved === true || normalized.events.some((event) => event.type === 'call.dtmf'),
+      };
       if (normalized.events.length) collected.push(...normalized.events);
       if (normalized.events.length || state.lastEventId || state.nextCursor) {
         await this.saveState(normalizedCallId, state);
@@ -189,12 +348,13 @@ class CallEReconciliationService {
       callId: normalizedCallId,
       events: Object.freeze(collected),
       state,
+      ivrDtmfObserved: state.ivrDtmfObserved === true,
       pagesRead,
       hasMore: Boolean(state.nextCursor),
     });
   }
 
-  async reconcileLocalCall(localCallId) {
+  async reconcileLocalCall(localCallId, options = {}) {
     const localId = String(localCallId || "").trim();
     if (!/^call_e_[0-9a-f-]{36}$/i.test(localId)) {
       throw callEReconciliationError("call_e_invalid_local_call_id", "VOICEDNUT call ID is invalid");
@@ -224,6 +384,14 @@ class CallEReconciliationService {
       result_status: call.resultStatus,
       error_code: call.errorCode,
     });
+    if (call.resultStatus === "available" && typeof options.onValidatedResult === "function") {
+      await options.onValidatedResult({
+        resultSchema: record.result_schema,
+        result: call.result,
+        executionStatus: call.status,
+        callOutcome: call.callOutcome,
+      });
+    }
     const events = await this.reconcileEventPages(providerCallId);
     return Object.freeze({
       localCallId: localId,
@@ -320,6 +488,47 @@ class CallEReconciliationService {
     });
   }
 
+  async getStructuredResultForOperator(localCallId, telegramId) {
+    const localId = String(localCallId || '').trim();
+    const actorId = String(telegramId || '').trim();
+    if (!/^call_e_[0-9a-f-]{36}$/i.test(localId) || !/^\d{1,20}$/.test(actorId) ||
+        typeof this.db?.getCallEReconciliationRecord !== 'function' ||
+        typeof this.db?.getCallEBusinessOperator !== 'function') {
+      throw callEReconciliationError('call_e_call_not_found', 'CALL-E call was not found');
+    }
+    const record = await this.db.getCallEReconciliationRecord(localId);
+    const providerCallId = normalizeCallId(record?.provider_call_id);
+    const businessId = String(record?.business_id || '').trim();
+    if (!providerCallId || !businessId || !record?.result_schema) {
+      throw callEReconciliationError('call_e_call_not_found', 'CALL-E call was not found');
+    }
+    const membership = await this.db.getCallEBusinessOperator(businessId, actorId);
+    if (!OPERATOR_ROLES.has(membership?.role)) {
+      throw callEReconciliationError('call_e_call_not_found', 'CALL-E call was not found');
+    }
+    if (!this.client?.isConfigured?.() || typeof this.client.getCall !== 'function') {
+      throw callEReconciliationError('call_e_not_configured', 'CALL-E result reads are disabled or unavailable');
+    }
+    const rawCall = this.providerRegistry
+      ? await this.providerRegistry.getCall('call_e', { providerCallId })
+      : await this.client.getCall(providerCallId);
+    const call = normalizeCallResource(rawCall, providerCallId);
+    if (call.resultStatus === 'available' && !validateCallEResult(record.result_schema, call.result).valid) {
+      throw callEReconciliationError('call_e_result_invalid', 'CALL-E returned a result that does not match the pinned local schema');
+    }
+    const resultAvailable = call.resultStatus === 'available';
+    const resultWithinLimit = !resultAvailable || Buffer.byteLength(JSON.stringify(call.result), 'utf8') <= MAX_REVIEW_RESULT_BYTES;
+    return Object.freeze({
+      localCallId: localId,
+      executionStatus: call.status,
+      callOutcome: call.callOutcome,
+      resultStatus: call.resultStatus,
+      resultAvailable: resultAvailable && resultWithinLimit,
+      result: resultAvailable && resultWithinLimit ? call.result : null,
+      resultOmittedForSize: resultAvailable && !resultWithinLimit,
+    });
+  }
+
   async cancelLocalCallForOperator(localCallId, telegramId, options = {}) {
     const localId = String(localCallId || "").trim();
     const actorId = String(telegramId || "").trim();
@@ -375,8 +584,10 @@ class CallEReconciliationService {
 module.exports = {
   CallEReconciliationService,
   createCallEReconciliationHandler,
+  createCallEOperatorReconciliationHandler,
   MAX_PAGES_PER_RUN,
   MAX_SEEN_EVENT_IDS,
   normalizeCallEEvent,
   normalizeCallEEventPage,
+  evaluateCallEConversationQuality,
 };

@@ -835,6 +835,7 @@ class PostCallAutomationService {
 
 module.exports = {
   PostCallAutomationService,
+  buildContext,
   normalizeEvent,
   matchesConditionSpec,
 };

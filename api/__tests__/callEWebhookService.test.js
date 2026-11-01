@@ -37,26 +37,53 @@ describe("CALL-E terminal webhook", () => {
 
   it("reconciles through the authenticated client, stores only receipt identifiers, then acknowledges", async () => {
     const records = [];
+    const workflowEvents = [];
     let reconciledLocalId;
     const handler = createCallEWebhookHandler({
       db: {
         async getCallEWebhookReceipt() { return null; },
         async getCallEReconciliationRecordByProviderId(id) {
           assert.equal(id, "call_test_123");
-          return { local_call_id: "call_e_123e4567-e89b-12d3-a456-426614174000" };
+          return {
+            local_call_id: "call_e_123e4567-e89b-12d3-a456-426614174000",
+            business_id: "biz-42",
+            template_id: 12,
+            template_version: 3,
+          };
         },
         async recordCallEWebhookReceipt(receipt) { records.push(receipt); },
       },
-      service: { async reconcileLocalCall(localId) {
+      service: { async reconcileLocalCall(localId, options) {
         reconciledLocalId = localId;
-        return { resultStatus: "available" };
+        await options.onValidatedResult({
+          resultSchema: { type: "object", additionalProperties: false, required: ["disposition"], properties: { disposition: { type: "string", enum: ["yes", "no"] } } },
+          result: { disposition: "yes" },
+          executionStatus: "completed",
+          callOutcome: "answered",
+        });
+        return { resultStatus: "available", executionStatus: "completed", callOutcome: "answered" };
       } },
+      getWorkflowService: () => ({ async triggerCallEResultReady(payload, resultSchema, result) { workflowEvents.push({ payload, resultSchema, result }); } }),
     });
     const res = responseRecorder();
     await handler({ headers: { "call-e-event-id": "evt_terminal_01" }, body: event() }, res);
     assert.equal(res.statusCode, 204);
     assert.equal(res.ended, true);
     assert.equal(reconciledLocalId, "call_e_123e4567-e89b-12d3-a456-426614174000");
+    assert.deepEqual(workflowEvents, [{
+      payload: {
+      idempotency_key: "call_test_123",
+      business_id: "biz-42",
+      local_call_id: "call_e_123e4567-e89b-12d3-a456-426614174000",
+      template_id: 12,
+      template_version: 3,
+      execution_status: "completed",
+      call_outcome: "answered",
+      result_status: "available",
+      },
+      resultSchema: { type: "object", additionalProperties: false, required: ["disposition"], properties: { disposition: { type: "string", enum: ["yes", "no"] } } },
+      result: { disposition: "yes" },
+    }]);
     assert.deepEqual(records, [{ provider_call_id: "call_test_123", event_id: "evt_terminal_01", event_type: "call.completed" }]);
   });
 
@@ -103,7 +130,9 @@ describe("CALL-E terminal webhook", () => {
         request_hash: "a".repeat(64),
         result_schema: { type: "object", additionalProperties: false, properties: {}, required: [] },
       });
-      assert.deepEqual(await db.getCallEReconciliationRecordByProviderId("call_test_123"), { local_call_id: localCallId });
+      assert.deepEqual(await db.getCallEReconciliationRecordByProviderId("call_test_123"), {
+        local_call_id: localCallId, business_id: null, template_id: 12, template_version: 1,
+      });
       assert.deepEqual(await db.recordCallEWebhookReceipt({
         provider_call_id: "call_test_123", event_id: "evt_terminal_01", event_type: "call.completed",
       }), { saved: true });

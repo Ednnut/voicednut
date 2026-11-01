@@ -21,6 +21,42 @@ const event = (id, type = "call.in_progress", overrides = {}) => ({
 });
 
 describe("CALL-E event reconciliation", () => {
+  it("returns only safe, operator-scoped call result summaries", async () => {
+    let received;
+    const service = new CallEReconciliationService({
+      db: {
+        async listCallEReconciliationCallsForOperator(input) {
+          received = input;
+          return {
+            operator_access: true,
+            rows: [{
+              local_call_id: "call_e_123e4567-e89b-12d3-a456-426614174000",
+              provider_call_id: "call_private_provider_id",
+              execution_status: "completed",
+              call_outcome: "completed",
+              result_status: "available",
+              result: { private: "not returned" },
+              transcript: "not returned",
+              created_at: "2026-10-26T10:00:00.000Z",
+            }],
+            total: 1,
+            summary: { active: 0, failed: 0, results_ready: 1 },
+            limit: 10,
+            offset: 0,
+          };
+        },
+      },
+    });
+
+    const result = await service.listCallsForOperator("12345", { limit: 10, offset: 0 });
+    assert.equal(received.telegram_id, "12345");
+    assert.equal(result.rows[0].resultStatus, "available");
+    assert.equal("providerCallId" in result.rows[0], false);
+    assert.equal("result" in result.rows[0], false);
+    assert.equal("transcript" in result.rows[0], false);
+    assert.equal(result.summary.resultsReady, 1);
+  });
+
   it("deduplicates stable event IDs and strips untrusted message and detail content", () => {
     const first = normalizeCallEEventPage({ object: "list", data: [event("evt_1"), event("evt_2")], next_cursor: "cursor_2" }, callId);
     const replay = normalizeCallEEventPage({ object: "list", data: [event("evt_1"), event("evt_2")], next_cursor: "cursor_2" }, callId, first.state);
@@ -90,12 +126,21 @@ describe("CALL-E event reconciliation", () => {
         async listCallEvents() { return { object: "list", data: [event("evt_done", "call.completed")], next_cursor: null }; },
       },
     });
-    const result = await service.reconcileLocalCall("call_e_123e4567-e89b-12d3-a456-426614174000");
+    let validatedResult;
+    const result = await service.reconcileLocalCall("call_e_123e4567-e89b-12d3-a456-426614174000", {
+      async onValidatedResult(value) { validatedResult = value; },
+    });
     assert.equal(result.executionStatus, "completed");
     assert.equal(result.resultAvailable, true);
     assert.equal("providerCallId" in result, false);
     assert.equal("transcript" in result, false);
     assert.equal("result" in result, false);
+    assert.deepEqual(validatedResult, {
+      resultSchema,
+      result: { ok: true },
+      executionStatus: "completed",
+      callOutcome: "completed",
+    });
     assert.equal(storedSnapshots[0].snapshot.result_status, "available");
     await assert.rejects(service.reconcileLocalCall("call_e_123e4567-e89b-12d3-a456-426614174001"), (error) => error.code === "call_e_call_not_found");
   });
@@ -263,8 +308,10 @@ describe("CALL-E additive reconciliation persistence", () => {
       call_outcome: "no_answer",
       result_status: "pending",
     });
+    const initialCursor = await db.getCallEReconciliationState("call_provider_123");
+    assert.equal(initialCursor.ivrDtmfObserved, false);
     await db.saveCallEReconciliationState("call_provider_123", {
-      lastEventId: "evt_2", nextCursor: null, seenEventIds: ["evt_1", "evt_2"],
+      lastEventId: "evt_2", nextCursor: null, seenEventIds: ["evt_1", "evt_2"], ivrDtmfObserved: true,
     });
     await db.updateCallEReconciliationSnapshot(localCallId, {
       execution_status: "completed", call_outcome: "no_answer", result_status: "unavailable", error_code: null,
@@ -274,7 +321,7 @@ describe("CALL-E additive reconciliation persistence", () => {
     assert.deepEqual(record.result_schema, resultSchema);
     assert.equal(record.result_status, "unavailable");
     assert.equal(record.call_outcome, "no_answer");
-    assert.deepEqual(cursor, { nextCursor: null, lastEventId: "evt_2", seenEventIds: ["evt_1", "evt_2"] });
+    assert.deepEqual(cursor, { nextCursor: null, lastEventId: "evt_2", seenEventIds: ["evt_1", "evt_2"], ivrDtmfObserved: true });
     const columns = await new Promise((resolve, reject) => db.db.all("PRAGMA table_info(call_e_reconciliation)", (err, rows) => err ? reject(err) : resolve(rows.map((row) => row.name))));
     assert.equal(columns.includes("phone"), false);
     assert.equal(columns.includes("transcript"), false);

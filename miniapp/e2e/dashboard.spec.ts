@@ -252,3 +252,118 @@ test('shows business-scoped CALL-E operations history and gated detail review fr
     expect(dimensions.document, `Horizontal overflow at ${width}px`).toBeLessThanOrEqual(dimensions.viewport + 1);
   }
 });
+
+test('platform admin can save workflow drafts and review sanitized run metadata from fixtures', async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto('/?fixtureRole=operator#/workflows');
+  await expect(page.getByRole('heading', { name: 'Post-call workflows' })).toHaveCount(0);
+  await expect(page.getByRole('heading', { name: 'Workflow Builder' })).toHaveCount(0);
+
+  await page.goto('/?fixtureRole=admin#/workflows');
+  await expect(page.locator('#va-view-stage-root').getByRole('heading', { name: 'Post-call workflows' })).toBeVisible();
+  await expect(page.getByText('Fixture post-call review')).toBeVisible();
+  await expect(page.getByRole('list', { name: 'Recent workflow runs' })).toContainText('workflow_run_fixture_001');
+
+  await page.getByLabel('Workflow ID').fill('browser_fixture_workflow');
+  await page.getByLabel('Workflow name').fill('Browser fixture workflow');
+  await page.getByLabel('Trigger').selectOption('call_e_result_ready');
+  await expect(page.getByLabel('Business ID')).toBeVisible();
+  await page.getByLabel('Business ID').fill('fixture_business');
+  await expect(page.getByLabel('New step type').locator('option[value="action"]')).toBeDisabled();
+  await expect(page.getByText('Raw values are never stored.')).toBeVisible();
+  await page.getByRole('button', { name: 'Add classification' }).click();
+  await page.getByLabel('Template ID').fill('42');
+  await page.getByLabel('Template version').fill('3');
+  await page.getByLabel('Classification ID').fill('lead_status');
+  await page.getByLabel('Result field').fill('qualification');
+  await page.getByLabel('Enum option index').fill('1');
+  await page.getByLabel('Outcome label').selectOption('positive');
+  await page.getByRole('button', { name: 'Save draft' }).click();
+  await expect(page.getByRole('status').filter({ hasText: 'Draft saved:' })).toBeVisible();
+  await page.getByLabel('Trigger').selectOption('post_call_completed');
+  await expect(page.getByRole('group', { name: 'CALL-E result classifications' })).toHaveCount(0);
+  await page.getByLabel('New step type').selectOption('wait');
+  await page.getByRole('button', { name: 'Add step' }).click();
+  await expect(page.getByRole('list', { name: 'Workflow steps' })).toContainText('wait');
+  await page.getByLabel('Wait seconds').fill('15');
+  const saveButton = page.getByRole('button', { name: 'Save draft' });
+  await saveButton.focus();
+  await expect(saveButton).toBeFocused();
+  await page.keyboard.press('Enter');
+  await expect(page.getByRole('status').filter({ hasText: 'Draft saved:' })).toBeVisible();
+  await expect(page.getByText('Browser fixture workflow')).toBeVisible();
+
+  await page.getByRole('button', { name: 'Inspect run workflow_run_fixture_001' }).click();
+  await expect(page.getByRole('heading', { name: 'Step audit' })).toBeVisible();
+  await expect(page.getByRole('list').filter({ hasText: 'send_followup' })).toContainText('provider_timeout');
+  await expect(page.getByText(/FIXTURE_PRIVATE_(TRIGGER_PAYLOAD|ACTION_RESULT)_MUST_NOT_RENDER/)).toHaveCount(0);
+
+  for (const viewport of [
+    { width: 390, height: 844 },
+    { width: 768, height: 1024 },
+    { width: 1280, height: 800 },
+  ]) {
+    await page.setViewportSize(viewport);
+    const dimensions = await page.evaluate(() => ({
+      viewport: document.documentElement.clientWidth,
+      document: document.documentElement.scrollWidth,
+    }));
+    expect(dimensions.document, `Horizontal overflow at ${viewport.width}px`).toBeLessThanOrEqual(dimensions.viewport + 1);
+  }
+});
+
+test('saves and reviews a masked CALL-E campaign report without dispatching calls', async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto('/?fixtureCallEReady=1#/content');
+  await page.getByRole('button', { name: 'Refresh Scripts' }).click();
+  const liveFixture = page.locator('li').filter({ hasText: 'CALL-E QA Fixture' });
+  await liveFixture.getByRole('button', { name: 'Select' }).click();
+
+  const rehearsal = page.getByRole('region', { name: 'CALL-E campaign rehearsal' });
+  await expect(rehearsal.getByText('Preview checks template compatibility only')).toBeVisible();
+  await expect(rehearsal).toContainText('does not verify consent, reserve calls, or place calls');
+  const destinations = rehearsal.getByLabel('Destinations (E.164; one per line)');
+  await destinations.fill('+14155550123\n+442079460123');
+  const runButton = rehearsal.getByRole('button', { name: 'Run compatibility previews' });
+  await expect(runButton).toBeDisabled();
+  await rehearsal.getByLabel('I confirm that I am authorized to contact every destination entered above.').check();
+  await expect(runButton).toBeEnabled();
+  await runButton.click();
+
+  const results = rehearsal.getByRole('region', { name: 'Simulated CALL-E readiness results' });
+  await expect(results.getByRole('listitem')).toHaveCount(2);
+  await expect(results).toContainText('2 compatible · 0 blocked');
+  await expect(results).toContainText('••••0123');
+  await expect(results).not.toContainText('+14155550123');
+  await expect(results).not.toContainText('+442079460123');
+  await expect(results).toContainText('(not saved)');
+  await results.getByRole('button', { name: 'Save durable review draft' }).click();
+  await expect(rehearsal.getByRole('heading', { name: 'Saved review report' })).toBeVisible();
+  await expect(rehearsal).toContainText('Durable review draft saved. The server stored masked destinations only; this is not a dispatch queue.');
+  await expect(rehearsal).toContainText('Status: draft · 2 compatible · 0 blocked');
+  await results.getByRole('button', { name: 'Refresh review queue' }).click();
+  const reviewQueue = rehearsal.getByRole('region', { name: 'CALL-E campaign review queue' });
+  await expect(reviewQueue).toContainText('draft');
+  await reviewQueue.getByRole('button', { name: 'View masked review rows' }).click();
+  const reviewRows = rehearsal.getByRole('region', { name: 'CALL-E campaign review recipients' });
+  await expect(reviewRows.getByRole('listitem')).toHaveCount(2);
+  await expect(reviewRows).not.toContainText('+14155550123');
+  await expect(reviewRows).not.toContainText('+442079460123');
+  await reviewQueue.getByRole('button', { name: 'Approve review report' }).click();
+  await expect(reviewQueue).toContainText('approved');
+  await expect(rehearsal).toContainText('This records a review decision only and does not dispatch calls.');
+  await expect(rehearsal.getByRole('button', { name: /dispatch/i })).toHaveCount(0);
+
+  const mobileDimensions = await page.evaluate(() => ({
+    viewport: document.documentElement.clientWidth,
+    document: document.documentElement.scrollWidth,
+  }));
+  expect(mobileDimensions.document).toBeLessThanOrEqual(mobileDimensions.viewport + 1);
+
+  await page.setViewportSize({ width: 1280, height: 800 });
+  const dimensions = await page.evaluate(() => ({
+    viewport: document.documentElement.clientWidth,
+    document: document.documentElement.scrollWidth,
+  }));
+  expect(dimensions.document).toBeLessThanOrEqual(dimensions.viewport + 1);
+});

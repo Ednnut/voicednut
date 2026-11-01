@@ -17,8 +17,9 @@ function createRouteHarness() {
   const policyService = {
     async recordConsent(input) { records.push({ kind: "consent", input }); return { recorded: true, idempotentReplay: false }; },
     async recordOptOut(input) { records.push({ kind: "optout", input }); return { recorded: true, idempotentReplay: false }; },
+    async getPolicySummary(input) { return { business_id: input.business_id, destination_masked: '••••0123', eligible: false, reason: 'opted_out', events: [] }; },
   };
-  const app = Object.fromEntries(["put", "delete", "post"].map((method) => [method, (route, ...handlers) => {
+  const app = Object.fromEntries(["get", "put", "delete", "post"].map((method) => [method, (route, ...handlers) => {
     routes.set(`${method.toUpperCase()} ${route}`, handlers);
   }]));
   const requireAdminToken = (req, res, next) => req.get("authorization") === "Bearer test-admin" ? next() : res.status(403).json({ success: false });
@@ -40,6 +41,13 @@ function createRouteHarness() {
     requireAdminToken,
     requireMiniAppSession,
     requireMiniAppCapability,
+    requireCallEApiAuthorization: (_req, _res, next) => next(),
+    requireCallEActorAssertion: (req, res, next) => {
+      const actorId = req.get('x-call-e-actor');
+      if (!actorId) return res.status(401).json({ success: false });
+      req.callEActorId = actorId;
+      return next();
+    },
   });
 
   async function dispatch(method, route, options = {}) {
@@ -48,6 +56,7 @@ function createRouteHarness() {
     const headers = options.headers || {};
     const req = {
       body: options.body || {},
+      query: options.query || {},
       miniAppSession: null,
       get(name) {
         const key = Object.keys(headers).find((entry) => entry.toLowerCase() === name.toLowerCase());
@@ -167,6 +176,45 @@ describe("CALL-E business-scoped contact policy routes", () => {
     assert.equal(records[0].input.recordedByTelegramId, "987654321");
     response = await dispatch("POST", "/miniapp/call-e/contact-policy/opt-out", { body: { template_id: 9 } });
     assert.equal(response.status, 401);
+    assert.equal(records.length, 1);
+  });
+
+  it('exposes masked API/BOT consent status only to the signed current policy manager', async () => {
+    const { dispatch, memberships } = createRouteHarness();
+    memberships.set('business_route_001:123456789', 'call_operator');
+    let response = await dispatch('GET', '/api/call-e/contact-policy', {
+      headers: { 'x-call-e-actor': '123456789' },
+      query: { business_id: 'business_route_001', actor_id: '123456789', destination: '+14155550123' },
+    });
+    assert.equal(response.status, 403);
+    memberships.set('business_route_001:123456789', 'policy_manager');
+    response = await dispatch('GET', '/api/call-e/contact-policy', {
+      headers: { 'x-call-e-actor': '123456789' },
+      query: { business_id: 'business_route_001', actor_id: '987654321', destination: '+14155550123' },
+    });
+    assert.equal(response.status, 200);
+    assert.equal(response.body.destination_masked, '••••0123');
+    assert.equal(JSON.stringify(response.body).includes('+14155550123'), false);
+  });
+
+  it('uses the signed actor for API/BOT consent writes and rejects role escalation', async () => {
+    const { dispatch, memberships, records } = createRouteHarness();
+    memberships.set('business_route_001:123456789', 'policy_manager');
+    let response = await dispatch('POST', '/api/call-e/contact-policy/events', {
+      headers: { 'x-call-e-actor': '123456789' },
+      body: { business_id: 'business_route_001', actor_id: '999999999', kind: 'optout', destination: '+14155550123',
+        event_key: 'bot-optout-event-0001', source: 'recipient_request', occurred_at: new Date().toISOString() },
+    });
+    assert.equal(response.status, 201);
+    assert.equal(records[0].input.recordedByTelegramId, '123456789');
+    assert.equal(records[0].input.businessId, 'business_route_001');
+    memberships.set('business_route_001:123456789', 'call_operator');
+    response = await dispatch('POST', '/api/call-e/contact-policy/events', {
+      headers: { 'x-call-e-actor': '123456789' },
+      body: { business_id: 'business_route_001', actor_id: '123456789', kind: 'optout', destination: '+14155550123',
+        event_key: 'bot-optout-event-0002', source: 'recipient_request', occurred_at: new Date().toISOString() },
+    });
+    assert.equal(response.status, 403);
     assert.equal(records.length, 1);
   });
 });

@@ -4,7 +4,14 @@ const os = require("node:os");
 const path = require("node:path");
 const Database = require("../db/db");
 const { previewCallETemplate } = require("../adapters/callETemplateAdapter");
-const { CallEOutboundCallService, normalizeCallResource, parseAllowedDestinations } = require("../services/callEOutboundCallService");
+const { CallEOutboundCallService: CallEOutboundCallServiceImpl, normalizeCallResource, parseAllowedDestinations } = require("../services/callEOutboundCallService");
+const testOutboundSafety = {
+  async reserveDispatch() { return { reservationKey: 'test-reservation' }; },
+  async completeDispatch() { return true; },
+};
+class CallEOutboundCallService extends CallEOutboundCallServiceImpl {
+  constructor(options = {}) { super({ ...options, outboundSafety: options.outboundSafety || testOutboundSafety }); }
+}
 
 const template = {
   id: 27,
@@ -256,6 +263,39 @@ describe("CALL-E outbound call service", () => {
     );
     assert.equal(creates, 1);
     assert.equal(db.pilotReservation.state, "consumed");
+  });
+
+  it("requires durable mission recipient authorization and leaves the single-call pilot slot untouched", async () => {
+    const db = createMemoryDb();
+    let creates = 0;
+    let authorization;
+    db.validateCallECampaignMissionRecipientDispatch = async (input) => {
+      authorization = input;
+      return input.mission_id === `mission_${"a".repeat(64)}` && input.position === 0;
+    };
+    db.reserveCallEPilotDispatch = async () => { throw new Error("mission dispatch must not reserve the single-call slot"); };
+    const service = new CallEOutboundCallService({
+      db,
+      allowedDestinations: ["+14155550123"],
+      client: { isConfigured: () => true, async createCall() { creates += 1; return callResponse(); } },
+    });
+    const request = createInput({
+      missionAuthorization: {
+        mission_id: `mission_${"a".repeat(64)}`,
+        business_id: "business_test_001",
+        request_hash: "b".repeat(64),
+        position: 0,
+      },
+    });
+    await service.createOutboundCall(request);
+    assert.equal(creates, 1);
+    assert.equal(authorization.idempotency_key, "voicednut:call-e:reminder:test:0001");
+    assert.equal(db.pilotReservation, null);
+    await assert.rejects(service.createOutboundCall(createInput({
+      missionAuthorization: { ...request.missionAuthorization, position: 1 },
+      idempotencyKey: "reminder:test:0002",
+    })), (error) => error.code === "call_e_mission_dispatch_not_authorized");
+    assert.equal(creates, 1);
   });
 
   it("claims the pilot cap when replaying an accepted idempotency row created before the guard", async () => {

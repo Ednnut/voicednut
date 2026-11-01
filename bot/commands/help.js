@@ -35,7 +35,25 @@ async function handleHelp(ctx) {
 
         const callList = [
             '📞 /call — launch a fresh voice session (requires access)',
-            '📜 /calllog — browse recent calls, search, and events'
+            ...(isAuthorized ? ['🤖 /calle — guided CALL-E menu for planning, results, campaigns, approvals, recovery, and missions'] : []),
+            ...(isOwner ? ['🟣 /vapi — Vapi readiness, phone inventory, call events, campaign drafts, and confirmed live call controls'] : []),
+            ...(isOwner ? ['🔷 /cartesia — Cartesia Managed Agents operations, voice cloning, speech previews, quality metrics, and safe call reconciliation'] : []),
+            '🧭 /callplan — plan a CALL-E template and check consent/compatibility without dialing',
+            '📜 /calllog — browse recent calls, search, and events',
+            ...(isOwner ? ['📊 /callresults — recent CALL-E execution and result readiness summaries'] : []),
+            ...(isOwner ? ['🧾 /callresult <call_id> — view one validated structured result in a private chat'] : []),
+            ...(isOwner ? ['🔄 /callreconcile <call_id> — refresh saved CALL-E status and event cursors; no call is started or canceled'] : []),
+            ...(isOwner ? ['🔎 /callquality <call_id> — deterministic, content-free conversation signals'] : []),
+            ...(isOwner ? ['🧪 /callcampaigns <business_id> — list campaign drafts, approvals, and rehearsal status'] : []),
+            ...(isOwner ? ['📝 /callcampaigncreate <business_id> <template_id> [request_key] — consent-checked campaign review draft; no calls'] : []),
+            ...(isOwner ? ['🔎 /callcampaigninfo <business_id> <campaign_id> — show campaign fingerprint and approval audit in private chat'] : []),
+            ...(isOwner ? ['✅ /callcampaignreview <business_id> <campaign_id> <approve|reject> — policy-manager campaign review'] : []),
+            ...(isOwner ? ['🧵 /callmissions <business_id> — view durable CALL-E mission state'] : []),
+            ...(isOwner ? ['🧩 /callmissioncreate <business_id> <approved_campaign_id> [request_key] — stage a mission for separate review; no calls'] : []),
+            ...(isOwner ? ['✅ /callmissionreview <business_id> <mission_id> <approve|reject> — separate mission approval'] : []),
+            ...(isOwner ? ['🔐 /callmissioninfo <business_id> <mission_id> — show the exact approval fingerprint'] : []),
+            ...(isOwner ? ['🛂 /callmissionresolve <business_id> <mission_id> <continue|cancel> [request_key] — resolve a paused mission; reuse the key on retry'] : []),
+            ...(isOwner ? ['▶️ /callmissionadvance <business_id> <mission_id> — process one approved mission step'] : [])
         ];
 
         const smsList = [

@@ -102,7 +102,10 @@ describe("CALL-E offline integration rehearsal", () => {
         };
       },
     };
-    const outbound = new CallEOutboundCallService({ db, client, allowedDestinations: ["+14155550123", "+14155550124"] });
+    const outbound = new CallEOutboundCallService({
+      db, client, allowedDestinations: ["+14155550123", "+14155550124"],
+      outboundSafety: { async reserveDispatch() { return { reservationKey: 'rehearsal' }; }, async completeDispatch() { return true; } },
+    });
     const request = {
       template,
       phone: "+14155550123",

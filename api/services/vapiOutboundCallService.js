@@ -42,6 +42,7 @@ class VapiOutboundCallService {
     this.db = options.db;
     this.getMapping = options.getMapping;
     this.getTemplate = options.getTemplate;
+    this.outboundSafety = options.outboundSafety || null;
   }
 
   async createOutboundCall(input = {}) {
@@ -85,7 +86,21 @@ class VapiOutboundCallService {
       number,
     })).digest("hex");
     const previous = await this.db.getOutboundCallIdempotency(idempotencyKey);
-    if (previous) return resolveExistingRequest(previous, requestHash);
+    if (previous) {
+      const resolution = resolveExistingRequest(previous, requestHash);
+      if (resolution.idempotentReplay === true) {
+        const previousResult = resolution;
+        const template = await this.getTemplate(Number(previousResult.templateId || input.templateId));
+        if (!template || typeof this.outboundSafety?.authorizeActor !== "function") {
+          throw vapiCallError("outbound_business_operator_required", "A verified business operator is required to access this call result");
+        }
+        await this.outboundSafety.authorizeActor({
+          business_id: template.business_id || template.businessId,
+          actor_id: input.actorId || input.actor_id,
+        });
+      }
+      return resolution;
+    }
 
     if (typeof this.getMapping !== "function" || typeof this.getTemplate !== "function") {
       throw vapiCallError("vapi_call_dependencies_missing", "Vapi call mapping lookup is unavailable");
@@ -110,12 +125,30 @@ class VapiOutboundCallService {
       throw vapiCallError("vapi_template_unsupported", "Vapi mapping contains behavior that is not supported for calls");
     }
 
-    const reservation = await this.db.reserveOutboundCallIdempotency({
-      idempotency_key: idempotencyKey,
+    if (!this.outboundSafety || typeof this.outboundSafety.reserveDispatch !== "function") {
+      throw vapiCallError("outbound_contact_policy_unavailable", "Outbound safety is unavailable; no call was placed");
+    }
+    const safetyReservation = await this.outboundSafety.reserveDispatch({
+      business_id: template.business_id || template.businessId,
+      actor_id: input.actorId || input.actor_id,
+      destination: number,
       provider: "vapi",
-      request_hash: requestHash,
+      idempotency_key: callerKey,
     });
+
+    let reservation;
+    try {
+      reservation = await this.db.reserveOutboundCallIdempotency({
+        idempotency_key: idempotencyKey,
+        provider: "vapi",
+        request_hash: requestHash,
+      });
+    } catch (error) {
+      if (!safetyReservation.idempotentReplay) await this.outboundSafety.completeDispatch(safetyReservation, "released");
+      throw error;
+    }
     if (!reservation?.reserved) {
+      if (!safetyReservation.idempotentReplay) await this.outboundSafety.completeDispatch(safetyReservation, "released");
       const existing = await this.db.getOutboundCallIdempotency(idempotencyKey);
       return resolveExistingRequest(existing, requestHash);
     }
@@ -141,6 +174,7 @@ class VapiOutboundCallService {
           status: "failed",
           error_message: String(error?.code || "vapi_call_failed").slice(0, 100),
         });
+        await this.outboundSafety.completeDispatch(safetyReservation, "released");
       }
       throw error;
     }
@@ -163,6 +197,7 @@ class VapiOutboundCallService {
       status: "completed",
       response_payload: result,
     });
+    await this.outboundSafety.completeDispatch(safetyReservation, "accepted");
     return result;
   }
 }

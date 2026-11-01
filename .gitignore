@@ -56,10 +56,18 @@ tests/
 api/db/data.db
 api/db/data.db-shm
 api/db/data.db-wal
+api/data/cartesia-phrase-cache/
+api/data/cartesia-stt-profile.json
 bot/db/data.db
 
-# Local Codex runtime marker
-.codex
+# Local Codex runtime files; keep project-level Codex settings trackable.
+.codex/
+!.codex/
+.codex/*
+!.codex/config.toml
+!.codex/agents/
+.codex/agents/*
+!.codex/agents/*.toml
 
 # Instruction files
 .github/implementation.md
@@ -106,6 +114,7 @@ docs/*
 !docs/phase19-vapi-tool-call-webhook-safety.md
 !docs/phase20-vapi-call-campaign-drafts.md
 !docs/call-e-integration-plan.md
+!docs/call-e-api-bot-implementation-map.md
 !docs/call-e-pilot-runbook.md
 .vscode
 miniapp/test-results/

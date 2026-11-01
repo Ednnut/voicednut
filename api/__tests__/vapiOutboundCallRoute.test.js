@@ -38,12 +38,12 @@ describe("customer outbound Vapi call route", () => {
     });
     const req = {
       body: { provider: "vapi", number: "+14155550123", script_id: 17, script_version: 4, mapping_id: 91, phone_number_id: "pn_provider_1", idempotency_key: "request-id-0001" },
-      headers: {}, requestId: "req-1",
+      headers: {}, requestId: "req-1", callEActorId: "7001",
     };
     const res = makeResponse();
     await handler(req, res);
     assert.deepEqual(calls, [{
-      templateId: 17, templateVersion: 4, mappingId: 91, phoneNumberId: "pn_provider_1", number: "+14155550123", idempotencyKey: "request-id-0001",
+      templateId: 17, templateVersion: 4, mappingId: 91, phoneNumberId: "pn_provider_1", number: "+14155550123", idempotencyKey: "request-id-0001", actorId: "7001",
     }]);
     assert.deepEqual(res.body, {
       success: true,

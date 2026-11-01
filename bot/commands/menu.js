@@ -46,6 +46,7 @@ async function handleMenu(ctx) {
             kb.row()
                 .text('📚 Guide', buildCallbackData(ctx, 'GUIDE'))
                 .text('ℹ️ Help', buildCallbackData(ctx, 'HELP'));
+            kb.row().text(isOwner ? '🤖 CALL-E Operations' : '🧭 CALL-E Planner', buildCallbackData(ctx, isOwner ? 'CALL_E_CENTER' : 'CALL_E_PLAN'));
             if (isOwner) {
                 kb.row()
                     .text('🏥 Health', buildCallbackData(ctx, 'HEALTH'))
@@ -66,6 +67,9 @@ async function handleMenu(ctx) {
                 .row()
                 .text('📵 Caller Flags', buildCallbackData(ctx, 'CALLER_FLAGS'))
                 .text('☎️ Provider', buildCallbackData(ctx, 'PROVIDER_STATUS'))
+                .row()
+                .text('🟣 Vapi Operations', buildCallbackData(ctx, 'VAPI_CENTER'))
+                .row().text('🔷 Cartesia Operations', buildCallbackData(ctx, 'CARTESIA_CENTER'))
                 .row()
                 .text('📤 SMS Sender', buildCallbackData(ctx, 'BULK_SMS'))
                 .text('📧 Mailer', buildCallbackData(ctx, 'BULK_EMAIL'));

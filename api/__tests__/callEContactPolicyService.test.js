@@ -3,6 +3,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const Database = require("../db/db");
+const crypto = require('node:crypto');
 const { CallEContactPolicyService, normalizePolicyInput } = require("../services/callEContactPolicyService");
 
 describe("CALL-E contact consent and opt-out policy", () => {
@@ -60,6 +61,64 @@ describe("CALL-E contact consent and opt-out policy", () => {
       reason: "consent_missing",
     });
     await assert.rejects(service.recordConsent(consent({ evidenceReference: "evidence:record:0002" })), (error) => error.code === "call_e_contact_policy_idempotency_conflict");
+  });
+
+  it('evaluates consent expiry and cooldown against an explicitly scheduled call time', async () => {
+    const start = Date.now();
+    const destination = '+14155550125';
+    const businessId = 'business_scheduled_policy';
+    await service.recordConsent(consent({
+      businessId, destination, eventKey: 'scheduled:consent:0001', evidenceReference: 'scheduled:evidence:0001',
+      occurredAt: new Date(start - 1000).toISOString(), expiresAt: new Date(start + 60 * 60 * 1000).toISOString(),
+    }));
+    assert.deepEqual(await service.checkEligibility({ businessId, destination, at: new Date(start + 30 * 60 * 1000).toISOString() }), {
+      eligible: true, reason: null,
+    });
+    assert.deepEqual(await service.checkEligibility({ businessId, destination, at: new Date(start + 2 * 60 * 60 * 1000).toISOString() }), {
+      eligible: false, reason: 'consent_expired',
+    });
+    assert.deepEqual(await service.checkEligibility({ businessId, destination, at: 'not-a-timestamp' }), {
+      eligible: false, reason: 'policy_storage_unavailable',
+    });
+  });
+
+  it("passes a keyed destination digest for cooldown checks", async () => {
+    let seen;
+    const secret = "test-only-cooldown-hash-secret-with-at-least-32-bytes";
+    const policyService = new CallEContactPolicyService({
+      db: { async getCallEContactPolicyEligibility(input) { seen = input; return { eligible: false, reason: "cooldown_active" }; } },
+      cooldownHashSecret: secret,
+    });
+    assert.deepEqual(await policyService.checkEligibility({ business_id: "business_policy_001", destination: "+14155550123" }), {
+      eligible: false, reason: "cooldown_active",
+    });
+    assert.match(seen.destination_hash, /^[a-f0-9]{64}$/);
+    assert.notEqual(seen.destination_hash, "+14155550123");
+  });
+
+  it('shares accepted-contact cooldowns across provider dispatches', async () => {
+    const secret = 'shared-outbound-cooldown-secret-with-32-bytes-minimum';
+    const destination = '+14155550123';
+    const businessId = 'business_shared_cooldown';
+    const digest = crypto.createHmac('sha256', secret).update(`${businessId}:${destination}`).digest('hex');
+    await service.recordConsent(consent({
+      businessId, destination, eventKey: 'shared:consent:0001', evidenceReference: 'shared:evidence:0001',
+    }));
+    await db.setCallEBusinessSafetyPolicy({
+      business_id: businessId, actor_id: '123456789', max_calls_per_day: 10,
+      quiet_hours_start: null, quiet_hours_end: null, timezone: 'UTC', emergency_stop: false,
+      contact_cooldown_hours: 24,
+    });
+    const reservation = await db.reserveOutboundContactDispatch({
+      reservation_key: 'twilio:dispatch-shared-0001', business_id: businessId,
+      destination_hash: digest, provider: 'twilio',
+    });
+    assert.equal(reservation.allowed, true);
+    await db.updateOutboundContactDispatch({ reservation_key: 'twilio:dispatch-shared-0001', status: 'accepted' });
+    const sharedPolicy = new CallEContactPolicyService({ db, cooldownHashSecret: secret });
+    assert.deepEqual(await sharedPolicy.checkEligibility({ businessId, destination }), {
+      eligible: false, reason: 'cooldown_active',
+    });
   });
 
   it("keeps an append-only business-operator grant and revoke history", async () => {

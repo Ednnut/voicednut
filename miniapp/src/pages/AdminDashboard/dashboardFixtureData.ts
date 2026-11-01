@@ -7,6 +7,48 @@ import {
 type DashboardFixtureRole = 'admin' | 'operator' | 'viewer';
 
 let fixtureCallTemplateVersion = 2;
+let workflowFixtureVersion = 1;
+let workflowFixtureVersions: Record<string, unknown>[] = [
+  {
+    workflow_id: 'fixture_post_call_review',
+    version: 1,
+    name: 'Fixture post-call review',
+    trigger_event: 'post_call_completed',
+    status: 'approved',
+    created_at: '2026-01-15T12:00:00.000Z',
+  },
+];
+let callECampaignFixtureSequence = 1;
+let callECampaignFixtureRows: Array<Record<string, unknown>> = [];
+
+const WORKFLOW_FIXTURE_RUN_ID = 'workflow_run_fixture_001';
+const WORKFLOW_FIXTURE_RUN = {
+  run_id: WORKFLOW_FIXTURE_RUN_ID,
+  workflow_id: 'fixture_post_call_review',
+  workflow_version: 1,
+  trigger_event: 'post_call_completed',
+  status: 'needs_review',
+  error_code: 'provider_timeout',
+  created_at: '2026-01-15T12:05:00.000Z',
+  payload_json: 'FIXTURE_PRIVATE_TRIGGER_PAYLOAD_MUST_NOT_RENDER',
+  steps: [
+    {
+      step_id: 'send_followup',
+      step_type: 'action',
+      action_type: 'send_email',
+      status: 'needs_review',
+      error_code: 'provider_timeout',
+      result_json: 'FIXTURE_PRIVATE_ACTION_RESULT_MUST_NOT_RENDER',
+    },
+  ],
+};
+
+const WORKFLOW_FIXTURE_ACTIONS = new Set<string>([
+  DASHBOARD_ACTION_CONTRACTS.WORKFLOW_VERSIONS,
+  DASHBOARD_ACTION_CONTRACTS.WORKFLOW_DRAFT,
+  DASHBOARD_ACTION_CONTRACTS.WORKFLOW_RUNS,
+  DASHBOARD_ACTION_CONTRACTS.WORKFLOW_RUN_GET,
+]);
 
 const DASHBOARD_ALL_CAPS = [
   'dashboard_view',
@@ -15,6 +57,7 @@ const DASHBOARD_ALL_CAPS = [
   'provider_manage',
   'caller_flags_manage',
   'users_manage',
+  'workflow_manage',
 ] as const;
 
 const DASHBOARD_ALL_MODULES = [
@@ -30,6 +73,7 @@ const DASHBOARD_ALL_MODULES = [
   'persona',
   'users',
   'audit',
+  'workflows',
 ] as const;
 
 const DASHBOARD_FIXTURE_ROLE_QUERY_PARAM = 'fixtureRole';
@@ -152,8 +196,12 @@ function createDashboardFixturePayload(
     poll_interval_seconds: 15,
     poll_at: nowIso,
     server_time: nowIso,
-    supported_actions: DASHBOARD_SUPPORTED_ACTIONS,
-    supported_action_count: DASHBOARD_SUPPORTED_ACTIONS.length,
+    supported_actions: role === 'admin'
+      ? DASHBOARD_SUPPORTED_ACTIONS
+      : DASHBOARD_SUPPORTED_ACTIONS.filter((action) => !WORKFLOW_FIXTURE_ACTIONS.has(action)),
+    supported_action_count: role === 'admin'
+      ? DASHBOARD_SUPPORTED_ACTIONS.length
+      : DASHBOARD_SUPPORTED_ACTIONS.filter((action) => !WORKFLOW_FIXTURE_ACTIONS.has(action)).length,
     session: {
       telegram_id: 1,
       role,
@@ -163,7 +211,9 @@ function createDashboardFixturePayload(
     },
     module_layout: {
       active_module: 'ops',
-      modules: DASHBOARD_ALL_MODULES.map((id, index) => ({ id, enabled: true, order: index })),
+      modules: DASHBOARD_ALL_MODULES
+        .filter((id) => id !== 'workflows' || role === 'admin')
+        .map((id, index) => ({ id, enabled: true, order: index })),
     },
     provider: {
       providers: {
@@ -395,9 +445,48 @@ function resolveDashboardFixtureActionData(
   payload: Record<string, unknown> = {},
 ): Record<string, unknown> {
   const requestedCallSid = toText(payload.call_sid, '').trim() || 'CA_FIXTURE_CALL_001';
+  if (WORKFLOW_FIXTURE_ACTIONS.has(action) && role !== 'admin') {
+    return { success: false, error: 'Workflow management requires platform admin role.' };
+  }
   const callEPilotFixtureEnabled = typeof window !== 'undefined' &&
     new URLSearchParams(window.location.search).get('fixtureCallEReady') === '1';
   switch (action) {
+    case DASHBOARD_ACTION_CONTRACTS.WORKFLOW_VERSIONS:
+      return { versions: workflowFixtureVersions.map((version) => ({ ...version })) };
+    case DASHBOARD_ACTION_CONTRACTS.WORKFLOW_DRAFT: {
+      const definition = asRecord(payload.definition);
+      workflowFixtureVersion += 1;
+      const version = {
+        workflow_id: toText(definition.workflow_id, 'fixture_workflow'),
+        version: workflowFixtureVersion,
+        name: toText(definition.name, 'Fixture workflow draft'),
+        trigger_event: toText(definition.trigger_event, 'post_call_completed'),
+        status: 'draft',
+        created_at: nowIso,
+      };
+      workflowFixtureVersions = [version, ...workflowFixtureVersions];
+      return { version };
+    }
+    case DASHBOARD_ACTION_CONTRACTS.WORKFLOW_RUNS: {
+      const run = WORKFLOW_FIXTURE_RUN;
+      const workflowId = toText(payload.workflow_id, '');
+      const rows = workflowId && workflowId !== run.workflow_id ? [] : [{
+        run_id: run.run_id,
+        workflow_id: run.workflow_id,
+        workflow_version: run.workflow_version,
+        trigger_event: run.trigger_event,
+        status: run.status,
+        error_code: run.error_code,
+        created_at: run.created_at,
+      }];
+      return { runs: rows };
+    }
+    case DASHBOARD_ACTION_CONTRACTS.WORKFLOW_RUN_GET:
+      return {
+        run: toText(payload.run_id, '') === WORKFLOW_FIXTURE_RUN_ID
+          ? { ...WORKFLOW_FIXTURE_RUN, steps: WORKFLOW_FIXTURE_RUN.steps.map((step) => ({ ...step })) }
+          : null,
+      };
     case DASHBOARD_ACTION_CONTRACTS.CALLE_CALLS_LIST: {
       const allRows = [
           {
@@ -488,6 +577,7 @@ function resolveDashboardFixtureActionData(
             flow_type: 'default',
             lifecycle_state: 'live',
             version: 1,
+            business_id: 'fixture_business',
           },
         ],
         total: 2,
@@ -553,6 +643,47 @@ function resolveDashboardFixtureActionData(
           source: { templateVersion: 1 },
         },
       };
+    case DASHBOARD_ACTION_CONTRACTS.CALLE_CAMPAIGN_CREATE: {
+      const campaignId = `campaign_${String(callECampaignFixtureSequence++).padStart(64, '0')}`;
+      const destinations = Array.isArray(payload.destinations) ? payload.destinations : [];
+      const campaign = {
+        campaign_id: campaignId,
+        business_id: 'fixture_business',
+        template_id: Number(payload.template_id) || 2,
+        template_version: 1,
+        status: 'draft',
+        recipient_count: destinations.length,
+        ready_count: destinations.length,
+        blocked_count: 0,
+        created_by: '10001',
+        reviewed_by: null,
+        created_at: nowIso,
+        reviewed_at: null,
+      };
+      const recipients = destinations.map((_destination, position) => ({
+        position,
+        destination_masked: `••••${String(position + 123).slice(-4)}`,
+        status: 'ready',
+        reason_code: 'compatible',
+      }));
+      const report = { campaign, recipients };
+      callECampaignFixtureRows = [report, ...callECampaignFixtureRows.filter((row) => asRecord(row.campaign).campaign_id !== campaignId)];
+      return report;
+    }
+    case DASHBOARD_ACTION_CONTRACTS.CALLE_CAMPAIGN_LIST:
+      return { campaigns: callECampaignFixtureRows.map((row) => ({ ...asRecord(row.campaign), can_review: asRecord(row.campaign).status === 'draft' })) };
+    case DASHBOARD_ACTION_CONTRACTS.CALLE_CAMPAIGN_GET: {
+      const report = callECampaignFixtureRows.find((row) => asRecord(row.campaign).campaign_id === payload.campaign_id);
+      return report ? { campaign: { ...asRecord(report.campaign) }, recipients: [...(Array.isArray(report.recipients) ? report.recipients : [])] } : { campaign: null, recipients: [] };
+    }
+    case DASHBOARD_ACTION_CONTRACTS.CALLE_CAMPAIGN_REVIEW: {
+      const report = callECampaignFixtureRows.find((row) => asRecord(row.campaign).campaign_id === payload.campaign_id);
+      if (!report) return { campaign: null, recipients: [] };
+      const campaign = { ...asRecord(report.campaign), status: payload.decision === 'approve' ? 'approved' : 'rejected', reviewed_by: '10002', reviewed_at: nowIso };
+      const updated = { ...report, campaign };
+      callECampaignFixtureRows = callECampaignFixtureRows.map((row) => row === report ? updated : row);
+      return { campaign, recipients: [...(Array.isArray(report.recipients) ? report.recipients : [])] };
+    }
     case DASHBOARD_ACTION_CONTRACTS.CALLSCRIPT_CALLE_CONFIRM:
       return { confirmed: true, confirmationId: 'fixture-confirmation-001' };
     case DASHBOARD_ACTION_CONTRACTS.CALLSCRIPT_CALLE_DISPATCH:

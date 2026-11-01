@@ -35,7 +35,7 @@ class VapiClient {
     return Boolean(this.enabled && this.apiKey && typeof this.fetch === "function");
   }
 
-  async request(method, path, body) {
+  async request(method, path, body, extraHeaders = {}) {
     if (!this.enabled) {
       throw new VapiApiError("Vapi integration is disabled", { code: "vapi_disabled" });
     }
@@ -56,6 +56,7 @@ class VapiClient {
       const response = await this.fetch(`${this.baseUrl}${path}`, {
         method: String(method || "GET").toUpperCase(),
         headers: {
+          ...(extraHeaders && typeof extraHeaders === "object" ? extraHeaders : {}),
           Authorization: `Bearer ${this.apiKey}`,
           Accept: "application/json",
           ...(body === undefined ? {} : { "Content-Type": "application/json" }),
@@ -106,6 +107,92 @@ class VapiClient {
     const id = String(assistantId || "").trim();
     if (!id) throw new VapiApiError("Vapi assistant ID is required", { code: "vapi_invalid_assistant_id" });
     return this.request("GET", `/assistant/${encodeURIComponent(id)}`);
+  }
+
+  listSimulationSuites(options = {}) {
+    const query = new URLSearchParams();
+    const assistantId = String(options.assistantId || "").trim();
+    if (assistantId) query.set("assistantId", assistantId);
+    query.set("limit", String(Math.max(1, Math.min(100, Math.floor(Number(options.limit) || 50)))));
+    return this.request("GET", `/eval/simulation/suite?${query.toString()}`);
+  }
+
+  getSimulationSuite(suiteId) {
+    const id = String(suiteId || "").trim();
+    if (!id) throw new VapiApiError("Vapi simulation suite ID is required", { code: "vapi_invalid_simulation_suite_id" });
+    return this.request("GET", `/eval/simulation/suite/${encodeURIComponent(id)}`);
+  }
+
+  getSimulation(simulationId) {
+    const id = String(simulationId || "").trim();
+    if (!id) throw new VapiApiError("Vapi simulation ID is required", { code: "vapi_invalid_simulation_id" });
+    return this.request("GET", `/eval/simulation/${encodeURIComponent(id)}`);
+  }
+
+  getSimulationScenario(scenarioId) {
+    const id = String(scenarioId || "").trim();
+    if (!id) throw new VapiApiError("Vapi simulation scenario ID is required", { code: "vapi_invalid_simulation_scenario_id" });
+    return this.request("GET", `/eval/simulation/scenario/${encodeURIComponent(id)}`);
+  }
+
+  listEvals(options = {}) {
+    const page = Math.max(1, Math.min(100000, Math.floor(Number(options.page) || 1)));
+    const limit = Math.max(1, Math.min(1000, Math.floor(Number(options.limit) || 50)));
+    const query = new URLSearchParams({ page: String(page), limit: String(limit), sortOrder: "DESC" });
+    const id = String(options.id || "").trim();
+    if (id) query.set("id", id);
+    return this.request("GET", `/eval?${query.toString()}`);
+  }
+
+  createEval(configuration) {
+    return this.request("POST", "/eval", configuration);
+  }
+
+  listEvalRuns(options = {}) {
+    const page = Math.max(1, Math.min(100000, Math.floor(Number(options.page) || 1)));
+    const limit = Math.max(1, Math.min(1000, Math.floor(Number(options.limit) || 50)));
+    const query = new URLSearchParams({ page: String(page), limit: String(limit), sortOrder: "DESC" });
+    const id = String(options.id || "").trim();
+    const search = String(options.search || "").trim().slice(0, 256);
+    if (id) query.set("id", id);
+    if (search) query.set("search", search);
+    return this.request("GET", `/eval/run?${query.toString()}`);
+  }
+
+  createEvalRun(configuration) {
+    return this.request("POST", "/eval/run", configuration);
+  }
+
+  getEvalRun(runId) {
+    const id = String(runId || "").trim();
+    if (!id) throw new VapiApiError("Vapi eval run ID is required", { code: "vapi_invalid_eval_run_id" });
+    return this.request("GET", `/eval/run/${encodeURIComponent(id)}`);
+  }
+
+  listSquads(options = {}) {
+    const limit = Math.max(1, Math.min(1000, Math.floor(Number(options.limit) || 100)));
+    const query = new URLSearchParams({ limit: String(limit) });
+    return this.request("GET", `/squad?${query.toString()}`);
+  }
+
+  getSquad(squadId) {
+    const id = String(squadId || "").trim();
+    if (!id) throw new VapiApiError("Vapi squad ID is required", { code: "vapi_invalid_squad_id" });
+    return this.request("GET", `/squad/${encodeURIComponent(id)}`);
+  }
+
+  createSimulationRun(configuration, idempotencyKey) {
+    const key = String(idempotencyKey || "").trim();
+    if (!key || key.length > 255 || /[^\x20-\x7E]/.test(key)) {
+      throw new VapiApiError("A valid Vapi simulation idempotency key is required", { code: "vapi_simulation_idempotency_key_required" });
+    }
+    return this.request("POST", "/eval/simulation/run", configuration, { "Idempotency-Key": key });
+  }
+
+  getSimulationRun(runId) {
+    const id = String(runId || "").trim();
+    if (!id) throw new VapiApiError("Vapi simulation run ID is required", { code: "vapi_invalid_simulation_run_id" });
+    return this.request("GET", `/eval/simulation/run/${encodeURIComponent(id)}`);
   }
 
   updateAssistant(assistantId, configuration) {

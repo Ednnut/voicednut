@@ -4,6 +4,7 @@ const { InlineKeyboard } = require('grammy');
 const { buildLine, section, escapeMarkdown, renderMenu } = require('../utils/ui');
 const { buildCallbackData } = require('../utils/actions');
 const { getAccessProfile } = require('../utils/capabilities');
+const { formatVoiceCapabilityMatrix } = require('../utils/providerCapabilities');
 
 const ADMIN_HEADER_NAME = 'x-admin-token';
 const SUPPORTED_PROVIDERS = ['twilio', 'plivo', 'vonage'];
@@ -98,7 +99,8 @@ function formatProviderStatus(status) {
     ];
     return [
         section('⚙️ Call Provider Settings', details),
-        formatReadinessMatrix(status)
+        formatReadinessMatrix(status),
+        formatVoiceCapabilityMatrix(status)
     ].join('\n\n');
 }
 

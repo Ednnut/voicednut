@@ -187,6 +187,50 @@ function validateAutomationRunRetry(payload: Record<string, unknown>): string | 
   return null;
 }
 
+function validateWorkflowDraft(payload: Record<string, unknown>): string | null {
+  if (!isRecord(payload.definition)) return 'definition must be a workflow object';
+  try {
+    if (new TextEncoder().encode(JSON.stringify(payload.definition)).byteLength > 64 * 1024) {
+      return 'definition must be 64 KiB or smaller';
+    }
+  } catch {
+    return 'definition must be valid JSON data';
+  }
+  return null;
+}
+
+function validateWorkflowRunGet(payload: Record<string, unknown>): string | null {
+  return isNonEmptyString(payload.run_id) && /^[A-Za-z0-9][A-Za-z0-9_-]{0,119}$/.test(payload.run_id.trim())
+    ? null
+    : 'run_id is required';
+}
+
+function validateCallECampaignCreate(payload: Record<string, unknown>): string | null {
+  if (!/^[A-Za-z0-9._:-]{1,120}$/.test(toText(payload.business_id, '').trim())) return 'business_id is required';
+  if (!Number.isSafeInteger(Number(payload.template_id)) || Number(payload.template_id) < 1) return 'template_id must be a positive integer';
+  if (!isStringArray(payload.destinations) || payload.destinations.length < 1 || payload.destinations.length > 25) return 'destinations must contain between 1 and 25 entries';
+  if (!isRecord(payload.result_schema)) return 'result_schema must be an object';
+  if (payload.authorized !== true) return 'authorized must be confirmed';
+  return null;
+}
+
+function validateCallECampaignScope(payload: Record<string, unknown>): string | null {
+  return /^[A-Za-z0-9._:-]{1,120}$/.test(toText(payload.business_id, '').trim()) ? null : 'business_id is required';
+}
+
+function validateCallECampaignGet(payload: Record<string, unknown>): string | null {
+  if (!/^[A-Za-z0-9._:-]{1,120}$/.test(toText(payload.business_id, '').trim())) return 'business_id is required';
+  return /^campaign_[a-f0-9]{64}$/.test(toText(payload.campaign_id, '').trim()) ? null : 'campaign_id is invalid';
+}
+
+function validateCallECampaignReview(payload: Record<string, unknown>): string | null {
+  const validation = validateCallECampaignGet(payload);
+  if (validation) return validation;
+  if (!['approve', 'reject'].includes(toText(payload.decision, '').trim())) return 'decision must be approve or reject';
+  if (payload.note !== undefined && (typeof payload.note !== 'string' || payload.note.length > 500)) return 'note must be 500 characters or fewer';
+  return null;
+}
+
 const ACTION_GUARDS: Record<string, (payload: Record<string, unknown>) => string | null> = {
   [DASHBOARD_ACTION_CONTRACTS.PROVIDER_SET]: validateProviderAction,
   [DASHBOARD_ACTION_CONTRACTS.PROVIDER_ROLLBACK]: validateProviderAction,
@@ -225,6 +269,20 @@ const ACTION_GUARDS: Record<string, (payload: Record<string, unknown>) => string
   [DASHBOARD_ACTION_CONTRACTS.EMAILTEMPLATE_CREATE]: validateEmailTemplateCreate,
   [DASHBOARD_ACTION_CONTRACTS.EMAILTEMPLATE_UPDATE]: validateEmailTemplateUpdate,
   [DASHBOARD_ACTION_CONTRACTS.AUTOMATION_RUN_RETRY]: validateAutomationRunRetry,
+  [DASHBOARD_ACTION_CONTRACTS.WORKFLOW_DRAFT]: validateWorkflowDraft,
+  [DASHBOARD_ACTION_CONTRACTS.WORKFLOW_RUN_GET]: validateWorkflowRunGet,
+  [DASHBOARD_ACTION_CONTRACTS.CALLE_CAMPAIGN_CREATE]: validateCallECampaignCreate,
+  [DASHBOARD_ACTION_CONTRACTS.CALLE_CAMPAIGN_LIST]: validateCallECampaignScope,
+  [DASHBOARD_ACTION_CONTRACTS.CALLE_CAMPAIGN_GET]: validateCallECampaignGet,
+  [DASHBOARD_ACTION_CONTRACTS.CALLE_CAMPAIGN_REVIEW]: validateCallECampaignReview,
+  [DASHBOARD_ACTION_CONTRACTS.CALLE_CAMPAIGN_PREFLIGHT]: (payload) => {
+    const base = validateCallECampaignGet(payload);
+    if (base) return base;
+    if (!Array.isArray(payload.destinations) || payload.destinations.length < 1 || payload.destinations.length > 25 ||
+        payload.destinations.some((value) => typeof value !== 'string' || value.length > 80)) return 'destinations must contain 1 to 25 entries';
+    if (!isRecord(payload.result_schema) || payload.authorized !== true) return 'result_schema and authorization are required';
+    return null;
+  },
 };
 
 const ACTION_ALIASES = DASHBOARD_ACTION_ALIAS_CONTRACTS;
@@ -405,6 +463,30 @@ const ACTION_POLICIES: Record<string, DashboardActionPolicy> = {
   [DASHBOARD_ACTION_CONTRACTS.CALLSCRIPT_CALLE_PREVIEW]: {
     capability: 'caller_flags_manage',
     risk: 'safe',
+  },
+  [DASHBOARD_ACTION_CONTRACTS.CALLE_CAMPAIGN_CREATE]: {
+    capability: 'caller_flags_manage',
+    risk: 'caution',
+    confirmTitle: 'Save CALL-E campaign review draft',
+    confirmTone: 'warning',
+    confirmConsequence: 'The server stores a review report with masked destinations and no phone numbers. This does not queue or place calls.',
+    confirmLabel: 'Save Review Draft',
+  },
+  [DASHBOARD_ACTION_CONTRACTS.CALLE_CAMPAIGN_REVIEW]: {
+    capability: 'caller_flags_manage',
+    risk: 'caution',
+    confirmTitle: 'Finalize campaign review',
+    confirmTone: 'warning',
+    confirmConsequence: 'This records a business-scoped review decision. It does not authorize or dispatch calls.',
+    confirmLabel: 'Record Review Decision',
+  },
+  [DASHBOARD_ACTION_CONTRACTS.CALLE_CAMPAIGN_PREFLIGHT]: {
+    capability: 'caller_flags_manage',
+    risk: 'caution',
+    confirmTitle: 'Preflight approved campaign',
+    confirmTone: 'warning',
+    confirmConsequence: 'The server will compare re-entered destinations with the approved report and recheck consent. This does not dispatch calls.',
+    confirmLabel: 'Run Preflight',
   },
   [DASHBOARD_ACTION_CONTRACTS.CALLSCRIPT_CALLE_CONFIRM]: {
     capability: 'caller_flags_manage',
@@ -613,6 +695,22 @@ const ACTION_POLICIES: Record<string, DashboardActionPolicy> = {
   },
   [DASHBOARD_ACTION_CONTRACTS.INCIDENTS_SUMMARY]: {
     capability: 'dashboard_view',
+    risk: 'safe',
+  },
+  [DASHBOARD_ACTION_CONTRACTS.WORKFLOW_VERSIONS]: {
+    capability: 'workflow_manage',
+    risk: 'safe',
+  },
+  [DASHBOARD_ACTION_CONTRACTS.WORKFLOW_DRAFT]: {
+    capability: 'workflow_manage',
+    risk: 'safe',
+  },
+  [DASHBOARD_ACTION_CONTRACTS.WORKFLOW_RUNS]: {
+    capability: 'workflow_manage',
+    risk: 'safe',
+  },
+  [DASHBOARD_ACTION_CONTRACTS.WORKFLOW_RUN_GET]: {
+    capability: 'workflow_manage',
     risk: 'safe',
   },
 };

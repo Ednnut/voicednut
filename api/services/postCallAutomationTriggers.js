@@ -204,8 +204,52 @@ function buildCallCompletionAutomationPayload({
   };
 }
 
+function buildPostCallOutcomeClassificationPayload({ callSid, finalStatus, notificationType }) {
+  const normalizedCallSid = normalizeText(callSid, 160);
+  if (!normalizedCallSid) return null;
+  const callOutcome = normalizeText(finalStatus, 80).toLowerCase().replace(/[\s-]+/g, "_");
+  const outcomeClassification = {
+    completed: "completed",
+    no_answer: "not_connected",
+    busy: "not_connected",
+    declined: "not_connected",
+    failed: "failed",
+    canceled: "canceled",
+  }[callOutcome] || "unknown";
+  return {
+    trigger_event: "post_call_outcome_classified",
+    call_sid: normalizedCallSid,
+    idempotency_key: `call-outcome-classified:${normalizedCallSid}`,
+    call_outcome: callOutcome || "unknown",
+    outcome_classification: outcomeClassification,
+    context: {
+      call_sid: normalizedCallSid,
+      call_outcome: callOutcome || "unknown",
+      outcome_classification: outcomeClassification,
+      notification_type: normalizeText(notificationType, 80) || null,
+    },
+  };
+}
+
+async function triggerPostCallOutcomeWorkflow({ workflowService, payload, logger = console }) {
+  if (!workflowService || typeof workflowService.trigger !== "function" || !payload) {
+    return { skipped: true, reason: "workflow_service_unavailable" };
+  }
+  try {
+    return await workflowService.trigger(payload);
+  } catch (error) {
+    const rawCode = String(error?.code || "workflow_trigger_failed").trim().toLowerCase();
+    logger?.error?.("post_call_outcome_workflow_trigger_failed", {
+      call_sid: payload.call_sid || null,
+      error_code: /^[a-z][a-z0-9_.-]{0,79}$/.test(rawCode) ? rawCode : "workflow_trigger_failed",
+    });
+    return { skipped: true, reason: "workflow_trigger_failed" };
+  }
+}
+
 async function runPostCallAutomationTrigger({
   service,
+  workflowService,
   webhookService,
   db,
   logger = console,
@@ -215,6 +259,17 @@ async function runPostCallAutomationTrigger({
   const effectiveCallSid = normalizeText(callSid || payload?.call_sid || payload?.callSid, 160);
   if (!service || typeof service.evaluateAndRun !== "function") {
     return { ok: false, skipped: true, reason: "service_unavailable" };
+  }
+  let workflowResult = null;
+  if (workflowService && typeof workflowService.trigger === "function") {
+    try {
+      workflowResult = await workflowService.trigger(payload || {});
+    } catch (error) {
+      logger?.error?.("post_call_workflow_trigger_failed", {
+        call_sid: effectiveCallSid || null,
+        error_code: String(error?.code || "workflow_trigger_failed").slice(0, 80),
+      });
+    }
   }
   try {
     const result = await service.evaluateAndRun(payload || {});
@@ -245,7 +300,7 @@ async function runPostCallAutomationTrigger({
         { force: matched > 0 },
       );
     }
-    return { ok: true, result };
+    return { ok: true, result, workflow_result: workflowResult };
   } catch (error) {
     logger?.error?.("post_call_automation_trigger_failed", {
       call_sid: effectiveCallSid || null,
@@ -288,6 +343,7 @@ async function maybeRunPaymentAutomation({ provider, result, ctx = {}, logger = 
   }
   return runPostCallAutomationTrigger({
     service: ctx.postCallAutomationService,
+    workflowService: ctx.postCallWorkflowExecutionService,
     webhookService: ctx.webhookService,
     db,
     logger,
@@ -298,9 +354,11 @@ async function maybeRunPaymentAutomation({ provider, result, ctx = {}, logger = 
 
 module.exports = {
   buildCallCompletionAutomationPayload,
+  buildPostCallOutcomeClassificationPayload,
   buildPaymentAutomationPayload,
   isSuccessfulPaymentStatus,
   maybeRunPaymentAutomation,
   resolvePaymentSession,
   runPostCallAutomationTrigger,
+  triggerPostCallOutcomeWorkflow,
 };

@@ -22,6 +22,9 @@ function registerCallEContactPolicyRoutes(app, options = {}) {
   const requireCapability = options.requireMiniAppCapability;
   const policyAdminLimiter = options.policyAdminLimiter || ((_req, _res, next) => next());
   const policyWriteLimiter = options.policyWriteLimiter || ((_req, _res, next) => next());
+  const callEApiAuth = options.requireCallEApiAuthorization || ((_req, _res, next) => next());
+  const callEActorAssertion = options.requireCallEActorAssertion || ((_req, _res, next) => next());
+  const callEApiLimiter = options.callEApiLimiter || ((_req, _res, next) => next());
 
   app.put("/api/call-e/business-operators", adminAuth, policyAdminLimiter, async (req, res) => {
     const body = isPlainObject(req.body) ? req.body : {};
@@ -114,6 +117,48 @@ function registerCallEContactPolicyRoutes(app, options = {}) {
   app.post("/miniapp/call-e/contact-policy/opt-out", miniAppAuth, policyWriteLimiter, async (req, res) => {
     if (typeof requireCapability === "function" && !requireCapability(req, res, "provider_manage")) return;
     return handlePolicyEvent(req, res, "optout");
+  });
+
+  async function callEPolicyMembership(res, businessId, actorId) {
+    if (!/^[A-Za-z0-9._:-]{1,120}$/.test(businessId) || !/^\d{1,20}$/.test(actorId) || typeof db?.getCallEBusinessOperator !== 'function') {
+      errorResponse(res, Object.assign(new Error('CALL-E business policy authorization is unavailable'), { code: 'call_e_business_membership_unavailable', status: 503 }));
+      return false;
+    }
+    const membership = await db.getCallEBusinessOperator(businessId, actorId);
+    if (membership?.role !== POLICY_MANAGER_ROLE) {
+      errorResponse(res, Object.assign(new Error('A business policy manager membership is required'), { code: 'call_e_business_policy_access_denied', status: 403 }));
+      return false;
+    }
+    return true;
+  }
+
+  app.get('/api/call-e/contact-policy', callEApiLimiter, callEApiAuth, callEActorAssertion, async (req, res) => {
+    const businessId = String(req.query?.business_id || '').trim();
+    const actorId = String(req.callEActorId || req.query?.actor_id || '').trim();
+    try {
+      if (!await callEPolicyMembership(res, businessId, actorId)) return;
+      const summary = await policyService.getPolicySummary({ business_id: businessId, destination: req.query?.destination });
+      return res.json({ success: true, ...summary });
+    } catch (error) { return errorResponse(res, error); }
+  });
+
+  app.post('/api/call-e/contact-policy/events', callEApiLimiter, callEApiAuth, callEActorAssertion, async (req, res) => {
+    const body = isPlainObject(req.body) ? req.body : {};
+    if (Object.keys(body).some((key) => !['business_id', 'actor_id', 'kind', 'destination', 'event_key', 'source', 'occurred_at', 'expires_at', 'evidence_reference'].includes(key))) {
+      return res.status(400).json({ success: false, code: 'call_e_contact_policy_invalid', error: 'Unsupported contact policy fields' });
+    }
+    const businessId = String(body.business_id || '').trim();
+    const actorId = String(req.callEActorId || '').trim();
+    const kind = String(body.kind || '').trim().toLowerCase();
+    try {
+      if (!await callEPolicyMembership(res, businessId, actorId)) return;
+      const event = { ...body, businessId, recordedByTelegramId: actorId };
+      const result = kind === 'consent' ? await policyService.recordConsent(event)
+        : kind === 'optout' ? await policyService.recordOptOut(event)
+          : null;
+      if (!result) return res.status(400).json({ success: false, code: 'call_e_contact_policy_invalid', error: 'kind must be consent or optout' });
+      return res.status(result.idempotentReplay ? 200 : 201).json({ success: true, ...result });
+    } catch (error) { return errorResponse(res, error); }
   });
 }
 

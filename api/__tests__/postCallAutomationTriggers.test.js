@@ -2,8 +2,10 @@ const assert = require("node:assert/strict");
 
 const {
   buildCallCompletionAutomationPayload,
+  buildPostCallOutcomeClassificationPayload,
   maybeRunPaymentAutomation,
   runPostCallAutomationTrigger,
+  triggerPostCallOutcomeWorkflow,
 } = require("../services/postCallAutomationTriggers");
 
 function createSilentLogger() {
@@ -145,5 +147,35 @@ describe("PostCallAutomationTriggers", () => {
     assert.equal(payload.transcript_summary, "Customer requested a booking link");
     assert.equal(payload.customer.phone, "+15551234567");
     assert.equal(payload.metadata.has_transcript, true);
+  });
+
+  it("builds a separate data-minimized post-call outcome classification payload", () => {
+    const payload = buildPostCallOutcomeClassificationPayload({
+      callSid: "CA321",
+      finalStatus: "no-answer",
+      notificationType: "call_no_answer",
+    });
+
+    assert.equal(payload.trigger_event, "post_call_outcome_classified");
+    assert.equal(payload.idempotency_key, "call-outcome-classified:CA321");
+    assert.equal(payload.call_outcome, "no_answer");
+    assert.equal(payload.context.outcome_classification, "not_connected");
+    assert.equal(Object.hasOwn(payload, "customer"), false);
+    assert.equal(Object.hasOwn(payload, "transcript_summary"), false);
+    assert.equal(Object.hasOwn(payload, "transcript"), false);
+    assert.equal(buildPostCallOutcomeClassificationPayload({ finalStatus: "completed" }), null);
+    const completed = buildPostCallOutcomeClassificationPayload({ callSid: "CA322", finalStatus: "completed" });
+    assert.equal(completed.outcome_classification, "completed");
+  });
+
+  it("logs only a sanitized error code when a classification workflow trigger fails", async () => {
+    const errors = [];
+    const result = await triggerPostCallOutcomeWorkflow({
+      workflowService: { trigger: async () => { throw Object.assign(new Error("private text"), { code: "private@example.com" }); } },
+      payload: { call_sid: "CA321" },
+      logger: { error: (...args) => errors.push(args) },
+    });
+    assert.deepEqual(result, { skipped: true, reason: "workflow_trigger_failed" });
+    assert.deepEqual(errors, [["post_call_outcome_workflow_trigger_failed", { call_sid: "CA321", error_code: "workflow_trigger_failed" }]]);
   });
 });

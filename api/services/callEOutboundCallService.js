@@ -16,6 +16,13 @@ function callEError(code, message, status = null, details = {}) {
   if (/^[a-z][a-z0-9_]{0,79}$/.test(String(details.providerCode || ""))) error.providerCode = details.providerCode;
   if (/^[a-z][a-z0-9_]{0,79}$/.test(String(details.reasonCode || ""))) error.providerReasonCode = details.reasonCode;
   if (/^[a-z][a-z0-9_]{0,79}$/.test(String(details.recoveryAction || ""))) error.recoveryAction = details.recoveryAction;
+  if (details.clarification && typeof details.clarification === 'object') {
+    const allowed = new Set(['task', 'phone', 'region', 'locale', 'result_schema']);
+    const safe = (value) => Array.isArray(value)
+      ? [...new Set(value.filter((item) => typeof item === 'string' && allowed.has(item)))].slice(0, 5)
+      : [];
+    error.clarification = { missingInputs: safe(details.clarification.missingInputs), fields: safe(details.clarification.fields) };
+  }
   return error;
 }
 
@@ -99,6 +106,7 @@ class CallEOutboundCallService {
     this.client = options.client;
     this.db = options.db;
     this.contactPolicy = options.contactPolicy || new CallEContactPolicyService({ db: this.db });
+    this.outboundSafety = options.outboundSafety || null;
     this.allowedDestinations = parseAllowedDestinations(options.allowedDestinations);
     this.env = options.env || process.env;
   }
@@ -118,14 +126,19 @@ class CallEOutboundCallService {
     if (!this.client?.isConfigured?.()) {
       throw callEError("call_e_not_configured", "CALL-E calling is disabled or not configured", 503);
     }
+    const missionAuthorization = input.missionAuthorization && typeof input.missionAuthorization === "object"
+      ? input.missionAuthorization
+      : null;
     if (!this.db || typeof this.db.reserveCallEOutboundCall !== "function" ||
         typeof this.db.getOutboundCallIdempotency !== "function" ||
         typeof this.db.completeOutboundCallIdempotency !== "function" ||
         typeof this.db.resetCallERejectedOutboundCall !== "function" ||
         typeof this.db.getCallEContactPolicyEligibility !== "function" ||
-        typeof this.db.reserveCallEPilotDispatch !== "function" ||
-        typeof this.db.consumeCallEPilotDispatch !== "function" ||
-        typeof this.db.releaseCallEPilotDispatch !== "function") {
+        (missionAuthorization
+          ? typeof this.db.validateCallECampaignMissionRecipientDispatch !== "function"
+          : typeof this.db.reserveCallEPilotDispatch !== "function" ||
+            typeof this.db.consumeCallEPilotDispatch !== "function" ||
+            typeof this.db.releaseCallEPilotDispatch !== "function")) {
       throw callEError("call_e_dependencies_missing", "CALL-E idempotency storage is unavailable", 503);
     }
 
@@ -166,6 +179,15 @@ class CallEOutboundCallService {
     }
     const idempotencyKeyForProvider = `${CALL_E_IDEMPOTENCY_PREFIX}${idempotencyKey}`;
     const requestHash = preview.fingerprint;
+    if (missionAuthorization) {
+      const validMissionDispatch = await this.db.validateCallECampaignMissionRecipientDispatch({
+        ...missionAuthorization,
+        idempotency_key: idempotencyKeyForProvider,
+      });
+      if (!validMissionDispatch) {
+        throw callEError("call_e_mission_dispatch_not_authorized", "This CALL-E mission recipient is not authorized for dispatch", 403);
+      }
+    }
     const persistReconciliation = async (localId, accepted = null) => {
       if (typeof this.db.upsertCallEReconciliationRecord !== "function") return;
       await this.db.upsertCallEReconciliationRecord({
@@ -205,19 +227,41 @@ class CallEOutboundCallService {
       const existingResolution = resolveReplay(existing, requestHash);
       existingReplay = existingResolution.replay || null;
     }
-    const pilotSlot = await this.db.reserveCallEPilotDispatch({ reservation_key: idempotencyKeyForProvider });
-    if (!pilotSlot?.reserved) {
-      if (pilotSlot?.reason === "pilot_cap_reached") {
-        throw callEError("call_e_pilot_cap_reached", "The single-call CALL-E pilot cap has already been reserved", 409);
+    if (!missionAuthorization) {
+      const pilotSlot = await this.db.reserveCallEPilotDispatch({ reservation_key: idempotencyKeyForProvider });
+      if (!pilotSlot?.reserved) {
+        if (pilotSlot?.reason === "pilot_cap_reached") {
+          throw callEError("call_e_pilot_cap_reached", "The single-call CALL-E pilot cap has already been reserved", 409);
+        }
+        throw callEError("call_e_pilot_guard_unavailable", "CALL-E pilot dispatch guard is unavailable", 503);
       }
-      throw callEError("call_e_pilot_guard_unavailable", "CALL-E pilot dispatch guard is unavailable", 503);
     }
     if (existingReplay) {
-      const consumed = await this.db.consumeCallEPilotDispatch({ reservation_key: idempotencyKeyForProvider });
-      if (!consumed) {
-        throw callEError("call_e_pilot_guard_unavailable", "CALL-E replay exists but the pilot cap state could not be confirmed", 503);
+      if (!missionAuthorization) {
+        const consumed = await this.db.consumeCallEPilotDispatch({ reservation_key: idempotencyKeyForProvider });
+        if (!consumed) {
+          throw callEError("call_e_pilot_guard_unavailable", "CALL-E replay exists but the pilot cap state could not be confirmed", 503);
+        }
       }
       return repairReplayRecord(existingReplay);
+    }
+    let outboundSafetyReservation = null;
+    if (!missionAuthorization) {
+      if (!this.outboundSafety || typeof this.outboundSafety.reserveDispatch !== "function") {
+        throw callEError("outbound_contact_policy_unavailable", "Outbound safety is unavailable; no call was placed", 503);
+      }
+      try {
+        outboundSafetyReservation = await this.outboundSafety.reserveDispatch({
+          business_id: businessId,
+          actor_id: input.actor_id,
+          destination,
+          provider: "call_e",
+          idempotency_key: idempotencyKey,
+        });
+      } catch (error) {
+        await this.db.releaseCallEPilotDispatch({ reservation_key: idempotencyKeyForProvider }).catch(() => {});
+        throw error;
+      }
     }
     let localCallId = null;
 
@@ -313,8 +357,9 @@ class CallEOutboundCallService {
           error_message: noCallCreated ? NO_CALL_CREATED_MARKER : "call_e_outcome_unknown",
         });
       } finally {
-        if (noCallCreated) {
+        if (noCallCreated && !missionAuthorization) {
           await this.db.releaseCallEPilotDispatch({ reservation_key: idempotencyKeyForProvider });
+          await this.outboundSafety.completeDispatch(outboundSafetyReservation, "released");
         }
       }
       if (noCallCreated) {
@@ -322,6 +367,7 @@ class CallEOutboundCallService {
           providerCode: error?.providerCode,
           reasonCode: error?.reasonCode,
           recoveryAction: error?.recoveryAction,
+          clarification: error?.clarification,
         });
       }
       throw callEError("call_e_call_outcome_unknown", "CALL-E acceptance is uncertain; retry only with the same request and idempotency key", 409, {
@@ -331,9 +377,11 @@ class CallEOutboundCallService {
       });
     }
 
-    const pilotSlotConsumed = await this.db.consumeCallEPilotDispatch({ reservation_key: idempotencyKeyForProvider });
-    if (!pilotSlotConsumed) {
-      throw callEError("call_e_call_outcome_unknown", "CALL-E accepted a request but the pilot cap state could not be confirmed; reconcile before retrying", 409);
+    if (!missionAuthorization) {
+      const pilotSlotConsumed = await this.db.consumeCallEPilotDispatch({ reservation_key: idempotencyKeyForProvider });
+      if (!pilotSlotConsumed) {
+        throw callEError("call_e_call_outcome_unknown", "CALL-E accepted a request but the pilot cap state could not be confirmed; reconcile before retrying", 409);
+      }
     }
 
     let normalized;
@@ -370,6 +418,7 @@ class CallEOutboundCallService {
       response_payload: result,
     });
     await persistReconciliation(localCallId, result);
+    await this.outboundSafety?.completeDispatch(outboundSafetyReservation, "accepted");
     return result;
   }
 

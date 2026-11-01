@@ -366,6 +366,8 @@ async function validateTemplatesApiConnectivity() {
 // Import dependencies
 const { expireInactiveUsers } = require("./db/db");
 const { callFlow, registerCallCommand } = require("./commands/call");
+const { callPlanFlow, registerCallPlanCommand } = require("./commands/callPlan");
+const { registerCallCampaignsCommand, callCampaignCreateFlow } = require("./commands/callCampaigns");
 const {
   smsFlow,
   bulkSmsFlow,
@@ -418,6 +420,13 @@ const {
   renderProviderMenu,
   renderProviderConfirm,
 } = require("./commands/provider");
+const { registerCallResultsCommand, handleCallResults } = require("./commands/callResults");
+const { registerCallQualityCommand } = require("./commands/callQuality");
+const { registerCallMissionsCommands, callMissionCreateFlow } = require("./commands/callMissions");
+const { callEOperationFlow, registerCallEOperations, renderCallECenter } = require("./commands/callEOperations");
+const { vapiOperationFlow, registerVapiCommand, renderVapiCenter } = require("./commands/vapiOperations");
+const { cartesiaOperationFlow, registerCartesiaCommand, renderCartesiaCenter } = require("./commands/cartesiaOperations");
+const { cartesiaStudioFlow, renderCartesiaStudio } = require("./commands/cartesiaStudio");
 const {
   addUserFlow,
   promoteFlow,
@@ -445,6 +454,13 @@ const {
 
 // Register conversations with error handling
 bot.use(wrapConversation(callFlow, "call-conversation"));
+bot.use(wrapConversation(callPlanFlow, "call-plan-conversation"));
+bot.use(wrapConversation(callCampaignCreateFlow, "call-campaign-create-conversation"));
+bot.use(wrapConversation(callMissionCreateFlow, "call-mission-create-conversation"));
+bot.use(wrapConversation(callEOperationFlow, "call-e-operation-conversation"));
+bot.use(wrapConversation(vapiOperationFlow, "vapi-operation-conversation"));
+bot.use(wrapConversation(cartesiaOperationFlow, "cartesia-operation-conversation"));
+bot.use(wrapConversation(cartesiaStudioFlow, "cartesia-studio-conversation"));
 bot.use(wrapConversation(addUserFlow, "adduser-conversation"));
 bot.use(wrapConversation(promoteFlow, "promote-conversation"));
 bot.use(wrapConversation(removeUserFlow, "remove-conversation"));
@@ -479,6 +495,14 @@ bot.use(wrapConversation(callerFlagSpamFlow, "callerflag-spam-conversation"));
 
 // Register command handlers
 registerCallCommand(bot);
+registerCallPlanCommand(bot);
+registerCallCampaignsCommand(bot);
+registerCallResultsCommand(bot);
+registerCallQualityCommand(bot);
+registerCallMissionsCommands(bot);
+registerCallEOperations(bot);
+registerVapiCommand(bot);
+registerCartesiaCommand(bot);
 registerSmsCommands(bot);
 registerEmailCommands(bot);
 registerScriptsCommand(bot);
@@ -931,6 +955,90 @@ bot.on("callback_query:data", async (ctx) => {
 
     // Handle conversation actions
     const conversations = {
+      CALL_E_PLAN: "call-plan-conversation",
+      CALL_E_REVIEW_INBOX: "call-e-operation-conversation",
+      CALL_E_MISSION_ALERTS: "call-e-operation-conversation",
+      CALL_E_MISSION_APPROVAL_POLICY: "call-e-operation-conversation",
+      CALL_E_PROVIDER_ROUTING: "call-e-operation-conversation",
+      CALL_E_MISSION_REPORT: "call-e-operation-conversation",
+      CALL_E_ALERT_SUBSCRIPTION: "call-e-operation-conversation",
+      CALL_E_REPORT_DIGEST: "call-e-operation-conversation",
+      CALL_E_CONTACT_POLICY: "call-e-operation-conversation",
+      CALL_E_REVIEW_ASSIGNMENTS: "call-e-operation-conversation",
+      CALL_E_MISSION_USAGE: "call-e-operation-conversation",
+      CALL_E_RESULT_FOLLOWUP: "call-e-operation-conversation",
+      CALL_E_MISSION_RECOVERY: "call-e-operation-conversation",
+      CALL_E_CDR_IMPORT: "call-e-operation-conversation",
+      CALL_E_PROVIDER_DIAGNOSTICS: "call-e-operation-conversation",
+      CALL_E_MISSION_READINESS: "call-e-operation-conversation",
+      CALL_E_MISSION_RETRY: "call-e-operation-conversation",
+      CALL_E_MISSION_SAFETY: "call-e-operation-conversation",
+      CALL_E_RETENTION: "call-e-operation-conversation",
+      CALL_E_OPERATIONS_AUDIT: "call-e-operation-conversation",
+      CALL_E_GOALS: "call-e-operation-conversation",
+      CALL_E_GOAL_RUN_CREATE: "call-e-operation-conversation",
+      CALL_E_GOAL_RUNS: "call-e-operation-conversation",
+      CALL_E_GOAL_RUN_REVIEW: "call-e-operation-conversation",
+      CALL_E_GOAL_RUN_ADVANCE: "call-e-operation-conversation",
+      CALL_E_GOAL_RUN_RECONCILE: "call-e-operation-conversation",
+      CALL_E_GOAL_RUN_STATUS: "call-e-operation-conversation",
+      CALL_E_CAMPAIGNS: "call-e-operation-conversation",
+      CALL_E_CAMPAIGN_CREATE: "call-campaign-create-conversation",
+      CALL_E_CAMPAIGN_INFO: "call-e-operation-conversation",
+      CALL_E_CAMPAIGN_REVIEW: "call-e-operation-conversation",
+      CALL_E_CALL_RESULT: "call-e-operation-conversation",
+      CALL_E_RECONCILE: "call-e-operation-conversation",
+      CALL_E_QUALITY: "call-e-operation-conversation",
+      CALL_E_MISSIONS: "call-e-operation-conversation",
+      CALL_E_MISSION_CREATE: "call-mission-create-conversation",
+      CALL_E_MISSION_REVIEW: "call-e-operation-conversation",
+      CALL_E_MISSION_ADVANCE: "call-e-operation-conversation",
+      CALL_E_MISSION_RESOLVE: "call-e-operation-conversation",
+      CALL_E_MISSION_INFO: "call-e-operation-conversation",
+      VAPI_STATUS: "vapi-operation-conversation",
+      VAPI_NUMBERS: "vapi-operation-conversation",
+      VAPI_EVENTS: "vapi-operation-conversation",
+      VAPI_CAMPAIGNS: "vapi-operation-conversation",
+      VAPI_CALL_INFO: "vapi-operation-conversation",
+      VAPI_RECONCILE: "vapi-operation-conversation",
+      VAPI_END: "vapi-operation-conversation",
+      VAPI_TRANSFER: "vapi-operation-conversation",
+      VAPI_TOOLS: "vapi-operation-conversation",
+      VAPI_MAPPING_HEALTH: "vapi-operation-conversation",
+      VAPI_SIMULATIONS: "vapi-operation-conversation",
+      VAPI_EVALS: "vapi-operation-conversation",
+      VAPI_EVAL_CREATE: "vapi-operation-conversation",
+      VAPI_SQUADS: "vapi-operation-conversation",
+      CARTESIA_CALL: "cartesia-operation-conversation",
+      CARTESIA_RECONCILE: "cartesia-operation-conversation",
+      CARTESIA_CALLS: "cartesia-operation-conversation",
+      CARTESIA_REVIEW_QUEUE: "cartesia-operation-conversation",
+      CARTESIA_REVIEW_RULES: "cartesia-operation-conversation",
+      CARTESIA_AGENT_HEALTH: "cartesia-operation-conversation",
+      CARTESIA_CAMPAIGN: "cartesia-operation-conversation",
+      CARTESIA_CAMPAIGN_STATUS: "cartesia-operation-conversation",
+      CARTESIA_BATCH_RECONCILE: "cartesia-operation-conversation",
+      CARTESIA_BATCH_CANCEL: "cartesia-operation-conversation",
+      CARTESIA_BATCH_RETRY: "cartesia-operation-conversation",
+      CARTESIA_STUDIO_VOICES: "cartesia-studio-conversation",
+      CARTESIA_STUDIO_CLONE: "cartesia-studio-conversation",
+      CARTESIA_STUDIO_PVC: "cartesia-studio-conversation",
+      CARTESIA_STUDIO_PREVIEW: "cartesia-studio-conversation",
+      CARTESIA_STUDIO_DICTIONARIES: "cartesia-studio-conversation",
+      CARTESIA_STUDIO_DICT_CREATE: "cartesia-studio-conversation",
+      CARTESIA_STUDIO_QUALITY: "cartesia-studio-conversation",
+      CARTESIA_STUDIO_LOGS: "cartesia-studio-conversation",
+      CARTESIA_STUDIO_TOOLS: "cartesia-studio-conversation",
+      CARTESIA_STUDIO_WEBHOOKS: "cartesia-studio-conversation",
+      CARTESIA_STUDIO_READINESS: "cartesia-studio-conversation",
+      CARTESIA_STUDIO_TOOL_CREATE: "cartesia-studio-conversation",
+      CARTESIA_STUDIO_STT: "cartesia-studio-conversation",
+      CARTESIA_STUDIO_PHRASE_CACHE: "cartesia-studio-conversation",
+      CARTESIA_STUDIO_VOICE_MANAGE: "cartesia-studio-conversation",
+      CARTESIA_STUDIO_STREAMS: "cartesia-studio-conversation",
+      CARTESIA_STUDIO_INFILL: "cartesia-studio-conversation",
+      CARTESIA_STUDIO_AGENTS: "cartesia-studio-conversation",
+      CARTESIA_STUDIO_USAGE: "cartesia-studio-conversation",
       CALL: "call-conversation",
       ADDUSER: "adduser-conversation",
       PROMOTE: "promote-conversation",
@@ -963,6 +1071,12 @@ bot.on("callback_query:data", async (ctx) => {
       await cancelActiveFlow(ctx, `callback:${action}`);
       await clearMenuMessages(ctx);
       startOperation(ctx, action.toLowerCase());
+      if (action.startsWith("CALL_E_") && !["CALL_E_PLAN", "CALL_E_CAMPAIGN_CREATE", "CALL_E_MISSION_CREATE"].includes(action)) {
+        ctx.session.callEOperationAction = action;
+      }
+      if (action.startsWith("VAPI_")) ctx.session.vapiOperationAction = action;
+      if (action.startsWith("CARTESIA_")) ctx.session.cartesiaOperationAction = action;
+      if (action.startsWith("CARTESIA_STUDIO_")) ctx.session.cartesiaStudioAction = action;
       const conversationLabels = {
         CALLLOG_RECENT: "call log (recent)",
         CALLLOG_SEARCH: "call log (search)",
@@ -990,6 +1104,31 @@ bot.on("callback_query:data", async (ctx) => {
     await clearMenuMessages(ctx);
 
     switch (action) {
+      case "CALL_E_CENTER":
+        await renderCallECenter(ctx);
+        finishMetric("ok");
+        break;
+
+      case "VAPI_CENTER":
+        await renderVapiCenter(ctx);
+        finishMetric("ok");
+        break;
+
+      case "CARTESIA_CENTER":
+        await renderCartesiaCenter(ctx);
+        finishMetric("ok");
+        break;
+
+      case "CARTESIA_STUDIO_CENTER":
+        await renderCartesiaStudio(ctx);
+        finishMetric("ok");
+        break;
+
+      case "CALL_E_RESULTS":
+        await handleCallResults(ctx);
+        finishMetric("ok");
+        break;
+
       case "HELP":
         await handleHelp(ctx);
         finishMetric("ok");
@@ -1185,7 +1324,23 @@ const TELEGRAM_COMMANDS = [
   { command: "guide", description: "Show detailed usage guide" },
   { command: "health", description: "Check bot and API health" },
   { command: "call", description: "Start outbound voice call" },
+  { command: "callplan", description: "Plan and preview a CALL-E template (no call placed)" },
+  { command: "calle", description: "Open the interactive CALL-E Operations center" },
   { command: "calllog", description: "Call history and search" },
+  { command: "callcampaigns", description: "List CALL-E campaign drafts and review state (admin only)" },
+  { command: "callcampaigncreate", description: "Create a consent-checked CALL-E campaign draft (admin only)" },
+  { command: "callcampaigninfo", description: "Show CALL-E campaign fingerprint and approval audit (private chat)" },
+  { command: "callcampaignreview", description: "Approve or reject a CALL-E campaign (policy manager only)" },
+  { command: "callresults", description: "Recent CALL-E result status summaries (admin only)" },
+  { command: "callresult", description: "View one validated CALL-E structured result (private chat)" },
+  { command: "callreconcile", description: "Refresh CALL-E call and event state (business-scoped, no dial)" },
+  { command: "callquality", description: "CALL-E transcript and result quality signals (admin only)" },
+  { command: "callmissions", description: "List CALL-E mission status (admin only)" },
+  { command: "callmissioncreate", description: "Create a CALL-E mission from an approved campaign (admin only)" },
+  { command: "callmissionreview", description: "Approve or reject a CALL-E mission (admin only)" },
+  { command: "callmissionadvance", description: "Advance one approved CALL-E mission step (admin only)" },
+  { command: "callmissionresolve", description: "Resolve a paused CALL-E mission (policy manager only)" },
+  { command: "callmissioninfo", description: "Show exact CALL-E mission approval fingerprint (admin only)" },
   { command: "sms", description: "Open SMS center" },
   { command: "email", description: "Open Email center" },
   { command: "smssender", description: "Bulk SMS center (admin only)" },
@@ -1193,6 +1348,8 @@ const TELEGRAM_COMMANDS = [
   { command: "scripts", description: "Manage call & SMS scripts (admin only)" },
   { command: "persona", description: "Manage personas (admin only)" },
   { command: "provider", description: "Manage call provider (admin only)" },
+  { command: "vapi", description: "Vapi operations and call controls (admin only)" },
+  { command: "cartesia", description: "Cartesia Managed Agents operations (admin only)" },
   { command: "callerflags", description: "Manage caller flags (admin only)" },
   { command: "users", description: "Manage users (admin only)" },
   { command: "admin", description: "Open Mini App admin console" },
@@ -1213,6 +1370,8 @@ const TELEGRAM_COMMANDS_USER = [
   { command: "guide", description: "Show detailed usage guide" },
   { command: "health", description: "Check bot and API health" },
   { command: "call", description: "Start outbound voice call" },
+  { command: "callplan", description: "Plan and preview a CALL-E template (no call placed)" },
+  { command: "calle", description: "Open the CALL-E planner" },
   { command: "calllog", description: "Call history and search" },
   { command: "sms", description: "Open SMS center" },
   { command: "email", description: "Open Email center" },

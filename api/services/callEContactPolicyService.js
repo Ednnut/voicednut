@@ -65,6 +65,7 @@ function normalizePolicyInput(input = {}, kind) {
 class CallEContactPolicyService {
   constructor(options = {}) {
     this.db = options.db;
+    this.cooldownHashSecret = String(options.cooldownHashSecret || '');
   }
 
   async recordConsent(input = {}) {
@@ -93,14 +94,46 @@ class CallEContactPolicyService {
     if (!/^[A-Za-z0-9._:-]{1,120}$/.test(businessId) || !/^\+[1-9]\d{7,14}$/.test(destination)) {
       return { eligible: false, reason: "scope_or_destination_invalid" };
     }
+    const at = input.at === undefined || input.at === null ? undefined : String(input.at).trim();
+    if (at !== undefined && (!at || !/(?:Z|[+-]\d{2}:\d{2})$/i.test(at) || !Number.isFinite(Date.parse(at)))) {
+      return { eligible: false, reason: "policy_storage_unavailable" };
+    }
     if (typeof this.db?.getCallEContactPolicyEligibility !== "function") {
       return { eligible: false, reason: "policy_storage_unavailable" };
     }
     try {
-      return await this.db.getCallEContactPolicyEligibility({ business_id: businessId, destination });
+      const destinationHash = this.cooldownHashSecret.length >= 32
+        ? crypto.createHmac('sha256', this.cooldownHashSecret).update(`${businessId}:${destination}`).digest('hex')
+        : '';
+      return await this.db.getCallEContactPolicyEligibility({ business_id: businessId, destination, destination_hash: destinationHash, ...(at ? { at: new Date(Date.parse(at)).toISOString() } : {}) });
     } catch {
       return { eligible: false, reason: "policy_storage_unavailable" };
     }
+  }
+
+  async getPolicySummary(input = {}) {
+    const businessId = String(input.business_id || input.businessId || '').trim();
+    const destination = String(input.destination || input.phone || '').trim();
+    if (!/^[A-Za-z0-9._:-]{1,120}$/.test(businessId) || !/^\+[1-9]\d{7,14}$/.test(destination)) {
+      throw policyError('call_e_contact_policy_invalid', 'Business and E.164 destination are required');
+    }
+    if (typeof this.db?.listCallEContactPolicyEvents !== 'function') {
+      throw policyError('call_e_contact_policy_unavailable', 'Contact policy history is unavailable', 503);
+    }
+    const [eligibility, events] = await Promise.all([
+      this.checkEligibility({ business_id: businessId, destination }),
+      this.db.listCallEContactPolicyEvents({ business_id: businessId, destination, limit: 10 }),
+    ]);
+    return {
+      business_id: businessId,
+      destination_masked: `••••${destination.slice(-4)}`,
+      eligible: eligibility.eligible === true,
+      reason: eligibility.reason || null,
+      events: events.map((event) => ({
+        event_type: event.event_type, source: event.source, occurred_at: event.occurred_at,
+        expires_at: event.expires_at || null,
+      })),
+    };
   }
 }
 
