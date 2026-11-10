@@ -127,13 +127,25 @@ describe("CartesiaStudioClient", () => {
   it("uses the documented platform-key auth and API version for agent lifecycle webhook management", async () => {
     const requests = [];
     const client = new CartesiaStudioClient({ enabled: true, apiKey: "sk_car_test", adminApiKey: "sk_admin_test",
-      fetch: async (url, options) => { requests.push({ url, options }); return { ok: true, status: 200, json: async () => ({ id: "agent_webhook_1", display_name: "Operations", secret: "must-not-be-returned" }) }; } });
+      fetch: async (url, options) => {
+        requests.push({ url, options });
+        return { ok: true, status: 200, json: async () => options.method === "PATCH" ? "agent_webhook_1" : ({ id: "agent_webhook_1", display_name: "Operations", secret: "must-not-be-returned" }) };
+      } });
     await client.createAgentWebhook({ url: "https://voice.example.com/webhook/cartesia", secret: "server-secret", display_name: "Operations" });
+    assert.deepEqual(await client.updateAgentWebhook("agent_webhook_1", {
+      url: "https://voice.example.com/webhook/cartesia",
+      display_name: "Updated",
+    }), { id: "agent_webhook_1" });
     assert.equal(requests[0].url, "https://api.cartesia.ai/agents/webhooks");
-    assert.equal(requests[0].options.headers["X-API-Key"], "sk_admin_test");
-    assert.equal(requests[0].options.headers["Cartesia-Version"], "2026-03-01");
-    assert.equal(Object.hasOwn(requests[0].options.headers, "Authorization"), false);
+    assert.equal(requests[0].options.headers.Authorization, "Bearer sk_car_test");
+    assert.equal(requests[0].options.headers["Cartesia-Version"], "2026-08-14");
     assert.deepEqual(JSON.parse(requests[0].options.body), { url: "https://voice.example.com/webhook/cartesia", secret: "server-secret", display_name: "Operations" });
+    assert.equal(requests[1].url, "https://api.cartesia.ai/agents/webhooks/agent_webhook_1");
+    assert.equal(requests[1].options.headers.Authorization, "Bearer sk_car_test");
+    assert.deepEqual(JSON.parse(requests[1].options.body), {
+      url: "https://voice.example.com/webhook/cartesia",
+      display_name: "Updated",
+    });
   });
 
   it("returns the documented TTS SSE body as a stream", async () => {
@@ -154,9 +166,10 @@ describe("CartesiaStudioClient", () => {
     const { EventEmitter } = require("node:events");
     const sent = [];
     let socketUrl;
+    let socketOptions;
     class FakeSocket extends EventEmitter {
       constructor(url, options) {
-        super(); this.url = url; this.options = options; socketUrl = url;
+        super(); this.url = url; this.options = options; socketUrl = url; socketOptions = options;
         queueMicrotask(() => this.emit("open"));
       }
       send(value) {
@@ -171,12 +184,82 @@ describe("CartesiaStudioClient", () => {
     const result = await client.transcribeAudioRealtime({ file: Buffer.alloc(6400), keyterms: ["VOICEDNUT"] });
     assert.equal(result.transcript, "recognized words");
     assert.equal(new URL(socketUrl).pathname, "/stt/turns/websocket");
+    assert.equal(new URL(socketUrl).searchParams.get("cartesia_version"), CARTESIA_API_VERSION);
     assert.equal(new URL(socketUrl).searchParams.get("keyterm"), "VOICEDNUT");
     assert.equal(new URL(socketUrl).searchParams.get("encoding"), "pcm_s16le");
+    assert.equal(socketOptions.headers.Authorization, "Bearer sk_car_test");
+    assert.equal(Object.hasOwn(socketOptions.headers, "X-API-Key"), false);
     const binaryChunks = sent.filter((entry) => Buffer.isBuffer(entry));
     assert.equal(binaryChunks.length, 2);
     assert.equal(binaryChunks[0].length, 3200);
     assert.deepEqual(JSON.parse(sent.at(-1)), { type: "close" });
+  });
+
+  it("finalizes manual Ink turns, concatenates only final deltas verbatim, then closes", async () => {
+    const { EventEmitter } = require("node:events");
+    const sent = [];
+    let socketUrl;
+    let socketOptions;
+    class FakeSocket extends EventEmitter {
+      constructor(url, options) { super(); socketUrl = url; socketOptions = options; queueMicrotask(() => this.emit("open")); }
+      send(value) {
+        sent.push(value);
+        if (value === "finalize") {
+          queueMicrotask(() => {
+            this.emit("message", Buffer.from(JSON.stringify({ type: "transcript", is_final: false, text: "ignored" })));
+            this.emit("message", Buffer.from(JSON.stringify({ type: "transcript", is_final: true, text: " preserve " })));
+            this.emit("message", Buffer.from(JSON.stringify({ type: "transcript", is_final: true, text: "spacing", duration: 0.4, language: "en" })));
+            this.emit("message", Buffer.from(JSON.stringify({ type: "flush_done" })));
+          });
+        }
+        if (value === "close") queueMicrotask(() => this.emit("message", Buffer.from(JSON.stringify({ type: "done" }))));
+      }
+      close() {}
+    }
+    const client = new CartesiaStudioClient({ enabled: true, apiKey: "sk_car_test", WebSocket: FakeSocket });
+    const result = await client.transcribeAudioManual({ file: Buffer.alloc(3200), keyterms: ["VOICEDNUT"] });
+    assert.equal(result.transcript, " preserve spacing");
+    assert.equal(result.language, "en");
+    assert.equal(result.durationSeconds, 0.4);
+    assert.equal(new URL(socketUrl).pathname, "/stt/websocket");
+    assert.equal(new URL(socketUrl).searchParams.get("cartesia_version"), CARTESIA_API_VERSION);
+    assert.equal(new URL(socketUrl).searchParams.get("keyterm"), "VOICEDNUT");
+    assert.equal(socketOptions.headers.Authorization, "Bearer sk_car_test");
+    assert.equal(new URL(socketUrl).searchParams.get("api_key"), null);
+    assert.deepEqual(sent.filter((entry) => typeof entry === "string"), ["finalize", "close"]);
+    assert.equal(sent.filter((entry) => Buffer.isBuffer(entry)).length, 1);
+  });
+
+  it("rejects manual Ink audio beyond the synchronous paced-upload bound before connecting", () => {
+    let opened = 0;
+    class FakeSocket { constructor() { opened += 1; } }
+    const client = new CartesiaStudioClient({ enabled: true, apiKey: "sk_car_test", WebSocket: FakeSocket });
+    assert.throws(() => client.transcribeAudioManual({ file: Buffer.alloc(1_600_002) }), {
+      code: "cartesia_stt_realtime_audio_invalid",
+      status: 400,
+    });
+    assert.equal(opened, 0);
+  });
+
+  it("sanitizes manual Ink provider errors", async () => {
+    const { EventEmitter } = require("node:events");
+    class FakeSocket extends EventEmitter {
+      constructor(_url, _options) { super(); queueMicrotask(() => this.emit("open")); }
+      send(value) {
+        if (value === "finalize") {
+          queueMicrotask(() => this.emit("message", Buffer.from(JSON.stringify({
+            type: "error", status_code: 429, message: "private provider response",
+          }))));
+        }
+      }
+      close() {}
+    }
+    const client = new CartesiaStudioClient({ enabled: true, apiKey: "sk_car_test", WebSocket: FakeSocket });
+    await assert.rejects(client.transcribeAudioManual({ file: Buffer.alloc(2) }), {
+      code: "cartesia_manual_stt_failed",
+      status: 429,
+      message: "Cartesia rejected manual transcription",
+    });
   });
 
   it("streams multiple TTS continuation segments over one mocked Cartesia context", async () => {
@@ -472,7 +555,7 @@ describe("CartesiaStudioService", () => {
       webhookUrl: "https://voice.example.com/webhook/cartesia",
       async listAgentWebhooks() { return { webhooks: [{ id: "agent_webhook_1", display_name: "Ops", url: this.webhookUrl, secret: "private" }] }; },
       async createAgentWebhook(input) { received.push(input); return { id: "agent_webhook_2", display_name: input.display_name, url: input.url, secret: input.secret }; },
-      async updateAgentWebhook(id, input) { received.push({ id, ...input }); return { id, display_name: input.display_name, url: this.webhookUrl }; },
+      async updateAgentWebhook(id, input) { received.push({ id, ...input }); return id; },
       async deleteAgentWebhook(id) { received.push({ delete: id }); },
     };
     const service = new CartesiaStudioService({ client });
@@ -483,10 +566,29 @@ describe("CartesiaStudioService", () => {
     assert.equal(created.webhook.id, "agent_webhook_2");
     assert.deepEqual(received[0], { url: "https://voice.example.com/webhook/cartesia", secret: client.webhookSecret, display_name: "Operations" });
     assert.doesNotMatch(JSON.stringify(created), /private|secret/);
-    await service.updateAgentWebhook("agent_webhook_2", { display_name: "Updated" });
+    const updated = await service.updateAgentWebhook("agent_webhook_2", { display_name: "Updated" });
+    assert.deepEqual(updated.webhook, {
+      id: "agent_webhook_2",
+      displayName: "Updated",
+      url: client.webhookUrl,
+      createdAt: null,
+      updatedAt: null,
+    });
     await service.updateAgentWebhook("agent_webhook_2", { rotate_secret: true });
     await service.deleteAgentWebhook("agent_webhook_2");
-    assert.deepEqual(received.slice(1), [{ id: "agent_webhook_2", display_name: "Updated" }, { id: "agent_webhook_2", secret: client.webhookSecret }, { delete: "agent_webhook_2" }]);
+    assert.deepEqual(received.slice(1), [
+      { id: "agent_webhook_2", display_name: "Updated", url: client.webhookUrl },
+      { id: "agent_webhook_2", secret: client.webhookSecret, url: client.webhookUrl },
+      { delete: "agent_webhook_2" },
+    ]);
+    const unconfirmed = new CartesiaStudioService({ client: {
+      webhookUrl: client.webhookUrl,
+      async updateAgentWebhook() { return "another_webhook"; },
+    } });
+    await assert.rejects(unconfirmed.updateAgentWebhook("agent_webhook_2", { display_name: "Updated" }), {
+      code: "cartesia_webhook_update_unconfirmed",
+      status: 502,
+    });
     const unconfigured = new CartesiaStudioService({ client: { webhookSecret: "too-short", webhookUrl: "" } });
     await assert.rejects(unconfigured.createAgentWebhook({ display_name: "Operations" }), { code: "cartesia_webhook_not_configured", status: 503 });
     const localCallback = new CartesiaStudioService({ client: {
@@ -628,15 +730,24 @@ describe("CartesiaStudioService", () => {
         assert.deepEqual(input.file, Buffer.from([1, 2, 3, 4]));
         assert.deepEqual(input.keyterms, ["VOICEDNUT"]);
         assert.deepEqual(input.turnSettings, { start_threshold: 0.8, eager_end_threshold: 0.6, end_threshold: 0.3, end_timeout_ms: 5600 });
-        return { transcript: "recognized", events: [{ type: "turn.end", transcript: "recognized", secret: "hidden" }] };
+        return { transcript: " recognized ", events: [{ type: "turn.end", transcript: " recognized ", secret: "hidden" }] };
+      },
+      async transcribeAudioManual(input) {
+        assert.deepEqual(input.file, Buffer.from([1, 2, 3, 4]));
+        assert.deepEqual(input.keyterms, ["VOICEDNUT"]);
+        return { transcript: "  manual text \n", language: "en", durationSeconds: 0.25 };
       },
     } });
     const infill = await service.infillSpeech({ leftAudio: Buffer.from("before"), filename: "context.wav", contentType: "audio/wav", transcript: "replacement", voiceId: "voice_1" });
     assert.deepEqual(Buffer.from(infill), Buffer.from([7, 6]));
     assert.equal(infill.contentType, "audio/wav");
     const realtime = await service.transcribeAudioRealtime({ audio: Buffer.from([1, 2, 3, 4]), keyterms: ["VOICEDNUT"], turn_settings: { start_threshold: 0.8, eager_end_threshold: 0.6, end_threshold: 0.3, end_timeout_ms: 5600 } });
-    assert.equal(realtime.transcript, "recognized");
+    assert.equal(realtime.transcript, " recognized ");
     assert.doesNotMatch(JSON.stringify(realtime), /hidden|secret/);
+    const manual = await service.transcribeAudioManual({ audio: Buffer.from([1, 2, 3, 4]), keyterms: ["VOICEDNUT"] });
+    assert.equal(manual.transcript, "  manual text \n");
+    assert.equal(manual.language, "en");
+    assert.equal(manual.durationSeconds, 0.25);
   });
 
   it("normalizes TTS settings, STT keyterms, and turn-detection thresholds", () => {

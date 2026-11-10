@@ -19,10 +19,15 @@ describe("voice provider capability registry", () => {
     assert.equal(isVoiceProviderCapabilityImplemented("cartesia", "managed_agents", "inbound_call"), false);
   });
 
-  it("reports the implemented Cartesia speech services without claiming WebSocket TTS support", () => {
+  it("reports implemented Cartesia speech services and the constrained WebSocket TTS session", () => {
+    const ttsSse = getVoiceProviderCapability("cartesia", "sonic", "tts_sse");
+    assert.equal(ttsSse.platform, PLATFORM_CAPABILITY_STATES.IMPLEMENTED);
     assert.equal(isVoiceProviderCapabilityImplemented("cartesia", "sonic", "tts_sse"), true);
+    assert.match(ttsSse.note, /implemented only through the Twilio adaptive stream queue/);
+    assert.match(ttsSse.note, /Vonage and Plivo.*buffered/);
     assert.equal(isVoiceProviderCapabilityImplemented("cartesia", "sonic", "tts_bytes"), true);
-    assert.equal(isVoiceProviderCapabilityImplemented("cartesia", "sonic", "tts_websocket"), false);
+    assert.equal(isVoiceProviderCapabilityImplemented("cartesia", "sonic", "tts_websocket"), true);
+    assert.match(getVoiceProviderCapability("cartesia", "sonic", "tts_websocket").note, /not wired as an automatic telephony media bridge/);
     assert.equal(isVoiceProviderCapabilityImplemented("cartesia", "sonic", "voice_catalog_read"), true);
     assert.equal(isVoiceProviderCapabilityImplemented("cartesia", "ink", "batch_stt"), true);
     assert.equal(isVoiceProviderCapabilityImplemented("cartesia", "ink", "realtime_stt_auto_turns"), true);

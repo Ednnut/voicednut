@@ -142,12 +142,12 @@ function createCartesiaWebhookHandler(options = {}) {
       return res.status(error.status || 400).json({ success: false, code: 'cartesia_webhook_invalid' });
     }
     const db = options.db;
-    if (typeof db?.recordCartesiaWebhookEvent !== 'function' ||
+    if (typeof db?.recordCartesiaWebhookReceipt !== 'function' ||
         (event.callRecord && typeof db?.upsertCartesiaCallRecord !== 'function')) {
       return res.status(503).json({ success: false, code: 'cartesia_webhook_storage_unavailable' });
     }
     try {
-      const receipt = await db.recordCartesiaWebhookEvent({
+      const receipt = await db.recordCartesiaWebhookReceipt({
         webhook_request_id: event.eventId,
         provider_call_id: event.providerCallId,
         event_type: event.type,

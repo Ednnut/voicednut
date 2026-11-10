@@ -139,6 +139,36 @@ describe('Cartesia batch persistence', () => {
     assert.equal((await db.listCartesiaCallBatchRecipients('batch_persist_01')).length, 2);
   });
 
+  it('selects only bounded expired terminal batches and exposes worker deletion audits', async () => {
+    await db.upsertCartesiaCallBatchSnapshot(snapshot({
+      status: 'completed',
+      total_calls_dispatched: 2,
+      total_calls_finished: 2,
+      provider_updated_at: '2025-01-02T00:00:00.000Z',
+    }));
+    await db.upsertCartesiaCallBatchSnapshot(snapshot({
+      provider_batch_id: 'batch_active_01',
+      status: 'in_progress',
+      provider_updated_at: '2025-01-01T00:00:00.000Z',
+      recipients: [],
+    }));
+    const candidates = await db.listExpiredCartesiaBatchRetentionCandidates({
+      cutoff: '2025-02-01T00:00:00.000Z',
+      limit: 10,
+    });
+    assert.deepEqual(candidates.map((row) => row.provider_batch_id), ['batch_persist_01']);
+    const audit = {
+      provider_batch_id: 'batch_persist_01',
+      request_fingerprint: 'b'.repeat(64),
+      recipient_count: 2,
+    };
+    await db.recordCartesiaBatchRetentionWorkerAudit({ ...audit, outcome: 'requested' });
+    await db.recordCartesiaBatchRetentionWorkerAudit({ ...audit, outcome: 'succeeded' });
+    const events = await db.listCartesiaAuditEvents({ limit: 10 });
+    assert.deepEqual(events.filter((event) => event.source === 'batch_retention_worker').map((event) => event.outcome), ['succeeded', 'requested']);
+    await assert.rejects(db.listExpiredCartesiaBatchRetentionCandidates({ cutoff: '2025-02-01T00:00:00.000Z', limit: 11 }), /query is invalid/);
+  });
+
   it('claims reconciliation work with a durable single-worker lease and only releases it for the matching token', async () => {
     await db.upsertCartesiaCallBatchSnapshot(snapshot({ status: 'in_progress', recipients: [] }));
     const first = await db.claimCartesiaBatchReconciliation({

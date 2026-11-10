@@ -2,6 +2,7 @@
 
 const crypto = require("node:crypto");
 const { isIP } = require("node:net");
+const { MAX_REALTIME_STT_AUDIO_BYTES } = require("./cartesiaStudioClient");
 
 const ID_PATTERN = /^[A-Za-z0-9._:-]{1,200}$/;
 const NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9 _.-]{0,79}$/;
@@ -37,6 +38,10 @@ function listFrom(value, ...keys) {
 
 function safeText(value, maxLength, fallback = "") {
   return typeof value === "string" ? value.trim().slice(0, maxLength) : fallback;
+}
+
+function safeSttTranscript(value) {
+  return String(value || "").replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, "").slice(0, 50000);
 }
 
 function normalizeManagedWebhook(value = {}) {
@@ -896,19 +901,38 @@ class CartesiaStudioService {
   async transcribeAudioRealtime(input = {}) {
     const audioInput = input.file ?? input.audio;
     const file = Buffer.isBuffer(audioInput) ? audioInput : Buffer.from(audioInput || "");
-    if (!file.length || file.length > 16 * 1024 * 1024 || file.length % 2 !== 0) throw serviceError("cartesia_stt_realtime_audio_invalid", "Realtime STT requires raw PCM16 audio up to 16 MB", 400);
+    if (!file.length || file.length > MAX_REALTIME_STT_AUDIO_BYTES || file.length % 2 !== 0) throw serviceError("cartesia_stt_realtime_audio_invalid", "Realtime STT requires raw PCM16 audio of no more than 50 seconds (1.6 MB)", 400);
     const keyterms = validateSttKeyterms(input.keyterms || []);
     const rawTurnSettings = input.turnSettings || input.turn_settings || {};
     const turnSettingsInput = Object.fromEntries(Object.entries(rawTurnSettings).filter(([, value]) => value !== undefined && value !== null && Number.isFinite(Number(value))));
     const turnSettings = Object.keys(turnSettingsInput).length ? normalizeSttTurnSettings(turnSettingsInput) : undefined;
     const result = await this.client.transcribeAudioRealtime({ ...input, file, keyterms, ...(turnSettings ? { turnSettings } : {}) });
-    const transcript = safeText(result?.transcript, 50000);
+    const transcript = safeSttTranscript(result?.transcript);
     if (!transcript) throw serviceError("cartesia_stt_realtime_response_invalid", "Cartesia returned no completed transcript", 502);
     const events = Array.isArray(result?.events) ? result.events.slice(0, 500).map((event) => ({
       type: safeText(event?.type, 32) || "event",
-      ...(typeof event?.transcript === "string" ? { transcript: safeText(event.transcript, 50000) } : {}),
+      ...(typeof event?.transcript === "string" ? { transcript: safeSttTranscript(event.transcript) } : {}),
     })) : [];
     return { transcript, language: safeText(result?.language, 20) || null, durationSeconds: null, events };
+  }
+  async transcribeAudioManual(input = {}) {
+    const audioInput = input.file ?? input.audio;
+    const file = Buffer.isBuffer(audioInput) ? audioInput : Buffer.from(audioInput || "");
+    if (!file.length || file.length > MAX_REALTIME_STT_AUDIO_BYTES || file.length % 2 !== 0) {
+      throw serviceError("cartesia_stt_manual_audio_invalid", "Manual STT requires raw PCM16 audio of no more than 50 seconds (1.6 MB)", 400);
+    }
+    const keyterms = validateSttKeyterms(input.keyterms || []);
+    const result = await this.client.transcribeAudioManual({ ...input, file, keyterms });
+    const transcript = safeSttTranscript(result?.transcript);
+    const durationValue = result?.durationSeconds;
+    const durationSeconds = durationValue !== null && durationValue !== undefined && Number.isFinite(Number(durationValue))
+      ? Number(durationValue)
+      : null;
+    return {
+      transcript,
+      language: safeText(result?.language, 20) || null,
+      durationSeconds,
+    };
   }
   async infillSpeech(input = {}) {
     const transcript = safeText(input.transcript, 1000);
@@ -1097,9 +1121,11 @@ class CartesiaStudioService {
       patch.display_name = safeText(input.display_name ?? input.displayName, 100);
       if (!NAME_PATTERN.test(patch.display_name)) throw serviceError("cartesia_webhook_name_invalid", "Provide a valid Cartesia webhook display name", 400);
     }
+    if (!this.client?.webhookUrl) throw serviceError("cartesia_webhook_not_configured", "Configure the public callback URL before updating Cartesia event webhooks", 503);
+    let configuredUrl;
+    try { configuredUrl = validateManagedWebhookUrl(this.client.webhookUrl); }
+    catch { throw serviceError("cartesia_webhook_not_configured", "Configured Cartesia webhook URL must be public HTTPS and end in /webhook/cartesia", 503); }
     if (input.url !== undefined) {
-      if (!this.client?.webhookUrl) throw serviceError("cartesia_webhook_not_configured", "Configure the public callback URL before updating Cartesia event webhooks", 503);
-      const configuredUrl = validateManagedWebhookUrl(this.client.webhookUrl);
       let candidate;
       try { candidate = validateManagedWebhookUrl(input.url); }
       catch { throw serviceError("cartesia_webhook_url_invalid", "Webhook URL must match the configured VOICEDNUT callback URL", 400); }
@@ -1112,8 +1138,20 @@ class CartesiaStudioService {
       patch.secret = secret;
     }
     if (!Object.keys(patch).length) throw serviceError("cartesia_webhook_update_invalid", "Provide a webhook display name or the configured callback URL", 400);
+    patch.url = configuredUrl;
     if (typeof this.client?.updateAgentWebhook !== "function") throw serviceError("cartesia_webhook_unavailable", "Cartesia webhook management is unavailable", 503);
-    return { webhook: normalizeManagedWebhook(await this.client.updateAgentWebhook(safeId(id, "webhook"), patch)) };
+    const webhookId = safeId(id, "webhook");
+    const result = await this.client.updateAgentWebhook(webhookId, patch);
+    const confirmedId = typeof result === "string" ? result : result?.id;
+    if (confirmedId !== webhookId) {
+      throw serviceError("cartesia_webhook_update_unconfirmed", "Cartesia did not confirm the expected webhook update", 502);
+    }
+    return { webhook: normalizeManagedWebhook({
+      ...(result && typeof result === "object" ? result : {}),
+      id: confirmedId,
+      display_name: result?.display_name || patch.display_name,
+      url: result?.url || patch.url,
+    }) };
   }
   async deleteAgentWebhook(id) {
     if (typeof this.client?.deleteAgentWebhook !== "function") throw serviceError("cartesia_webhook_unavailable", "Cartesia webhook management is unavailable", 503);

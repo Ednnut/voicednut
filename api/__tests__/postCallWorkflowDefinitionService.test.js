@@ -55,6 +55,17 @@ describe("PostCallWorkflowDefinitionService", () => {
     assert.equal(normalizeWorkflowDefinition(definition).trigger_event, "post_call_completed");
   });
 
+  it("binds business-scoped builder drafts to the authenticated business", async () => {
+    const draft = await service.createDraft(validDefinition(), "123456", "biz-42");
+    assert.equal(draft.business_id, "biz-42");
+    assert.equal(draft.definition.business_id, "biz-42");
+    assert.throws(() => normalizeWorkflowDefinition(validDefinition({ business_id: "bad business id" })), /business_id is invalid/);
+    await assert.rejects(
+      service.createDraft(validDefinition({ business_id: "biz-other" }), "123456", "biz-42"),
+      (error) => error.code === "conflict",
+    );
+  });
+
   it("rejects cycles, unsupported steps, excessive waits, and credential-shaped fields", () => {
     const loop = validDefinition({
       steps: [
@@ -167,6 +178,27 @@ describe("PostCallWorkflowDefinitionService", () => {
       'UPDATE call_e_result_workflow_action_approvals SET approved_by = ? WHERE workflow_id = ?', ['333', 'result_ticket_rule'],
       (error) => error ? reject(error) : resolve(),
     )), /append-only/);
+  });
+
+  it("lists generic approved workflows and workflow runs only within the requested business", async () => {
+    const draft = await service.createDraft(validDefinition({ business_id: "biz-42" }), "123456");
+    await service.approveVersion(draft.workflow_id, draft.version, "123456", "biz-42");
+    assert.equal((await db.listApprovedPostCallWorkflowDefinitions("post_call_completed", "biz-42")).length, 1);
+    assert.equal((await db.listApprovedPostCallWorkflowDefinitions("post_call_completed", "biz-other")).length, 0);
+    assert.equal((await db.listApprovedPostCallWorkflowDefinitions("post_call_completed")).length, 0);
+
+    await db.createPostCallWorkflowRun({
+      run_id: "run_biz_42",
+      workflow_id: draft.workflow_id,
+      workflow_version: draft.version,
+      business_id: "biz-42",
+      trigger_event: "post_call_completed",
+      idempotency_key: "workflow-biz-42-run",
+      current_step_id: "route",
+      payload_json: "{}",
+    });
+    assert.ok(await db.getPostCallWorkflowRun("run_biz_42", "biz-42"));
+    assert.equal(await db.getPostCallWorkflowRun("run_biz_42", "biz-other"), null);
   });
 
   it("persists immutable draft versions and records approval without starting a run", async () => {

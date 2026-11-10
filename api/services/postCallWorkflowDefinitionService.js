@@ -114,8 +114,8 @@ function normalizeWorkflowDefinition(input = {}) {
   const businessId = input.business_id == null ? "" : String(input.business_id).trim();
   if (BUSINESS_SCOPED_TRIGGER_EVENTS.has(triggerEvent)) {
     if (!/^[A-Za-z0-9._:-]{1,120}$/.test(businessId)) fail("business_id is required for this workflow trigger");
-  } else if (businessId) {
-    fail("business_id is only supported for business-scoped workflow triggers");
+  } else if (businessId && !/^[A-Za-z0-9._:-]{1,120}$/.test(businessId)) {
+    fail("business_id is invalid");
   }
   if (!BUSINESS_SCOPED_TRIGGER_EVENTS.has(triggerEvent) &&
       (input.template_id != null || input.template_version != null ||
@@ -303,11 +303,17 @@ class PostCallWorkflowDefinitionService {
   }
 
   async createDraft(input, actor = "admin_token", businessId = undefined) {
+    if (businessId !== undefined) {
+      const requestedBusinessId = input?.business_id == null ? "" : String(input.business_id).trim();
+      if (requestedBusinessId && requestedBusinessId !== businessId) {
+        fail("Workflow business scope must match the authenticated business", "conflict");
+      }
+      input = { ...input, business_id: businessId };
+    }
     const definition = normalizeWorkflowDefinition(input);
     if (!this.db || typeof this.db.createPostCallWorkflowDefinitionDraft !== "function") {
       fail("Workflow definition persistence is not available", "service_unavailable");
     }
-<<<<<<< HEAD
     if (typeof this.db.getLatestPostCallWorkflowDefinition === "function") {
       const latest = await this.db.getLatestPostCallWorkflowDefinition(definition.workflow_id);
       if (latest && String(latest.business_id || "") !== String(definition.business_id || "")) {
@@ -317,17 +323,6 @@ class PostCallWorkflowDefinitionService {
     const row = await this.db.createPostCallWorkflowDefinitionDraft({
       workflow_id: definition.workflow_id,
       business_id: definition.business_id,
-=======
-    const scope = businessId === undefined ? (input.business_id ?? null) : businessId;
-    if (scope !== null && !/^[A-Za-z0-9._:-]{1,120}$/.test(String(scope))) fail("business_id is invalid");
-    const previous = await this.db.getLatestPostCallWorkflowDefinition(definition.workflow_id);
-    if (previous && (previous.business_id || null) !== (scope || null)) {
-      fail("workflow_id is already assigned to another business", "conflict");
-    }
-    const row = await this.db.createPostCallWorkflowDefinitionDraft({
-      workflow_id: definition.workflow_id,
-      business_id: scope,
->>>>>>> 95a068c (updated)
       name: definition.name,
       trigger_event: definition.trigger_event,
       schema_version: definition.schema_version,

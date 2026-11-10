@@ -156,6 +156,7 @@ class CartesiaBatchService {
     this.enabled = options.enabled === true;
     this.dispatchEnabled = options.dispatchEnabled === true;
     this.retentionEnabled = options.retentionEnabled === true;
+    this.retentionAutoEnabled = options.retentionAutoEnabled === true;
     this.retentionDays = Number.isSafeInteger(options.retentionDays) && options.retentionDays >= 1 && options.retentionDays <= 3650
       ? options.retentionDays
       : 0;
@@ -169,11 +170,13 @@ class CartesiaBatchService {
     this.reconciliationLeaseMs = 90000;
     this.reconciliationLeaseRenewMs = 30000;
     this.reconciliationWorkerRunning = false;
+    this.retentionWorkerRunning = false;
     this.clock = options.clock || (() => new Date());
   }
 
   ensureEnabled() {
-    if (!this.enabled || !this.client?.isConfigured?.()) {
+    const clientConfigured = this.client?.isReadConfigured?.() ?? this.client?.isConfigured?.();
+    if (!this.enabled || !clientConfigured) {
       throw batchError('cartesia_not_configured', 'Cartesia Managed Agents is disabled or not configured', 503);
     }
   }
@@ -232,7 +235,8 @@ class CartesiaBatchService {
     if (!reservation?.reserved) throw batchError('cartesia_idempotency_in_progress', 'Cartesia batch submission is unresolved; inspect provider state before retrying', 409);
     let response;
     try {
-      response = await this.client.createCallBatch(normalizeBatchInput(input).providerRequest);
+      const createBatch = this.client.createCallBatchRaw || this.client.createCallBatch;
+      response = await createBatch.call(this.client, normalizeBatchInput(input).providerRequest);
     } catch (error) {
       if (Number.isInteger(error?.status) && error.status >= 400 && error.status < 500) {
         await this.db.completeOutboundCallIdempotency({ idempotency_key: namespacedKey, provider: 'cartesia', request_hash: preview.requestFingerprint, status: 'failed', error_message: 'cartesia_batch_rejected' }).catch(() => {});
@@ -544,11 +548,11 @@ class CartesiaBatchService {
     return { ...common, eligible: true, recipientCount, expiresAt, fingerprint, reason: null };
   }
 
-  async purgeExpiredRecipients(batchId, confirmedFingerprint) {
+  async purgeExpiredRecipients(batchId, confirmedFingerprint, now = new Date()) {
     if (!this.retentionEnabled || this.retentionDays < 1) {
       throw batchError('cartesia_batch_retention_disabled', 'Cartesia batch recipient retention deletion is disabled', 403);
     }
-    const preview = await this.prepareRetentionPurge(batchId);
+    const preview = await this.prepareRetentionPurge(batchId, now);
     if (!preview.eligible || !/^[a-f0-9]{64}$/.test(String(confirmedFingerprint || '')) ||
         confirmedFingerprint !== preview.fingerprint) {
       throw batchError('cartesia_batch_retention_confirmation_mismatch', 'A current eligible retention preview fingerprint is required', 409);
@@ -568,6 +572,68 @@ class CartesiaBatchService {
     } catch (error) {
       if (error?.code === 'cartesia_batch_retention_stale') throw batchError(error.code, 'Cartesia batch results changed after preview; create a new retention preview', 409);
       throw batchError('cartesia_batch_retention_failed', 'Cartesia batch recipient records could not be deleted', 503);
+    }
+  }
+
+  async runRetentionWorker() {
+    if (!this.retentionAutoEnabled || !this.retentionEnabled || this.retentionDays < 1) {
+      return { enabled: false, skipped: true, scanned: 0, purged: 0, deletedRecipients: 0, failed: 0 };
+    }
+    if (this.retentionWorkerRunning) {
+      return { enabled: true, skipped: true, scanned: 0, purged: 0, deletedRecipients: 0, failed: 0 };
+    }
+    if (typeof this.db?.listExpiredCartesiaBatchRetentionCandidates !== 'function' ||
+        typeof this.db?.recordCartesiaBatchRetentionWorkerAudit !== 'function') {
+      throw batchError('cartesia_batch_storage_unavailable', 'Cartesia automated retention storage is unavailable', 503);
+    }
+    const now = this.clock();
+    if (!Number.isFinite(Date.parse(now))) {
+      throw batchError('cartesia_batch_retention_clock_invalid', 'Cartesia retention worker clock is invalid', 500);
+    }
+    const cutoff = new Date(Date.parse(now) - this.retentionDays * 86400000).toISOString();
+    this.retentionWorkerRunning = true;
+    try {
+      const candidates = await this.db.listExpiredCartesiaBatchRetentionCandidates({ cutoff, limit: 10 });
+      const result = { enabled: true, skipped: false, scanned: 0, purged: 0, deletedRecipients: 0, failed: 0 };
+      for (const candidate of candidates) {
+        const batchId = String(candidate?.provider_batch_id || '').trim();
+        if (!/^[A-Za-z0-9_-]{1,200}$/.test(batchId)) continue;
+        result.scanned += 1;
+        const preview = await this.prepareRetentionPurge(batchId, now);
+        if (!preview.eligible) continue;
+
+        await this.db.recordCartesiaBatchRetentionWorkerAudit({
+          provider_batch_id: preview.batchId,
+          outcome: 'requested',
+          recipient_count: preview.recipientCount,
+          request_fingerprint: preview.fingerprint,
+        });
+        let purge;
+        try {
+          purge = await this.purgeExpiredRecipients(preview.batchId, preview.fingerprint, now);
+        } catch (error) {
+          await this.db.recordCartesiaBatchRetentionWorkerAudit({
+            provider_batch_id: preview.batchId,
+            outcome: 'failed',
+            recipient_count: preview.recipientCount,
+            request_fingerprint: preview.fingerprint,
+            reason_code: error?.code || 'retention_failed',
+          });
+          result.failed += 1;
+          continue;
+        }
+        await this.db.recordCartesiaBatchRetentionWorkerAudit({
+          provider_batch_id: preview.batchId,
+          outcome: 'succeeded',
+          recipient_count: purge.deletedCount,
+          request_fingerprint: preview.fingerprint,
+        });
+        result.purged += 1;
+        result.deletedRecipients += purge.deletedCount;
+      }
+      return result;
+    } finally {
+      this.retentionWorkerRunning = false;
     }
   }
 

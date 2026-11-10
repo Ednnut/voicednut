@@ -142,7 +142,6 @@ const { OutboundCallSafetyService } = require("./services/outboundCallSafetyServ
 const { registerCallEContactPolicyRoutes } = require("./services/callEContactPolicyRoutes");
 const { CallEOperatorConfirmationService } = require("./services/callEOperatorConfirmationService");
 const { CallEDispatchService, approvedFingerprintFromEnv } = require("./services/callEDispatchService");
-<<<<<<< HEAD
 const { CallECampaignService } = require("./services/callECampaignService");
 const { CallECampaignMissionService } = require("./services/callECampaignMissionService");
 const { CallECampaignMissionWorker } = require("./services/callECampaignMissionWorker");
@@ -158,7 +157,6 @@ const { CallEGoalRunService } = require("./services/callEGoalRunService");
 const { createCallECampaignRouteHandlers } = require("./services/callECampaignRouteHandlers");
 const { createCallEActorAssertionMiddleware, verifyCallEActorAssertion } = require("./services/callEActorAssertion");
 const { CallEGoalPlannerService } = require("./services/callEGoalPlannerService");
-=======
 const { createCartesiaClient } = require("./services/cartesiaClient");
 const { CartesiaCallService } = require("./services/cartesiaCallService");
 const { CartesiaBatchService } = require("./services/cartesiaBatchService");
@@ -171,7 +169,6 @@ const { registerCartesiaCallRoutes } = require("./services/cartesiaCallRoutes");
 const { registerCartesiaDashboardRoutes } = require("./services/cartesiaDashboardRoutes");
 const { registerCartesiaSpeechRoutes } = require("./services/cartesiaSpeechRoutes");
 const { registerCartesiaSpeechProfileRoutes } = require("./services/cartesiaSpeechProfileRoutes");
->>>>>>> 95a068c (updated)
 const {
   CALL_AGENT_SCHEMA_VERSION,
   validateCallAgentDefinition,
@@ -371,14 +368,11 @@ let crmContactSyncService;
 let postCallAutomationService;
 let postCallWorkflowDefinitionService;
 let postCallWorkflowExecutionService;
-<<<<<<< HEAD
 let callECampaignMissionWorker = null;
 let callECampaignRetentionWorker = null;
 let callEMissionAlertWorker = null;
 let callEMissionAutomationWorker = null;
 let businessIntegrationConnectionService;
-=======
->>>>>>> 95a068c (updated)
 const sttFallbackCalls = new Set();
 const streamTimeoutCalls = new Set();
 const inboundRateBuckets = new Map();
@@ -9890,13 +9884,12 @@ function captureRawBody(req, _res, buf) {
 
 // CALL-E terminal snapshots may include transcripts; keep their larger bounded parser isolated to this path.
 app.use("/api/webhooks/call-e", express.json({ limit: "10mb", verify: captureRawBody }));
-<<<<<<< HEAD
 // Cartesia lifecycle events can carry final transcript payloads; bound them separately from small JSON APIs.
 app.use("/webhook/cartesia", express.json({ limit: "5mb", verify: captureRawBody }));
-=======
 // Cartesia supports batches up to 5,000 recipients; keep their larger request body capped and path-scoped.
 app.use("/api/cartesia/call-batches", express.json({ limit: "512kb", verify: captureRawBody }));
->>>>>>> 95a068c (updated)
+// Large campaign drafts persist encrypted recipient records before approval.
+app.use("/api/cartesia/campaigns", express.json({ limit: "512kb", verify: captureRawBody }));
 app.use(express.json({ verify: captureRawBody }));
 app.use(express.urlencoded({ extended: true, verify: captureRawBody }));
 
@@ -14943,38 +14936,90 @@ function startBackgroundWorkers() {
   if (backgroundWorkersStarted) return;
   backgroundWorkersStarted = true;
 
-<<<<<<< HEAD
+  const safeCartesiaWorkerErrorCode = (value, fallback) => {
+    const candidate = String(value || "");
+    return /^[a-z][a-z0-9_]{0,79}$/.test(candidate) ? candidate : fallback;
+  };
+
   postCallWorkflowExecutionService?.start();
 
-  if (config.cartesia?.dispatchEnabled === true && typeof db?.listDueCartesiaCampaigns === "function") {
+  if (config.cartesia?.batchDispatchEnabled === true && typeof db?.listDueCartesiaCampaigns === "function") {
+    let dispatchingDueCartesiaCampaigns = false;
+    let lastCartesiaDispatchObservationAt = 0;
     const dispatchDueCartesiaCampaigns = async () => {
-      const now = new Date();
-      const due = await db.listDueCartesiaCampaigns({ now_iso: now.toISOString(), limit: 10 });
-      for (const campaign of due) {
-        try {
-          const service = createCartesiaCampaignService();
-          const stored = await db.getCartesiaCampaign(campaign.campaign_id, campaign.business_id);
-          if (!stored || stored.campaign.status !== "approved") continue;
-          await service.submit({
-            campaign_id: campaign.campaign_id,
-            business_id: campaign.business_id,
-            actor_id: String(campaign.approved_by || ""),
-            confirmation_phrase: cartesiaCampaignConfirmationPhrase(stored.campaign),
-          });
-        } catch (error) {
-          console.warn("Cartesia scheduled campaign dispatch deferred or blocked", {
-            code: String(error?.code || "cartesia_campaign_dispatch_failed").slice(0, 80),
-          });
+      if (dispatchingDueCartesiaCampaigns) return;
+      dispatchingDueCartesiaCampaigns = true;
+      const startedAt = Date.now();
+      let scanned = 0;
+      let dispatched = 0;
+      let blocked = 0;
+      let failed = 0;
+      let uncertain = 0;
+      let skipped = 0;
+      try {
+        const now = new Date();
+        const due = await db.listDueCartesiaCampaigns({ now_iso: now.toISOString(), limit: 10 });
+        scanned = due.length;
+        for (const campaign of due) {
+          try {
+            const service = createCartesiaCampaignService();
+            const stored = await db.getCartesiaCampaign(campaign.campaign_id, campaign.business_id);
+            if (!stored || stored.campaign.status !== "approved") {
+              skipped += 1;
+              continue;
+            }
+            let result;
+            if (stored.campaign.dispatch_requested_at) {
+              result = await service.dispatchQueuedCampaign({ campaign_id: campaign.campaign_id, business_id: campaign.business_id });
+            } else {
+              result = await service.submit({
+                campaign_id: campaign.campaign_id,
+                business_id: campaign.business_id,
+                actor_id: String(campaign.approved_by || ""),
+                confirmation_phrase: cartesiaCampaignConfirmationPhrase(stored.campaign),
+              });
+              if (result?.queued_for_async_dispatch) {
+                result = await service.dispatchQueuedCampaign({ campaign_id: campaign.campaign_id, business_id: campaign.business_id });
+              }
+            }
+            if (result?.campaign?.status === "submitted") dispatched += 1;
+            else if (result?.campaign?.status === "blocked") blocked += 1;
+            else if (["unknown", "submitting"].includes(String(result?.campaign?.status || ""))) uncertain += 1;
+            else skipped += 1;
+          } catch (error) {
+            if (String(error?.code || "").includes("unresolved")) uncertain += 1;
+            else failed += 1;
+            console.warn("Cartesia scheduled campaign dispatch deferred or blocked", {
+              code: safeCartesiaWorkerErrorCode(error?.code, "cartesia_campaign_dispatch_failed"),
+            });
+          }
         }
+        const completedAt = Date.now();
+        if (scanned > 0 || failed > 0 || completedAt - lastCartesiaDispatchObservationAt >= 5 * 60 * 1000) {
+          console.info("cartesia_campaign_dispatch_run", {
+            scanned,
+            dispatched,
+            blocked,
+            failed,
+            uncertain,
+            skipped,
+            scan_limit_reached: scanned === 10,
+            duration_ms: Math.max(0, completedAt - startedAt),
+          });
+          lastCartesiaDispatchObservationAt = completedAt;
+        }
+      } catch (error) {
+        console.error("Cartesia scheduled campaign worker failed", {
+          code: safeCartesiaWorkerErrorCode(error?.code, "worker_failed"),
+          duration_ms: Math.max(0, Date.now() - startedAt),
+        });
+      } finally {
+        dispatchingDueCartesiaCampaigns = false;
       }
     };
-    setInterval(() => dispatchDueCartesiaCampaigns().catch((error) => {
-      console.error("Cartesia scheduled campaign worker failed", { code: String(error?.code || "worker_failed").slice(0, 80) });
-    }), 30000).unref?.();
-    dispatchDueCartesiaCampaigns().catch((error) => {
-      console.error("Initial Cartesia scheduled campaign scan failed", { code: String(error?.code || "worker_failed").slice(0, 80) });
-    });
-    console.info("Cartesia just-in-time campaign dispatch enabled; consent and policy are checked at release time.");
+    setInterval(dispatchDueCartesiaCampaigns, 30000).unref?.();
+    dispatchDueCartesiaCampaigns();
+    console.info("cartesia_campaign_dispatch_worker_started", { interval_ms: 30000 });
   }
 
   const missionWorkerConfig = {
@@ -15039,27 +15084,58 @@ function startBackgroundWorkers() {
     } else {
       console.info('CALL-E scheduled missions, review escalations, and report digests started.');
     }
-=======
+  }
+
   if (config.cartesia?.batchReconciliationEnabled === true) {
     const runCartesiaBatchReconciliation = () => {
+      const startedAt = Date.now();
       cartesiaBatchService.runReconciliationWorker().then((result) => {
-        if (result?.scanned > 0) {
-          console.log('cartesia_batch_reconciliation_run', {
-            scanned: result.scanned,
-            reconciled: result.reconciled,
-            failed: result.failed,
-            exhausted: result.exhausted,
-          });
-        }
-      }).catch(() => {
-        console.error('cartesia_batch_reconciliation_worker_failed');
+        console.info('cartesia_batch_reconciliation_run', {
+          scanned: result?.scanned || 0,
+          reconciled: result?.reconciled || 0,
+          failed: result?.failed || 0,
+          exhausted: result?.exhausted || 0,
+          duration_ms: Math.max(0, Date.now() - startedAt),
+        });
+      }).catch((error) => {
+        console.error('cartesia_batch_reconciliation_worker_failed', {
+          code: safeCartesiaWorkerErrorCode(error?.code, 'worker_failed'),
+          duration_ms: Math.max(0, Date.now() - startedAt),
+        });
       });
     };
     const intervalMs = config.cartesia.batchReconciliationIntervalMs || 60000;
     const timer = setInterval(runCartesiaBatchReconciliation, intervalMs);
     if (typeof timer.unref === 'function') timer.unref();
+    console.info('cartesia_batch_reconciliation_worker_started', { interval_ms: intervalMs });
     runCartesiaBatchReconciliation();
->>>>>>> 95a068c (updated)
+  }
+
+  if (config.cartesia?.batchRetentionAutoEnabled === true &&
+      config.cartesia?.batchRetentionEnabled === true &&
+      Number.isSafeInteger(config.cartesia?.batchRetentionDays) &&
+      config.cartesia.batchRetentionDays > 0) {
+    const runCartesiaBatchRetention = () => {
+      const startedAt = Date.now();
+      cartesiaBatchService.runRetentionWorker().then((result) => {
+        console.info('cartesia_batch_retention_run', {
+          scanned: result?.scanned || 0,
+          purged: result?.purged || 0,
+          deleted_recipients: result?.deletedRecipients || 0,
+          failed: result?.failed || 0,
+          duration_ms: Math.max(0, Date.now() - startedAt),
+        });
+      }).catch((error) => {
+        console.error('cartesia_batch_retention_worker_failed', {
+          code: safeCartesiaWorkerErrorCode(error?.code, 'worker_failed'),
+          duration_ms: Math.max(0, Date.now() - startedAt),
+        });
+      });
+    };
+    const timer = setInterval(runCartesiaBatchRetention, 15 * 60 * 1000);
+    if (typeof timer.unref === 'function') timer.unref();
+    console.info('cartesia_batch_retention_worker_started', { interval_ms: 15 * 60 * 1000 });
+    runCartesiaBatchRetention();
   }
 
   setInterval(() => {
@@ -15101,18 +15177,6 @@ function startBackgroundWorkers() {
       console.error("❌ Call job processor error:", error);
     });
   }, config.callJobs?.intervalMs || 5000);
-
-  setInterval(() => {
-    Promise.all([
-      postCallWorkflowExecutionService?.reconcileInterruptedRuns() || 0,
-      postCallWorkflowExecutionService?.reconcilePendingEvents() || 0,
-    ]).then(([reconciledRuns, queuedEvents]) => {
-      if (reconciledRuns > 0) console.warn("Interrupted post-call workflow runs require review", { count: reconciledRuns });
-      if (queuedEvents > 0) console.log("Pending post-call workflow events queued", { count: queuedEvents });
-    }).catch(() => {
-      console.error("❌ Post-call workflow reconciliation failed");
-    });
-  }, 60_000);
 
   processCallJobs().catch((error) => {
     console.error("❌ Initial call job processor error:", error);
@@ -15445,33 +15509,18 @@ async function startServer(options = {}) {
       logger: console,
     });
     postCallWorkflowDefinitionService = new PostCallWorkflowDefinitionService({ db });
-<<<<<<< HEAD
     businessIntegrationConnectionService = new BusinessIntegrationConnectionService({
       db,
       secretResolver: new BusinessIntegrationSecretResolver(),
     });
-=======
->>>>>>> 95a068c (updated)
     postCallWorkflowExecutionService = new PostCallWorkflowExecutionService({
       db,
       definitionService: postCallWorkflowDefinitionService,
       automationService: postCallAutomationService,
-<<<<<<< HEAD
       enabled: config.postCallWorkflows?.enabled === true,
       pollMs: config.postCallWorkflows?.pollIntervalMs,
       logger: console,
     });
-=======
-    });
-    const reconciledWorkflowRuns = await postCallWorkflowExecutionService.reconcileInterruptedRuns();
-    if (reconciledWorkflowRuns > 0) {
-      console.warn("Interrupted post-call workflow runs require review", { count: reconciledWorkflowRuns });
-    }
-    const queuedWorkflowEvents = await postCallWorkflowExecutionService.reconcilePendingEvents();
-    if (queuedWorkflowEvents > 0) {
-      console.log("Pending post-call workflow events queued", { count: queuedWorkflowEvents });
-    }
->>>>>>> 95a068c (updated)
     const defaultAutomationRules = await postCallAutomationService.ensureDefaultRules();
     if (defaultAutomationRules.installed > 0) {
       console.log(
@@ -25093,6 +25142,8 @@ function createCartesiaCampaignService() {
     client: new CartesiaClient(config.cartesia),
     db,
     outboundSafety: createOutboundCallSafetyService(),
+    enabled: cartesiaManagedAgentsEnabled,
+    dispatchEnabled: config.cartesia?.batchDispatchEnabled === true,
     idempotencySecret: config.apiAuth?.hmacSecret,
     encryptionKeys: config.callE?.missionEncryptionKeys,
     encryptionKeyVersion: config.callE?.missionEncryptionKeyVersion || 1,
@@ -25763,7 +25814,6 @@ app.post(
   }),
 );
 
-<<<<<<< HEAD
 app.get("/api/call-scripts/:id/vapi-tools", requireAdminToken, async (req, res) => {
   try {
     const service = new VapiToolPolicyService({ db });
@@ -25797,12 +25847,15 @@ app.put("/api/call-scripts/:id/vapi-tools", requireAdminToken, async (req, res) 
     const status = Number.isInteger(error?.status) ? error.status : 500;
     return res.status(status).json({ success: false, error: status >= 500 ? "Failed to update Vapi tool policy" : error.message, code: error?.code || "vapi_tool_policy_failed" });
   }
-=======
+});
+
+const cartesiaManagedAgentsEnabled = config.cartesia?.enabled === true &&
+  config.cartesia?.managedAgentsEnabled === true;
 const cartesiaClient = createCartesiaClient(config.cartesia);
 const cartesiaCallService = new CartesiaCallService({
   client: cartesiaClient,
   db,
-  enabled: config.cartesia?.enabled === true,
+  enabled: cartesiaManagedAgentsEnabled,
   dispatchEnabled: config.cartesia?.dispatchEnabled === true,
   allowedDestinations: config.cartesia?.allowedDestinations || [],
 });
@@ -25810,9 +25863,10 @@ const cartesiaBatchService = new CartesiaBatchService({
   client: cartesiaClient,
   callService: cartesiaCallService,
   db,
-  enabled: config.cartesia?.enabled === true,
+  enabled: cartesiaManagedAgentsEnabled,
   dispatchEnabled: config.cartesia?.batchDispatchEnabled === true,
   retentionEnabled: config.cartesia?.batchRetentionEnabled === true,
+  retentionAutoEnabled: config.cartesia?.batchRetentionAutoEnabled === true,
   retentionDays: config.cartesia?.batchRetentionDays || 0,
   reconciliationEnabled: config.cartesia?.batchReconciliationEnabled === true,
   reconciliationIntervalMs: config.cartesia?.batchReconciliationIntervalMs || 60000,
@@ -25821,14 +25875,14 @@ const cartesiaBatchService = new CartesiaBatchService({
 const cartesiaPhoneNumberService = new CartesiaPhoneNumberService({
   client: cartesiaClient,
   db,
-  enabled: config.cartesia?.enabled === true,
+  enabled: cartesiaManagedAgentsEnabled,
   mutationsEnabled: config.cartesia?.phoneNumberMutationsEnabled === true,
   provisioningEnabled: config.cartesia?.phoneNumberProvisioningEnabled === true,
 });
 const cartesiaTelephonyProviderService = new CartesiaTelephonyProviderService({
   client: cartesiaClient,
   db,
-  enabled: config.cartesia?.enabled === true,
+  enabled: cartesiaManagedAgentsEnabled,
   sipMutationsEnabled: config.cartesia?.sipProviderMutationsEnabled === true,
   providerMutationsEnabled: config.cartesia?.telephonyProviderMutationsEnabled === true,
   fingerprintSecret: config.cartesia?.apiKey,
@@ -25836,7 +25890,7 @@ const cartesiaTelephonyProviderService = new CartesiaTelephonyProviderService({
 const cartesiaWebhookConfigService = new CartesiaWebhookConfigService({
   client: cartesiaClient,
   db,
-  enabled: config.cartesia?.enabled === true,
+  enabled: cartesiaManagedAgentsEnabled,
   mutationsEnabled: config.cartesia?.webhookMutationsEnabled === true,
   webhookSecret: config.cartesia?.webhookSecret,
   fingerprintSecret: config.cartesia?.apiKey,
@@ -25907,7 +25961,6 @@ registerCartesiaDashboardRoutes(app, {
   lineDataHandlingReviewed: config.cartesia?.lineDataHandlingReviewed === true,
   ttsProvider: config.tts?.provider,
   sttProvider: config.transcription?.provider,
->>>>>>> 95a068c (updated)
 });
 
 app.post(
@@ -29933,15 +29986,13 @@ registerPostCallWorkflowDefinitionRoutes(app, {
   db,
   getService: () => postCallWorkflowDefinitionService,
   getExecutionService: () => postCallWorkflowExecutionService,
-<<<<<<< HEAD
   requireAdminToken,
+  requireMiniAppSession,
   sendApiError,
 });
 
 registerBusinessIntegrationConnectionRoutes(app, {
   getService: () => businessIntegrationConnectionService,
-=======
->>>>>>> 95a068c (updated)
   requireAdminToken,
   requireMiniAppSession,
   sendApiError,
@@ -33642,7 +33693,7 @@ registerCartesiaStudioRoutes(app, {
   createCartesiaStudioService,
 }, express);
 
-registerCartesiaWebhookRoutes(app, { db, secret: config.cartesia?.webhookSecret, enabled: config.cartesia?.enabled === true, limiter: callEWebhookLimiter });
+registerCartesiaWebhookRoutes(app, { db, secret: config.cartesia?.webhookSecret, enabled: cartesiaManagedAgentsEnabled, limiter: callEWebhookLimiter });
 
 registerCartesiaKnowledgeBaseRoutes(app, {
   requireOutboundAuthorization,
@@ -33977,12 +34028,9 @@ registerWebhookRoutes(app, {
   endCallForProvider,
   webhookService,
   postCallAutomationService,
-<<<<<<< HEAD
   postCallWorkflowExecutionService,
-=======
   getPostCallAutomationService: () => postCallAutomationService,
   getPostCallWorkflowExecutionService: () => postCallWorkflowExecutionService,
->>>>>>> 95a068c (updated)
   buildVonageTalkHangupNcco,
   buildVonageUnavailableNcco,
   buildTwilioStreamTwiml,

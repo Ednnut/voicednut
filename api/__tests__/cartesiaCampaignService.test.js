@@ -23,6 +23,7 @@ function makeHarness(options = {}) {
         request_hash: input.request_hash, campaign_name: input.name, agent_id: input.agent_id,
         from_number_id: input.from_number_id, target_concurrency_limit: input.target_concurrency_limit,
         scheduled_at: input.scheduled_at || null,
+        dispatch_requested_at: null,
         status: 'draft', recipient_count: input.recipients.length,
         ready_count: input.recipients.filter((row) => row.readiness === 'ready').length,
         blocked_count: input.recipients.filter((row) => row.readiness !== 'ready').length,
@@ -32,6 +33,11 @@ function makeHarness(options = {}) {
       return { ...saved, idempotentReplay: false };
     },
     async getCartesiaCampaign(id, businessId) { return saved?.campaign.campaign_id === id && saved.campaign.business_id === businessId ? saved : null; },
+    async queueCartesiaCampaignDispatch(input) {
+      if (!saved || saved.campaign.status !== 'approved' || saved.campaign.request_hash !== input.request_hash) return false;
+      saved.campaign.dispatch_requested_at ||= input.requested_at;
+      return true;
+    },
     async transitionCartesiaCampaign(input) {
       if (!saved || saved.campaign.status !== input.expected_status) return false;
       saved.campaign.status = input.status;
@@ -56,6 +62,67 @@ function makeHarness(options = {}) {
       if (['unknown', 'submitting'].includes(saved.campaign.status)) saved.campaign.status = 'submitted';
       for (const update of input.recipients) Object.assign(saved.recipients.find((row) => row.position === update.position), {
         provider_status: update.provider_status, provider_call_id: update.provider_call_id,
+      });
+
+      it('queues approved campaigns above the synchronous threshold and rechecks every recipient in the worker', async () => {
+        const harness = makeHarness({ eligible: true });
+        const destinations = Array.from({ length: 101 }, (_, index) => `+1415555${String(index).padStart(4, '0')}`);
+        const draft = await harness.service.createDraft({ ...draftInput, destinations });
+        const phrase = confirmationPhrase({ campaign_id: draft.campaign.campaign_id, ready_count: 101 });
+
+        const queued = await harness.service.submit({ ...draftInput, campaign_id: draft.campaign.campaign_id, confirmation_phrase: phrase });
+        assert.equal(queued.queued_for_async_dispatch, true);
+        assert.equal(queued.campaign.dispatch_queued, true);
+        assert.equal(queued.campaign.status, 'approved');
+        assert.equal(harness.providerSubmissions, 0);
+
+        const dispatched = await harness.service.dispatchQueuedCampaign({
+          campaign_id: draft.campaign.campaign_id, business_id: 'biz-1',
+        });
+        assert.equal(dispatched.campaign.status, 'submitted');
+        assert.equal(harness.providerSubmissions, 1);
+        assert.equal(harness.providerBatchInput.recipients.length, 101);
+        assert.equal(harness.eligibilityChecks.length, 202);
+      });
+
+      it('blocks an asynchronously queued campaign if consent changes before worker dispatch', async () => {
+        const harness = makeHarness({ eligible: true });
+        const destinations = Array.from({ length: 101 }, (_, index) => `+1415555${String(index).padStart(4, '0')}`);
+        const draft = await harness.service.createDraft({ ...draftInput, destinations });
+        await harness.service.submit({
+          ...draftInput,
+          campaign_id: draft.campaign.campaign_id,
+          confirmation_phrase: confirmationPhrase({ campaign_id: draft.campaign.campaign_id, ready_count: 101 }),
+        });
+        harness.service.outboundSafety.contactPolicy.checkEligibility = async () => ({ eligible: false, reason: 'consent_expired' });
+
+        await assert.rejects(harness.service.dispatchQueuedCampaign({
+          campaign_id: draft.campaign.campaign_id, business_id: 'biz-1',
+        }), { code: 'cartesia_campaign_dispatch_contact_blocked' });
+        assert.equal(harness.saved.campaign.status, 'blocked');
+        assert.equal(harness.providerSubmissions, 0);
+      });
+
+      it('allows exact-confirmation cancellation of a queued large campaign before provider submission', async () => {
+        const harness = makeHarness({ eligible: true });
+        const destinations = Array.from({ length: 101 }, (_, index) => `+1415555${String(index).padStart(4, '0')}`);
+        const draft = await harness.service.createDraft({ ...draftInput, destinations });
+        await harness.service.submit({
+          ...draftInput,
+          campaign_id: draft.campaign.campaign_id,
+          confirmation_phrase: confirmationPhrase({ campaign_id: draft.campaign.campaign_id, ready_count: 101 }),
+        });
+        const result = await harness.service.cancelBatch({
+          ...draftInput,
+          campaign_id: draft.campaign.campaign_id,
+          confirmation_phrase: `CANCEL CARTESIA CAMPAIGN ${draft.campaign.campaign_id} BEFORE DISPATCH`,
+        });
+        assert.equal(result.status, 'blocked');
+        assert.equal(result.error_code, 'cancelled_before_dispatch');
+        await assert.rejects(harness.service.dispatchQueuedCampaign({
+          campaign_id: draft.campaign.campaign_id, business_id: 'biz-1',
+        }), { code: 'cartesia_campaign_dispatch_not_queued' });
+        assert.equal(harness.providerSubmissions, 0);
       });
       return true;
     },
@@ -99,7 +166,7 @@ function makeHarness(options = {}) {
     async retryCallBatch() { providerRetries += 1; if (options.providerRetryError) throw options.providerRetryError; return batchDetails; },
   };
   const service = new CartesiaCampaignService({
-    client, db, outboundSafety: safety, idempotencySecret: 's'.repeat(40),
+    client, db, outboundSafety: safety, enabled: options.enabled !== false, dispatchEnabled: options.dispatchEnabled !== false, idempotencySecret: 's'.repeat(40),
     encryptionKeys: { 1: 'e'.repeat(40) }, now: () => new Date(options.now || '2026-10-31T12:00:00Z'),
   });
   safety.completeDispatch = async (reservation, status) => { completionStatuses.push(status); reservation.status = status; };
@@ -142,6 +209,30 @@ describe('CartesiaCampaignService', () => {
     assert.equal(harness.providerSubmissions, 1);
   });
 
+  it('supports the existing 100-recipient size within the synchronous campaign path', async () => {
+    const harness = makeHarness({ eligible: true });
+    const destinations = Array.from({ length: 100 }, (_, index) => `+1415555${String(index).padStart(4, '0')}`);
+    const draft = await harness.service.createDraft({ ...draftInput, destinations });
+    assert.equal(draft.campaign.recipient_count, 100);
+    assert.equal(draft.campaign.ready_count, 100);
+    assert.equal(draft.campaign.recipients.length, 100);
+
+  });
+
+  it('accepts 1,000 recipients for queued dispatch and rejects larger campaigns', async () => {
+    const harness = makeHarness({ eligible: true });
+    const destinations = Array.from({ length: 1000 }, (_, index) => `+1415555${String(index).padStart(4, '0')}`);
+    const draft = await harness.service.createDraft({ ...draftInput, destinations });
+    assert.equal(draft.campaign.recipient_count, 1000);
+    assert.equal(draft.campaign.ready_count, 1000);
+
+    await assert.rejects(harness.service.createDraft({
+      ...draftInput,
+      request_key: 'cartesia:request-1001',
+      destinations: [...destinations, '+14155559999'],
+    }), { code: 'cartesia_campaign_invalid', status: 400 });
+  });
+
   it('holds a scheduled approval locally and rechecks current policy before immediate Cartesia dispatch', async () => {
     const harness = makeHarness({ eligible: true });
     const scheduledAt = '2026-11-01T11:00:00+00:00';
@@ -165,6 +256,47 @@ describe('CartesiaCampaignService', () => {
     assert.equal(dueHarness.submissionClaim.usage_date, '2026-11-01');
     assert.ok(dueHarness.eligibilityChecks.length >= 2);
     await assert.rejects(harness.service.createDraft({ ...draftInput, scheduled_at: '2026-11-01T12:00:00Z' }), { code: 'cartesia_campaign_idempotency_conflict' });
+  });
+
+  it('keeps immediate campaign submission and retry default-off while allowing local scheduling', async () => {
+    const disabled = makeHarness({ eligible: true, dispatchEnabled: false });
+    const draft = await disabled.service.createDraft(draftInput);
+    const phrase = confirmationPhrase({ campaign_id: draft.campaign.campaign_id, ready_count: 1 });
+    await assert.rejects(disabled.service.submit({
+      ...draftInput,
+      campaign_id: draft.campaign.campaign_id,
+      confirmation_phrase: phrase,
+    }), { code: 'cartesia_batch_dispatch_disabled', status: 503 });
+    assert.equal(disabled.saved.campaign.status, 'draft');
+    assert.equal(disabled.providerSubmissions, 0);
+    assert.equal(disabled.reservations.length, 0);
+
+    const scheduled = makeHarness({ eligible: true, dispatchEnabled: false });
+    const scheduledDraft = await scheduled.service.createDraft({
+      ...draftInput,
+      scheduled_at: '2026-11-01T11:00:00Z',
+    });
+    const scheduledPhrase = confirmationPhrase({
+      campaign_id: scheduledDraft.campaign.campaign_id,
+      ready_count: 1,
+      scheduled_at: scheduledDraft.campaign.scheduled_at,
+    });
+    const held = await scheduled.service.submit({
+      ...draftInput,
+      campaign_id: scheduledDraft.campaign.campaign_id,
+      confirmation_phrase: scheduledPhrase,
+    });
+    assert.equal(held.held_for_local_dispatch, true);
+    assert.equal(scheduled.providerSubmissions, 0);
+
+    const managedAgentsDisabled = makeHarness({ eligible: true, enabled: false });
+    const disabledDraft = await managedAgentsDisabled.service.createDraft(draftInput);
+    await assert.rejects(managedAgentsDisabled.service.submit({
+      ...draftInput,
+      campaign_id: disabledDraft.campaign.campaign_id,
+      confirmation_phrase: confirmationPhrase({ campaign_id: disabledDraft.campaign.campaign_id, ready_count: 1 }),
+    }), { code: 'cartesia_not_configured', status: 503 });
+    assert.equal(managedAgentsDisabled.providerSubmissions, 0);
   });
 
   it('rejects unsafe timestamps and blocks a locally scheduled campaign if consent changes before dispatch', async () => {
@@ -268,6 +400,21 @@ describe('CartesiaCampaignService', () => {
     assert.equal(harness.providerRetries, 1);
     await assert.rejects(harness.service.retryFailedRecipients({ campaign_id: draft.campaign.campaign_id, business_id: 'biz-1', actor_id: '7001', confirmation_phrase: phrase }), { code: 'cartesia_campaign_retry_already_attempted' });
     assert.equal(harness.providerRetries, 1);
+  });
+
+  it('blocks campaign retries before provider access while batch dispatch is disabled', async () => {
+    const harness = makeHarness({ eligible: true, dispatchEnabled: false });
+    const draft = await harness.service.createDraft(draftInput);
+    harness.saved.campaign.status = 'submitted';
+    harness.saved.campaign.provider_batch_id = 'batch_1';
+    const phrase = `RETRY CARTESIA CAMPAIGN ${draft.campaign.campaign_id} BATCH batch_1 RETRY 1 FOR 1 RECIPIENTS`;
+    await assert.rejects(harness.service.retryFailedRecipients({
+      campaign_id: draft.campaign.campaign_id,
+      business_id: 'biz-1',
+      actor_id: '7001',
+      confirmation_phrase: phrase,
+    }), { code: 'cartesia_batch_dispatch_disabled', status: 503 });
+    assert.equal(harness.providerRetries, 0);
   });
 
   it('blocks provider retry when fresh consent or suppression eligibility has changed', async () => {

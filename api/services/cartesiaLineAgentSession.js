@@ -174,19 +174,28 @@ class CartesiaLineAgentSession extends EventEmitter {
 
     switch (event.type) {
       case "session_ready": {
-        if (this.connected || !event.call_id || !event.agent_id) {
-          this.emit("error", new Error("cartesia_line_invalid_session_ready"));
+        const validCallId = typeof event.call_id === "string" && event.call_id.length > 0 && event.call_id.length <= 200;
+        const validAgentVersionId = typeof event.agent_version_id === "string" &&
+          event.agent_version_id.length > 0 && event.agent_version_id.length <= 200;
+        const validAudio = event.audio && typeof event.audio === "object" &&
+          !Array.isArray(event.audio) && event.audio.input_format === this.inputFormat;
+        if (this.connected || !validCallId || event.agent_id !== this.agentId || !validAgentVersionId || !validAudio) {
+          const error = new Error("cartesia_line_invalid_session_ready");
+          error.code = "cartesia_line_invalid_session_ready";
+          this.failConnect(error);
+          this.emit("error", error);
+          this.connection?.close(1008, "invalid session ready");
           return;
         }
         this.connected = true;
-        this.callId = String(event.call_id);
-        this.agentVersionId = event.agent_version_id ? String(event.agent_version_id) : null;
+        this.callId = event.call_id;
+        this.agentVersionId = event.agent_version_id;
         this.clearConnectTimer();
         const resolve = this.resolveConnect;
         this.resolveConnect = null;
         this.rejectConnect = null;
-        resolve?.({ callId: this.callId, agentId: String(event.agent_id), agentVersionId: this.agentVersionId });
-        this.emit("ready", { callId: this.callId, agentId: String(event.agent_id), agentVersionId: this.agentVersionId });
+        resolve?.({ callId: this.callId, agentId: event.agent_id, agentVersionId: this.agentVersionId });
+        this.emit("ready", { callId: this.callId, agentId: event.agent_id, agentVersionId: this.agentVersionId });
         return;
       }
       case "audio_output": {

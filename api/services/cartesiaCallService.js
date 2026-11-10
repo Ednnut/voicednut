@@ -146,7 +146,8 @@ class CartesiaCallService {
   }
 
   ensureEnabled() {
-    if (!this.enabled || !this.client?.isConfigured?.()) {
+    const clientConfigured = this.client?.isReadConfigured?.() ?? this.client?.isConfigured?.();
+    if (!this.enabled || !clientConfigured) {
       throw cartesiaCallError('cartesia_not_configured', 'Cartesia Managed Agents is disabled or not configured', 503);
     }
   }
@@ -232,7 +233,8 @@ class CartesiaCallService {
     const request = normalizeOutboundCallInput(input).request;
     let providerResponse;
     try {
-      providerResponse = await this.client.createOutboundCall(request);
+      const createCall = this.client.createOutboundCallRaw || this.client.createOutboundCall;
+      providerResponse = await createCall.call(this.client, request);
     } catch (error) {
       // The Cartesia create-call contract has no documented idempotency key. Once
       // submitted, a transport failure has an ambiguous outcome and stays pending.

@@ -1,6 +1,7 @@
 'use strict';
 
 const crypto = require('node:crypto');
+const { MAX_REALTIME_STT_AUDIO_BYTES } = require('./cartesiaStudioClient');
 const ID_PATTERN = /^[A-Za-z0-9._:-]{1,200}$/;
 
 function sendError(ctx, req, res, status, code, message) {
@@ -126,8 +127,15 @@ function registerCartesiaStudioRoutes(app, ctx = {}, express) {
     return studio.transcribeAudio({ file: req.body, filename: String(req.query?.filename || 'speech.wav').slice(0, 120), contentType: String(req.query?.content_type || 'application/octet-stream'), model: String(req.query?.model || 'ink-whisper'), language: String(req.query?.language || ''), timestampGranularities: String(req.query?.timestamps || '') === 'word' ? ['word'] : [] });
   }, { message: 'Cartesia transcription failed' }));
   app.post(`${root}/stt/realtime`, limiter, authorize, rawAudio, actor, handle(ctx, (studio, req) => {
-    if (!Buffer.isBuffer(req.body) || !req.body.length || req.body.length > 16 * 1024 * 1024) throw Object.assign(new Error('A raw PCM sample up to 16 MB is required'), { code: 'cartesia_stt_audio_invalid', status: 400 });
-    if (String(req.query?.confirmation_phrase || '') !== 'TRANSCRIBE AUDIO WITH CARTESIA INK REALTIME') throw Object.assign(new Error('An exact realtime transcription confirmation phrase is required'), { code: 'cartesia_confirmation_required', status: 400 });
+    if (!Buffer.isBuffer(req.body) || !req.body.length || req.body.length > MAX_REALTIME_STT_AUDIO_BYTES) {
+      throw Object.assign(new Error('Realtime Ink requires raw PCM audio of no more than 50 seconds (1.6 MB)'), { code: 'cartesia_stt_realtime_audio_invalid', status: 400 });
+    }
+    const turnMode = String(req.query?.turn_mode || 'auto');
+    if (!['auto', 'manual'].includes(turnMode)) throw Object.assign(new Error('STT turn_mode must be auto or manual'), { code: 'cartesia_stt_turn_mode_invalid', status: 400 });
+    const expectedPhrase = turnMode === 'manual'
+      ? 'TRANSCRIBE AUDIO WITH CARTESIA INK MANUAL'
+      : 'TRANSCRIBE AUDIO WITH CARTESIA INK REALTIME';
+    if (String(req.query?.confirmation_phrase || '') !== expectedPhrase) throw Object.assign(new Error('An exact realtime transcription confirmation phrase is required'), { code: 'cartesia_confirmation_required', status: 400 });
     const profileHeader = String(req.headers?.['x-cartesia-stt-profile'] || '');
     const profileHash = String(req.query?.stt_profile_sha256 || '');
     let profile = {};
@@ -138,7 +146,14 @@ function registerCartesiaStudioRoutes(app, ctx = {}, express) {
       catch { throw Object.assign(new Error('Invalid signed STT profile metadata'), { code: 'cartesia_stt_profile_invalid', status: 400 }); }
       if (crypto.createHash('sha256').update(profileJson).digest('hex') !== profileHash || !profile || typeof profile !== 'object' || Array.isArray(profile)) throw Object.assign(new Error('STT profile signature did not match'), { code: 'cartesia_stt_profile_invalid', status: 400 });
     }
-    return studio.transcribeAudioRealtime({ audio: req.body, encoding: String(req.query?.encoding || 'pcm_s16le'), sampleRate: Number(req.query?.sample_rate) || 16000, keyterms: Array.isArray(profile.keyterms) ? profile.keyterms : [], turnSettings: profile.turnSettings || {} });
+    const input = {
+      audio: req.body,
+      encoding: String(req.query?.encoding || 'pcm_s16le'),
+      sampleRate: Number(req.query?.sample_rate) || 16000,
+      keyterms: Array.isArray(profile.keyterms) ? profile.keyterms : [],
+    };
+    if (turnMode === 'manual') return studio.transcribeAudioManual(input);
+    return studio.transcribeAudioRealtime({ ...input, turnSettings: profile.turnSettings || {} });
   }, { message: 'Cartesia realtime transcription failed' }));
   app.post(`${root}/infill`, limiter, authorize, rawAudio, actor, handle(ctx, (studio, req) => {
     if (!Buffer.isBuffer(req.body) || !req.body.length || req.body.length > 16 * 1024 * 1024) throw Object.assign(new Error('One audio context clip up to 16 MB is required'), { code: 'cartesia_infill_audio_invalid', status: 400 });

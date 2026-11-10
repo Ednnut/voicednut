@@ -464,4 +464,38 @@ describe('Cartesia Studio API routes', () => {
     assert.deepEqual(received.keyterms, ['Acme product']);
     assert.equal(received.turnSettings.end_timeout_ms, 5600);
   });
+
+  it('requires the manual Ink confirmation phrase and routes manual mode without auto-turn settings', async () => {
+    let received;
+    let manualCalls = 0;
+    const { routes } = makeHarness({ methods: {
+      async transcribeAudioManual(input) { manualCalls += 1; received = input; return { transcript: 'manual transcript' }; },
+    } });
+    const route = routes.get('POST /api/cartesia/studio/stt/realtime').at(-1);
+    const base = { params: {}, body: Buffer.from([0, 0, 0, 0]), callEActorId: '7001', headers: {} };
+    const invalidMode = makeResponse();
+    await route({ ...base, query: { actor_id: '7001', turn_mode: 'vad', confirmation_phrase: 'TRANSCRIBE AUDIO WITH CARTESIA INK MANUAL' } }, invalidMode);
+    assert.equal(invalidMode.statusCode, 400);
+    assert.equal(manualCalls, 0);
+
+    const invalidConfirmation = makeResponse();
+    await route({ ...base, query: { actor_id: '7001', turn_mode: 'manual', confirmation_phrase: 'TRANSCRIBE AUDIO WITH CARTESIA INK REALTIME' } }, invalidConfirmation);
+    assert.equal(invalidConfirmation.statusCode, 400);
+    assert.equal(manualCalls, 0);
+
+    const oversized = makeResponse();
+    await route({ ...base, body: Buffer.alloc(1_600_002), query: { actor_id: '7001', turn_mode: 'manual', confirmation_phrase: 'TRANSCRIBE AUDIO WITH CARTESIA INK MANUAL' } }, oversized);
+    assert.equal(oversized.statusCode, 400);
+    assert.equal(manualCalls, 0);
+
+    const accepted = makeResponse();
+    await route({ ...base, query: { actor_id: '7001', turn_mode: 'manual', confirmation_phrase: 'TRANSCRIBE AUDIO WITH CARTESIA INK MANUAL' } }, accepted);
+    assert.equal(accepted.statusCode, 200);
+    assert.equal(manualCalls, 1);
+    assert.deepEqual(received.audio, Buffer.from([0, 0, 0, 0]));
+    assert.equal(received.encoding, 'pcm_s16le');
+    assert.equal(received.sampleRate, 16000);
+    assert.deepEqual(received.keyterms, []);
+    assert.equal(Object.hasOwn(received, 'turnSettings'), false);
+  });
 });

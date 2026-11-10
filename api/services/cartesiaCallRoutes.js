@@ -22,6 +22,57 @@ function cartesiaBatchCsvCell(value, maxLength = 200) {
   return `"${text.replace(/"/g, '""')}"`;
 }
 
+const CARTESIA_AUDIT_SOURCES = new Set([
+  'admin_action',
+  'batch_retention',
+  'batch_retention_worker',
+  'call_operation',
+  'call_review',
+  'phone_number_operation',
+  'provider_operation',
+  'webhook_assignment',
+  'webhook_creation',
+]);
+
+function decodeCartesiaAuditCursor(value) {
+  if (typeof value !== 'string' || value.length > 256 || !/^[A-Za-z0-9_-]+$/.test(value)) return null;
+  try {
+    const json = Buffer.from(value, 'base64url').toString('utf8');
+    if (Buffer.from(json).toString('base64url') !== value) return null;
+    const cursor = JSON.parse(json);
+    if (!cursor || typeof cursor !== 'object' || Array.isArray(cursor) ||
+        typeof cursor.createdAt !== 'string' || !Number.isFinite(Date.parse(cursor.createdAt)) ||
+        !CARTESIA_AUDIT_SOURCES.has(cursor.source) ||
+        !Number.isSafeInteger(Number(cursor.id)) || Number(cursor.id) < 1) {
+      return null;
+    }
+    return { createdAt: cursor.createdAt, source: cursor.source, id: Number(cursor.id) };
+  } catch {
+    return null;
+  }
+}
+
+function cartesiaAuditCsv(events) {
+  const columns = [
+    ['created_at', 'created_at', 40],
+    ['event_type', 'source', 32],
+    ['actor_type', 'actor_type', 32],
+    ['actor_id', 'actor_id', 100],
+    ['action', 'action', 80],
+    ['resource_type', 'resource_type', 32],
+    ['resource_id', 'resource_id', 220],
+    ['outcome', 'outcome', 32],
+    ['reason_code', 'reason_code', 80],
+    ['business_id', 'business_id', 120],
+    ['target_agent_id', 'target_agent_id', 200],
+  ];
+  const lines = [columns.map(([header]) => cartesiaBatchCsvCell(header, 64)).join(',')];
+  for (const event of events) {
+    lines.push(columns.map(([, field, maxLength]) => cartesiaBatchCsvCell(event[field], maxLength)).join(','));
+  }
+  return `${lines.join('\r\n')}\r\n`;
+}
+
 function cartesiaBatchResultsCsv(batch) {
   const columns = [
     ['recipient_id', 'id', 200],
@@ -248,6 +299,45 @@ function registerCartesiaCallRoutes(app, options = {}) {
         telephonyProviderMutationsEnabled: telephonyProviderService?.providerMutationsEnabled === true,
       },
     });
+  });
+
+  app.get('/api/cartesia/audit/export', requireAdminToken, limiter, async (req, res) => {
+    res.set('Cache-Control', 'no-store');
+    const query = req.query || {};
+    if (Object.keys(query).some((key) => !['limit', 'cursor'].includes(key))) {
+      return res.status(400).json({ success: false, code: 'cartesia_audit_export_query_invalid', error: 'Unsupported audit export query fields' });
+    }
+    const limit = query.limit === undefined ? 100 : Number(query.limit);
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 500) {
+      return res.status(400).json({ success: false, code: 'cartesia_audit_export_query_invalid', error: 'limit must be between 1 and 500' });
+    }
+    const cursor = query.cursor === undefined ? null : decodeCartesiaAuditCursor(query.cursor);
+    if (query.cursor !== undefined && !cursor) {
+      return res.status(400).json({ success: false, code: 'cartesia_audit_export_cursor_invalid', error: 'cursor is invalid' });
+    }
+    if (typeof options.db?.listCartesiaAuditEvents !== 'function') {
+      return res.status(503).json({ success: false, code: 'cartesia_audit_export_unavailable', error: 'Cartesia audit export is unavailable' });
+    }
+    let rows;
+    try {
+      rows = await options.db.listCartesiaAuditEvents({ limit: limit + 1, cursor });
+    } catch {
+      return res.status(503).json({ success: false, code: 'cartesia_audit_export_unavailable', error: 'Cartesia audit export is unavailable' });
+    }
+    const hasMore = rows.length > limit;
+    const events = rows.slice(0, limit);
+    res.set('X-Cartesia-Audit-Has-More', String(hasMore));
+    if (hasMore && events.length > 0) {
+      const last = events[events.length - 1];
+      res.set('X-Cartesia-Audit-Next-Cursor', Buffer.from(JSON.stringify({
+        createdAt: last.created_at,
+        source: last.source,
+        id: last.id,
+      })).toString('base64url'));
+    }
+    return res.type('text/csv')
+      .set('Content-Disposition', 'attachment; filename="cartesia-audit.csv"')
+      .send(cartesiaAuditCsv(events));
   });
 
   if (phoneNumberService) {

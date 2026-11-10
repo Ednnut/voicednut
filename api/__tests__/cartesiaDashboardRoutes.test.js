@@ -533,12 +533,50 @@ describe('Cartesia Mini App operations overview', () => {
         actor_type: 'admin_api', actor_id: 'shared_admin_token', action: 'outbound_call_cancel',
         resource_id: 'ac_test_01', outcome: 'requested', request_fingerprint: 'd'.repeat(64),
       });
+      await db.recordCartesiaBatchRetentionAudit({
+        provider_batch_id: 'batch_test_01',
+        request_fingerprint: 'e'.repeat(64),
+        outcome: 'requested',
+        recipient_count: 2,
+      });
+      await db.recordCartesiaBatchRetentionWorkerAudit({
+        provider_batch_id: 'batch_test_01',
+        request_fingerprint: 'f'.repeat(64),
+        outcome: 'requested',
+        recipient_count: 2,
+      });
       const callOperationAuditRows = await db.listCartesiaCallOperationAudit(10);
       assert.equal(callOperationAuditRows.length, 1);
       assert.equal(callOperationAuditRows[0].action, 'outbound_call_cancel');
       assert.equal(Object.hasOwn(callOperationAuditRows[0], 'request_fingerprint'), false);
       await assert.rejects(db.recordCartesiaCallOperationAudit({ actor_type: 'admin_api', actor_id: 'wrong' }), /call operation audit input is invalid/);
       await assert.rejects(db.listCartesiaCallOperationAudit(101), /call operation audit limit is invalid/);
+      const auditEvents = await db.listCartesiaAuditEvents({ limit: 100 });
+      assert.deepEqual(new Set(auditEvents.map((event) => event.source)), new Set([
+        'admin_action',
+        'batch_retention',
+        'batch_retention_worker',
+        'call_operation',
+        'call_review',
+        'phone_number_operation',
+        'provider_operation',
+        'webhook_assignment',
+        'webhook_creation',
+      ]));
+      assert.equal(auditEvents.some((event) => Object.hasOwn(event, 'request_fingerprint')), false);
+      const firstAuditPage = await db.listCartesiaAuditEvents({ limit: 3 });
+      const lastEvent = firstAuditPage[firstAuditPage.length - 1];
+      const secondAuditPage = await db.listCartesiaAuditEvents({
+        limit: 100,
+        cursor: { createdAt: lastEvent.created_at, source: lastEvent.source, id: lastEvent.id },
+      });
+      assert.equal(firstAuditPage.length, 3);
+      assert.equal(secondAuditPage.length, 7);
+      assert.equal(secondAuditPage.some((event) => event.id === lastEvent.id && event.source === lastEvent.source), false);
+      await assert.rejects(
+        db.listCartesiaAuditEvents({ limit: 1, cursor: { createdAt: '2026-11-04', source: 'invalid', id: 1 } }),
+        /audit export query is invalid/,
+      );
       assert.equal(Object.hasOwn(rows[0], 'business_id'), false);
       await assert.rejects(db.listCartesiaCallRecords(51), /limit is invalid/);
     } finally {

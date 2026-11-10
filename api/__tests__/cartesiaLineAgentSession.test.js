@@ -89,7 +89,13 @@ describe("Cartesia hosted Line agent session", () => {
     const readyPromise = session.connect();
     const socket = FakeWebSocket.instances[0];
     socket.open();
-    socket.receive({ type: "session_ready", call_id: "ac_test", agent_id: "agent" });
+    socket.receive({
+      type: "session_ready",
+      call_id: "ac_test",
+      agent_id: "agent",
+      agent_version_id: "av_test",
+      audio: { input_format: "mulaw_8000" },
+    });
     await readyPromise;
 
     assert.equal(session.sendAudio(Buffer.from([1, 2, 3])), true);
@@ -118,7 +124,13 @@ describe("Cartesia hosted Line agent session", () => {
     const readyPromise = session.connect();
     const socket = FakeWebSocket.instances[0];
     socket.open();
-    socket.receive({ type: "session_ready", call_id: "ac_test", agent_id: "agent" });
+    socket.receive({
+      type: "session_ready",
+      call_id: "ac_test",
+      agent_id: "agent",
+      agent_version_id: "av_test",
+      audio: { input_format: "mulaw_8000" },
+    });
     await readyPromise;
 
     let toolRequest;
@@ -166,7 +178,13 @@ describe("Cartesia hosted Line agent session", () => {
     const readyPromise = session.connect();
     const socket = FakeWebSocket.instances[0];
     socket.open();
-    socket.receive({ type: "session_ready", call_id: "ac_test", agent_id: "agent" });
+    socket.receive({
+      type: "session_ready",
+      call_id: "ac_test",
+      agent_id: "agent",
+      agent_version_id: "av_test",
+      audio: { input_format: "mulaw_8000" },
+    });
     await readyPromise;
 
     assert.equal(session.sendDtmf("5"), true);
@@ -183,5 +201,45 @@ describe("Cartesia hosted Line agent session", () => {
     assert.throws(() => new CartesiaLineAgentSession({ apiKey: "key", agentId: "agent", inputFormat: "mulaw_16000" }), /input_format_unsupported/);
     assert.throws(() => new CartesiaLineAgentSession({ apiKey: "key", agentId: "agent", apiVersion: "latest" }), /api_version_invalid/);
     assert.equal(FakeWebSocket.instances.length, 0);
+  });
+
+  it("rejects mismatched or incomplete session_ready events without waiting for timeout", async () => {
+    for (const ready of [
+      {
+        type: "session_ready",
+        call_id: "ac_test",
+        agent_id: "agent_other",
+        agent_version_id: "av_test",
+        audio: { input_format: "mulaw_8000" },
+      },
+      {
+        type: "session_ready",
+        call_id: "ac_test",
+        agent_id: "agent",
+        agent_version_id: "av_test",
+        audio: { input_format: "pcm_16000" },
+      },
+      {
+        type: "session_ready",
+        call_id: "ac_test",
+        agent_id: "agent",
+        audio: { input_format: "mulaw_8000" },
+      },
+    ]) {
+      const session = new CartesiaLineAgentSession({
+        apiKey: "key",
+        agentId: "agent",
+        WebSocketImpl: FakeWebSocket,
+        connectTimeoutMs: 9000,
+      });
+      session.on("error", () => {});
+      const readyPromise = session.connect();
+      const socket = FakeWebSocket.instances.at(-1);
+      socket.open();
+      socket.receive(ready);
+      await assert.rejects(readyPromise, /cartesia_line_invalid_session_ready/);
+      assert.equal(session.connected, false);
+      assert.equal(socket.readyState, FakeWebSocket.CLOSED);
+    }
   });
 });

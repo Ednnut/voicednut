@@ -1155,8 +1155,8 @@ module.exports = {
   },
   callE,
   cartesia: {
-<<<<<<< HEAD
     enabled: cartesiaEnabled,
+    managedAgentsEnabled: readBooleanEnv("CARTESIA_MANAGED_AGENTS_ENABLED", false),
     dispatchEnabled: readBooleanEnv("CARTESIA_DISPATCH_ENABLED", false),
     agentRuntimeEnabled: readBooleanEnv("CARTESIA_AGENT_RUNTIME_ENABLED", false),
     apiKey: readEnv("CARTESIA_API_KEY") || "",
@@ -1167,9 +1167,6 @@ module.exports = {
     webhookSecret: readEnv("CARTESIA_WEBHOOK_SECRET") || "",
     webhookUrl: readEnv("CARTESIA_WEBHOOK_URL") || "",
     requestTimeoutMs: Number(readEnv("CARTESIA_API_TIMEOUT_MS") || "12000"),
-=======
-    enabled: readBooleanEnv("CARTESIA_MANAGED_AGENTS_ENABLED", false),
-    apiKey: String(readEnv("CARTESIA_API_KEY") || "").trim(),
     apiVersion: String(readEnv("CARTESIA_API_VERSION") || "2026-08-14").trim(),
     lineAgentEnabled: readBooleanEnv("CARTESIA_LINE_AGENT_ENABLED", false),
     lineDataHandlingReviewed: readBooleanEnv("CARTESIA_LINE_DATA_HANDLING_REVIEWED", false),
@@ -1177,10 +1174,10 @@ module.exports = {
       1000,
       Math.min(30000, Number(readEnv("CARTESIA_MANAGED_AGENTS_TIMEOUT_MS") || 10000)),
     ),
-    dispatchEnabled: readBooleanEnv("CARTESIA_DISPATCH_ENABLED", false),
     batchDispatchEnabled: readBooleanEnv("CARTESIA_BATCH_DISPATCH_ENABLED", false),
     batchRetentionEnabled: readBooleanEnv("CARTESIA_BATCH_RETENTION_ENABLED", false),
     batchRetentionDays: parseBoundedInteger(readEnv("CARTESIA_BATCH_RETENTION_DAYS"), 0, 0, 3650),
+    batchRetentionAutoEnabled: readBooleanEnv("CARTESIA_BATCH_RETENTION_AUTO_ENABLED", false),
     batchReconciliationEnabled: readBooleanEnv("CARTESIA_BATCH_RECONCILIATION_ENABLED", false),
     batchReconciliationIntervalMs: parseBoundedInteger(readEnv("CARTESIA_BATCH_RECONCILIATION_INTERVAL_MS"), 60000, 15000, 900000),
     batchReconciliationBatchSize: parseBoundedInteger(readEnv("CARTESIA_BATCH_RECONCILIATION_BATCH_SIZE"), 5, 1, 10),
@@ -1190,8 +1187,6 @@ module.exports = {
     telephonyProviderMutationsEnabled: readBooleanEnv("CARTESIA_TELEPHONY_PROVIDER_MUTATIONS_ENABLED", false),
     webhookMutationsEnabled: readBooleanEnv("CARTESIA_WEBHOOK_MUTATIONS_ENABLED", false),
     allowedDestinations: parseList(readEnv("CARTESIA_ALLOWED_DESTINATIONS")),
-    webhookSecret: String(readEnv("CARTESIA_WEBHOOK_SECRET") || "").trim(),
->>>>>>> 95a068c (updated)
   },
   twilio: {
     accountSid: ensure("TWILIO_ACCOUNT_SID"),

@@ -368,7 +368,8 @@ class CartesiaTelephonyProviderService {
   }
 
   ensureEnabled() {
-    if (!this.enabled || !this.client?.isConfigured?.()) {
+    const clientConfigured = this.client?.isReadConfigured?.() ?? this.client?.isConfigured?.();
+    if (!this.enabled || !clientConfigured) {
       throw providerError('cartesia_not_configured', 'Cartesia Managed Agents is disabled or not configured', 503);
     }
   }

@@ -2,46 +2,33 @@ const assert = require("node:assert/strict");
 
 const { registerPostCallWorkflowDefinitionRoutes } = require("../services/postCallWorkflowDefinitionRoutes");
 
-function createHarness() {
+function createHarness(options = {}) {
   const routes = new Map();
   const calls = [];
   const service = {
     async listVersions(workflowId, limit, businessId) { calls.push(["list", workflowId, limit, businessId]); return []; },
-    async createDraft(definition, actor, businessId) { calls.push(["create", definition, actor, businessId]); return { workflow_id: definition.workflow_id, business_id: businessId, version: 1, status: "draft" }; },
-    async approveVersion(workflowId, version, actor, businessId) { calls.push(["approve", workflowId, version, actor, businessId]); return { workflow_id: workflowId, business_id: businessId, version: Number(version), status: "approved" }; },
-  };
-  const executionService = {
-    async listRuns(limit, businessId) { calls.push(["runs", limit, businessId]); return []; },
-    async getRun(runId, businessId) { calls.push(["get_run", runId, businessId]); return { run_id: runId, status: "completed" }; },
-    async start(input, actor, businessId) { calls.push(["start_run", input, actor, businessId]); return { run_id: "run-1", status: "completed" }; },
-    async approveStep(runId, stepId, actor, businessId) { calls.push(["approve_step", runId, stepId, actor, businessId]); return { run_id: runId, status: "completed" }; },
-    async cancelRun(runId, businessId) { calls.push(["cancel_run", runId, businessId]); return { run_id: runId, status: "canceled" }; },
-    async retryFailedEmailStep(runId, stepId, actor, businessId) { calls.push(["retry_email", runId, stepId, actor, businessId]); return { run_id: runId, status: "queued" }; },
-    async reviewRun(runId, decision, actor, businessId) { calls.push(["review_run", runId, decision, actor, businessId]); return { run_id: runId, status: "failed", review_decision: decision }; },
+    async createDraft(definition, actor, businessId) { calls.push(["create", definition, actor, businessId]); return { workflow_id: definition.workflow_id, business_id: businessId || null, version: 1, status: "draft" }; },
+    async approveVersion(workflowId, version, actor, businessId) { calls.push(["approve", workflowId, version, actor, businessId]); return { workflow_id: workflowId, business_id: businessId || null, version: Number(version), status: "approved" }; },
   };
   const executionService = {
     async listRuns(filters) { calls.push(["runs", filters]); return []; },
-    async getRun(runId) { calls.push(["getRun", runId]); return { run_id: runId, status: "waiting_approval", steps: [] }; },
+    async getRun(runId, businessId) { calls.push(["getRun", runId, businessId]); return { run_id: runId, business_id: businessId, status: "waiting_approval", steps: [] }; },
     async approveRun(runId, actor) { calls.push(["approveRun", runId, actor]); return { run_id: runId, status: "queued" }; },
     async cancelRun(runId, actor) { calls.push(["cancelRun", runId, actor]); return { run_id: runId, status: "canceled" }; },
   };
   const app = Object.fromEntries(["get", "post"].map((method) => [method, (route, ...handlers) => routes.set(`${method.toUpperCase()} ${route}`, handlers)]));
   const requireAdminToken = (req, res, next) => req.get("x-admin") === "authorized" ? next() : res.status(403).json({ success: false });
   const sendApiError = (res, status, code, message, requestId) => res.status(status).json({ success: false, error: { code, message }, request_id: requestId || null });
-<<<<<<< HEAD
   registerPostCallWorkflowDefinitionRoutes(app, {
+    db: options.db || { async getCallEBusinessOperator(businessId, telegramId) {
+      return businessId === "biz-42" && telegramId === "123456" ? { role: options.role || "policy_manager" } : null;
+    } },
     getService: () => service,
     getExecutionService: () => executionService,
     requireAdminToken,
+    requireMiniAppSession: (req, res, next) => req.miniAppSession ? next() : res.status(401).json({ success: false }),
     sendApiError,
   });
-=======
-  const db = { async getCallEBusinessOperator(businessId, telegramId) {
-    return businessId === "business-a" && telegramId === "12345" ? { role: "policy_manager" } : null;
-  } };
-  const requireMiniAppSession = (req, _res, next) => { req.miniAppSession = { telegram_id: "12345" }; return next(); };
-  registerPostCallWorkflowDefinitionRoutes(app, { db, getService: () => service, getExecutionService: () => executionService, requireAdminToken, requireMiniAppSession, sendApiError });
->>>>>>> 95a068c (updated)
 
   async function dispatch(method, route, options = {}) {
     const handlers = routes.get(`${method} ${route}`);
@@ -51,6 +38,7 @@ function createHarness() {
       body: options.body || {},
       params: options.params || {},
       query: options.query || {},
+      miniAppSession: options.miniAppSession,
       requestId: "request-workflow-test",
       get(name) { return headers[name] || headers[name.toLowerCase()]; },
     };
@@ -97,7 +85,6 @@ describe("Post-call workflow definition routes", () => {
     assert.equal(calls[1][3], "admin_token");
   });
 
-<<<<<<< HEAD
   it("keeps run audit, approval, and cancellation endpoints behind admin authorization", async () => {
     const { dispatch, calls } = createHarness();
     let response = await dispatch("GET", "/post-call/workflows/runs");
@@ -123,77 +110,48 @@ describe("Post-call workflow definition routes", () => {
       query: { workflow_id: "followup", limit: "12" },
     });
     assert.equal(response.status, 200);
-    assert.deepEqual(calls[0], ["list", "followup", "12"]);
-=======
-  it("protects workflow run controls with admin authorization and exposes only execution state", async () => {
-    const { dispatch, calls } = createHarness();
-    let response = await dispatch("POST", "/post-call/workflow-runs");
-    assert.equal(response.status, 403);
-    assert.equal(calls.length, 0);
-
-    response = await dispatch("POST", "/post-call/workflow-runs/:run_id/review", {
-      params: { run_id: "run-1" }, body: { decision: "confirm_failed" },
-    });
-    assert.equal(response.status, 403);
-    assert.equal(calls.length, 0);
-
-    response = await dispatch("POST", "/post-call/workflow-runs/:run_id/steps/:step_id/retry", {
-      params: { run_id: "run-1", step_id: "email" },
-    });
-    assert.equal(response.status, 403);
-    assert.equal(calls.length, 0);
-
-    response = await dispatch("POST", "/post-call/workflow-runs", {
-      headers: { "x-admin": "authorized" },
-      body: { workflow_id: "followup", version: 1, idempotency_key: "request-12345678", payload: { email: "private@example.test" } },
-    });
-    assert.equal(response.status, 202);
-    assert.equal(response.body.run.run_id, "run-1");
-    assert.equal("payload" in response.body.run, false);
-
-    response = await dispatch("POST", "/post-call/workflow-runs/:run_id/cancel", {
-      headers: { "x-admin": "authorized" }, params: { run_id: "run-1" },
-    });
-    assert.equal(response.body.run.status, "canceled");
-    response = await dispatch("POST", "/post-call/workflow-runs/:run_id/steps/:step_id/retry", {
-      headers: { "x-admin": "authorized" }, params: { run_id: "run-1", step_id: "email" },
-    });
-    assert.equal(response.status, 202);
-    assert.equal(response.body.run.status, "queued");
-    response = await dispatch("POST", "/post-call/workflow-runs/:run_id/review", {
-      headers: { "x-admin": "authorized" }, params: { run_id: "run-1" }, body: { decision: "confirm_failed" },
-    });
-    assert.equal(response.body.run.review_decision, "confirm_failed");
-    assert.deepEqual(calls.map(([kind]) => kind), ["start_run", "cancel_run", "retry_email", "review_run"]);
-    assert.equal(calls[0][2], "admin_token");
-    assert.equal(calls[2][3], "admin_token");
-    assert.equal(calls[3][3], "admin_token");
+    assert.deepEqual(calls[0], ["list", "followup", "12", undefined]);
   });
 
-  it("requires authenticated business membership and passes verified scope to workflow services", async () => {
+  it("restores Mini App workflow routes with membership authorization and enforced business scope", async () => {
     const { dispatch, calls } = createHarness();
-    let response = await dispatch("GET", "/miniapp/businesses/:business_id/post-call/workflows", {
-      params: { business_id: "business-b" },
-    });
-    assert.equal(response.status, 403);
-    assert.equal(calls.length, 0);
-
-    response = await dispatch("GET", "/miniapp/businesses/:business_id/post-call/workflows", {
-      params: { business_id: "business-a" },
+    const session = { telegram_id: "123456" };
+    const base = "/miniapp/businesses/:business_id/post-call";
+    let response = await dispatch("GET", `${base}/workflows`, {
+      params: { business_id: "biz-42" }, miniAppSession: session,
     });
     assert.equal(response.status, 200);
-    assert.equal(response.body.business_id, "business-a");
-    assert.equal(calls[0][0], "list");
-    assert.equal(calls[0][3], "business-a");
+    assert.deepEqual(calls.at(-1), ["list", undefined, undefined, "biz-42"]);
 
-    response = await dispatch("POST", "/miniapp/businesses/:business_id/post-call/workflows", {
-      params: { business_id: "business-a" },
-      body: { schema_version: 1, workflow_id: "tenant_flow", name: "Tenant flow", trigger_event: "post_call.completed", start_step_id: "end", steps: [{ id: "end", type: "end" }] },
+    response = await dispatch("POST", `${base}/workflows`, {
+      params: { business_id: "biz-42" }, miniAppSession: session,
+      body: { workflow_id: "business_followup", trigger_event: "post_call_completed" },
     });
     assert.equal(response.status, 201);
-    assert.equal(response.body.version.business_id, "business-a");
-    assert.equal(calls[1][2], "12345");
-    assert.equal(calls[1][3], "business-a");
->>>>>>> 95a068c (updated)
+    assert.deepEqual(calls.at(-1), ["create", { workflow_id: "business_followup", trigger_event: "post_call_completed" }, "123456", "biz-42"]);
+
+    response = await dispatch("POST", `${base}/workflows/:workflow_id/versions/:version/approve`, {
+      params: { business_id: "biz-42", workflow_id: "business_followup", version: "1" },
+      miniAppSession: session,
+    });
+    assert.equal(response.status, 200);
+    assert.deepEqual(calls.at(-1), ["approve", "business_followup", "1", "123456", "biz-42"]);
+
+    response = await dispatch("GET", `${base}/workflow-runs`, {
+      params: { business_id: "biz-42" }, miniAppSession: session,
+    });
+    assert.equal(response.status, 200);
+    assert.deepEqual(calls.at(-1), ["runs", { business_id: "biz-42", limit: undefined }]);
+  });
+
+  it("denies builder writes to non-policy-manager memberships and does not resolve services", async () => {
+    const { dispatch, calls } = createHarness({ role: "call_operator" });
+    const response = await dispatch("POST", "/miniapp/businesses/:business_id/post-call/workflows", {
+      params: { business_id: "biz-42" },
+      miniAppSession: { telegram_id: "123456" },
+      body: { workflow_id: "business_followup" },
+    });
+    assert.equal(response.status, 403);
+    assert.deepEqual(calls, []);
   });
 });

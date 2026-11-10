@@ -2114,7 +2114,7 @@ function registerCallRoutes(app, ctx = {}) {
       const result = await ctx.submitCartesiaCampaign({
         ...(req.body || {}), campaign_id: req.params?.campaignId, actor_id: req.callEActorId,
       });
-      return res.json({ success: true, ...result });
+      return res.status(result?.queued_for_async_dispatch ? 202 : 200).json({ success: true, ...result });
     } catch (error) {
       const code = String(error?.code || "cartesia_campaign_submit_failed");
       const status = Number(error?.status) || (code.includes("not_found") ? 404 : code.includes("operator") ? 403 : code.includes("invalid") || code.includes("required") ? 400 : code.includes("conflict") || code.includes("blocked") || code.includes("unresolved") ? 409 : 502);

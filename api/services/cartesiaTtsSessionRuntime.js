@@ -30,28 +30,98 @@ function parseJson(raw) {
 }
 
 function normalizeGeneration(input) {
-  const fields = new Set(['model_id', 'transcript', 'voice', 'language', 'context_id', 'output_format', 'add_timestamps', 'continue']);
+  const fields = new Set([
+    'model_id', 'transcript', 'voice', 'language', 'locale', 'accent', 'normalization',
+    'context_id', 'output_format', 'add_timestamps', 'add_phoneme_timestamps',
+    'use_normalized_timestamps', 'pronunciation_dict_id', 'generation_config',
+    'max_buffer_delay_ms', 'continue', 'flush',
+  ]);
   if (Object.keys(input).some((key) => !fields.has(key))) throw sessionError('cartesia_tts_session_message_invalid', 'TTS generation contains unsupported fields');
-  const modelId = String(input.model_id || '').trim();
+  const modelId = typeof input.model_id === 'string' ? input.model_id.trim() : '';
   const transcript = typeof input.transcript === 'string' ? input.transcript : null;
-  const voice = String(input.voice || '').trim();
-  const language = String(input.language || '').trim();
-  if (!/^[A-Za-z0-9._:-]{1,80}$/.test(modelId) || transcript === null || transcript.length > 12000 || !ID_PATTERN.test(voice) || !/^[a-z]{2,3}(?:-[A-Za-z0-9]{2,8}){0,2}$/.test(language)) {
-    throw sessionError('cartesia_tts_session_message_invalid', 'Provide valid model, transcript, voice, and language fields');
+  const voiceInput = input.voice;
+  const voice = typeof voiceInput === 'string'
+    ? voiceInput.trim()
+    : voiceInput && typeof voiceInput === 'object' && !Array.isArray(voiceInput) && typeof voiceInput.id === 'string'
+      ? voiceInput.id.trim()
+      : '';
+  const contextId = typeof input.context_id === 'string' ? input.context_id.trim() : '';
+  const language = input.language;
+  const locale = input.locale;
+  const localePattern = /^[A-Za-z]{2,3}(?:[-_][A-Za-z0-9]{2,8}){0,2}$/;
+  if (!/^[A-Za-z0-9._:-]{1,80}$/.test(modelId) || transcript === null || transcript.length > 12000 ||
+      !ID_PATTERN.test(voice) || !/^[A-Za-z0-9._:-]{1,120}$/.test(contextId) ||
+      (language !== undefined && (typeof language !== 'string' || !localePattern.test(language))) ||
+      (locale !== undefined && (typeof locale !== 'string' || !localePattern.test(locale))) ||
+      (language !== undefined && locale !== undefined)) {
+    throw sessionError('cartesia_tts_session_message_invalid', 'Provide valid model, transcript, voice, context, and optional language or locale fields');
   }
-  const message = { model_id: modelId, transcript, voice, language };
-  if (input.context_id !== undefined) {
-    if (!/^[A-Za-z0-9._:-]{1,120}$/.test(String(input.context_id))) throw sessionError('cartesia_tts_session_message_invalid', 'context_id is invalid');
-    message.context_id = String(input.context_id);
+  const message = { model_id: modelId, transcript, voice, context_id: contextId };
+  if (language !== undefined) message.language = language;
+  if (locale !== undefined) message.locale = locale;
+  const format = input.output_format;
+  const encodings = new Set(['pcm_f32le', 'pcm_s16le', 'pcm_mulaw', 'pcm_alaw']);
+  if (!format || typeof format !== 'object' || Array.isArray(format) ||
+      Object.keys(format).some((key) => !['container', 'encoding', 'sample_rate'].includes(key)) ||
+      format.container !== 'raw' || !encodings.has(format.encoding) ||
+      ![8000, 16000, 22050, 24000, 44100, 48000].includes(format.sample_rate)) {
+    throw sessionError('cartesia_tts_session_format_invalid', 'TTS sessions require raw PCM output with a documented encoding and sample rate');
   }
-  if (input.output_format !== undefined) {
-    const format = input.output_format;
-    if (!format || typeof format !== 'object' || Array.isArray(format) || Object.keys(format).some((key) => !['container', 'encoding', 'sample_rate'].includes(key)) || format.container !== 'raw' || format.encoding !== 'pcm_s16le' || ![8000, 16000, 22050, 24000, 44100].includes(Number(format.sample_rate))) {
-      throw sessionError('cartesia_tts_session_format_invalid', 'TTS sessions currently support raw pcm_s16le at 8, 16, 22.05, 24, or 44.1 kHz');
+  message.output_format = { container: 'raw', encoding: format.encoding, sample_rate: format.sample_rate };
+  if (input.accent !== undefined) {
+    if (typeof input.accent !== 'string' || !input.accent.trim() || input.accent.length > 80 || /[\u0000-\u001f\u007f]/.test(input.accent)) {
+      throw sessionError('cartesia_tts_session_message_invalid', 'accent must be a non-empty string of at most 80 characters');
     }
-    message.output_format = { container: 'raw', encoding: 'pcm_s16le', sample_rate: Number(format.sample_rate) };
+    message.accent = input.accent.trim();
   }
-  for (const key of ['add_timestamps', 'continue']) {
+  if (input.normalization !== undefined) {
+    const normalization = input.normalization;
+    if (typeof normalization !== 'string' || (normalization !== 'auto' && normalization !== 'off' && !localePattern.test(normalization))) {
+      throw sessionError('cartesia_tts_session_message_invalid', 'normalization must be auto, off, or a supported language or locale code');
+    }
+    message.normalization = normalization;
+  }
+  if (input.pronunciation_dict_id !== undefined) {
+    if (typeof input.pronunciation_dict_id !== 'string' || !ID_PATTERN.test(input.pronunciation_dict_id)) {
+      throw sessionError('cartesia_tts_session_message_invalid', 'pronunciation_dict_id is invalid');
+    }
+    message.pronunciation_dict_id = input.pronunciation_dict_id;
+  }
+  if (input.generation_config !== undefined) {
+    const config = input.generation_config;
+    const allowed = new Set(['speed', 'volume', 'emotion']);
+    if (!config || typeof config !== 'object' || Array.isArray(config) ||
+        Object.keys(config).some((key) => !allowed.has(key))) {
+      throw sessionError('cartesia_tts_session_message_invalid', 'generation_config contains unsupported fields');
+    }
+    const normalized = {};
+    if (config.speed !== undefined) {
+      if (typeof config.speed !== 'number' || !Number.isFinite(config.speed) || config.speed < 0.6 || config.speed > 1.5) {
+        throw sessionError('cartesia_tts_session_message_invalid', 'generation_config.speed must be between 0.6 and 1.5');
+      }
+      normalized.speed = config.speed;
+    }
+    if (config.volume !== undefined) {
+      if (typeof config.volume !== 'number' || !Number.isFinite(config.volume) || config.volume < 0.5 || config.volume > 2) {
+        throw sessionError('cartesia_tts_session_message_invalid', 'generation_config.volume must be between 0.5 and 2');
+      }
+      normalized.volume = config.volume;
+    }
+    if (config.emotion !== undefined) {
+      if (!['neutral', 'calm', 'angry', 'content', 'sad'].includes(config.emotion)) {
+        throw sessionError('cartesia_tts_session_message_invalid', 'generation_config.emotion is unsupported');
+      }
+      normalized.emotion = config.emotion;
+    }
+    message.generation_config = normalized;
+  }
+  if (input.max_buffer_delay_ms !== undefined) {
+    if (!Number.isSafeInteger(input.max_buffer_delay_ms) || input.max_buffer_delay_ms < 0 || input.max_buffer_delay_ms > 5000) {
+      throw sessionError('cartesia_tts_session_message_invalid', 'max_buffer_delay_ms must be an integer from 0 to 5000');
+    }
+    message.max_buffer_delay_ms = input.max_buffer_delay_ms;
+  }
+  for (const key of ['add_timestamps', 'add_phoneme_timestamps', 'use_normalized_timestamps', 'continue', 'flush']) {
     if (input[key] !== undefined) {
       if (typeof input[key] !== 'boolean') throw sessionError('cartesia_tts_session_message_invalid', `${key} must be a boolean`);
       message[key] = input[key];
@@ -66,13 +136,21 @@ function safeProviderEvent(event) {
   if (!['chunk', 'done', 'flush_done', 'timestamps', 'phoneme_timestamps', 'error'].includes(type)) return null;
   const result = { type };
   if (event.context_id && /^[A-Za-z0-9._:-]{1,120}$/.test(String(event.context_id))) result.context_id = String(event.context_id);
-  if (type === 'chunk' && typeof event.data === 'string' && /^[A-Za-z0-9+/]*={0,2}$/.test(event.data) && event.data.length <= MAX_UPSTREAM_EVENT_BYTES * 2) result.data = event.data;
+  if (Number.isInteger(event.status_code) && event.status_code >= 100 && event.status_code <= 599) result.status_code = event.status_code;
+  if (typeof event.done === 'boolean') result.done = event.done;
+  if (type === 'chunk') {
+    if (typeof event.data === 'string' && /^[A-Za-z0-9+/]*={0,2}$/.test(event.data) && event.data.length <= MAX_UPSTREAM_EVENT_BYTES * 2) result.data = event.data;
+    if (typeof event.step_time === 'number' && Number.isFinite(event.step_time) && event.step_time >= 0) result.step_time = event.step_time;
+    if (Number.isSafeInteger(event.flush_id) && event.flush_id >= 0) result.flush_id = event.flush_id;
+  }
   const cleanAlignment = (alignment, wordsKey) => {
     if (!alignment || typeof alignment !== 'object' || Array.isArray(alignment)) return null;
     const labels = Array.isArray(alignment[wordsKey]) ? alignment[wordsKey].slice(0, 2000).map((word) => typeof word === 'string' ? word.slice(0, 40) : '') : [];
-    const starts = Array.isArray(alignment.start) ? alignment.start.slice(0, 2000).map(Number) : [];
-    const ends = Array.isArray(alignment.end) ? alignment.end.slice(0, 2000).map(Number) : [];
-    if (!labels.length || labels.length !== starts.length || labels.length !== ends.length || starts.some((time) => !Number.isFinite(time) || time < 0) || ends.some((time) => !Number.isFinite(time) || time < 0)) return null;
+    const starts = Array.isArray(alignment.start) ? alignment.start.slice(0, 2000) : [];
+    const ends = Array.isArray(alignment.end) ? alignment.end.slice(0, 2000) : [];
+    if (!labels.length || labels.length !== starts.length || labels.length !== ends.length ||
+        starts.some((time) => typeof time !== 'number' || !Number.isFinite(time) || time < 0) ||
+        ends.some((time, index) => typeof time !== 'number' || !Number.isFinite(time) || time < starts[index])) return null;
     return { [wordsKey]: labels, start: starts, end: ends };
   };
   if (type === 'timestamps') {
@@ -83,13 +161,14 @@ function safeProviderEvent(event) {
     const alignment = cleanAlignment(event.phoneme_timestamps, 'phonemes');
     if (alignment) result.phoneme_timestamps = alignment;
   }
-  if (type === 'flush_done' && Number.isInteger(event.flush_id)) result.flush_id = event.flush_id;
+  if (type === 'flush_done') {
+    if (Number.isSafeInteger(event.flush_id) && event.flush_id >= 1) result.flush_id = event.flush_id;
+    if (typeof event.flush_done === 'boolean') result.flush_done = event.flush_done;
+  }
   if (type === 'error') {
     result.error_code = String(event.error_code || 'cartesia_tts_error').slice(0, 80);
     result.message = 'Cartesia could not generate speech for this session message.';
-    if (Number.isInteger(event.status_code)) result.status_code = event.status_code;
   }
-  if (event.done === true) result.done = true;
   return result;
 }
 
@@ -109,10 +188,11 @@ class CartesiaTtsSessionRuntime {
     if (!actor?.id) throw sessionError('cartesia_tts_session_actor_required', 'An authenticated administrator is required', 401);
     if (!clientSocket || typeof clientSocket.on !== 'function') throw sessionError('cartesia_tts_session_socket_required', 'A client WebSocket is required');
     const params = new URLSearchParams({ cartesia_version: this.apiVersion });
-    const upstream = new this.WebSocket(`${this.websocketBaseUrl}/tts/websocket?${params}`, { headers: { 'X-API-Key': this.apiKey }, maxPayload: MAX_UPSTREAM_EVENT_BYTES });
+    const upstream = new this.WebSocket(`${this.websocketBaseUrl}/tts/websocket?${params}`, { headers: { Authorization: `Bearer ${this.apiKey}` }, maxPayload: MAX_UPSTREAM_EVENT_BYTES });
     let closed = false;
     let requests = 0;
     const pending = [];
+    const contextConfigurations = new Map();
     let idleTimer;
     const connectTimer = setTimeout(() => {
       sendError('cartesia_tts_session_connect_timeout', 'Cartesia TTS session connection timed out.');
@@ -172,10 +252,27 @@ class CartesiaTtsSessionRuntime {
       }
       if (++requests > MAX_REQUESTS_PER_SESSION) { sendError('cartesia_tts_session_limit', 'This TTS session reached its 100-message limit.'); return close(1008, 'message limit'); }
       try {
-        const payload = JSON.stringify(normalizeGeneration(message));
-        if (upstream.readyState === 1) upstream.send(payload);
-        else if (pending.length < 10) pending.push(payload);
-        else { sendError('cartesia_tts_session_not_ready', 'Cartesia TTS session is still connecting. Retry this message.'); }
+        const generation = normalizeGeneration(message);
+        const contextSettings = { ...generation };
+        delete contextSettings.transcript;
+        delete contextSettings.continue;
+        delete contextSettings.flush;
+        const signature = JSON.stringify(contextSettings);
+        const previousSignature = contextConfigurations.get(generation.context_id);
+        if (previousSignature && previousSignature !== signature) {
+          sendError('cartesia_tts_session_context_mismatch', 'Generation settings must remain unchanged within a TTS context.');
+          return;
+        }
+        const payload = JSON.stringify(generation);
+        if (upstream.readyState === 1) {
+          upstream.send(payload);
+          contextConfigurations.set(generation.context_id, signature);
+        } else if (pending.length < 10) {
+          pending.push(payload);
+          contextConfigurations.set(generation.context_id, signature);
+        } else {
+          sendError('cartesia_tts_session_not_ready', 'Cartesia TTS session is still connecting. Retry this message.');
+        }
       } catch (error) { sendError(error.code || 'cartesia_tts_session_message_invalid', error.message); }
     });
     clientSocket.on('close', () => close());

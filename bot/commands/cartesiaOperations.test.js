@@ -21,6 +21,7 @@ const {
     formatPhoneNumberChoices, maskDestination, pendingRequestMatches,
     normalizeCampaignSchedule, campaignSubmitPhrase,
     runCartesiaAgentRuntime, runCartesiaCallOperations, formatCallDetails, formatCallTranscript, formatCampaignOutcomes,
+    formatCampaignStatus,
   },
 } = require('./cartesiaOperations');
 
@@ -31,6 +32,7 @@ test('Cartesia operations expose guarded single-call and batch campaign actions'
   assert.equal(ACTIONS.has('CARTESIA_CALLS'), true);
   assert.equal(ACTIONS.has('CARTESIA_CAMPAIGN'), true);
   assert.equal(ACTIONS.has('CARTESIA_CAMPAIGN_STATUS'), true);
+  assert.equal(ACTIONS.has('CARTESIA_CAMPAIGN_RECONCILE'), true);
   assert.equal(ACTIONS.has('CARTESIA_BATCH_RECONCILE'), true);
   assert.equal(ACTIONS.has('CARTESIA_BATCH_CANCEL'), true);
   assert.equal(ACTIONS.has('CARTESIA_BATCH_RETRY'), true);
@@ -57,6 +59,9 @@ test('Cartesia menu uses signed callback data for the call action', () => {
   assert.ok(keyboard.inline_keyboard.flat().some((button) => /CARTESIA_BATCH_RECONCILE/.test(button.callback_data)));
   assert.ok(keyboard.inline_keyboard.flat().some((button) => /CARTESIA_BATCH_CANCEL/.test(button.callback_data)));
   assert.ok(keyboard.inline_keyboard.flat().some((button) => /CARTESIA_BATCH_RETRY/.test(button.callback_data)));
+  const campaignReconcile = keyboard.inline_keyboard.flat().find((button) => button.callback_data.includes('CARTESIA_CAMPAIGN_RECONCILE'));
+  assert.ok(campaignReconcile);
+  assert.match(campaignReconcile.text, /provider progress/i);
   assert.ok(keyboard.inline_keyboard.flat().some((button) => /CARTESIA_STUDIO_CENTER/.test(button.callback_data)));
   const health = keyboard.inline_keyboard.flat().find((button) => button.callback_data.includes('CARTESIA_AGENT_HEALTH'));
   assert.ok(health);
@@ -74,6 +79,59 @@ test('Cartesia review formatting escapes transcript content and campaign outcome
   assert.match(transcript, /&lt;img/);
   assert.doesNotMatch(transcript, /private argument|private result/);
   assert.match(formatCampaignOutcomes({ outcome_summary: { total: 4, eligible: 4, blocked: 0, completed: 2, failed: 1, unanswered: 0, pending: 1, unknown: 0, completion_rate_percent: 50 } }), /Completion rate: 50% \(2\/4 eligible recipients\)/);
+});
+
+test('campaign status gives state-specific next steps and avoids unsafe retries', () => {
+  const queued = formatCampaignStatus({
+    campaign_id: `cartesia_campaign_${'a'.repeat(64)}`,
+    status: 'approved',
+    dispatch_queued: true,
+    ready_count: 101,
+    recipient_count: 101,
+  });
+  assert.match(queued, /Queued on VOICEDNUT/);
+  assert.match(queued, /do not create a duplicate/);
+  const unknown = formatCampaignStatus({
+    campaign_id: `cartesia_campaign_${'b'.repeat(64)}`,
+    status: 'unknown',
+    error_code: '<img src=x>',
+  });
+  assert.match(unknown, /do not resubmit/);
+  assert.doesNotMatch(unknown, /<img/);
+  assert.match(unknown, /&lt;img/);
+});
+
+test('campaign reconciliation explicitly refreshes provider progress through the protected API flow', async () => {
+  const originalPost = httpClient.post;
+  const requests = [];
+  const replies = [];
+  const campaignId = `cartesia_campaign_${'c'.repeat(64)}`;
+  httpClient.post = async (_ctx, url, body, options) => {
+    requests.push({ url, body, options });
+    return { data: { campaign: {
+      campaign_id: campaignId, status: 'submitted', provider_batch_id: 'batch_test_01',
+      ready_count: 1, recipient_count: 1,
+      outcome_summary: { total: 1, eligible: 1, completed: 1, failed: 0, unanswered: 0, pending: 0, not_started: 0, blocked: 0, unknown: 0, completion_rate_percent: 100 },
+    } } };
+  };
+  const answers = [{ message: { text: 'biz-1' } }, { message: { text: campaignId } }];
+  const ctx = {
+    from: { id: 7001 }, chat: { type: 'private' },
+    session: { accessProfile: { isAdmin: true, checkedAt: Date.now() }, cartesiaOperationAction: 'CARTESIA_CAMPAIGN_RECONCILE' },
+    async reply(message) { replies.push(String(message)); },
+  };
+  try {
+    await cartesiaOperationFlow({ async wait() { return answers.shift(); } }, ctx);
+  } finally {
+    httpClient.post = originalPost;
+  }
+  assert.equal(requests.length, 1);
+  assert.match(requests[0].url, new RegExp(`/api/cartesia/campaigns/${campaignId}/reconcile$`));
+  assert.deepEqual(requests[0].body, { business_id: 'biz-1' });
+  assert.equal(requests[0].options.timeout, 20000);
+  assert.match(replies.join('\n'), /Provider progress refreshed/);
+  assert.match(replies.join('\n'), /provider batch was accepted/);
+  assert.match(replies.join('\n'), /completed/);
 });
 
 test('Managed Agent runtime status is available through the interactive bot flow', async () => {
@@ -119,6 +177,102 @@ test('interactive private admin health flow displays sanitized Cartesia deployme
   assert.match(replies.at(-1).text, /Needs attention/);
   assert.match(replies.at(-1).text, /deploy_1/);
   assert.doesNotMatch(replies.at(-1).text, /secret|private|build_logs/);
+});
+
+test('interactive Cartesia campaigns accept more than 25 recipients and bound preview output', async () => {
+  const originalGet = httpClient.get;
+  const originalPost = httpClient.post;
+  const requests = [];
+  const replies = [];
+  const campaignId = `cartesia_campaign_${'f'.repeat(64)}`;
+  const destinations = Array.from({ length: 26 }, (_, index) => `+1415555${String(index).padStart(4, '0')}`);
+  const responses = [
+    { message: { text: 'biz-1' } }, { message: { text: '1' } }, { message: { text: '1' } },
+    { message: { text: 'Larger campaign' } }, { message: { text: destinations.join('\n') } },
+    { message: { text: '1' } }, { message: { text: '{}' } }, { message: { text: 'now' } },
+    { message: { text: `SUBMIT CARTESIA CAMPAIGN ${campaignId} WITH 26 RECIPIENTS` } },
+  ];
+  const ctx = {
+    from: { id: 7001 }, chat: { type: 'private' },
+    session: { accessProfile: { isAdmin: true, checkedAt: Date.now() }, cartesiaOperationAction: 'CARTESIA_CAMPAIGN' },
+    async reply(message) { replies.push(String(message)); },
+  };
+  httpClient.get = async () => ({ data: { agents: [{ id: 'agent_1', name: 'Support', ready: true, phoneNumbers: [{ id: 'number_1', displayNumber: '••••0111' }] }] } });
+  httpClient.post = async (_ctx, url, body) => {
+    requests.push({ url, body });
+    if (url.endsWith('/api/cartesia/campaigns')) return { data: { campaign: {
+      campaign_id: campaignId, ready_count: 26, recipient_count: 26,
+      recipients: destinations.map((destination) => ({ status: 'ready', destination_masked: `+••••${destination.slice(-4)}`, reason_code: 'ready' })),
+    } } };
+    return { data: { campaign: { status: 'submitted', provider_batch_id: 'batch_1' } } };
+  };
+  try { await cartesiaOperationFlow({ async wait() { return responses.shift(); } }, ctx); }
+  finally { httpClient.get = originalGet; httpClient.post = originalPost; }
+  assert.equal(requests[0].body.destinations.length, 26);
+  assert.equal(requests[1].body.confirmation_phrase, `SUBMIT CARTESIA CAMPAIGN ${campaignId} WITH 26 RECIPIENTS`);
+  assert.ok(replies.some((message) => message.includes('16 additional recipients omitted')));
+  assert.ok(replies.every((message) => !destinations.some((destination) => message.includes(destination))));
+});
+
+test('interactive Cartesia campaigns collect recipient chunks and queue campaigns over 100', async () => {
+  const originalGet = httpClient.get;
+  const originalPost = httpClient.post;
+  const requests = [];
+  const replies = [];
+  const campaignId = `cartesia_campaign_${'e'.repeat(64)}`;
+  const destinations = Array.from({ length: 101 }, (_, index) => `+1415555${String(index).padStart(4, '0')}`);
+  const responses = [
+    { message: { text: 'biz-1' } }, { message: { text: '1' } }, { message: { text: '1' } },
+    { message: { text: 'Large campaign' } },
+    { message: { text: destinations.slice(0, 100).join('\n') } },
+    { message: { text: destinations[100] } },
+    { message: { text: '1' } }, { message: { text: '{}' } }, { message: { text: 'now' } },
+    { message: { text: `SUBMIT CARTESIA CAMPAIGN ${campaignId} WITH 101 RECIPIENTS` } },
+  ];
+  const ctx = {
+    from: { id: 7001 }, chat: { type: 'private' },
+    session: { accessProfile: { isAdmin: true, checkedAt: Date.now() }, cartesiaOperationAction: 'CARTESIA_CAMPAIGN' },
+    async reply(message) { replies.push(String(message)); },
+  };
+  httpClient.get = async () => ({ data: { agents: [{ id: 'agent_1', name: 'Support', ready: true, phoneNumbers: [{ id: 'number_1', displayNumber: '••••0111' }] }] } });
+  httpClient.post = async (_ctx, url, body) => {
+    requests.push({ url, body });
+    if (url.endsWith('/api/cartesia/campaigns')) return { data: { campaign: {
+      campaign_id: campaignId, ready_count: 101, recipient_count: 101,
+      recipients: destinations.map((destination) => ({ status: 'ready', destination_masked: `+••••${destination.slice(-4)}`, reason_code: 'ready' })),
+    } } };
+    return { data: { queued_for_async_dispatch: true, campaign: { status: 'approved', dispatch_queued: true } } };
+  };
+  try { await cartesiaOperationFlow({ async wait() { return responses.shift(); } }, ctx); }
+  finally { httpClient.get = originalGet; httpClient.post = originalPost; }
+  assert.equal(requests[0].body.destinations.length, 101);
+  assert.deepEqual(requests[0].body.destinations, destinations);
+  assert.equal(requests[1].body.confirmation_phrase, `SUBMIT CARTESIA CAMPAIGN ${campaignId} WITH 101 RECIPIENTS`);
+  assert.ok(replies.some((message) => message.includes('queues the approved campaign for background dispatch')));
+  assert.ok(replies.some((message) => message.includes('Queued for asynchronous dispatch')));
+});
+
+test('interactive Cartesia campaigns reject more than 100 recipients before calling the API', async () => {
+  const originalGet = httpClient.get;
+  const originalPost = httpClient.post;
+  const requests = [];
+  const replies = [];
+  const destinations = Array.from({ length: 101 }, (_, index) => `+1415555${String(index).padStart(4, '0')}`);
+  const responses = [
+    { message: { text: 'biz-1' } }, { message: { text: '1' } }, { message: { text: '1' } },
+    { message: { text: 'Too many' } }, { message: { text: destinations.join('\n') } },
+  ];
+  const ctx = {
+    from: { id: 7001 }, chat: { type: 'private' },
+    session: { accessProfile: { isAdmin: true, checkedAt: Date.now() }, cartesiaOperationAction: 'CARTESIA_CAMPAIGN' },
+    async reply(message) { replies.push(String(message)); },
+  };
+  httpClient.get = async () => ({ data: { agents: [{ id: 'agent_1', name: 'Support', ready: true, phoneNumbers: [{ id: 'number_1', displayNumber: '••••0111' }] }] } });
+  httpClient.post = async (_ctx, url, body) => { requests.push({ url, body }); return { data: {} }; };
+  try { await cartesiaOperationFlow({ async wait() { return responses.shift(); } }, ctx); }
+  finally { httpClient.get = originalGet; httpClient.post = originalPost; }
+  assert.equal(requests.length, 0);
+  assert.ok(replies.some((message) => message.includes('Provide 1–100 valid E.164 numbers')));
 });
 
 test('interactive Cartesia campaign requires the campaign-specific phrase before submitting', async () => {

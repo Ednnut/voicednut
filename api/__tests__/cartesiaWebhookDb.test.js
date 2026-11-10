@@ -34,4 +34,41 @@ describe('Cartesia webhook event persistence', () => {
       for (const file of [dbPath, `${dbPath}-wal`, `${dbPath}-shm`]) { try { fs.unlinkSync(file); } catch { /* already removed */ } }
     }
   });
+
+  it('stores Cartesia call webhook receipts in an independent idempotency ledger', async () => {
+    const dbPath = path.join(os.tmpdir(), `voicednut-cartesia-receipt-${Date.now()}-${Math.random()}.sqlite`);
+    const db = new Database();
+    db.dbPath = dbPath;
+    try {
+      await db.initialize();
+      const input = {
+        webhook_request_id: 'webhook_req_2',
+        provider_call_id: 'ac_call_1',
+        event_type: 'call_completed',
+        event_timestamp: '2026-11-01T12:00:00.000Z',
+        payload_hash: 'c'.repeat(64),
+      };
+      assert.deepEqual(await db.recordCartesiaWebhookReceipt(input), {
+        inserted: true,
+        duplicate: false,
+        conflict: false,
+      });
+      assert.deepEqual(await db.recordCartesiaWebhookReceipt(input), {
+        inserted: false,
+        duplicate: true,
+        conflict: false,
+      });
+      assert.deepEqual(await db.recordCartesiaWebhookReceipt({
+        ...input,
+        payload_hash: 'd'.repeat(64),
+      }), {
+        inserted: false,
+        duplicate: false,
+        conflict: true,
+      });
+    } finally {
+      if (db.db) await new Promise((resolve) => db.db.close(resolve));
+      for (const file of [dbPath, `${dbPath}-wal`, `${dbPath}-shm`]) { try { fs.unlinkSync(file); } catch { /* already removed */ } }
+    }
+  });
 });

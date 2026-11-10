@@ -95,6 +95,7 @@ function scanSource() {
     const urls = file.content.matchAll(/https?:\/\/([a-z0-9.-]+)/gi);
     for (const match of urls) {
       const hostname = match[1].toLowerCase();
+      if (hostname === "test" || hostname.endsWith(".test")) continue;
       if (hostPrefixes.some((prefix) => hostname.startsWith(prefix)) || specialHosts.has(hostname)) {
         detectedHosts.add(hostname);
       }

@@ -12,6 +12,9 @@ const REQUEST_PATTERN = /^[A-Za-z0-9._:-]{8,180}$/;
 const PHONE_PATTERN = /^\+[1-9]\d{7,14}$/;
 const SCHEDULE_PATTERN = /^(\d{4})-(\d{2})-(\d{2})T(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d{1,9})?(?:Z|[+-](?:[01]\d|2[0-3]):[0-5]\d)$/i;
 const MAX_SCHEDULE_AHEAD_MS = 24 * 60 * 60 * 1000;
+const MAX_CAMPAIGN_RECIPIENTS = 1000;
+const MAX_SYNCHRONOUS_CAMPAIGN_RECIPIENTS = 100;
+const ASYNC_DISPATCH_TOKEN = Symbol('cartesia_campaign_async_dispatch');
 const REASONS = new Set(['ready', 'invalid_destination', 'duplicate_destination', 'consent_missing', 'consent_expired', 'consent_not_effective', 'opted_out', 'cooldown_active', 'policy_storage_unavailable']);
 
 function campaignError(code, message, status = 409) {
@@ -102,6 +105,7 @@ function safeCampaign(campaign, recipients = []) {
     agent_id: String(campaign.agent_id), from_number_id: String(campaign.from_number_id),
     target_concurrency_limit: Number(campaign.target_concurrency_limit) || 1,
     scheduled_at: campaign.scheduled_at || null,
+    dispatch_queued: campaign.status === 'approved' && Boolean(campaign.dispatch_requested_at),
     recipient_count: Number(campaign.recipient_count) || 0,
     ready_count: Number(campaign.ready_count) || 0,
     blocked_count: Number(campaign.blocked_count) || 0,
@@ -139,10 +143,21 @@ class CartesiaCampaignService {
     this.client = options.client;
     this.db = options.db;
     this.outboundSafety = options.outboundSafety;
+    this.enabled = options.enabled === true;
+    this.dispatchEnabled = options.dispatchEnabled === true;
     this.idempotencySecret = String(options.idempotencySecret || '');
     this.encryptionKeys = options.encryptionKeys || {};
     this.encryptionKeyVersion = Number(options.encryptionKeyVersion || 1);
     this.now = options.now || (() => new Date());
+  }
+
+  ensureDispatchEnabled() {
+    if (!this.enabled) {
+      throw campaignError('cartesia_not_configured', 'Cartesia Managed Agents is disabled or not configured', 503);
+    }
+    if (!this.dispatchEnabled) {
+      throw campaignError('cartesia_batch_dispatch_disabled', 'Cartesia batch dispatch is disabled', 503);
+    }
   }
 
   async createDraft(input = {}) {
@@ -165,10 +180,10 @@ class CartesiaCampaignService {
     const concurrency = Number(input.target_concurrency_limit || 1);
     const scheduledAt = normalizeScheduledAt(input.scheduled_at, this.now());
     if (!BUSINESS_PATTERN.test(businessId) || !ACTOR_PATTERN.test(actorId) || !REQUEST_PATTERN.test(requestKey) ||
-        !ID_PATTERN.test(agentId) || !ID_PATTERN.test(fromNumberId) || destinations.length < 1 || destinations.length > 25 ||
+        !ID_PATTERN.test(agentId) || !ID_PATTERN.test(fromNumberId) || destinations.length < 1 || destinations.length > MAX_CAMPAIGN_RECIPIENTS ||
         destinations.some((number) => number.length > 80) || !name || name.length > 120 ||
         !Number.isSafeInteger(concurrency) || concurrency < 1 || concurrency > 10) {
-      throw campaignError('cartesia_campaign_invalid', 'A valid business, request key, agent, source number, campaign name, concurrency, and 1–25 destinations are required', 400);
+      throw campaignError('cartesia_campaign_invalid', 'A valid business, request key, agent, source number, campaign name, concurrency, and 1–1,000 destinations are required', 400);
     }
     if (!this.db?.createCartesiaCampaignDraft || !this.db?.getCartesiaCampaign) {
       throw campaignError('cartesia_campaign_unavailable', 'Cartesia campaign storage is unavailable', 503);
@@ -322,7 +337,7 @@ class CartesiaCampaignService {
     const stored = await this._authorizedCampaign(input);
     const campaign = stored.campaign;
     const batchId = String(campaign.provider_batch_id || '');
-    if (!batchId && campaign.status === 'approved' && campaign.scheduled_at) {
+    if (!batchId && campaign.status === 'approved' && (campaign.scheduled_at || campaign.dispatch_requested_at)) {
       const expectedLocalCancel = `CANCEL CARTESIA CAMPAIGN ${campaign.campaign_id} BEFORE DISPATCH`;
       if (!constantTimeEqual(input.confirmation_phrase, expectedLocalCancel)) throw campaignError('cartesia_campaign_confirmation_required', 'The exact local campaign cancellation phrase is required', 400);
       const cancelled = await this.db.transitionCartesiaCampaign({ campaign_id: campaign.campaign_id, business_id: campaign.business_id,
@@ -343,6 +358,7 @@ class CartesiaCampaignService {
 
   async retryFailedRecipients(input = {}) {
     const stored = await this._authorizedCampaign(input);
+    this.ensureDispatchEnabled();
     const { campaign, recipients } = stored;
     const batchId = String(campaign.provider_batch_id || '');
     if (!batchId) throw campaignError('cartesia_campaign_batch_unresolved', 'Reconcile this campaign before retrying recipients', 409);
@@ -431,6 +447,7 @@ class CartesiaCampaignService {
   }
 
   async submit(input = {}) {
+    const asyncWorkerDispatch = input[ASYNC_DISPATCH_TOKEN] === true;
     const campaignId = String(input.campaign_id || '').trim();
     const businessId = String(input.business_id || '').trim();
     const actorId = String(input.actor_id || '').trim();
@@ -448,12 +465,22 @@ class CartesiaCampaignService {
       throw campaignError('cartesia_campaign_confirmation_required', 'The exact campaign-specific approval phrase is required', 400);
     }
     if (campaign.status === 'submitted') return { campaign: safeCampaign(campaign, recipients), idempotent_replay: true };
+    if (asyncWorkerDispatch && (campaign.status !== 'approved' || !campaign.dispatch_requested_at ||
+        Number(campaign.recipient_count) <= MAX_SYNCHRONOUS_CAMPAIGN_RECIPIENTS)) {
+      throw campaignError('cartesia_campaign_dispatch_not_queued', 'This campaign is not awaiting asynchronous dispatch', 409);
+    }
     if (['submitting', 'unknown'].includes(campaign.status)) {
       throw campaignError('cartesia_campaign_outcome_unresolved', 'This campaign may already have been submitted; reconcile it before any retry', 409);
     }
     if (!['draft', 'approved'].includes(campaign.status) || Number(campaign.ready_count) !== Number(campaign.recipient_count) || recipients.length !== Number(campaign.recipient_count)) {
       throw campaignError('cartesia_campaign_preflight_blocked', 'Every campaign recipient must pass consent and suppression checks before submission', 409);
     }
+    const now = this.now();
+    const nowMs = now instanceof Date ? now.getTime() : Date.parse(now);
+    const scheduledAt = campaign.scheduled_at ? new Date(campaign.scheduled_at).toISOString() : null;
+    const heldForFuture = Boolean(scheduledAt && Date.parse(scheduledAt) > nowMs);
+    if (!heldForFuture) this.ensureDispatchEnabled();
+
     if (campaign.status === 'draft') {
       const approved = await this.db.transitionCartesiaCampaign({
         campaign_id: campaignId, business_id: businessId, expected_status: 'draft', status: 'approved', approved_by: actorId, error_code: null,
@@ -465,24 +492,25 @@ class CartesiaCampaignService {
         }
       }
     }
-    const now = this.now();
-    const nowMs = now instanceof Date ? now.getTime() : Date.parse(now);
-    const scheduledAt = campaign.scheduled_at ? new Date(campaign.scheduled_at).toISOString() : null;
-    if (scheduledAt && Date.parse(scheduledAt) > nowMs) {
-      if (campaign.status === 'draft') {
-        const approved = await this.db.transitionCartesiaCampaign({ campaign_id: campaignId, business_id: businessId,
-          expected_status: 'draft', status: 'approved', approved_by: actorId, error_code: null });
-        if (!approved) {
-          const current = await this.db.getCartesiaCampaign(campaignId, businessId);
-          if (current?.campaign?.status !== 'approved') throw campaignError('cartesia_campaign_state_changed', 'Campaign state changed before approval; review its current status', 409);
-        }
-      }
+    if (heldForFuture) {
       const held = await this.db.getCartesiaCampaign(campaignId, businessId);
       return { campaign: safeCampaign(held.campaign, held.recipients), idempotent_replay: false, held_for_local_dispatch: true };
     }
+    if (Number(campaign.recipient_count) > MAX_SYNCHRONOUS_CAMPAIGN_RECIPIENTS && !asyncWorkerDispatch) {
+      if (campaign.status === 'approved' && campaign.dispatch_requested_at) {
+        return { campaign: safeCampaign(campaign, recipients), idempotent_replay: true, queued_for_async_dispatch: true };
+      }
+      const queued = await this.db.queueCartesiaCampaignDispatch?.({
+        campaign_id: campaignId, business_id: businessId, request_hash: campaign.request_hash,
+        requested_at: now instanceof Date ? now.toISOString() : new Date(now).toISOString(),
+      });
+      if (!queued) throw campaignError('cartesia_campaign_state_changed', 'Campaign state changed before it could be queued; review its current status', 409);
+      const queuedCampaign = await this.db.getCartesiaCampaign(campaignId, businessId);
+      return { campaign: safeCampaign(queuedCampaign.campaign, queuedCampaign.recipients), idempotent_replay: false, queued_for_async_dispatch: true };
+    }
     const keyVersion = Number(campaign.encryption_key_version);
     const destinations = recipients.map((row) => decryptDestination(row.encrypted_destination, this.encryptionKeys, campaignId, Number(row.position), keyVersion));
-    if (scheduledAt) {
+    if (scheduledAt || asyncWorkerDispatch) {
       for (const destination of destinations) {
         let eligibility;
         try { eligibility = await this.outboundSafety?.contactPolicy?.checkEligibility?.({ businessId, destination }); }
@@ -492,6 +520,7 @@ class CartesiaCampaignService {
             expected_status: 'approved', status: 'blocked', error_code: String(eligibility?.reason || 'dispatch_consent_blocked').slice(0, 80) });
           throw campaignError('cartesia_campaign_dispatch_contact_blocked', 'A recipient no longer has current consent or contact eligibility; the scheduled campaign was blocked', 409);
         }
+
       }
     }
     await this._assertAgentSource(campaign.agent_id, campaign.from_number_id);
@@ -550,6 +579,24 @@ class CartesiaCampaignService {
         ? campaignError('cartesia_campaign_outcome_unresolved', 'Cartesia batch outcome is unknown; reconcile this campaign before retrying', 502)
         : error;
     }
+  }
+
+  async dispatchQueuedCampaign(input = {}) {
+    const campaignId = String(input.campaign_id || '').trim();
+    const businessId = String(input.business_id || '').trim();
+    const stored = await this.db?.getCartesiaCampaign?.(campaignId, businessId);
+    if (!stored || stored.campaign.status !== 'approved' || !stored.campaign.dispatch_requested_at ||
+        Number(stored.campaign.recipient_count) <= MAX_SYNCHRONOUS_CAMPAIGN_RECIPIENTS) {
+      throw campaignError('cartesia_campaign_dispatch_not_queued', 'This campaign is not awaiting asynchronous dispatch', 409);
+    }
+    const actorId = String(stored.campaign.approved_by || '');
+    return this.submit({
+      campaign_id: campaignId,
+      business_id: businessId,
+      actor_id: actorId,
+      confirmation_phrase: confirmationPhrase(stored.campaign),
+      [ASYNC_DISPATCH_TOKEN]: true,
+    });
   }
 }
 

@@ -37,6 +37,56 @@ test('Cartesia Studio menu exposes the requested capability families with signed
   assert.ok(buttons.some((button) => button.url === 'https://www.cartesia.ai/product/voice-conversion'));
 });
 
+test('Cartesia Ink manual mode uploads bounded PCM with explicit turn finalization', async () => {
+  const originalGet = httpClient.get;
+  const originalPost = httpClient.post;
+  const requests = [];
+  const replies = [];
+  httpClient.get = async (_ctx, url) => {
+    assert.match(url, /\/stt-profile/);
+    return { data: { profile: { keyterms: ['Acme'], turnSettings: { end_timeout_ms: 5600 } } } };
+  };
+  httpClient.post = async (_ctx, url, body, options) => {
+    requests.push({ url, body, options });
+    return { data: { transcript: '  preserve spacing ', language: 'en', durationSeconds: 0.2 } };
+  };
+  const updates = [
+    { message: { text: 'manual' } },
+    { message: { document: { file_id: 'telegram-file-1', file_name: 'clip.pcm', file_size: 6400, mime_type: 'application/octet-stream' } } },
+    { message: { text: 'TRANSCRIBE AUDIO WITH CARTESIA INK MANUAL' } },
+  ];
+  const ctx = {
+    from: { id: 7001 },
+    api: { async getFile(id) { assert.equal(id, 'telegram-file-1'); return { file_path: 'audio/clip.pcm' }; } },
+    async reply(message) { replies.push(String(message)); },
+  };
+  try {
+    await __testables.runInkTranscription(
+      { async wait() { return updates.shift(); } },
+      ctx,
+      () => {},
+      { async downloadAudio(_ctx, file, maxBytes) {
+        assert.equal(file.file_path, 'audio/clip.pcm');
+        assert.equal(maxBytes, 1_600_000);
+        return Buffer.alloc(6400);
+      } },
+    );
+  } finally {
+    httpClient.get = originalGet;
+    httpClient.post = originalPost;
+  }
+  assert.equal(requests.length, 1);
+  const url = new URL(requests[0].url);
+  assert.equal(url.searchParams.get('turn_mode'), 'manual');
+  assert.equal(url.searchParams.get('confirmation_phrase'), 'TRANSCRIBE AUDIO WITH CARTESIA INK MANUAL');
+  assert.equal(url.searchParams.get('encoding'), 'pcm_s16le');
+  assert.equal(url.searchParams.get('sample_rate'), '16000');
+  assert.deepEqual(requests[0].body, Buffer.alloc(6400));
+  assert.equal(requests[0].options.retry.retries, 0);
+  assert.match(replies.join('\n'), /manual turn finalization transcript/);
+  assert.match(replies.join('\n'), /  preserve spacing /);
+});
+
 test('Cartesia readiness menu renders safe diagnostics and labels local webhook receipts', async () => {
   const originalGet = httpClient.get;
   const replies = [];

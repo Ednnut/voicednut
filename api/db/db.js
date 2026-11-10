@@ -1,7 +1,6 @@
 const sqlite3 = require('sqlite3').verbose();
 const crypto = require('node:crypto');
 const path = require('path');
-const crypto = require('crypto');
 const {
     buildObjectiveTagsForFlow,
     getEffectiveObjectiveTags,
@@ -11,6 +10,7 @@ const {
 } = require('../functions/FlowMetadata');
 const { normalizeRelationshipProfileType } = require('../functions/Dating');
 
+const MAX_CARTESIA_CAMPAIGN_RECIPIENTS = 1000;
 const CALL_STATUS_ORDER = Object.freeze([
     'queued',
     'initiated',
@@ -194,6 +194,7 @@ class EnhancedDatabase {
                     .then(() => this.ensureOutboundContactDispatchCartesiaProvider())
                     .then(() => this.ensureOutboundCallBusinessScopeColumn())
                     .then(() => this.ensureCartesiaCampaignProgressColumns())
+                    .then(() => this.ensureCartesiaCampaignRecipientLimit())
                     .then(() => this.ensureCartesiaVoiceGovernanceColumns())
                     .then(() => this.ensureCallESensitiveDataColumns())
                     .then(() => this.ensureCallEMissionEnhancementColumns())
@@ -831,13 +832,14 @@ class EnhancedDatabase {
                 target_concurrency_limit INTEGER NOT NULL,
                 scheduled_at TEXT,
                 status TEXT NOT NULL CHECK(status IN ('draft', 'approved', 'submitting', 'submitted', 'unknown', 'blocked')),
-                recipient_count INTEGER NOT NULL CHECK(recipient_count BETWEEN 1 AND 25),
+                recipient_count INTEGER NOT NULL CHECK(recipient_count BETWEEN 1 AND 1000),
                 ready_count INTEGER NOT NULL,
                 blocked_count INTEGER NOT NULL,
                 encryption_key_version INTEGER NOT NULL,
                 provider_batch_id TEXT,
                 provider_status TEXT,
                 provider_retry_count INTEGER NOT NULL DEFAULT 0,
+                dispatch_requested_at TEXT,
                 error_code TEXT,
                 created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -1003,9 +1005,21 @@ class EnhancedDatabase {
                 reason_code TEXT,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )`,
+            `CREATE TABLE IF NOT EXISTS cartesia_batch_retention_worker_audit (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                actor_type TEXT NOT NULL CHECK(actor_type = 'retention_worker'),
+                actor_id TEXT NOT NULL,
+                provider_batch_id TEXT NOT NULL,
+                action TEXT NOT NULL CHECK(action IN ('recipient_purge')),
+                outcome TEXT NOT NULL CHECK(outcome IN ('requested', 'succeeded', 'failed')),
+                recipient_count INTEGER NOT NULL DEFAULT 0,
+                request_fingerprint TEXT NOT NULL,
+                reason_code TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )`,
 
             // Durable dedupe ledger for Cartesia's stable webhook_request_id.
-            `CREATE TABLE IF NOT EXISTS cartesia_webhook_events (
+            `CREATE TABLE IF NOT EXISTS cartesia_webhook_event_receipts (
                 webhook_request_id TEXT PRIMARY KEY,
                 provider_call_id TEXT NOT NULL,
                 event_type TEXT NOT NULL,
@@ -1737,7 +1751,8 @@ class EnhancedDatabase {
             'CREATE INDEX IF NOT EXISTS idx_cartesia_batch_recipients_batch_status ON cartesia_call_batch_recipients(provider_batch_id, provider_status)',
             'CREATE INDEX IF NOT EXISTS idx_cartesia_batch_recipients_call_id ON cartesia_call_batch_recipients(provider_call_id)',
             'CREATE INDEX IF NOT EXISTS idx_cartesia_batch_retention_audit_created ON cartesia_batch_retention_audit(created_at DESC)',
-            'CREATE INDEX IF NOT EXISTS idx_cartesia_webhook_call_event ON cartesia_webhook_events(provider_call_id, event_timestamp)',
+            'CREATE INDEX IF NOT EXISTS idx_cartesia_batch_retention_worker_audit_created ON cartesia_batch_retention_worker_audit(created_at DESC)',
+            'CREATE INDEX IF NOT EXISTS idx_cartesia_webhook_receipts_call_event ON cartesia_webhook_event_receipts(provider_call_id, event_timestamp)',
             
             // Transcript indexes for both table names
             'CREATE INDEX IF NOT EXISTS idx_transcripts_call_sid ON call_transcripts(call_sid)',
@@ -1919,6 +1934,79 @@ class EnhancedDatabase {
         if (!campaignColumns.has('provider_retry_count')) await new Promise((resolve, reject) => this.db.run(
             'ALTER TABLE cartesia_campaigns ADD COLUMN provider_retry_count INTEGER NOT NULL DEFAULT 0', (error) => error ? reject(error) : resolve(),
         ));
+        if (!campaignColumns.has('dispatch_requested_at')) await new Promise((resolve, reject) => this.db.run(
+            'ALTER TABLE cartesia_campaigns ADD COLUMN dispatch_requested_at TEXT', (error) => error ? reject(error) : resolve(),
+        ));
+    }
+
+    async ensureCartesiaCampaignRecipientLimit() {
+        const schema = await new Promise((resolve, reject) => this.db.get(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'cartesia_campaigns'",
+            (error, row) => error ? reject(error) : resolve(String(row?.sql || '')),
+        ));
+        if (/recipient_count\s+INTEGER\s+NOT NULL\s+CHECK\s*\(\s*recipient_count\s+BETWEEN\s+1\s+AND\s+1000\s*\)/i.test(schema)) return;
+        if (!/recipient_count\s+INTEGER\s+NOT NULL\s+CHECK\s*\(\s*recipient_count\s+BETWEEN\s+1\s+AND\s+(?:25|100)\s*\)/i.test(schema)) {
+            throw new Error('Cartesia campaign recipient-count schema is unsupported');
+        }
+
+        const run = (sql) => new Promise((resolve, reject) => this.db.run(sql, (error) => error ? reject(error) : resolve()));
+        await run('PRAGMA foreign_keys = OFF');
+        let transactionStarted = false;
+        try {
+            await run('BEGIN IMMEDIATE');
+            transactionStarted = true;
+            await run(`CREATE TABLE cartesia_campaigns_new (
+                campaign_id TEXT PRIMARY KEY,
+                business_id TEXT NOT NULL,
+                created_by TEXT NOT NULL,
+                approved_by TEXT,
+                request_key TEXT NOT NULL,
+                request_hash TEXT NOT NULL,
+                campaign_name TEXT NOT NULL,
+                agent_id TEXT NOT NULL,
+                from_number_id TEXT NOT NULL,
+                target_concurrency_limit INTEGER NOT NULL,
+                scheduled_at TEXT,
+                status TEXT NOT NULL CHECK(status IN ('draft', 'approved', 'submitting', 'submitted', 'unknown', 'blocked')),
+                recipient_count INTEGER NOT NULL CHECK(recipient_count BETWEEN 1 AND 1000),
+                ready_count INTEGER NOT NULL,
+                blocked_count INTEGER NOT NULL,
+                encryption_key_version INTEGER NOT NULL,
+                provider_batch_id TEXT,
+                provider_status TEXT,
+                provider_retry_count INTEGER NOT NULL DEFAULT 0,
+                dispatch_requested_at TEXT,
+                error_code TEXT,
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(business_id, request_key)
+            )`);
+            await run(`INSERT INTO cartesia_campaigns_new (
+                campaign_id, business_id, created_by, approved_by, request_key, request_hash, campaign_name,
+                agent_id, from_number_id, target_concurrency_limit, scheduled_at, status, recipient_count,
+                ready_count, blocked_count, encryption_key_version, provider_batch_id, provider_status,
+                provider_retry_count, dispatch_requested_at, error_code, created_at, updated_at
+            ) SELECT campaign_id, business_id, created_by, approved_by, request_key, request_hash, campaign_name,
+                agent_id, from_number_id, target_concurrency_limit, scheduled_at, status, recipient_count,
+                ready_count, blocked_count, encryption_key_version, provider_batch_id, provider_status,
+                provider_retry_count, dispatch_requested_at, error_code, created_at, updated_at
+              FROM cartesia_campaigns`);
+            await run('DROP TABLE cartesia_campaigns');
+            await run('ALTER TABLE cartesia_campaigns_new RENAME TO cartesia_campaigns');
+            await run('CREATE INDEX IF NOT EXISTS idx_cartesia_campaigns_scope ON cartesia_campaigns(business_id, status, created_at DESC)');
+            await run('COMMIT');
+            transactionStarted = false;
+        } catch (error) {
+            if (transactionStarted) await run('ROLLBACK');
+            throw error;
+        } finally {
+            await run('PRAGMA foreign_keys = ON');
+        }
+
+        const violations = await new Promise((resolve, reject) => this.db.all(
+            'PRAGMA foreign_key_check', (error, rows) => error ? reject(error) : resolve(rows || []),
+        ));
+        if (violations.length) throw new Error('Cartesia campaign schema upgrade left foreign-key violations');
     }
 
     async ensureCartesiaVoiceGovernanceColumns() {
@@ -2010,7 +2098,6 @@ class EnhancedDatabase {
         });
     }
 
-<<<<<<< HEAD
     async ensureCallEReconciliationIvrColumn() {
         const columns = await new Promise((resolve, reject) => {
             this.db.all('PRAGMA table_info(call_e_reconciliation)', (error, rows) => {
@@ -2025,10 +2112,14 @@ class EnhancedDatabase {
                 resolve();
             });
         });
-=======
+    }
+
     async ensureCartesiaBatchReconciliationColumns() {
         const existing = await new Promise((resolve, reject) => {
-            this.db.all('PRAGMA table_info(cartesia_call_batches)', (error, rows) => error ? reject(error) : resolve(rows || []));
+            this.db.all('PRAGMA table_info(cartesia_call_batches)', (error, rows) => {
+                if (error) return reject(error);
+                resolve(rows || []);
+            });
         });
         const names = new Set(existing.map((row) => row.name));
         const columns = {
@@ -2047,7 +2138,6 @@ class EnhancedDatabase {
                 });
             });
         }
->>>>>>> 95a068c (updated)
     }
 
     async ensureCallColumns(columns = []) {
@@ -5606,7 +5696,7 @@ class EnhancedDatabase {
             !/^\d{1,20}$/.test(createdBy) || !/^[A-Za-z0-9._:-]{8,180}$/.test(requestKey) || !/^[a-f0-9]{64}$/.test(requestHash) ||
             !/^[A-Za-z0-9._:-]{1,200}$/.test(String(input.agent_id || '')) || !/^[A-Za-z0-9._:-]{1,200}$/.test(String(input.from_number_id || '')) ||
             !Number.isSafeInteger(Number(input.target_concurrency_limit)) || Number(input.target_concurrency_limit) < 1 || Number(input.target_concurrency_limit) > 10 ||
-            !Number.isSafeInteger(Number(input.encryption_key_version)) || Number(input.encryption_key_version) < 1 || recipients.length < 1 || recipients.length > 25) {
+            !Number.isSafeInteger(Number(input.encryption_key_version)) || Number(input.encryption_key_version) < 1 || recipients.length < 1 || recipients.length > MAX_CARTESIA_CAMPAIGN_RECIPIENTS) {
             throw Object.assign(new Error('Cartesia campaign draft is invalid'), { code: 'cartesia_campaign_invalid' });
         }
         let release;
@@ -5720,11 +5810,28 @@ class EnhancedDatabase {
         const limit = Math.max(1, Math.min(50, Number(input.limit) || 10));
         if (!Number.isFinite(Date.parse(nowIso))) return [];
         return new Promise((resolve, reject) => this.db.all(
-            `SELECT campaign_id, business_id, approved_by, scheduled_at
+            `SELECT campaign_id, business_id, approved_by, scheduled_at, dispatch_requested_at, recipient_count
              FROM cartesia_campaigns
-             WHERE status = 'approved' AND scheduled_at IS NOT NULL AND scheduled_at <= ?
+             WHERE status = 'approved' AND (
+                 (scheduled_at IS NOT NULL AND scheduled_at <= ?) OR dispatch_requested_at IS NOT NULL
+             )
              ORDER BY scheduled_at, created_at LIMIT ?`,
             [nowIso, limit], (error, rows) => error ? reject(error) : resolve(rows || []),
+        ));
+    }
+
+    async queueCartesiaCampaignDispatch(input = {}) {
+        const campaignId = String(input.campaign_id || '').trim();
+        const businessId = String(input.business_id || '').trim();
+        const requestHash = String(input.request_hash || '').trim();
+        const requestedAt = String(input.requested_at || new Date().toISOString());
+        if (!/^cartesia_campaign_[a-f0-9]{64}$/.test(campaignId) || !/^[A-Za-z0-9._:-]{1,120}$/.test(businessId) ||
+            !/^[a-f0-9]{64}$/.test(requestHash) || !Number.isFinite(Date.parse(requestedAt))) return false;
+        return new Promise((resolve, reject) => this.db.run(
+            `UPDATE cartesia_campaigns SET dispatch_requested_at = COALESCE(dispatch_requested_at, ?), updated_at = CURRENT_TIMESTAMP
+             WHERE campaign_id = ? AND business_id = ? AND request_hash = ? AND status = 'approved'`,
+            [new Date(requestedAt).toISOString(), campaignId, businessId, requestHash],
+            function (error) { error ? reject(error) : resolve(this.changes === 1); },
         ));
     }
 
@@ -5736,7 +5843,7 @@ class EnhancedDatabase {
         const retryCount = Math.max(0, Math.min(100, Number(input.provider_retry_count) || 0));
         const recipients = Array.isArray(input.recipients) ? input.recipients : [];
         if (!/^cartesia_campaign_[a-f0-9]{64}$/.test(campaignId) || !/^[A-Za-z0-9._:-]{1,120}$/.test(businessId) ||
-            !/^[A-Za-z0-9._:-]{1,200}$/.test(batchId) || !/^[A-Za-z0-9_-]{1,40}$/.test(status) || recipients.length > 25 ||
+            !/^[A-Za-z0-9._:-]{1,200}$/.test(batchId) || !/^[A-Za-z0-9_-]{1,40}$/.test(status) || recipients.length > MAX_CARTESIA_CAMPAIGN_RECIPIENTS ||
             recipients.some((row) => !Number.isSafeInteger(Number(row.position)) || Number(row.position) < 0)) return false;
         let release;
         const previous = this.callECampaignWriteChain;
@@ -9579,6 +9686,164 @@ class EnhancedDatabase {
         });
     }
 
+    async recordCartesiaBatchRetentionWorkerAudit(event = {}) {
+        const batchId = String(event.provider_batch_id || '').trim();
+        const fingerprint = String(event.request_fingerprint || '').trim().toLowerCase();
+        const outcome = String(event.outcome || '').trim();
+        const reasonCode = /^[a-z][a-z0-9_]{0,79}$/.test(String(event.reason_code || '')) ? event.reason_code : null;
+        const recipientCount = Number(event.recipient_count || 0);
+        if (!/^[A-Za-z0-9_-]{1,200}$/.test(batchId) || !/^[a-f0-9]{64}$/.test(fingerprint) ||
+            !['requested', 'succeeded', 'failed'].includes(outcome) ||
+            !Number.isSafeInteger(recipientCount) || recipientCount < 0 || recipientCount > 10000) {
+            throw new Error('Cartesia batch retention worker audit event is invalid');
+        }
+        return new Promise((resolve, reject) => {
+            this.db.run(`INSERT INTO cartesia_batch_retention_worker_audit (
+                actor_type, actor_id, provider_batch_id, action, outcome,
+                recipient_count, request_fingerprint, reason_code
+            ) VALUES ('retention_worker', 'api_process', ?, 'recipient_purge', ?, ?, ?, ?)`,
+            [batchId, outcome, recipientCount, fingerprint, reasonCode], function (error) {
+                if (error) return reject(error);
+                resolve({ saved: true, id: this.lastID });
+            });
+        });
+    }
+
+    async listExpiredCartesiaBatchRetentionCandidates({ cutoff, limit = 10 } = {}) {
+        const normalizedCutoff = String(cutoff || '').trim();
+        const normalizedLimit = Number(limit);
+        if (!Number.isFinite(Date.parse(normalizedCutoff)) ||
+            !Number.isSafeInteger(normalizedLimit) || normalizedLimit < 1 || normalizedLimit > 10) {
+            throw new Error('Cartesia batch retention candidate query is invalid');
+        }
+        return new Promise((resolve, reject) => {
+            this.db.all(`
+                SELECT b.provider_batch_id
+                FROM cartesia_call_batches b
+                WHERE b.status IN ('completed', 'failed', 'cancelled')
+                  AND b.provider_updated_at <= ?
+                  AND EXISTS (
+                      SELECT 1 FROM cartesia_call_batch_recipients r
+                      WHERE r.provider_batch_id = b.provider_batch_id
+                  )
+                ORDER BY b.provider_updated_at ASC, b.created_at ASC
+                LIMIT ?
+            `, [normalizedCutoff, normalizedLimit], (error, rows) => error ? reject(error) : resolve(rows || []));
+        });
+    }
+
+    async listCartesiaAuditEvents({ limit = 100, cursor = null } = {}) {
+        const normalizedLimit = Number(limit);
+        const validSources = new Set([
+            'admin_action',
+            'batch_retention',
+            'batch_retention_worker',
+            'call_operation',
+            'call_review',
+            'phone_number_operation',
+            'provider_operation',
+            'webhook_assignment',
+            'webhook_creation',
+        ]);
+        if (!Number.isSafeInteger(normalizedLimit) || normalizedLimit < 1 || normalizedLimit > 501 ||
+            (cursor !== null && (
+                typeof cursor !== 'object' ||
+                typeof cursor.createdAt !== 'string' ||
+                !Number.isFinite(Date.parse(cursor.createdAt)) ||
+                !validSources.has(cursor.source) ||
+                !Number.isSafeInteger(Number(cursor.id)) ||
+                Number(cursor.id) < 1
+            ))) {
+            throw new Error('Cartesia audit export query is invalid');
+        }
+
+        const cursorWhere = cursor === null
+            ? ''
+            : `WHERE created_at < ?
+                OR (created_at = ? AND source < ?)
+                OR (created_at = ? AND source = ? AND id < ?)`;
+        const params = cursor === null
+            ? [normalizedLimit]
+            : [
+                cursor.createdAt,
+                cursor.createdAt,
+                cursor.source,
+                cursor.createdAt,
+                cursor.source,
+                Number(cursor.id),
+                normalizedLimit,
+            ];
+        return new Promise((resolve, reject) => {
+            this.db.all(`
+                SELECT id, source, created_at, actor_type, actor_id, action,
+                       resource_type, resource_id, outcome, reason_code,
+                       business_id, target_agent_id
+                FROM (
+                    SELECT id, 'call_review' AS source, created_at,
+                           'miniapp_user' AS actor_type, actor_telegram_id AS actor_id,
+                           'private_call_review' AS action, 'call' AS resource_type,
+                           provider_call_id AS resource_id, outcome, reason_code,
+                           business_id, NULL AS target_agent_id
+                    FROM cartesia_call_review_audit
+                    UNION ALL
+                    SELECT id, 'admin_action' AS source, created_at,
+                           'miniapp_user' AS actor_type, actor_telegram_id AS actor_id,
+                           action, resource_type, resource_id, outcome, reason_code,
+                           NULL AS business_id, target_agent_id
+                    FROM cartesia_admin_action_audit
+                    UNION ALL
+                    SELECT id, 'phone_number_operation' AS source, created_at,
+                           actor_type, actor_id, action, 'phone_number' AS resource_type,
+                           resource_id, outcome, reason_code, NULL AS business_id,
+                           target_agent_id
+                    FROM cartesia_phone_number_operation_audit
+                    UNION ALL
+                    SELECT id, 'provider_operation' AS source, created_at,
+                           actor_type, actor_id, action, 'provider' AS resource_type,
+                           resource_id, outcome, reason_code, NULL AS business_id,
+                           NULL AS target_agent_id
+                    FROM cartesia_provider_operation_audit
+                    UNION ALL
+                    SELECT id, 'webhook_assignment' AS source, created_at,
+                           actor_type, actor_id, action, 'webhook' AS resource_type,
+                           resource_id, outcome, reason_code, NULL AS business_id,
+                           NULL AS target_agent_id
+                    FROM cartesia_webhook_assignment_audit
+                    UNION ALL
+                    SELECT id, 'webhook_creation' AS source, created_at,
+                           actor_type, actor_id, action, 'webhook' AS resource_type,
+                           resource_id, outcome, reason_code, NULL AS business_id,
+                           NULL AS target_agent_id
+                    FROM cartesia_webhook_creation_audit
+                    UNION ALL
+                    SELECT id, 'call_operation' AS source, created_at,
+                           actor_type, actor_id, action, 'call' AS resource_type,
+                           resource_id, outcome, reason_code, NULL AS business_id,
+                           NULL AS target_agent_id
+                    FROM cartesia_call_operation_audit
+                    UNION ALL
+                    SELECT id, 'batch_retention' AS source, created_at,
+                           actor_type, actor_id, action, 'call_batch' AS resource_type,
+                           provider_batch_id AS resource_id, outcome, reason_code,
+                           NULL AS business_id, NULL AS target_agent_id
+                    FROM cartesia_batch_retention_audit
+                    UNION ALL
+                    SELECT id, 'batch_retention_worker' AS source, created_at,
+                           actor_type, actor_id, action, 'call_batch' AS resource_type,
+                           provider_batch_id AS resource_id, outcome, reason_code,
+                           NULL AS business_id, NULL AS target_agent_id
+                    FROM cartesia_batch_retention_worker_audit
+                ) AS audit_events
+                ${cursorWhere}
+                ORDER BY created_at DESC, source DESC, id DESC
+                LIMIT ?
+            `, params, (error, rows) => {
+                if (error) return reject(error);
+                resolve(Array.isArray(rows) ? rows : []);
+            });
+        });
+    }
+
     async deleteExpiredCartesiaBatchRecipients(payload = {}) {
         const batchId = String(payload.provider_batch_id || '').trim();
         const businessId = String(payload.business_id || '').trim();
@@ -10089,7 +10354,7 @@ class EnhancedDatabase {
         });
     }
 
-    async recordCartesiaWebhookEvent(payload = {}) {
+    async recordCartesiaWebhookReceipt(payload = {}) {
         const eventId = String(payload.webhook_request_id || '').trim();
         const providerCallId = String(payload.provider_call_id || '').trim();
         const eventType = String(payload.event_type || '').trim();
@@ -10103,23 +10368,24 @@ class EnhancedDatabase {
         }
         const existing = await new Promise((resolve, reject) => {
             this.db.get(
-                'SELECT provider_call_id, event_type, payload_hash FROM cartesia_webhook_events WHERE webhook_request_id = ?',
+                'SELECT provider_call_id, event_type, payload_hash FROM cartesia_webhook_event_receipts WHERE webhook_request_id = ?',
                 [eventId],
                 (err, row) => err ? reject(err) : resolve(row || null),
             );
         });
         if (existing) {
+            const matches = existing.provider_call_id === providerCallId &&
+                existing.event_type === eventType && existing.payload_hash === payloadHash;
             return {
-                duplicate: existing.provider_call_id === providerCallId &&
-                    existing.event_type === eventType && existing.payload_hash === payloadHash,
-                conflict: existing.provider_call_id !== providerCallId ||
-                    existing.event_type !== eventType || existing.payload_hash !== payloadHash,
+                inserted: false,
+                duplicate: matches,
+                conflict: !matches,
             };
         }
         const database = this.db;
         return new Promise((resolve, reject) => {
             database.run(
-                `INSERT OR IGNORE INTO cartesia_webhook_events (
+                `INSERT OR IGNORE INTO cartesia_webhook_event_receipts (
                     webhook_request_id, provider_call_id, event_type, event_timestamp, payload_hash
                 ) VALUES (?, ?, ?, ?, ?)`,
                 [eventId, providerCallId, eventType, eventTimestamp, payloadHash],
@@ -10130,7 +10396,7 @@ class EnhancedDatabase {
                         return;
                     }
                     database.get(
-                        'SELECT provider_call_id, event_type, payload_hash FROM cartesia_webhook_events WHERE webhook_request_id = ?',
+                        'SELECT provider_call_id, event_type, payload_hash FROM cartesia_webhook_event_receipts WHERE webhook_request_id = ?',
                         [eventId],
                         (readError, row) => {
                             if (readError) return reject(readError);
@@ -12924,7 +13190,6 @@ class EnhancedDatabase {
                approved_at DATETIME,
                PRIMARY KEY(workflow_id, version)
            )`,
-<<<<<<< HEAD
            `CREATE TABLE IF NOT EXISTS call_e_result_workflow_action_approvals (
                workflow_id TEXT NOT NULL,
                version INTEGER NOT NULL,
@@ -12941,13 +13206,10 @@ class EnhancedDatabase {
            `CREATE TRIGGER IF NOT EXISTS call_e_result_workflow_action_approvals_no_delete
             BEFORE DELETE ON call_e_result_workflow_action_approvals
             BEGIN SELECT RAISE(ABORT, 'CALL-E result workflow approvals are append-only'); END`,
-=======
->>>>>>> 95a068c (updated)
            `CREATE TABLE IF NOT EXISTS post_call_workflow_runs (
                run_id TEXT PRIMARY KEY,
                workflow_id TEXT NOT NULL,
                workflow_version INTEGER NOT NULL,
-<<<<<<< HEAD
                business_id TEXT,
                trigger_event TEXT NOT NULL,
                trigger_reference TEXT,
@@ -12981,41 +13243,6 @@ class EnhancedDatabase {
                completed_at DATETIME,
                PRIMARY KEY(run_id, step_id),
                FOREIGN KEY(run_id) REFERENCES post_call_workflow_runs(run_id) ON DELETE CASCADE
-=======
-               idempotency_key TEXT NOT NULL UNIQUE,
-               trigger_event TEXT NOT NULL,
-               status TEXT NOT NULL CHECK(status IN ('queued', 'running', 'waiting', 'awaiting_approval', 'completed', 'failed', 'needs_review', 'canceled')),
-               current_step_id TEXT,
-               payload_json TEXT NOT NULL,
-               state_json TEXT NOT NULL,
-               error_code TEXT,
-               created_by TEXT NOT NULL,
-               created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-               updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-               next_run_at DATETIME,
-               completed_at DATETIME,
-               execution_owner TEXT,
-               lease_expires_at DATETIME,
-               reviewed_by TEXT,
-               review_decision TEXT,
-               reviewed_at DATETIME,
-               FOREIGN KEY(workflow_id, workflow_version) REFERENCES post_call_workflow_definitions(workflow_id, version)
-           )`,
-           `CREATE TABLE IF NOT EXISTS post_call_workflow_events (
-               event_id TEXT PRIMARY KEY,
-               event_key TEXT NOT NULL UNIQUE,
-               business_id TEXT,
-               trigger_event TEXT NOT NULL,
-               definition_versions_json TEXT NOT NULL,
-               payload_json TEXT NOT NULL,
-               status TEXT NOT NULL CHECK(status IN ('pending', 'processing', 'completed')),
-               error_code TEXT,
-               locked_at DATETIME,
-               last_enqueued_at DATETIME,
-               created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-               updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-               processed_at DATETIME
->>>>>>> 95a068c (updated)
            )`,
            `CREATE TABLE IF NOT EXISTS crm_contact_sync_records (
                id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -13045,14 +13272,9 @@ class EnhancedDatabase {
            'CREATE INDEX IF NOT EXISTS idx_post_call_runs_call_sid ON post_call_automation_runs(call_sid)',
            'CREATE INDEX IF NOT EXISTS idx_post_call_runs_idempotency ON post_call_automation_runs(idempotency_key)',
            'CREATE INDEX IF NOT EXISTS idx_post_call_workflow_status ON post_call_workflow_definitions(status, created_at)',
-<<<<<<< HEAD
            'CREATE INDEX IF NOT EXISTS idx_post_call_workflow_runs_due ON post_call_workflow_runs(status, next_run_at, created_at)',
            'CREATE INDEX IF NOT EXISTS idx_post_call_workflow_runs_workflow ON post_call_workflow_runs(workflow_id, created_at)',
            'CREATE INDEX IF NOT EXISTS idx_post_call_workflow_steps_status ON post_call_workflow_step_runs(run_id, status)',
-=======
-           'CREATE INDEX IF NOT EXISTS idx_post_call_workflow_runs_status ON post_call_workflow_runs(status, updated_at)',
-           'CREATE INDEX IF NOT EXISTS idx_post_call_workflow_events_status ON post_call_workflow_events(status, updated_at)',
->>>>>>> 95a068c (updated)
            'CREATE INDEX IF NOT EXISTS idx_crm_contact_sync_email ON crm_contact_sync_records(email)',
            'CREATE INDEX IF NOT EXISTS idx_crm_activity_sync_contact ON crm_activity_sync_events(external_contact_id)',
        ];
@@ -13074,8 +13296,6 @@ class EnhancedDatabase {
        });
        await this.ensurePostCallWorkflowTriggers();
        await this.ensurePostCallAutomationRunColumns();
-       await this.ensurePostCallWorkflowScopeColumns();
-       await this.ensurePostCallWorkflowRunColumns();
        await new Promise((resolve, reject) => {
            this.db.run('CREATE INDEX IF NOT EXISTS idx_post_call_workflow_runs_lease ON post_call_workflow_runs(status, lease_expires_at, updated_at)',
                (err) => err ? reject(err) : resolve());
@@ -13083,7 +13303,6 @@ class EnhancedDatabase {
        console.log('✅ Post-call automation tables created successfully');
    }
 
-<<<<<<< HEAD
    async ensurePostCallWorkflowRunColumns() {
        for (const table of ['post_call_workflow_definitions', 'post_call_workflow_runs']) {
            const tableRows = await new Promise((resolve, reject) => {
@@ -13125,69 +13344,10 @@ class EnhancedDatabase {
        if (!names.has('next_step_id')) {
            await new Promise((resolve, reject) => {
                this.db.run('ALTER TABLE post_call_workflow_step_runs ADD COLUMN next_step_id TEXT', (err) => err ? reject(err) : resolve());
-=======
-   async ensurePostCallWorkflowScopeColumns() {
-       for (const table of ['post_call_workflow_definitions', 'post_call_workflow_events']) {
-           const existing = await new Promise((resolve, reject) => {
-               this.db.all(`PRAGMA table_info(${table})`, (err, rows) => err ? reject(err) : resolve(rows || []));
-           });
-           if (existing.some((column) => column.name === 'business_id')) continue;
-           await new Promise((resolve, reject) => {
-               this.db.run(`ALTER TABLE ${table} ADD COLUMN business_id TEXT`, (err) => {
-                   if (!err) return resolve();
-                   this.db.all(`PRAGMA table_info(${table})`, (readErr, rows) => {
-                       if (readErr) return reject(err);
-                       if ((rows || []).some((column) => column.name === 'business_id')) return resolve();
-                       reject(err);
-                   });
-               });
-           });
-       }
-       await new Promise((resolve, reject) => {
-           this.db.run('CREATE INDEX IF NOT EXISTS idx_post_call_workflow_business ON post_call_workflow_definitions(business_id, status, trigger_event, version)',
-               (err) => err ? reject(err) : resolve());
-       });
-   }
-
-   async ensurePostCallWorkflowRunColumns() {
-       const existing = await new Promise((resolve, reject) => {
-           this.db.all('PRAGMA table_info(post_call_workflow_runs)', (err, rows) => {
-               if (err) reject(err);
-               else resolve(rows || []);
-           });
-       });
-       const names = new Set(existing.map((row) => row.name));
-       const columns = {
-           execution_owner: 'TEXT',
-           lease_expires_at: 'DATETIME',
-           reviewed_by: 'TEXT',
-           review_decision: 'TEXT',
-           reviewed_at: 'DATETIME',
-       };
-       for (const [name, type] of Object.entries(columns)) {
-           if (names.has(name)) continue;
-           await new Promise((resolve, reject) => {
-               this.db.run(`ALTER TABLE post_call_workflow_runs ADD COLUMN ${name} ${type}`,
-                   (err) => {
-                       if (!err) {
-                           resolve();
-                           return;
-                       }
-                       this.db.all('PRAGMA table_info(post_call_workflow_runs)', (readErr, rows) => {
-                           if (readErr) {
-                               reject(err);
-                               return;
-                           }
-                           if ((rows || []).some((column) => column.name === name)) resolve();
-                           else reject(err);
-                       });
-                   });
->>>>>>> 95a068c (updated)
            });
        }
    }
 
-<<<<<<< HEAD
    async ensurePostCallWorkflowTriggers() {
        const statements = [
            `CREATE TRIGGER IF NOT EXISTS post_call_workflow_business_scope_immutable
@@ -13225,8 +13385,6 @@ class EnhancedDatabase {
        }
    }
 
-=======
->>>>>>> 95a068c (updated)
    async ensurePostCallAutomationRunColumns() {
        if (this.postCallAutomationRunColumnsEnsured) {
            return;
@@ -14172,11 +14330,7 @@ class EnhancedDatabase {
            `;
            this.db.get(sql, [
                definition.workflow_id,
-<<<<<<< HEAD
                definition.business_id || null,
-=======
-               definition.business_id ?? null,
->>>>>>> 95a068c (updated)
                definition.name,
                definition.trigger_event,
                definition.schema_version,
@@ -14373,7 +14527,6 @@ class EnhancedDatabase {
        });
    }
 
-<<<<<<< HEAD
    async approveCallEResultWorkflowActions(input = {}) {
        const workflowId = String(input.workflow_id || '').trim();
        const version = Number(input.version);
@@ -14435,8 +14588,9 @@ class EnhancedDatabase {
    }
 
    async listApprovedPostCallWorkflowDefinitions(triggerEvent, businessId = null) {
-       const scoped = triggerEvent === 'call_e_result_ready';
-       if ((scoped && !businessId) || (!scoped && businessId)) return [];
+       const requiresBusinessScope = triggerEvent === 'call_e_result_ready';
+       if ((requiresBusinessScope && !businessId) || (businessId && !/^[A-Za-z0-9._:-]{1,120}$/.test(String(businessId)))) return [];
+       const scoped = Boolean(businessId);
        const scopeClause = scoped ? 'business_id = ?' : 'business_id IS NULL';
        const params = scoped
            ? [triggerEvent, businessId, triggerEvent, businessId]
@@ -14456,7 +14610,7 @@ class EnhancedDatabase {
                (err, rows) => err ? reject(err) : resolve(rows || []),
            );
        });
-       if (!scoped) return rows;
+       if (triggerEvent !== 'call_e_result_ready') return rows;
        const eligible = [];
        for (const row of rows) {
            let hasActions = false;
@@ -14495,11 +14649,12 @@ class EnhancedDatabase {
        return { row, created: row?.run_id === run.run_id };
    }
 
-   async getPostCallWorkflowRun(runId) {
+   async getPostCallWorkflowRun(runId, businessId = undefined) {
+       const scoped = businessId !== undefined;
        return new Promise((resolve, reject) => {
            this.db.get(
-               'SELECT * FROM post_call_workflow_runs WHERE run_id = ?',
-               [runId],
+               `SELECT * FROM post_call_workflow_runs WHERE run_id = ?${scoped ? ' AND business_id IS ?' : ''}`,
+               scoped ? [runId, businessId] : [runId],
                (err, row) => err ? reject(err) : resolve(row || null),
            );
        });
@@ -14671,73 +14826,10 @@ class EnhancedDatabase {
                ) VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`,
                [step.run_id, step.step_id, step.next_step_id || null, step.step_type, step.action_type || null, step.status || 'running', step.idempotency_key || null],
                function (err) { err ? reject(err) : resolve(this.changes === 1); },
-=======
-   async createPostCallWorkflowRun(run = {}) {
-       const now = new Date().toISOString();
-       await new Promise((resolve, reject) => {
-           this.db.run(
-               `INSERT OR IGNORE INTO post_call_workflow_runs (
-                   run_id, workflow_id, workflow_version, idempotency_key, trigger_event,
-                   status, current_step_id, payload_json, state_json, created_by, created_at, updated_at
-               ) VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?)`,
-               [run.run_id, run.workflow_id, run.workflow_version, run.idempotency_key,
-                   run.trigger_event, run.current_step_id, run.payload_json, run.state_json,
-                   run.created_by, now, now],
-               (err) => err ? reject(err) : resolve(),
-           );
-       });
-       return this.getPostCallWorkflowRunByIdempotencyKey(run.idempotency_key);
-   }
-
-   async getPostCallWorkflowRun(runId, businessId = undefined) {
-       return new Promise((resolve, reject) => {
-           const scoped = businessId !== undefined;
-           this.db.get(
-               `SELECT run.* FROM post_call_workflow_runs AS run
-                JOIN post_call_workflow_definitions AS definition
-                  ON definition.workflow_id = run.workflow_id AND definition.version = run.workflow_version
-                WHERE run.run_id = ?${scoped ? ' AND definition.business_id IS ?' : ''}`,
-               scoped ? [runId, businessId] : [runId],
-               (err, row) => err ? reject(err) : resolve(row || null));
-       });
-   }
-
-   async getPostCallWorkflowRunByIdempotencyKey(key) {
-       return new Promise((resolve, reject) => {
-           this.db.get('SELECT * FROM post_call_workflow_runs WHERE idempotency_key = ?', [key],
-               (err, row) => err ? reject(err) : resolve(row || null));
-       });
-   }
-
-   async listPostCallWorkflowRuns(limit = 100, businessId = undefined) {
-       const safeLimit = Math.max(1, Math.min(200, Math.floor(Number(limit) || 100)));
-       const scoped = businessId !== undefined;
-       return new Promise((resolve, reject) => {
-           this.db.all(
-               `SELECT run.* FROM post_call_workflow_runs AS run
-                JOIN post_call_workflow_definitions AS definition
-                  ON definition.workflow_id = run.workflow_id AND definition.version = run.workflow_version
-                ${scoped ? 'WHERE definition.business_id IS ?' : ''}
-                ORDER BY run.created_at DESC LIMIT ?`,
-               scoped ? [businessId, safeLimit] : [safeLimit],
-               (err, rows) => err ? reject(err) : resolve(rows || []));
-       });
-   }
-
-   async claimPostCallWorkflowRun(runId, ownerId, leaseExpiresAt) {
-       const now = new Date().toISOString();
-       return new Promise((resolve, reject) => {
-           this.db.run(
-               `UPDATE post_call_workflow_runs SET status = 'running', updated_at = ?, next_run_at = NULL,
-                   execution_owner = ?, lease_expires_at = ?
-                WHERE run_id = ? AND (status = 'queued' OR (status = 'waiting' AND next_run_at <= ?))`,
-               [now, ownerId, leaseExpiresAt, runId, now], function (err) { err ? reject(err) : resolve(this.changes || 0); },
->>>>>>> 95a068c (updated)
            );
        });
    }
 
-<<<<<<< HEAD
    async finishPostCallWorkflowStep(runId, stepId, patch = {}) {
        const allowed = new Set(['status', 'result_json', 'error_code', 'approved_by']);
        const entries = Object.entries(patch).filter(([key]) => allowed.has(key));
@@ -14750,26 +14842,11 @@ class EnhancedDatabase {
            this.db.run(
                `UPDATE post_call_workflow_step_runs SET ${assignments.join(', ')} WHERE run_id = ? AND step_id = ?`,
                values,
-=======
-   async savePostCallWorkflowRun(runId, update = {}) {
-       const now = new Date().toISOString();
-       return new Promise((resolve, reject) => {
-           this.db.run(
-               `UPDATE post_call_workflow_runs SET status = ?, current_step_id = ?, state_json = ?,
-                   error_code = ?, next_run_at = ?, updated_at = ?, execution_owner = ?,
-                   lease_expires_at = ?,
-                   completed_at = CASE WHEN ? IN ('completed', 'failed', 'canceled', 'needs_review') THEN ? ELSE NULL END
-                WHERE run_id = ? AND status = 'running' AND execution_owner = ?`,
-               [update.status, update.current_step_id || null, update.state_json, update.error_code || null,
-                   update.next_run_at || null, now, update.execution_owner || null,
-                   update.lease_expires_at || null, update.status, now, runId, update.lock_owner],
->>>>>>> 95a068c (updated)
                function (err) { err ? reject(err) : resolve(this.changes || 0); },
            );
        });
    }
 
-<<<<<<< HEAD
    async approvePostCallWorkflowRunStep(runId, stepId, approvedBy, nextStepId) {
        return new Promise((resolve, reject) => {
            this.db.run(
@@ -14782,21 +14859,11 @@ class EnhancedDatabase {
                     WHERE run_id = ? AND status = 'waiting_approval' AND current_step_id = ?
                   )`,
                [approvedBy, runId, stepId, nextStepId, runId, stepId],
-=======
-   async renewPostCallWorkflowRunLease(runId, ownerId, leaseExpiresAt) {
-       const now = new Date().toISOString();
-       return new Promise((resolve, reject) => {
-           this.db.run(
-               `UPDATE post_call_workflow_runs SET lease_expires_at = ?, updated_at = ?
-                WHERE run_id = ? AND status = 'running' AND execution_owner = ?`,
-               [leaseExpiresAt, now, runId, ownerId],
->>>>>>> 95a068c (updated)
                function (err) { err ? reject(err) : resolve(this.changes || 0); },
            );
        });
    }
 
-<<<<<<< HEAD
    async cancelPostCallWorkflowRun(runId, actor) {
        return new Promise((resolve, reject) => {
            this.db.run(
@@ -14806,75 +14873,6 @@ class EnhancedDatabase {
                     updated_at = CURRENT_TIMESTAMP
                 WHERE run_id = ? AND status IN ('queued', 'waiting', 'waiting_approval')`,
                [actor || 'admin_token', runId],
-=======
-   async reconcileExpiredPostCallWorkflowRuns({ now = new Date().toISOString(), staleBefore = now } = {}) {
-       return new Promise((resolve, reject) => {
-           this.db.run(
-               `UPDATE post_call_workflow_runs SET status = 'needs_review', error_code = 'execution_interrupted',
-                   execution_owner = NULL, lease_expires_at = NULL, updated_at = ?, completed_at = ?
-                WHERE status = 'running' AND (
-                    (lease_expires_at IS NOT NULL AND julianday(lease_expires_at) <= julianday(?))
-                    OR (lease_expires_at IS NULL AND julianday(updated_at) <= julianday(?))
-                )`,
-               [now, now, now, staleBefore],
-               function (err) { err ? reject(err) : resolve(this.changes || 0); },
-           );
-       });
-   }
-
-   async approvePostCallWorkflowRun(runId, stepId, stateJson, nextStepId, businessId = undefined) {
-       const now = new Date().toISOString();
-       const scoped = businessId !== undefined;
-       return new Promise((resolve, reject) => {
-           this.db.run(
-               `UPDATE post_call_workflow_runs SET status = 'queued', current_step_id = ?, state_json = ?, updated_at = ?
-                WHERE run_id = ? AND status = 'awaiting_approval' AND current_step_id = ?${scoped ? " AND EXISTS (SELECT 1 FROM post_call_workflow_definitions AS definition WHERE definition.workflow_id = post_call_workflow_runs.workflow_id AND definition.version = post_call_workflow_runs.workflow_version AND definition.business_id IS ?)" : ''}`,
-               scoped ? [nextStepId, stateJson, now, runId, stepId, businessId] : [nextStepId, stateJson, now, runId, stepId],
-               function (err) { err ? reject(err) : resolve(this.changes || 0); },
-           );
-       });
-   }
-
-   async queuePostCallWorkflowEmailRetry(runId, stepId, expectedUpdatedAt, stateJson, businessId = undefined) {
-       const now = new Date().toISOString();
-       const scoped = businessId !== undefined;
-       return new Promise((resolve, reject) => {
-           this.db.run(
-               `UPDATE post_call_workflow_runs SET status = 'queued', state_json = ?, error_code = NULL,
-                   next_run_at = NULL, execution_owner = NULL, lease_expires_at = NULL,
-                   completed_at = NULL, updated_at = ?
-                WHERE run_id = ? AND status = 'failed' AND current_step_id = ? AND updated_at = ?${scoped ? " AND EXISTS (SELECT 1 FROM post_call_workflow_definitions AS definition WHERE definition.workflow_id = post_call_workflow_runs.workflow_id AND definition.version = post_call_workflow_runs.workflow_version AND definition.business_id IS ?)" : ''}`,
-               scoped ? [stateJson, now, runId, stepId, expectedUpdatedAt, businessId] : [stateJson, now, runId, stepId, expectedUpdatedAt],
-               function (err) { err ? reject(err) : resolve(this.changes || 0); },
-           );
-       });
-   }
-
-   async cancelPostCallWorkflowRun(runId, businessId = undefined) {
-       const now = new Date().toISOString();
-       const scoped = businessId !== undefined;
-       return new Promise((resolve, reject) => {
-           this.db.run(
-               `UPDATE post_call_workflow_runs SET status = 'canceled', updated_at = ?, completed_at = ?
-                WHERE run_id = ? AND status IN ('queued', 'waiting', 'awaiting_approval')${scoped ? " AND EXISTS (SELECT 1 FROM post_call_workflow_definitions AS definition WHERE definition.workflow_id = post_call_workflow_runs.workflow_id AND definition.version = post_call_workflow_runs.workflow_version AND definition.business_id IS ?)" : ''}`,
-               scoped ? [now, now, runId, businessId] : [now, now, runId], function (err) { err ? reject(err) : resolve(this.changes || 0); },
-           );
-       });
-   }
-
-   async reviewPostCallWorkflowRun(runId, status, decision, actor, stateJson, businessId = undefined) {
-       const now = new Date().toISOString();
-       const scoped = businessId !== undefined;
-       return new Promise((resolve, reject) => {
-           this.db.run(
-               `UPDATE post_call_workflow_runs SET status = ?, error_code = ?, state_json = ?,
-                   reviewed_by = ?, review_decision = ?, reviewed_at = ?, updated_at = ?, completed_at = ?,
-                   execution_owner = NULL, lease_expires_at = NULL
-                WHERE run_id = ? AND status = 'needs_review'${scoped ? " AND EXISTS (SELECT 1 FROM post_call_workflow_definitions AS definition WHERE definition.workflow_id = post_call_workflow_runs.workflow_id AND definition.version = post_call_workflow_runs.workflow_version AND definition.business_id IS ?)" : ''}`,
-               scoped ? [status, status === 'failed' ? 'operator_confirmed_failure' : null, stateJson, actor, decision,
-                   now, now, now, runId, businessId] : [status, status === 'failed' ? 'operator_confirmed_failure' : null, stateJson, actor, decision,
-                   now, now, now, runId],
->>>>>>> 95a068c (updated)
                function (err) { err ? reject(err) : resolve(this.changes || 0); },
            );
        });

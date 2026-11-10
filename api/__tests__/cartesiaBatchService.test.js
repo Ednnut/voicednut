@@ -41,6 +41,12 @@ function makeHarness(overrides = {}) {
     async getCartesiaCallBatch(id) { return overrides.retention?.batch || { provider_batch_id: id, business_id: 'business_test', request_fingerprint: 'a'.repeat(64), status: 'in_progress', provider_updated_at: '2026-11-09T00:00:00.000Z' }; },
     async listCartesiaCallBatchRecipients() { return overrides.retention?.recipients || []; },
     async deleteExpiredCartesiaBatchRecipients(input) { calls.push(['retention-delete', input]); return { deletedCount: input.expected_recipient_count }; },
+    async listExpiredCartesiaBatchRetentionCandidates(input) { calls.push(['retention-candidates', input]); return overrides.retentionCandidates || []; },
+    async recordCartesiaBatchRetentionWorkerAudit(input) {
+      calls.push(['retention-worker-audit', input]);
+      if (overrides.retentionAuditFails === true) throw new Error('audit storage unavailable');
+      return { saved: true };
+    },
     async claimCartesiaBatchReconciliation(input) { calls.push(['reconcile-claim', input]); return claims.shift() || null; },
     async renewCartesiaBatchReconciliationLease(...input) { calls.push(['reconcile-renew', ...input]); return { updated: true }; },
     async completeCartesiaBatchReconciliation(...input) { calls.push(['reconcile-complete', ...input]); return { updated: true }; },
@@ -56,6 +62,7 @@ function makeHarness(overrides = {}) {
   return { service: new CartesiaBatchService({
     client, callService, db, enabled: true, dispatchEnabled: overrides.dispatchEnabled === true,
     retentionEnabled: overrides.retentionEnabled === true, retentionDays: overrides.retentionDays || 0,
+    retentionAutoEnabled: overrides.retentionAutoEnabled === true,
     reconciliationEnabled: overrides.reconciliationEnabled === true,
     reconciliationIntervalMs: overrides.reconciliationIntervalMs || 60000,
     reconciliationBatchSize: overrides.reconciliationBatchSize || 5,
@@ -195,6 +202,53 @@ describe('Cartesia batch service', () => {
     const preview = await harness.service.prepareRetentionPurge('batch_test_01', new Date('2026-02-01T00:00:00.000Z'));
     assert.equal(preview.eligible, false);
     assert.equal(preview.reason, 'batch_not_terminal');
+    assert.equal(harness.calls.some((call) => call[0] === 'retention-delete'), false);
+  });
+
+  it('automatically purges only expired terminal batches with a separate opt-in and audit trail', async () => {
+    const now = new Date('2026-02-01T00:00:00.000Z');
+    const harness = makeHarness({
+      retentionEnabled: true,
+      retentionAutoEnabled: true,
+      retentionDays: 30,
+      clock: () => now,
+      retentionCandidates: [{ provider_batch_id: 'batch_test_01' }],
+      retention: {
+        batch: {
+          provider_batch_id: 'batch_test_01',
+          business_id: 'business_test',
+          status: 'completed',
+          provider_updated_at: '2026-01-01T00:00:00.000Z',
+        },
+        recipients: [{}, {}],
+      },
+    });
+    const result = await harness.service.runRetentionWorker();
+    assert.deepEqual(result, { enabled: true, skipped: false, scanned: 1, purged: 1, deletedRecipients: 2, failed: 0 });
+    assert.deepEqual(harness.calls.filter((call) => call[0] === 'retention-worker-audit').map((call) => call[1].outcome), ['requested', 'succeeded']);
+    assert.equal(harness.calls.find((call) => call[0] === 'retention-candidates')[1].limit, 10);
+    assert.equal(harness.calls.some((call) => call[0] === 'create'), false);
+  });
+
+  it('does not purge automatically when the pre-purge audit cannot be recorded', async () => {
+    const harness = makeHarness({
+      retentionEnabled: true,
+      retentionAutoEnabled: true,
+      retentionDays: 30,
+      clock: () => new Date('2026-02-01T00:00:00.000Z'),
+      retentionCandidates: [{ provider_batch_id: 'batch_test_01' }],
+      retentionAuditFails: true,
+      retention: {
+        batch: {
+          provider_batch_id: 'batch_test_01',
+          business_id: 'business_test',
+          status: 'completed',
+          provider_updated_at: '2026-01-01T00:00:00.000Z',
+        },
+        recipients: [{}],
+      },
+    });
+    await assert.rejects(harness.service.runRetentionWorker(), /audit storage unavailable/);
     assert.equal(harness.calls.some((call) => call[0] === 'retention-delete'), false);
   });
 

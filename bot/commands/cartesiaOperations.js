@@ -9,11 +9,13 @@ const { buildCallbackData } = require('../utils/actions');
 const { escapeHtml, renderMenu } = require('../utils/ui');
 const { startOperation, ensureOperationActive } = require('../utils/sessionState');
 
-const ACTIONS = new Set(['CARTESIA_CALL', 'CARTESIA_RECONCILE', 'CARTESIA_CALLS', 'CARTESIA_REVIEW_QUEUE', 'CARTESIA_REVIEW_RULES', 'CARTESIA_CAMPAIGN', 'CARTESIA_CAMPAIGN_STATUS', 'CARTESIA_BATCH_RECONCILE', 'CARTESIA_BATCH_CANCEL', 'CARTESIA_BATCH_RETRY', 'CARTESIA_AGENT_HEALTH', 'CARTESIA_AGENT_RUNTIME']);
+const ACTIONS = new Set(['CARTESIA_CALL', 'CARTESIA_RECONCILE', 'CARTESIA_CALLS', 'CARTESIA_REVIEW_QUEUE', 'CARTESIA_REVIEW_RULES', 'CARTESIA_CAMPAIGN', 'CARTESIA_CAMPAIGN_STATUS', 'CARTESIA_CAMPAIGN_RECONCILE', 'CARTESIA_BATCH_RECONCILE', 'CARTESIA_BATCH_CANCEL', 'CARTESIA_BATCH_RETRY', 'CARTESIA_AGENT_HEALTH', 'CARTESIA_AGENT_RUNTIME']);
 const BUSINESS_ID_PATTERN = /^[A-Za-z0-9._:-]{1,120}$/;
 const IDENTIFIER_PATTERN = /^[A-Za-z0-9._:-]{1,200}$/;
 const DESTINATION_PATTERN = /^\+[1-9]\d{7,14}$/;
 const REQUEST_KEY_PATTERN = /^[A-Za-z0-9._:-]{8,180}$/;
+const MAX_CARTESIA_CAMPAIGN_RECIPIENTS = 1000;
+const MAX_CARTESIA_CAMPAIGN_RECIPIENTS_PER_MESSAGE = 100;
 const CANCEL_WORDS = new Set(['cancel', 'exit', 'quit']);
 const SCHEDULE_PATTERN = /^\d{4}-\d{2}-\d{2}T(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d{1,9})?(?:Z|[+-](?:[01]\d|2[0-3]):[0-5]\d)$/i;
 
@@ -26,6 +28,7 @@ function buildCartesiaKeyboard(ctx) {
     .text('📞 Place a single call', buildCallbackData(ctx, 'CARTESIA_CALL')).row()
     .text('👥 Plan a batch campaign', buildCallbackData(ctx, 'CARTESIA_CAMPAIGN')).row()
     .text('🔎 Check campaign status', buildCallbackData(ctx, 'CARTESIA_CAMPAIGN_STATUS')).row()
+    .text('🔄 Refresh provider progress', buildCallbackData(ctx, 'CARTESIA_CAMPAIGN_RECONCILE')).row()
     .text('🔄 Reconcile batch progress', buildCallbackData(ctx, 'CARTESIA_BATCH_RECONCILE')).row()
     .text('🎛 Cartesia Studio', buildCallbackData(ctx, 'CARTESIA_STUDIO_CENTER')).row()
     .text('⛔ Cancel queued batch calls', buildCallbackData(ctx, 'CARTESIA_BATCH_CANCEL')).row()
@@ -352,6 +355,43 @@ function formatCampaignOutcomes(campaign) {
   return `\nOutcomes: ${Number(outcomes.completed) || 0} completed · ${Number(outcomes.failed) || 0} failed · ${Number(outcomes.unanswered) || 0} unanswered · ${Number(outcomes.pending) || 0} pending · ${Number(outcomes.not_started) || 0} not started · ${Number(outcomes.blocked) || 0} blocked · ${Number(outcomes.unknown) || 0} unknown\nCompletion rate: ${Number(outcomes.completion_rate_percent) || 0}% (${Number(outcomes.completed) || 0}/${Number(outcomes.eligible) || 0} eligible recipients)`;
 }
 
+function formatCampaignStatus(campaign) {
+  const status = String(campaign?.status || 'unknown');
+  let nextStep = 'Refresh status before taking another action.';
+  if (status === 'approved' && campaign?.dispatch_queued === true) {
+    nextStep = 'Queued on VOICEDNUT for background dispatch. Check this campaign again; do not create a duplicate.';
+  } else if (status === 'approved' && campaign?.scheduled_at) {
+    nextStep = `Scheduled locally for ${String(campaign.scheduled_at)} UTC. Cancel before dispatch if plans change.`;
+  } else if (status === 'approved') {
+    nextStep = 'Approved and awaiting dispatch. Check this campaign again; do not create a duplicate.';
+  } else if (status === 'submitted') {
+    nextStep = 'The provider batch was accepted. Refresh provider progress to reconcile recipient outcomes.';
+  } else if (status === 'unknown' || status === 'submitting') {
+    nextStep = 'Provider outcome is unresolved. Refresh provider progress or inspect Cartesia; do not resubmit or create another campaign.';
+  } else if (status === 'blocked') {
+    nextStep = 'Dispatch is blocked. Resolve the reported issue and review consent and business policy before creating a new campaign.';
+  } else if (status === 'draft') {
+    nextStep = 'This draft has not been approved or submitted.';
+  }
+  const errorCode = campaign?.error_code
+    ? `\nIssue code: <code>${escapeHtml(campaign.error_code)}</code>`
+    : '';
+  return `Campaign: <code>${escapeHtml(campaign?.campaign_id || 'unknown')}</code>\nStatus: <b>${escapeHtml(status)}</b>\nRecipients: ${Number(campaign?.ready_count) || 0}/${Number(campaign?.recipient_count) || 0} ready${formatCampaignOutcomes(campaign)}\nBatch: <code>${escapeHtml(campaign?.provider_batch_id || 'not confirmed')}</code>${errorCode}\nNext: ${escapeHtml(nextStep)}`;
+}
+
+async function getCampaignReference(conversation, ctx, ensureActive) {
+  const pending = ctx.session?.cartesiaCampaignPending;
+  const businessId = pending?.businessId || await askInput(conversation, ctx, 'Enter the business ID for the saved Cartesia campaign.', ensureActive);
+  if (businessId === null) return null;
+  const campaignId = pending?.campaignId || await askInput(conversation, ctx, 'Enter the campaign ID (cartesia_campaign_…).', ensureActive);
+  if (campaignId === null) return null;
+  if (!BUSINESS_ID_PATTERN.test(String(businessId || '')) || !/^cartesia_campaign_[a-f0-9]{64}$/.test(String(campaignId || ''))) {
+    await ctx.reply('Campaign lookup needs the original business ID and a valid campaign ID.');
+    return null;
+  }
+  return { businessId: String(businessId), campaignId: String(campaignId) };
+}
+
 async function runCartesiaCallOperations(conversation, ctx, ensureActive, options = {}) {
   try {
     if (ctx.chat?.type !== 'private') {
@@ -471,31 +511,37 @@ async function runCartesiaCallOperations(conversation, ctx, ensureActive, option
 }
 
 async function runCartesiaCampaignStatus(conversation, ctx, ensureActive) {
-  let pending = ctx.session?.cartesiaCampaignPending;
-  if (!pending) {
-    const businessId = await askInput(conversation, ctx, 'Enter the business ID for the saved Cartesia campaign.', ensureActive);
-    if (businessId === null) return;
-    const campaignId = await askInput(conversation, ctx, 'Enter the campaign ID (cartesia_campaign_…).', ensureActive);
-    if (campaignId === null) return;
-    pending = { businessId, campaignId };
-  }
-  if (!BUSINESS_ID_PATTERN.test(String(pending.businessId || '')) || !/^cartesia_campaign_[a-f0-9]{64}$/.test(String(pending.campaignId || ''))) {
-    await ctx.reply('Campaign status lookup needs the original business ID and a valid campaign ID.');
-    return;
-  }
+  const pending = await getCampaignReference(conversation, ctx, ensureActive);
+  if (!pending) return;
   try {
     const query = new URLSearchParams({ business_id: pending.businessId });
     const response = await httpClient.get(ctx, `${apiRoot()}/api/cartesia/campaigns/${encodeURIComponent(pending.campaignId)}?${query}`, { timeout: 20000 });
     ensureActive();
     const campaign = response?.data?.campaign;
     if (!campaign || campaign.campaign_id !== pending.campaignId) throw new Error('Cartesia campaign response did not match the saved campaign.');
-    const unresolved = ['unknown', 'submitting'].includes(String(campaign.status))
-      ? '\nProvider outcome is unresolved. Verify this batch in Cartesia before creating or submitting another campaign; VOICEDNUT will not retry it.'
-      : '';
-    const summary = `Campaign: <code>${escapeHtml(campaign.campaign_id)}</code>\nStatus: <b>${escapeHtml(campaign.status)}</b>\nRecipients: ${Number(campaign.ready_count)}/${Number(campaign.recipient_count)} ready${formatCampaignOutcomes(campaign)}\nBatch: <code>${escapeHtml(campaign.provider_batch_id || 'not confirmed')}</code>${campaign.error_code ? `\nIssue: ${escapeHtml(campaign.error_code)}` : ''}${unresolved}`;
-    await ctx.reply(`${summary}${campaign.status === 'approved' && campaign.scheduled_at ? `\nScheduled locally for <code>${escapeHtml(campaign.scheduled_at)}</code>. Choose “Cancel queued batch” to cancel before dispatch.` : ''}`, { parse_mode: 'HTML' });
+    await ctx.reply(formatCampaignStatus(campaign), { parse_mode: 'HTML' });
   } catch (error) {
     await ctx.reply(httpClient.getUserMessage(error, 'Campaign status is unavailable. Keep the same campaign ID; do not create another batch while its outcome is unresolved.'));
+  }
+}
+
+async function runCartesiaCampaignReconciliation(conversation, ctx, ensureActive) {
+  const pending = await getCampaignReference(conversation, ctx, ensureActive);
+  if (!pending) return;
+  try {
+    const response = await httpClient.post(ctx,
+      `${apiRoot()}/api/cartesia/campaigns/${encodeURIComponent(pending.campaignId)}/reconcile`,
+      { business_id: pending.businessId },
+      { timeout: 20000 });
+    ensureActive();
+    const campaign = response?.data?.campaign;
+    if (!campaign || campaign.campaign_id !== pending.campaignId) {
+      throw new Error('Cartesia campaign reconciliation response did not match the saved campaign.');
+    }
+    await ctx.reply(`Provider progress refreshed.\n${formatCampaignStatus(campaign)}`, { parse_mode: 'HTML' });
+  } catch (error) {
+    await ctx.reply(httpClient.getUserMessage(error,
+      `Provider progress could not be confirmed for ${pending.campaignId}. Do not resubmit; check the same campaign again.`));
   }
 }
 
@@ -596,11 +642,27 @@ async function runCartesiaCampaign(conversation, ctx, ensureActive) {
   if (phoneChoice < 0 || phoneChoice >= numbers.length) { await ctx.reply('Campaign canceled. Choose one of the listed source numbers.'); return; }
   const name = await askInput(conversation, ctx, 'Enter a campaign name (up to 120 characters).', ensureActive);
   if (name === null) return;
-  const rawDestinations = await askInput(conversation, ctx, 'Paste 1–25 authorized E.164 destinations, one per line. Recorded consent is required for every recipient.', ensureActive);
+  const rawDestinations = await askInput(conversation, ctx, 'Paste up to 100 authorized E.164 destinations, one per line. Recorded consent is required for every recipient.', ensureActive);
   if (rawDestinations === null) return;
-  const destinations = rawDestinations.split(/[\s,;]+/).filter(Boolean);
-  if (destinations.length < 1 || destinations.length > 25 || destinations.some((value) => !DESTINATION_PATTERN.test(value))) {
-    await ctx.reply('Campaign canceled. Provide 1–25 valid E.164 numbers, with no extra text.'); return;
+  let destinationChunk = rawDestinations.split(/[\s,;]+/).filter(Boolean);
+  const destinations = [];
+  if (destinationChunk.length < 1 || destinationChunk.length > MAX_CARTESIA_CAMPAIGN_RECIPIENTS_PER_MESSAGE ||
+      destinationChunk.some((value) => !DESTINATION_PATTERN.test(value))) {
+    await ctx.reply('Campaign canceled. Provide 1–100 valid E.164 numbers, with no extra text.'); return;
+  }
+  destinations.push(...destinationChunk);
+  while (destinationChunk.length === MAX_CARTESIA_CAMPAIGN_RECIPIENTS_PER_MESSAGE && destinations.length < MAX_CARTESIA_CAMPAIGN_RECIPIENTS) {
+    const rawNextChunk = await askInput(conversation, ctx,
+      `Campaign currently has ${destinations.length} recipients. Paste another chunk of up to 100 authorized E.164 destinations, or type DONE. The total limit is 1,000.`, ensureActive);
+    if (rawNextChunk === null) return;
+    if (rawNextChunk.trim().toUpperCase() === 'DONE') break;
+    destinationChunk = rawNextChunk.split(/[\s,;]+/).filter(Boolean);
+    if (destinationChunk.length < 1 || destinationChunk.length > MAX_CARTESIA_CAMPAIGN_RECIPIENTS_PER_MESSAGE ||
+        destinations.length + destinationChunk.length > MAX_CARTESIA_CAMPAIGN_RECIPIENTS ||
+        destinationChunk.some((value) => !DESTINATION_PATTERN.test(value))) {
+      await ctx.reply('Campaign canceled. Each chunk must contain 1–100 valid E.164 numbers, with no more than 1,000 total.'); return;
+    }
+    destinations.push(...destinationChunk);
   }
   const concurrencyText = await askInput(conversation, ctx, 'Target concurrent calls (1–10). Enter 1 for the safest default.', ensureActive);
   if (concurrencyText === null) return;
@@ -638,14 +700,18 @@ async function runCartesiaCampaign(conversation, ctx, ensureActive) {
   if (!campaign?.campaign_id) throw new Error('The API did not return a saved campaign reference.');
   if ((scheduledAt || null) !== (campaign.scheduled_at || null)) throw new Error('The API did not confirm the requested Cartesia campaign schedule.');
   ctx.session.cartesiaCampaignPending = { businessId, campaignId: campaign.campaign_id };
-  const recipients = (campaign.recipients || []).map((row) => `${row.status === 'ready' ? '✓' : '×'} ${escapeHtml(row.destination_masked)}${row.reason_code && row.reason_code !== 'ready' ? ` (${escapeHtml(row.reason_code)})` : ''}`).join('\n');
-  await ctx.reply(`Saved Cartesia campaign <code>${escapeHtml(campaign.campaign_id)}</code>.\nReady: ${Number(campaign.ready_count)}/${Number(campaign.recipient_count)}\nDynamic variable keys: ${variableKeys.map(escapeHtml).join(', ') || 'none'}\n${recipients || 'No recipient details returned.'}`, { parse_mode: 'HTML' });
+  const recipientRows = Array.isArray(campaign.recipients) ? campaign.recipients : [];
+  const recipients = recipientRows.slice(0, 10).map((row) => `${row.status === 'ready' ? '✓' : '×'} ${escapeHtml(row.destination_masked)}${row.reason_code && row.reason_code !== 'ready' ? ` (${escapeHtml(row.reason_code)})` : ''}`).join('\n');
+  const extraRecipients = Math.max(0, recipientRows.length - 10);
+  const variableKeyPreview = variableKeys.slice(0, 10).map(escapeHtml).join(', ') || 'none';
+  const extraVariableKeys = Math.max(0, variableKeys.length - 10);
+  await ctx.reply(`Saved Cartesia campaign <code>${escapeHtml(campaign.campaign_id)}</code>.\nReady: ${Number(campaign.ready_count)}/${Number(campaign.recipient_count)}\nDynamic variable keys: ${variableKeyPreview}${extraVariableKeys ? ` (+${extraVariableKeys} more)` : ''}\n${recipients || 'No recipient details returned.'}${extraRecipients ? `\n… ${extraRecipients} additional recipients omitted from this preview.` : ''}`, { parse_mode: 'HTML' });
   if (Number(campaign.ready_count) !== Number(campaign.recipient_count) || Number(campaign.ready_count) < 1) {
     await ctx.reply('The campaign has blocked recipients and cannot be submitted. Review consent and policy, then create a new campaign after resolving them.'); return;
   }
   const phrase = campaignSubmitPhrase(campaign);
   const confirmation = await askInput(conversation, ctx,
-    `${campaign.scheduled_at ? `This saves the approved campaign locally for ${campaign.scheduled_at} UTC. VOICEDNUT will recheck current consent, quiet hours, emergency stop, and daily capacity immediately before releasing it to Cartesia. ` : 'This submits one real Cartesia batch now and can initiate calls to every listed recipient. '}Confirm that you are authorized to contact all of them, then type this exact phrase: ${phrase}`,
+    `${campaign.scheduled_at ? `This saves the approved campaign locally for ${campaign.scheduled_at} UTC. VOICEDNUT will recheck current consent, quiet hours, emergency stop, and daily capacity immediately before releasing it to Cartesia. ` : Number(campaign.recipient_count) > 100 ? 'This queues the approved campaign for background dispatch; when processed it can initiate calls to every listed recipient. VOICEDNUT will recheck consent and business safety limits before release. ' : 'This submits one real Cartesia batch now and can initiate calls to every listed recipient. '}Confirm that you are authorized to contact all of them, then type this exact phrase: ${phrase}`,
     ensureActive);
   if (confirmation !== phrase) { await ctx.reply('Campaign approval canceled. No batch was submitted.'); return; }
   try {
@@ -654,7 +720,7 @@ async function runCartesiaCampaign(conversation, ctx, ensureActive) {
     }, { timeout: 30000 });
     ensureActive();
     const saved = submitted?.data?.campaign;
-    await ctx.reply(`Cartesia campaign status: <b>${escapeHtml(saved?.status || 'unknown')}</b>\n${saved?.held_for_local_dispatch ? `Scheduled locally for <code>${escapeHtml(saved?.scheduled_at || '')}</code>; dispatch-time checks will run before Cartesia receives it.\n` : ''}Batch: <code>${escapeHtml(saved?.provider_batch_id || (saved?.held_for_local_dispatch ? 'not sent yet' : 'not confirmed'))}</code>\nUse “Check campaign status” to inspect the same saved campaign. Do not create another campaign if the result is unclear.`, { parse_mode: 'HTML' });
+    await ctx.reply(`Cartesia campaign status: <b>${escapeHtml(saved?.status || 'unknown')}</b>\n${saved?.dispatch_queued || submitted?.data?.queued_for_async_dispatch ? 'Queued for asynchronous dispatch; consent and business safety limits will be checked before release.\n' : ''}${saved?.held_for_local_dispatch ? `Scheduled locally for <code>${escapeHtml(saved?.scheduled_at || '')}</code>; dispatch-time checks will run before Cartesia receives it.\n` : ''}Batch: <code>${escapeHtml(saved?.provider_batch_id || (saved?.held_for_local_dispatch || saved?.dispatch_queued || submitted?.data?.queued_for_async_dispatch ? 'not sent yet' : 'not confirmed'))}</code>\nUse “Check campaign status” to inspect the same saved campaign. Do not create another campaign if the result is unclear.`, { parse_mode: 'HTML' });
   } catch (error) {
     await ctx.reply(httpClient.getUserMessage(error, `Campaign submission result may be unresolved. Check status for ${campaign.campaign_id}; do not create a second campaign or submit with a new request key.`));
   }
@@ -706,6 +772,10 @@ async function cartesiaOperationFlow(conversation, ctx) {
   }
   if (action === 'CARTESIA_CAMPAIGN_STATUS') {
     await runCartesiaCampaignStatus(conversation, ctx, ensureActive);
+    return;
+  }
+  if (action === 'CARTESIA_CAMPAIGN_RECONCILE') {
+    await runCartesiaCampaignReconciliation(conversation, ctx, ensureActive);
     return;
   }
   if (action === 'CARTESIA_BATCH_RECONCILE' || action === 'CARTESIA_BATCH_CANCEL' || action === 'CARTESIA_BATCH_RETRY') {
@@ -905,7 +975,9 @@ module.exports = {
     formatCallDetails,
     formatCallTranscript,
     formatCampaignOutcomes,
+    formatCampaignStatus,
     runCartesiaCampaignStatus,
+    runCartesiaCampaignReconciliation,
     normalizeCampaignSchedule,
     campaignSubmitPhrase,
     runCartesiaBatchControl,

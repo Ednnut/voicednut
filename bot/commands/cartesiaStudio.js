@@ -24,6 +24,7 @@ const ACTIONS = new Set([
 const CANCEL_WORDS = new Set(['cancel', 'exit', 'quit']);
 const ID_PATTERN = /^[A-Za-z0-9._:-]{1,200}$/;
 const NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9 _.-]{0,79}$/;
+const MAX_REALTIME_STT_AUDIO_BYTES = 1_600_000;
 
 function apiRoot() { return String(config.apiUrl || '').replace(/\/+$/, ''); }
 function rootPath(...parts) { return `${apiRoot()}/api/cartesia/studio/${parts.map((part) => String(part).replace(/^\/+|\/+$/g, '')).join('/')}`; }
@@ -163,13 +164,13 @@ async function showVoices(conversation, ctx, ensureActive) {
   await ctx.reply(`Voice: <b>${escapeHtml(voice.name)}</b>\nID: <code>${escapeHtml(voice.id)}</code>\nNative/locales: ${accents.length ? accents.map((entry) => `${escapeHtml(entry.locale || 'unknown')}${entry.isNative ? ' (native)' : ''}`).join(', ') : 'No accent metadata returned.'}\nUse a listed locale for native-sounding output.`, { parse_mode: 'HTML' });
 }
 
-async function fetchTelegramAudio(ctx, file) {
+async function fetchTelegramAudio(ctx, file, maxBytes = 16 * 1024 * 1024) {
   const token = String(config.botToken || '');
   if (!token || !file?.file_path) throw new Error('Telegram sample could not be retrieved.');
-  const response = await fetch(`https://api.telegram.org/file/bot${token}/${file.file_path}`, { timeout: 20000, size: 16 * 1024 * 1024 });
+  const response = await fetch(`https://api.telegram.org/file/bot${token}/${file.file_path}`, { timeout: 20000, size: maxBytes });
   if (!response.ok) throw new Error('Telegram sample download failed.');
   const bytes = Buffer.from(await response.arrayBuffer());
-  if (!bytes.length || bytes.length > 16 * 1024 * 1024) throw new Error('Voice sample must be smaller than 16 MB.');
+  if (!bytes.length || bytes.length > maxBytes) throw new Error('The uploaded audio exceeds the allowed size.');
   return bytes;
 }
 
@@ -547,15 +548,17 @@ async function runClientToolCreate(conversation, ctx, ensureActive) {
   await ctx.reply(`Cartesia client tool definition created. ID: <code>${escapeHtml(created?.data?.tool?.id || 'unavailable')}</code>\nAttach it to a Managed Agent in Cartesia. VOICEDNUT's API WebSocket runtime supports only its registered safe handler allowlist; other tools need a handler in your connected client. Phone-call integrations do not execute client_tool_call events.`, { parse_mode: 'HTML' });
 }
 
-async function uploadedAudio(conversation, ctx, ensureActive, prompt, maxBytes = 16 * 1024 * 1024) {
+async function uploadedAudio(conversation, ctx, ensureActive, prompt, maxBytes = 16 * 1024 * 1024, downloadAudio = fetchTelegramAudio) {
   await ctx.reply(`${prompt}\nSend one supported audio document, or type cancel.`);
   const update = await conversation.wait();
   ensureActive();
   if (String(update?.message?.text || '').toLowerCase() === 'cancel') return null;
   const file = update?.message?.voice || update?.message?.audio || update?.message?.document;
-  if (!file?.file_id || Number(file.file_size) > maxBytes) throw new Error(`Send a supported audio file no larger than ${Math.floor(maxBytes / (1024 * 1024))} MB.`);
+  const limitLabel = maxBytes === MAX_REALTIME_STT_AUDIO_BYTES ? '50 seconds (1.6 MB)' : `${Math.floor(maxBytes / (1024 * 1024))} MB`;
+  if (!file?.file_id || Number(file.file_size) > maxBytes) throw new Error(`Send a supported audio file no larger than ${limitLabel}.`);
   const telegramFile = await ctx.api.getFile(file.file_id);
-  const bytes = await fetchTelegramAudio(ctx, telegramFile);
+  const bytes = Buffer.from(await downloadAudio(ctx, telegramFile, maxBytes));
+  if (!bytes.length || bytes.length > maxBytes) throw new Error('The uploaded audio exceeds the allowed size.');
   ensureActive();
   return { bytes, filename: String(file.file_name || (update.message.voice ? 'voice.ogg' : 'audio.wav')).slice(0, 120), contentType: String(file.mime_type || (update.message.voice ? 'audio/ogg' : 'audio/wav')) };
 }
@@ -732,23 +735,29 @@ async function runSpeechContinuations(conversation, ctx, ensureActive) {
   }
 }
 
-async function runInkTranscription(conversation, ctx, ensureActive) {
-  const mode = await askInput(conversation, ctx, 'Type batch for Cartesia batch transcription, or realtime to transcribe an uploaded raw PCM clip with Ink turn detection. This upload flow is not a live microphone stream.', ensureActive);
+async function runInkTranscription(conversation, ctx, ensureActive, options = {}) {
+  const mode = await askInput(conversation, ctx, 'Type batch for Cartesia batch transcription, realtime for an uploaded PCM clip with Ink auto-turn detection, or manual for an uploaded PCM clip with explicit turn finalization. Realtime uploads are paced and limited to 50 seconds; this is not a live microphone stream.', ensureActive);
   if (!mode) return;
-  const realtime = mode.toLowerCase() === 'realtime';
-  if (!realtime && mode.toLowerCase() !== 'batch') { await ctx.reply('Choose batch or realtime.'); return; }
+  const selectedMode = mode.toLowerCase();
+  const manual = selectedMode === 'manual';
+  const realtime = manual || selectedMode === 'realtime';
+  if (!realtime && selectedMode !== 'batch') { await ctx.reply('Choose batch, realtime, or manual.'); return; }
   const file = await uploadedAudio(conversation, ctx, ensureActive, realtime
-    ? 'Upload mono 16 kHz signed 16-bit PCM audio as a .pcm document for Ink realtime transcription.'
-    : 'Upload an audio file for Cartesia Ink batch transcription.');
+    ? 'Upload mono 16 kHz signed 16-bit PCM audio as a .pcm document, no larger than 1.6 MB (50 seconds), for Ink realtime transcription.'
+    : 'Upload an audio file for Cartesia Ink batch transcription.',
+  realtime ? MAX_REALTIME_STT_AUDIO_BYTES : 16 * 1024 * 1024, options.downloadAudio);
   if (!file) return;
   if (realtime && !/\.pcm$/i.test(file.filename)) { await ctx.reply('Realtime Ink mode requires raw PCM bytes in a .pcm document. Use batch mode for voice notes or WAV/MP3 files.'); return; }
-  const phrase = realtime ? 'TRANSCRIBE AUDIO WITH CARTESIA INK REALTIME' : 'TRANSCRIBE AUDIO WITH CARTESIA INK';
+  const phrase = !realtime
+    ? 'TRANSCRIBE AUDIO WITH CARTESIA INK'
+    : manual ? 'TRANSCRIBE AUDIO WITH CARTESIA INK MANUAL' : 'TRANSCRIBE AUDIO WITH CARTESIA INK REALTIME';
   if (!await confirm(conversation, ctx, phrase, ensureActive, `Transcribe ${file.filename} with Cartesia Ink? The audio will be sent to Cartesia.`)) return;
   const extension = String(file.filename.split('.').pop() || 'wav').toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 8) || 'wav';
   const params = new URLSearchParams({ actor_id: String(ctx.from.id), filename: `audio.${extension}`, content_type: file.contentType, confirmation_phrase: phrase });
   const headers = { 'Content-Type': 'application/octet-stream' };
   if (realtime) {
     params.set('encoding', 'pcm_s16le'); params.set('sample_rate', '16000');
+    params.set('turn_mode', manual ? 'manual' : 'auto');
     const loadedProfile = await httpClient.get(ctx, actorUrl(ctx, rootPath('stt-profile')), { timeout: 15000 });
     ensureActive();
     const profile = loadedProfile?.data?.profile || {};
@@ -763,7 +772,8 @@ async function runInkTranscription(conversation, ctx, ensureActive) {
   const response = await httpClient.post(ctx, `${rootPath('stt', realtime ? 'realtime' : 'transcribe')}?${params}`, file.bytes, { timeout: 90000, headers, retry: { retries: 0 } });
   ensureActive();
   const transcript = String(response?.data?.transcript || '').slice(0, 12000);
-  await ctx.reply(`<b>Cartesia Ink ${realtime ? 'uploaded PCM clip with realtime turn detection' : 'batch'} transcript</b>\nLanguage: ${escapeHtml(response?.data?.language || 'unknown')} · Duration: ${Number(response?.data?.durationSeconds || 0).toFixed(1)}s\n\n${escapeHtml(transcript || 'No speech detected.')}`, { parse_mode: 'HTML' });
+  const modeLabel = manual ? 'uploaded PCM clip with manual turn finalization' : realtime ? 'uploaded PCM clip with automatic turn detection' : 'batch';
+  await ctx.reply(`<b>Cartesia Ink ${modeLabel} transcript</b>\nLanguage: ${escapeHtml(response?.data?.language || 'unknown')} · Duration: ${Number(response?.data?.durationSeconds || 0).toFixed(1)}s\n\n${escapeHtml(transcript || 'No speech detected.')}`, { parse_mode: 'HTML' });
 }
 
 async function runInfill(conversation, ctx, ensureActive) {

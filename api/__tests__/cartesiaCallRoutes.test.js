@@ -24,6 +24,7 @@ function createApp(overrides = {}) {
   const providerCalls = [];
   const providerAuditEvents = [];
   const callAuditEvents = [];
+  const auditExportQueries = [];
   const webhookAssignments = [];
   const webhookConfigService = {
     mutationsEnabled: false,
@@ -91,12 +92,22 @@ function createApp(overrides = {}) {
         callAuditEvents.push(event);
         return { recorded: true };
       },
+      async listCartesiaAuditEvents(query) {
+        auditExportQueries.push(query);
+        if (overrides.auditExportError) throw overrides.auditExportError;
+        const events = overrides.auditExportEvents || [];
+        const cursorIndex = query.cursor
+          ? events.findIndex((event) => event.source === query.cursor.source &&
+            event.id === query.cursor.id && event.created_at === query.cursor.createdAt)
+          : -1;
+        return events.slice(cursorIndex + 1, cursorIndex + 1 + query.limit);
+      },
     },
     requireAdminToken: auth,
     webhookSecret: 'configured',
     webhookHandler: (_req, res) => res.status(204).end(),
   });
-  return { app, calls, providerCalls, providerAuditEvents, callAuditEvents, webhookAssignments };
+  return { app, calls, providerCalls, providerAuditEvents, callAuditEvents, auditExportQueries, webhookAssignments };
 }
 
 describe('Cartesia call routes', () => {
@@ -106,6 +117,78 @@ describe('Cartesia call routes', () => {
     const preview = await request(app).post('/api/cartesia/calls/preview').send({});
     assert.equal(status.status, 403);
     assert.equal(preview.status, 403);
+  });
+
+  it('exports bounded, sanitized audit CSV pages only to admins', async () => {
+    const auditExportEvents = [
+      {
+        id: 2,
+        source: 'call_operation',
+        created_at: '2026-11-04 12:05:01',
+        actor_type: 'admin_api',
+        actor_id: 'shared_admin_token',
+        action: 'outbound_call_cancel',
+        resource_type: 'call',
+        resource_id: '=formula',
+        outcome: 'succeeded',
+        reason_code: null,
+        business_id: null,
+        target_agent_id: null,
+        request_fingerprint: 'must-not-export',
+      },
+      {
+        id: 1,
+        source: 'call_review',
+        created_at: '2026-11-04 12:05:00',
+        actor_type: 'miniapp_user',
+        actor_id: '12345',
+        action: 'private_call_review',
+        resource_type: 'call',
+        resource_id: 'ac_test_01',
+        outcome: 'allowed',
+        reason_code: null,
+        business_id: 'business_test',
+        target_agent_id: null,
+      },
+    ];
+    const { app, auditExportQueries } = createApp({ auditExportEvents });
+    const unauthenticated = await request(app).get('/api/cartesia/audit/export');
+    const invalid = await request(app).get('/api/cartesia/audit/export?limit=501').set('x-admin-token', 'test-admin');
+    const unsupported = await request(app).get('/api/cartesia/audit/export?include_private=true').set('x-admin-token', 'test-admin');
+    const firstPage = await request(app).get('/api/cartesia/audit/export?limit=1').set('x-admin-token', 'test-admin');
+    const cursor = firstPage.headers['x-cartesia-audit-next-cursor'];
+    const secondPage = await request(app).get('/api/cartesia/audit/export')
+      .query({ limit: 1, cursor }).set('x-admin-token', 'test-admin');
+
+    assert.equal(unauthenticated.status, 403);
+    assert.equal(invalid.status, 400);
+    assert.equal(unsupported.status, 400);
+    assert.equal(firstPage.status, 200);
+    assert.match(firstPage.headers['content-type'], /text\/csv/);
+    assert.equal(firstPage.headers['cache-control'], 'no-store');
+    assert.equal(firstPage.headers['content-disposition'], 'attachment; filename="cartesia-audit.csv"');
+    assert.equal(firstPage.headers['x-cartesia-audit-has-more'], 'true');
+    assert.ok(cursor);
+    assert.match(firstPage.text, /'=formula/);
+    assert.equal(firstPage.text.includes('must-not-export'), false);
+    assert.equal(secondPage.status, 200);
+    assert.equal(secondPage.headers['x-cartesia-audit-has-more'], 'false');
+    assert.match(secondPage.text, /ac_test_01/);
+    const invalidCursor = await request(app).get('/api/cartesia/audit/export')
+      .query({ cursor: Buffer.from(JSON.stringify({ createdAt: '2026-11-04', source: 'unknown', id: 1 })).toString('base64url') })
+      .set('x-admin-token', 'test-admin');
+    assert.equal(invalidCursor.status, 400);
+    assert.deepEqual(auditExportQueries.map(({ limit }) => limit), [2, 2]);
+    assert.equal(auditExportQueries[1].cursor.source, 'call_operation');
+  });
+
+  it('returns a sanitized unavailable response when audit storage fails', async () => {
+    const { app } = createApp({ auditExportError: new Error('sensitive database detail') });
+    const response = await request(app).get('/api/cartesia/audit/export').set('x-admin-token', 'test-admin');
+    assert.equal(response.status, 503);
+    assert.equal(response.body.code, 'cartesia_audit_export_unavailable');
+    assert.equal(JSON.stringify(response.body).includes('sensitive database detail'), false);
+    assert.equal(response.headers['cache-control'], 'no-store');
   });
 
   it('wires preview, explicitly confirmed dispatch, read and cancellation to the service', async () => {

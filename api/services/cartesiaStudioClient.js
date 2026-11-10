@@ -5,7 +5,8 @@ const { cartesiaWebSocketBaseUrl, normalizeCartesiaApiBaseUrl } = require("./car
 
 const CARTESIA_API_BASE_URL = "https://api.cartesia.ai";
 const CARTESIA_API_VERSION = "2026-08-14";
-const CARTESIA_WEBHOOK_API_VERSION = "2026-03-01";
+const CARTESIA_WEBHOOK_API_VERSION = "2026-08-14";
+const MAX_REALTIME_STT_AUDIO_BYTES = 1_600_000;
 const ID_PATTERN = /^[A-Za-z0-9._:-]{1,200}$/;
 const AUDIO_EXTENSIONS = new Set(["flac", "mp3", "mpeg", "mpga", "oga", "ogg", "wav", "webm"]);
 
@@ -49,6 +50,57 @@ function multipartBody(fields, file) {
   }
   chunks.push(Buffer.from(`--${boundary}--\r\n`));
   return { boundary, body: Buffer.concat(chunks) };
+}
+
+function createRealtimeSttSession(client, input, path) {
+  const audioInput = input.file ?? input.audio;
+  const file = Buffer.isBuffer(audioInput) ? audioInput : Buffer.from(audioInput || "");
+  if (!file.length || file.length > MAX_REALTIME_STT_AUDIO_BYTES || file.length % 2 !== 0) {
+    throw studioError("cartesia_stt_realtime_audio_invalid", "Realtime STT requires raw PCM16 audio of no more than 50 seconds (1.6 MB)", 400);
+  }
+  if (!client.enabled || !client.apiKey || client.apiVersion !== CARTESIA_API_VERSION) {
+    throw studioError("cartesia_studio_not_configured", "Cartesia Studio operations are disabled or not configured", 503);
+  }
+  let WebSocket = client.WebSocket;
+  if (!WebSocket) {
+    try { WebSocket = require("ws"); }
+    catch { throw studioError("cartesia_realtime_stt_unavailable", "A WebSocket client is required for realtime Cartesia STT", 503); }
+  }
+  const encoding = String(input.encoding || "pcm_s16le");
+  const sampleRate = Number(input.sampleRate || 16000);
+  if (encoding !== "pcm_s16le" || sampleRate !== 16000) throw studioError("cartesia_stt_realtime_format_invalid", "Realtime transcription currently requires PCM16 audio sampled at 16 kHz", 400);
+  const params = new URLSearchParams({
+    model: input.model || "ink-2",
+    encoding,
+    sample_rate: String(sampleRate),
+    cartesia_version: client.apiVersion,
+  });
+  for (const term of Array.isArray(input.keyterms) ? input.keyterms.slice(0, 100) : []) params.append("keyterm", String(term).slice(0, 120));
+  const socket = new WebSocket(`${client.websocketBaseUrl}${path}?${params}`, {
+    headers: { Authorization: `Bearer ${client.apiKey}` },
+    maxPayload: 64 * 1024,
+  });
+  const audioDurationMs = Math.ceil(file.length / 32);
+  return {
+    file,
+    socket,
+    timeoutMs: Math.min(60000, Math.max(client.timeoutMs, audioDurationMs + 10000)),
+  };
+}
+
+function wait(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+async function sendRealtimeSttAudio(socket, file, isActive) {
+  const bytesPerChunk = 3200;
+  for (let offset = 0; offset < file.length; offset += bytesPerChunk) {
+    if (!isActive()) return false;
+    const chunk = file.subarray(offset, Math.min(file.length, offset + bytesPerChunk));
+    socket.send(chunk);
+    await wait(Math.max(1, Math.ceil(chunk.length / 32)));
+  }
+  return isActive();
 }
 
 function cryptoRandomHex() {
@@ -118,35 +170,36 @@ class CartesiaStudioClient {
 
   async listAgentWebhooks() {
     const result = await this.request("GET", "/agents/webhooks", {
-      operation: "agent_webhook_list", apiKey: this.adminApiKey || this.apiKey,
-      authHeader: "X-API-Key", apiVersion: CARTESIA_WEBHOOK_API_VERSION,
+      operation: "agent_webhook_list", apiKey: this.apiKey,
+      apiVersion: CARTESIA_WEBHOOK_API_VERSION,
     });
     return { webhooks: Array.isArray(result?.webhooks) ? result.webhooks : Array.isArray(result?.data) ? result.data : [] };
   }
   async getAgentWebhook(id) {
     return this.request("GET", `/agents/webhooks/${encodedId(id, "webhook")}`, {
-      operation: "agent_webhook_lookup", apiKey: this.adminApiKey || this.apiKey,
-      authHeader: "X-API-Key", apiVersion: CARTESIA_WEBHOOK_API_VERSION,
+      operation: "agent_webhook_lookup", apiKey: this.apiKey,
+      apiVersion: CARTESIA_WEBHOOK_API_VERSION,
     });
   }
   async createAgentWebhook(input = {}) {
     return this.request("POST", "/agents/webhooks", {
-      operation: "agent_webhook_create", apiKey: this.adminApiKey || this.apiKey,
-      authHeader: "X-API-Key", apiVersion: CARTESIA_WEBHOOK_API_VERSION,
+      operation: "agent_webhook_create", apiKey: this.apiKey,
+      apiVersion: CARTESIA_WEBHOOK_API_VERSION,
       headers: { "Content-Type": "application/json" }, body: JSON.stringify(input),
     });
   }
   async updateAgentWebhook(id, input = {}) {
-    return this.request("PATCH", `/agents/webhooks/${encodedId(id, "webhook")}`, {
-      operation: "agent_webhook_update", apiKey: this.adminApiKey || this.apiKey,
-      authHeader: "X-API-Key", apiVersion: CARTESIA_WEBHOOK_API_VERSION,
+    const result = await this.request("PATCH", `/agents/webhooks/${encodedId(id, "webhook")}`, {
+      operation: "agent_webhook_update", apiKey: this.apiKey,
+      apiVersion: CARTESIA_WEBHOOK_API_VERSION,
       headers: { "Content-Type": "application/json" }, body: JSON.stringify(input),
     });
+    return typeof result === "string" ? { id: result } : result;
   }
   async deleteAgentWebhook(id) {
     return this.request("DELETE", `/agents/webhooks/${encodedId(id, "webhook")}`, {
-      operation: "agent_webhook_delete", apiKey: this.adminApiKey || this.apiKey,
-      authHeader: "X-API-Key", apiVersion: CARTESIA_WEBHOOK_API_VERSION,
+      operation: "agent_webhook_delete", apiKey: this.apiKey,
+      apiVersion: CARTESIA_WEBHOOK_API_VERSION,
     });
   }
 
@@ -309,52 +362,38 @@ class CartesiaStudioClient {
   }
 
   transcribeAudioRealtime(input = {}) {
-    const audioInput = input.file ?? input.audio;
-    const file = Buffer.isBuffer(audioInput) ? audioInput : Buffer.from(audioInput || "");
-    if (!file.length || file.length > 16 * 1024 * 1024 || file.length % 2 !== 0) {
-      throw studioError("cartesia_stt_realtime_audio_invalid", "Realtime STT requires raw PCM16 audio up to 16 MB", 400);
-    }
-    if (!this.enabled || !this.apiKey || this.apiVersion !== CARTESIA_API_VERSION) {
-      throw studioError("cartesia_studio_not_configured", "Cartesia Studio operations are disabled or not configured", 503);
-    }
-    let WebSocket = this.WebSocket;
-    if (!WebSocket) {
-      try { WebSocket = require("ws"); }
-      catch { throw studioError("cartesia_realtime_stt_unavailable", "A WebSocket client is required for realtime Cartesia STT", 503); }
-    }
-    const encoding = String(input.encoding || "pcm_s16le");
-    const sampleRate = Number(input.sampleRate || 16000);
-    if (encoding !== "pcm_s16le" || sampleRate !== 16000) throw studioError("cartesia_stt_realtime_format_invalid", "Realtime transcription currently requires PCM16 audio sampled at 16 kHz", 400);
-    const params = new URLSearchParams({ model: input.model || "ink-2", encoding, sample_rate: String(sampleRate) });
-    for (const term of Array.isArray(input.keyterms) ? input.keyterms.slice(0, 100) : []) params.append("keyterm", String(term).slice(0, 120));
-    const url = `${this.websocketBaseUrl}/stt/turns/websocket?${params}`;
-    const socket = new WebSocket(url, { headers: { "X-API-Key": this.apiKey, "Cartesia-Version": this.apiVersion } });
+    const { file, socket, timeoutMs } = createRealtimeSttSession(this, input, "/stt/turns/websocket");
     return new Promise((resolve, reject) => {
       const events = [];
       const partials = [];
       let settled = false;
-      const timeout = setTimeout(() => finish(studioError("cartesia_realtime_stt_timeout", "Cartesia realtime transcription timed out", 504)), this.timeoutMs);
-      timeout.unref?.();
       const finish = (error, finalEvent) => {
         if (settled) return;
         settled = true;
         clearTimeout(timeout);
         try { socket.close(); } catch { /* close best-effort */ }
         if (error) reject(error);
-        else resolve({ transcript: safeRealtimeTranscript(finalEvent?.transcript || partials.at(-1) || ""), events: events.slice(0, 500) });
+        else resolve({ transcript: safeRealtimeTranscript(finalEvent?.transcript ?? partials.at(-1) ?? ""), events: events.slice(0, 500) });
       };
+      const timeout = setTimeout(() => finish(studioError("cartesia_realtime_stt_timeout", "Cartesia realtime transcription timed out", 504)), timeoutMs);
+      timeout.unref?.();
       socket.on("open", () => {
-        if (input.turnSettings && typeof input.turnSettings === "object") {
-          const keys = ["start_threshold", "eager_end_threshold", "end_threshold", "end_timeout_ms"];
-          const hasAllSettings = keys.every((key) => Number.isFinite(Number(input.turnSettings[key])));
-          if (hasAllSettings) {
-            const turn = Object.fromEntries(keys.map((key) => [key, Number(input.turnSettings[key])]));
-            socket.send(JSON.stringify({ type: "config", turn }));
+        void (async () => {
+          try {
+            if (input.turnSettings && typeof input.turnSettings === "object") {
+              const keys = ["start_threshold", "eager_end_threshold", "end_threshold", "end_timeout_ms"];
+              const hasAllSettings = keys.every((key) => Number.isFinite(Number(input.turnSettings[key])));
+              if (hasAllSettings) {
+                const turn = Object.fromEntries(keys.map((key) => [key, Number(input.turnSettings[key])]));
+                socket.send(JSON.stringify({ type: "config", turn }));
+              }
+            }
+            if (!await sendRealtimeSttAudio(socket, file, () => !settled) || settled) return;
+            socket.send(JSON.stringify({ type: "close" }));
+          } catch {
+            finish(studioError("cartesia_realtime_stt_transport_error", "Cartesia realtime transcription is temporarily unavailable", 502));
           }
-        }
-        const bytesPerChunk = 3200; // 100 ms of mono PCM16 at 16 kHz.
-        for (let offset = 0; offset < file.length; offset += bytesPerChunk) socket.send(file.subarray(offset, Math.min(file.length, offset + bytesPerChunk)));
-        socket.send(JSON.stringify({ type: "close" }));
+        })();
       });
       socket.on("message", (raw) => {
         let event;
@@ -363,12 +402,81 @@ class CartesiaStudioClient {
         if (!event || typeof event !== "object") return;
         if (event.type === "error") return finish(studioError("cartesia_realtime_stt_failed", "Cartesia rejected realtime transcription", Number(event.status_code) || 502));
         if (typeof event.transcript === "string" && ["turn.update", "turn.eager_end", "turn.end"].includes(event.type)) partials.push(event.transcript);
-        events.push({ type: String(event.type || "event").slice(0, 32), ...(typeof event.transcript === "string" ? { transcript: safeRealtimeTranscript(event.transcript) } : {}) });
+        if (events.length < 500) events.push({ type: String(event.type || "event").slice(0, 32), ...(typeof event.transcript === "string" ? { transcript: safeRealtimeTranscript(event.transcript) } : {}) });
         if (event.type === "turn.end") finish(null, event);
       });
       socket.on("error", () => finish(studioError("cartesia_realtime_stt_transport_error", "Cartesia realtime transcription is temporarily unavailable", 502)));
       socket.on("close", (code) => {
-        if (!settled) finish(code === 1000 ? null : studioError("cartesia_realtime_stt_closed", "Cartesia realtime transcription closed before completion", 502));
+        if (!settled) finish(studioError("cartesia_realtime_stt_closed", `Cartesia realtime transcription closed before completion (${Number(code) || 0})`, 502));
+      });
+    });
+  }
+
+  transcribeAudioManual(input = {}) {
+    const { socket, file, timeoutMs } = createRealtimeSttSession(this, input, "/stt/websocket");
+    return new Promise((resolve, reject) => {
+      let transcript = "";
+      let language = null;
+      let durationSeconds = null;
+      let messageCount = 0;
+      let finalizeSent = false;
+      let closeSent = false;
+      let settled = false;
+      const finish = (error) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        try { socket.close(); } catch { /* close best-effort */ }
+        if (error) reject(error);
+        else resolve({ transcript, language, durationSeconds });
+      };
+      const timeout = setTimeout(() => finish(studioError("cartesia_manual_stt_timeout", "Cartesia manual transcription timed out", 504)), timeoutMs);
+      timeout.unref?.();
+      socket.on("open", () => {
+        void (async () => {
+          try {
+            if (!await sendRealtimeSttAudio(socket, file, () => !settled) || settled) return;
+            finalizeSent = true;
+            socket.send("finalize");
+          } catch {
+            finish(studioError("cartesia_manual_stt_transport_error", "Cartesia manual transcription is temporarily unavailable", 502));
+          }
+        })();
+      });
+      socket.on("message", (raw) => {
+        if (++messageCount > 1000) return finish(studioError("cartesia_manual_stt_response_invalid", "Cartesia returned too many manual transcription events", 502));
+        let event;
+        try { event = JSON.parse(Buffer.isBuffer(raw) ? raw.toString("utf8") : String(raw)); }
+        catch { return finish(studioError("cartesia_manual_stt_response_invalid", "Cartesia returned an invalid manual transcription event", 502)); }
+        if (!event || typeof event !== "object" || Array.isArray(event)) return finish(studioError("cartesia_manual_stt_response_invalid", "Cartesia returned an invalid manual transcription event", 502));
+        if (event.type === "error") return finish(studioError("cartesia_manual_stt_failed", "Cartesia rejected manual transcription", Number(event.status_code) || 502));
+        if (event.type === "transcript") {
+          if (typeof event.is_final !== "boolean" || typeof event.text !== "string") {
+            return finish(studioError("cartesia_manual_stt_response_invalid", "Cartesia returned an invalid transcript event", 502));
+          }
+          if (event.is_final) {
+            if (event.text.length + transcript.length > 50000) return finish(studioError("cartesia_manual_stt_response_invalid", "Cartesia returned an oversized transcript", 502));
+            transcript += safeRealtimeTranscript(event.text);
+            if (typeof event.language === "string") language = event.language.slice(0, 20);
+            if (event.duration !== null && event.duration !== undefined && Number.isFinite(Number(event.duration))) durationSeconds = Number(event.duration);
+          }
+          return;
+        }
+        if (event.type === "flush_done") {
+          if (!finalizeSent || closeSent) return finish(studioError("cartesia_manual_stt_response_invalid", "Cartesia returned an unexpected flush acknowledgment", 502));
+          closeSent = true;
+          try { socket.send("close"); }
+          catch { finish(studioError("cartesia_manual_stt_transport_error", "Cartesia manual transcription is temporarily unavailable", 502)); }
+          return;
+        }
+        if (event.type === "done") {
+          if (!closeSent) return finish(studioError("cartesia_manual_stt_response_invalid", "Cartesia closed manual transcription before the flush completed", 502));
+          return finish(null);
+        }
+      });
+      socket.on("error", () => finish(studioError("cartesia_manual_stt_transport_error", "Cartesia manual transcription is temporarily unavailable", 502)));
+      socket.on("close", (code) => {
+        if (!settled) finish(studioError("cartesia_manual_stt_closed", `Cartesia manual transcription closed before completion (${Number(code) || 0})`, 502));
       });
     });
   }
@@ -458,4 +566,10 @@ function safeRealtimeTranscript(value) {
   return String(value || "").replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, "").slice(0, 50000);
 }
 
-module.exports = { CartesiaStudioClient, CARTESIA_API_BASE_URL, CARTESIA_API_VERSION, studioError };
+module.exports = {
+  CartesiaStudioClient,
+  CARTESIA_API_BASE_URL,
+  CARTESIA_API_VERSION,
+  MAX_REALTIME_STT_AUDIO_BYTES,
+  studioError,
+};

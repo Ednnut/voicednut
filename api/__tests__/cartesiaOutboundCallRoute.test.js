@@ -213,6 +213,37 @@ describe("Cartesia outbound call API contract", () => {
       retryCartesiaCampaignBatch: async (input) => { received.push(['retry', input]); return { retried_recipient_count: 1 }; },
       sendApiError(res, status, code, message) { return res.status(status).json({ success: false, code, error: message }); },
     });
+
+    it('returns Accepted when an approved large campaign is durably queued for background dispatch', async () => {
+      const routes = new Map();
+      const app = { post(path, ...handlers) { routes.set(`POST ${path}`, handlers); }, get() {}, patch() {} };
+      const limiter = () => {};
+      const authorization = () => {};
+      const assertion = () => {};
+      let received;
+      registerCallRoutes(app, {
+        cartesiaApprovalLimiter: limiter,
+        requireOutboundAuthorization: authorization,
+        requireCallEActorAssertion: assertion,
+        isCartesiaAdminActor: async (actorId) => actorId === '7001',
+        submitCartesiaCampaign: async (input) => {
+          received = input;
+          return { queued_for_async_dispatch: true, campaign: { campaign_id: input.campaign_id, status: 'approved', dispatch_queued: true } };
+        },
+        sendApiError(res, status, code, message) { return res.status(status).json({ success: false, code, error: message }); },
+      });
+      const handlers = routes.get('POST /api/cartesia/campaigns/:campaignId/submit');
+      assert.deepEqual(handlers.slice(0, 3), [limiter, authorization, assertion]);
+      const res = makeResponse();
+      await handlers[3]({
+        params: { campaignId: `cartesia_campaign_${'a'.repeat(64)}` },
+        body: { business_id: 'biz-1', confirmation_phrase: 'exact phrase' },
+        callEActorId: '7001',
+      }, res);
+      assert.equal(res.statusCode, 202);
+      assert.equal(res.body.queued_for_async_dispatch, true);
+      assert.equal(received.actor_id, '7001');
+    });
     const campaignId = `cartesia_campaign_${'a'.repeat(64)}`;
     for (const [operation, expectedName] of [['reconcile', 'reconcileCartesiaCampaign'], ['cancel', 'cancelCartesiaCampaignBatch'], ['retry', 'retryCartesiaCampaignBatch']]) {
       const path = `POST /api/cartesia/campaigns/:campaignId/${operation}`;

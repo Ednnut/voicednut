@@ -62,7 +62,7 @@ describe('Cartesia call lifecycle webhook', () => {
     const handler = createCartesiaWebhookHandler({
       webhookSecret: WEBHOOK_SECRET,
       db: {
-        async recordCartesiaWebhookEvent() { writes += 1; },
+        async recordCartesiaWebhookReceipt() { writes += 1; },
         async upsertCartesiaCallRecord() { writes += 1; },
       },
     });
@@ -83,7 +83,7 @@ describe('Cartesia call lifecycle webhook', () => {
     const receipts = new Map();
     const calls = [];
     const db = {
-      async recordCartesiaWebhookEvent(payload) {
+      async recordCartesiaWebhookReceipt(payload) {
         const existing = receipts.get(payload.webhook_request_id);
         if (existing) return {
           duplicate: existing.payload_hash === payload.payload_hash,
@@ -114,7 +114,7 @@ describe('Cartesia call lifecycle webhook', () => {
     const handler = createCartesiaWebhookHandler({
       webhookSecret: WEBHOOK_SECRET,
       db: {
-        async recordCartesiaWebhookEvent(payload) {
+        async recordCartesiaWebhookReceipt(payload) {
           const existing = receipts.get(payload.webhook_request_id);
           if (existing) return { conflict: existing !== payload.payload_hash };
           receipts.set(payload.webhook_request_id, payload.payload_hash);
@@ -147,13 +147,14 @@ describe('Cartesia call lifecycle webhook', () => {
         event_timestamp: event.timestamp,
         payload_hash: event.payloadHash,
       };
-      assert.deepEqual(await db.recordCartesiaWebhookEvent(receipt), {
+      assert.deepEqual(await db.recordCartesiaWebhookReceipt(receipt), {
         inserted: true,
         duplicate: false,
         conflict: false,
       });
       await db.upsertCartesiaCallRecord(event.callRecord);
-      assert.deepEqual(await db.recordCartesiaWebhookEvent(receipt), {
+      assert.deepEqual(await db.recordCartesiaWebhookReceipt(receipt), {
+        inserted: false,
         duplicate: true,
         conflict: false,
       });

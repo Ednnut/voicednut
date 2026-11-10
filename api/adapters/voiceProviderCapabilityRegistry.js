@@ -197,7 +197,7 @@ const VOICE_PROVIDER_CAPABILITY_REGISTRY = deepFreeze({
           PROVIDER_CONTRACT_STATES.DOCUMENTED,
           PLATFORM_CAPABILITY_STATES.IMPLEMENTED,
           "https://docs.cartesia.ai/api-reference/tts/sse",
-          "Supports server-side text generation, language/locale, accent, normalization, pronunciation dictionary ID, speed, and volume. The current call path buffers SSE chunks before adapting raw PCM16; it does not yet play chunks as they arrive.",
+          "Incremental PCM playback is implemented only through the Twilio adaptive stream queue. Cache hits and bytes transport remain buffered; Vonage and Plivo use their provider-specific buffered audio envelopes.",
         ),
         voice_catalog_read: capability(
           PROVIDER_CONTRACT_STATES.DOCUMENTED,
@@ -213,8 +213,9 @@ const VOICE_PROVIDER_CAPABILITY_REGISTRY = deepFreeze({
         ),
         tts_websocket: capability(
           PROVIDER_CONTRACT_STATES.DOCUMENTED,
-          PLATFORM_CAPABILITY_STATES.NOT_IMPLEMENTED,
+          PLATFORM_CAPABILITY_STATES.IMPLEMENTED,
           "https://docs.cartesia.ai/api-reference/tts/websocket",
+          "Admin-only server session supports bounded text continuations, validated contexts, cancellation, documented raw PCM formats, timestamps, flushes, and generation controls. It is not wired as an automatic telephony media bridge.",
         ),
       },
     },

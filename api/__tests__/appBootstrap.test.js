@@ -97,27 +97,12 @@ describe("API app bootstrap", function () {
     assert.ok(routes.every((handlers) => handlers.length >= 2));
   });
 
-<<<<<<< HEAD
   it("registers Agent Lab promotion controls behind admin-token authorization", function () {
     const layers = app._router.stack;
     for (const path of ["/api/call-scripts/:id/promotion-readiness", "/api/call-scripts/:id/promotion-history", "/api/call-scripts/:id/promote-live"]) {
       const route = layers.find((layer) => layer.route?.path === path);
       assert.ok(route, `${path} should be registered`);
       assert.equal(route.route.stack[0].name, "requireAdminToken");
-=======
-  it("registers Cartesia speech profile preview and update routes behind admin-token authorization", function () {
-    const layers = app._router.stack;
-    const paths = [
-      "/api/call-scripts/:id/cartesia-speech-profile/preview",
-      "/api/call-scripts/:id/cartesia-speech-profile",
-    ];
-
-    for (const path of paths) {
-      const layer = layers.find((entry) => entry.route?.path === path);
-      assert.ok(layer, `${path} should be registered`);
-      assert.equal(layer.route.stack[0].name, "requireAdminToken");
-      assert.equal(layer.route.stack.length, 3);
->>>>>>> 95a068c (updated)
     }
   });
 
