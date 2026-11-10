@@ -58,20 +58,27 @@ describe("PostCallAutomationTriggers", () => {
             };
           },
         },
+        getPostCallWorkflowExecutionService: () => ({
+          async enqueueEvent(payload) {
+            payloads.push({ ...payload, workflow_event: true });
+            return { accepted: true, event_id: "workflow-event-1", status: "pending", trigger_event: payload.trigger_event };
+          },
+        }),
       },
       logger: createSilentLogger(),
     });
 
     assert.equal(result.ok, true);
-    assert.equal(payloads.length, 1);
+    assert.equal(payloads.length, 2);
     assert.equal(payloads[0].trigger_event, "payment_succeeded");
     assert.equal(payloads[0].call_sid, "CA123");
     assert.equal(payloads[0].idempotency_key, "payment:stripe:evt_123");
     assert.equal(payloads[0].payment_state, "paid");
     assert.equal(payloads[0].customer.email, "ada@example.com");
     assert.equal(states[0].state, "post_call_automation_completed");
+    assert.equal(states[0].data.workflow_event_id, "workflow-event-1");
     assert.equal(liveEvents[0].callSid, "CA123");
-    assert.equal(liveEvents[0].line, "Automation ran 1 rule");
+    assert.equal(liveEvents[0].line, "Automation ran 1 rule; workflow event queued");
   });
 
   it("skips duplicate or non-success payment events", async () => {
@@ -105,10 +112,17 @@ describe("PostCallAutomationTriggers", () => {
   it("records and reports automation failures without throwing", async () => {
     const states = [];
     const liveEvents = [];
+    const workflowEvents = [];
     const result = await runPostCallAutomationTrigger({
       service: {
         evaluateAndRun: async () => {
           throw new Error("email unavailable");
+        },
+      },
+      workflowService: {
+        async enqueueEvent(payload) {
+          workflowEvents.push(payload);
+          return { accepted: true, event_id: "workflow-event-2", status: "pending", trigger_event: payload.trigger_event };
         },
       },
       webhookService: {
@@ -127,8 +141,40 @@ describe("PostCallAutomationTriggers", () => {
     });
 
     assert.equal(result.ok, false);
+    assert.equal(workflowEvents.length, 1);
     assert.equal(states[0].state, "post_call_automation_failed");
     assert.equal(liveEvents[0].line, "Automation failed");
+  });
+
+  it("dispatches workflow events alongside existing post-call rules and records sanitized workflow state", async () => {
+    const states = [];
+    const liveEvents = [];
+    const eventPayloads = [];
+    const result = await runPostCallAutomationTrigger({
+      service: {
+        async evaluateAndRun(payload) {
+          return { trigger_event: payload.trigger_event, matched: 0, runs: [] };
+        },
+      },
+      workflowService: {
+        async enqueueEvent(payload) {
+          eventPayloads.push(payload);
+          return { accepted: true, event_id: "workflow-event-3", status: "pending", trigger_event: payload.trigger_event };
+        },
+      },
+      db: { async updateCallState(callSid, state, data) { states.push({ callSid, state, data }); } },
+      webhookService: { addLiveEvent(callSid, line, options) { liveEvents.push({ callSid, line, options }); } },
+      callSid: "CA_TEST_123",
+      payload: { trigger_event: "post_call_completed", idempotency_key: "call-completed:CA_TEST_123" },
+      logger: createSilentLogger(),
+    });
+
+    assert.equal(result.ok, true);
+    assert.equal(eventPayloads.length, 1);
+    assert.equal(result.workflow_result.status, "pending");
+    assert.equal(states[0].data.workflow_event_id, "workflow-event-3");
+    assert.deepEqual(states[0].data.workflow_runs, []);
+    assert.equal(liveEvents[0].line, "Workflow event queued");
   });
 
   it("builds post-call completion payloads from call summaries and transcripts", () => {

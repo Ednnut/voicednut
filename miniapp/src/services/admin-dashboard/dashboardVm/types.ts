@@ -150,6 +150,7 @@ type MailerVmKeys =
   | 'invokeAction';
 
 type ProviderVmKeys =
+  | 'request'
   | 'providerReadinessTotals'
   | 'providerDegradedCount'
   | 'providerReadinessPercent'

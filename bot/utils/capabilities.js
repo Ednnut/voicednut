@@ -68,8 +68,12 @@ const COMMAND_CAPABILITIES = {
   scripts: 'scripts_manage',
   persona: 'persona_manage',
   provider: 'provider_manage',
+<<<<<<< HEAD
   vapi: 'vapi_manage',
   cartesia: 'cartesia_manage',
+=======
+  cartesia: 'provider_manage',
+>>>>>>> 95a068c (updated)
   users: 'users_manage',
   callerflags: 'caller_flags_manage',
   admin: 'admin_panel',

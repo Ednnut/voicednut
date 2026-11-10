@@ -1,4 +1,5 @@
 const assert = require("node:assert/strict");
+<<<<<<< HEAD
 const { PostCallWorkflowExecutionService, minimizePayload } = require("../services/postCallWorkflowExecutionService");
 const { PostCallWorkflowDefinitionService } = require("../services/postCallWorkflowDefinitionService");
 
@@ -416,5 +417,329 @@ describe("PostCallWorkflowExecutionService", () => {
     await service.advanceRun(run);
     assert.equal(runs.get(run.run_id).current_step_id, "completed");
     assert.equal(steps.get(`${run.run_id}:classify`).result_json, JSON.stringify({ matched: true }));
+=======
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+const sqlite3 = require("sqlite3").verbose();
+const Database = require("../db/db");
+const { PostCallWorkflowDefinitionService } = require("../services/postCallWorkflowDefinitionService");
+const { PostCallWorkflowExecutionService } = require("../services/postCallWorkflowExecutionService");
+
+function definition(id = "workflow_run_test") {
+  return {
+    schema_version: 1,
+    workflow_id: id,
+    name: "Workflow execution test",
+    trigger_event: "post_call.completed",
+    start_step_id: "review",
+    steps: [
+      { id: "review", type: "approval", next_step_id: "route" },
+      { id: "route", type: "branch", condition: { field: "outcome", equals: "completed" }, true_step_id: "email", false_step_id: "done" },
+      { id: "email", type: "action", action_type: "send_email", config: { subject: "Follow up" }, next_step_id: "done" },
+      { id: "done", type: "end" },
+    ],
+  };
+}
+
+describe("PostCallWorkflowExecutionService", () => {
+  let db;
+  let dbPath;
+  let definitions;
+  let calls;
+  let service;
+
+  beforeEach(async () => {
+    dbPath = path.join(os.tmpdir(), `voicednut-workflow-runs-${Date.now()}-${Math.random()}.sqlite`);
+    db = new Database();
+    db.dbPath = dbPath;
+    await db.initialize();
+    definitions = new PostCallWorkflowDefinitionService({ db });
+    calls = [];
+    service = new PostCallWorkflowExecutionService({
+      db,
+      definitionService: definitions,
+      automationService: { async executeAction(...args) { calls.push(args); return { type: "send_email", status: "ok", message_id: "private-id" }; } },
+    });
+  });
+
+  afterEach(async () => {
+    if (db?.db) await new Promise((resolve) => db.db.close(resolve));
+    [dbPath, `${dbPath}-wal`, `${dbPath}-shm`].forEach((file) => { try { fs.unlinkSync(file); } catch (_) {} });
+  });
+
+  async function approved() {
+    const draft = await definitions.createDraft(definition());
+    return definitions.approveVersion(draft.workflow_id, draft.version);
+  }
+
+  it("starts only approved versions, pauses for human approval, and executes an approved action once", async () => {
+    const draft = await definitions.createDraft(definition());
+    await assert.rejects(() => service.start({ workflow_id: draft.workflow_id, version: 1, trigger_event: "post_call.completed", idempotency_key: "workflow-start-0001" }), (error) => error.code === "conflict");
+    await definitions.approveVersion(draft.workflow_id, 1);
+    const run = await service.start({ workflow_id: draft.workflow_id, version: 1, trigger_event: "post_call.completed", idempotency_key: "workflow-start-0001", payload: { outcome: "completed" } });
+    assert.equal(run.status, "awaiting_approval");
+    assert.equal(run.current_step_id, "review");
+    const completed = await service.approveStep(run.run_id, "review", "admin_token");
+    assert.equal(completed.status, "completed");
+    assert.equal(completed.state.steps.email.status, "completed");
+    assert.equal("message_id" in completed.state.steps.email.result, false);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0][5], `workflow:${run.run_id}:email`);
+  });
+
+  it("deduplicates the same idempotent request and rejects reusing the key for different input", async () => {
+    await approved();
+    const input = { workflow_id: "workflow_run_test", version: 1, trigger_event: "post_call.completed", idempotency_key: "workflow-start-0002", payload: { outcome: "missed" } };
+    const first = await service.start(input);
+    const replay = await service.start(input);
+    assert.equal(replay.run_id, first.run_id);
+    assert.equal(replay.status, "awaiting_approval");
+    await assert.rejects(() => service.start({ ...input, payload: { outcome: "completed" } }), (error) => error.code === "conflict");
+    assert.equal(calls.length, 0);
+  });
+
+  it("queues one admin-approved retry for a failed email step using its original idempotency key", async () => {
+    await approved();
+    let attempts = 0;
+    service.automationService.executeAction = async (...args) => {
+      calls.push(args);
+      attempts += 1;
+      if (attempts === 1) {
+        const error = new Error("temporary email enqueue failure");
+        error.code = "timeout";
+        throw error;
+      }
+      return { type: "send_email", status: "ok", deduped: true };
+    };
+    const run = await service.start({
+      workflow_id: "workflow_run_test", version: 1, trigger_event: "post_call.completed",
+      idempotency_key: "workflow-email-retry-0001", payload: { outcome: "completed" },
+    });
+    const failed = await service.approveStep(run.run_id, "review");
+    assert.equal(failed.status, "failed");
+    assert.equal(failed.state.steps.email.retry_count || 0, 0);
+
+    const queued = await service.retryFailedEmailStep(run.run_id, "email", "admin_token");
+    assert.equal(queued.status, "queued");
+    assert.equal(queued.state.steps.email.status, "retry_queued");
+    assert.equal(queued.state.steps.email.retry_count, 1);
+    assert.equal(queued.state.steps.email.retry_requested_by, "admin_token");
+    const jobs = await db.listCallJobs({ job_type: "post_call_workflow_resume", limit: 10 });
+    assert.equal(jobs.length, 1);
+    assert.equal(JSON.parse(jobs[0].payload).run_id, run.run_id);
+
+    const completed = await service.resumeRun(run.run_id);
+    assert.equal(completed.status, "completed");
+    assert.equal(completed.state.steps.email.retry_count, 1);
+    assert.equal(calls.length, 2);
+    assert.equal(calls[0][5], `workflow:${run.run_id}:email`);
+    assert.equal(calls[1][5], calls[0][5]);
+    await assert.rejects(() => service.retryFailedEmailStep(run.run_id, "email"), (error) => error.code === "conflict");
+  });
+
+  it("does not permit retrying a CRM action with an ambiguous external result", async () => {
+    const value = definition("workflow_crm_retry_test");
+    value.start_step_id = "crm";
+    value.steps = [
+      { id: "crm", type: "action", action_type: "crm_sync", config: {}, next_step_id: "done" },
+      { id: "done", type: "end" },
+    ];
+    const draft = await definitions.createDraft(value);
+    await definitions.approveVersion(draft.workflow_id, 1);
+    service.automationService.executeAction = async () => { throw new Error("ambiguous result"); };
+    const run = await service.start({
+      workflow_id: draft.workflow_id, version: 1, trigger_event: "post_call.completed",
+      idempotency_key: "workflow-crm-retry-0001",
+    });
+    assert.equal(run.status, "needs_review");
+    await assert.rejects(() => service.retryFailedEmailStep(run.run_id, "crm"), (error) => error.code === "conflict");
+  });
+
+  it("queues durable workflow events and dispatches only the latest approved version once", async () => {
+    const firstDraft = await definitions.createDraft({ ...definition(), trigger_event: "post_call_completed" });
+    await definitions.approveVersion(firstDraft.workflow_id, firstDraft.version);
+    const secondDraft = await definitions.createDraft({ ...definition(), trigger_event: "post_call_completed", name: "Workflow execution v2" });
+    const event = { trigger_event: "post_call_completed", idempotency_key: "call-completed:CA_TEST_123", outcome: "completed" };
+
+    const first = await service.enqueueEvent(event);
+    const replay = await service.enqueueEvent({ ...event, context: { delivery_attempt: 2 } });
+    assert.equal(first.status, "pending");
+    assert.equal(replay.event_id, first.event_id);
+    const firstJobs = await db.listCallJobs({ job_type: "post_call_workflow_event", limit: 10 });
+    assert.equal(firstJobs.length, 1);
+    await new Promise((resolve, reject) => db.db.run(
+      "DELETE FROM call_jobs WHERE job_type = 'post_call_workflow_event'",
+      (error) => error ? reject(error) : resolve(),
+    ));
+    await new Promise((resolve, reject) => db.db.run(
+      "UPDATE post_call_workflow_events SET last_enqueued_at = '2000-01-01 00:00:00' WHERE event_id = ?",
+      [first.event_id],
+      (error) => error ? reject(error) : resolve(),
+    ));
+    assert.equal(await service.reconcilePendingEvents(), 1);
+    assert.equal((await db.listCallJobs({ job_type: "post_call_workflow_event", limit: 10 })).length, 1);
+    await definitions.approveVersion(secondDraft.workflow_id, secondDraft.version);
+    const processed = await service.processEvent(first.event_id);
+    assert.equal(processed.status, "completed");
+    assert.equal(processed.result.matched, 1);
+    assert.equal(processed.result.runs[0].workflow_version, 1);
+    const storedEvent = await db.getPostCallWorkflowEvent(first.event_id);
+    assert.equal(storedEvent.payload_json, "{}");
+    assert.deepEqual(JSON.parse(storedEvent.definition_versions_json), [{ workflow_id: firstDraft.workflow_id, version: 1 }]);
+    assert.equal((await service.processEvent(first.event_id)).status, "completed");
+    assert.equal(calls.length, 0);
+
+    const nextEvent = await service.enqueueEvent({ ...event, idempotency_key: "call-completed:CA_TEST_456" });
+    const afterApproval = await service.processEvent(nextEvent.event_id);
+    assert.equal(afterApproval.result.matched, 1);
+    assert.equal(afterApproval.result.runs[0].workflow_version, 2);
+    assert.equal(calls.length, 0);
+  });
+
+  it("isolates automatic triggers and run reads by business scope", async () => {
+    const first = await definitions.createDraft(definition("workflow_tenant_a"), "manager-1", "business-a");
+    const second = await definitions.createDraft(definition("workflow_tenant_b"), "manager-2", "business-b");
+    await definitions.approveVersion(first.workflow_id, first.version, "manager-1", "business-a");
+    await definitions.approveVersion(second.workflow_id, second.version, "manager-2", "business-b");
+
+    const event = await service.enqueueEvent({
+      trigger_event: "post_call.completed",
+      idempotency_key: "tenant-call-event-0001",
+      business_id: "business-a",
+      outcome: "missed",
+    });
+    const stored = await db.getPostCallWorkflowEvent(event.event_id);
+    assert.equal(stored.business_id, "business-a");
+    const processed = await service.processEvent(event.event_id);
+    assert.equal(processed.result.matched, 1);
+    assert.equal(processed.result.runs[0].workflow_id, first.workflow_id);
+    const runId = processed.result.runs[0].run_id;
+    assert.equal((await service.getRun(runId, "business-a")).workflow_id, first.workflow_id);
+    await assert.rejects(() => service.getRun(runId, "business-b"), (error) => error.code === "not_found");
+
+    const unscoped = await service.enqueueEvent({ trigger_event: "post_call.completed", idempotency_key: "global-call-event-0001" });
+    const globalResult = await service.processEvent(unscoped.event_id);
+    assert.equal(globalResult.result.matched, 0);
+  });
+
+  it("requires a source event idempotency key before dispatching approved workflows", async () => {
+    await assert.rejects(() => service.enqueueEvent({ trigger_event: "post_call_completed" }), /idempotency_key is required/);
+  });
+
+  it("does not execute an event against a draft definition", async () => {
+    await definitions.createDraft({ ...definition(), trigger_event: "post_call_completed" });
+    const event = await service.enqueueEvent({ trigger_event: "post_call_completed", idempotency_key: "call-completed:CA_DRAFT_ONLY" });
+    const result = await service.processEvent(event.event_id);
+    assert.equal(result.status, "completed");
+    assert.equal(result.result.matched, 0);
+    assert.equal((await db.listPostCallWorkflowRuns(20)).length, 0);
+    assert.equal(calls.length, 0);
+  });
+
+  it("persists bounded waits as durable resume jobs and permits cancellation before resume", async () => {
+    const value = definition("workflow_wait_test");
+    value.start_step_id = "wait";
+    value.steps = [
+      { id: "wait", type: "wait", seconds: 30, next_step_id: "done" },
+      { id: "done", type: "end" },
+    ];
+    const draft = await definitions.createDraft(value);
+    await definitions.approveVersion(draft.workflow_id, 1);
+    const run = await service.start({ workflow_id: draft.workflow_id, version: 1, trigger_event: "post_call.completed", idempotency_key: "workflow-wait-0001" });
+    assert.equal(run.status, "waiting");
+    assert.ok(run.next_run_at);
+    const jobs = await db.listCallJobs({ job_type: "post_call_workflow_resume", limit: 10 });
+    assert.equal(jobs.length, 1);
+    assert.equal(JSON.parse(jobs[0].payload).run_id, run.run_id);
+    assert.equal((await service.cancelRun(run.run_id)).status, "canceled");
+  });
+
+  it("reconciles stale runs and records a terminal operator decision without replaying actions", async () => {
+    await approved();
+    const run = await service.start({ workflow_id: "workflow_run_test", version: 1, trigger_event: "post_call.completed", idempotency_key: "workflow-start-0003", payload: { outcome: "completed" } });
+    await new Promise((resolve, reject) => db.db.run(
+      "UPDATE post_call_workflow_runs SET status = 'running', execution_owner = NULL, lease_expires_at = NULL, updated_at = '2000-01-01T00:00:00.000Z' WHERE run_id = ?",
+      [run.run_id],
+      (error) => error ? reject(error) : resolve(),
+    ));
+    assert.equal(await service.reconcileInterruptedRuns(), 1);
+    const needsReview = await service.getRun(run.run_id);
+    assert.equal(needsReview.status, "needs_review");
+    const resolved = await service.reviewRun(run.run_id, "confirm_failed", "admin_token");
+    assert.equal(resolved.status, "failed");
+    assert.equal(resolved.review_decision, "confirm_failed");
+    assert.equal(resolved.reviewed_by, "admin_token");
+    assert.equal(resolved.state.operator_review.decision, "confirm_failed");
+    await assert.rejects(() => service.reviewRun(run.run_id, "confirm_completed"), (error) => error.code === "conflict");
+    assert.equal(calls.length, 0);
+  });
+
+  it("keeps runs with a live lease out of startup reconciliation", async () => {
+    await approved();
+    const run = await service.start({ workflow_id: "workflow_run_test", version: 1, trigger_event: "post_call.completed", idempotency_key: "workflow-start-0004" });
+    await new Promise((resolve, reject) => db.db.run(
+      "UPDATE post_call_workflow_runs SET status = 'running', execution_owner = 'active-worker', lease_expires_at = ? WHERE run_id = ?",
+      [new Date(Date.now() + 60_000).toISOString(), run.run_id],
+      (error) => error ? reject(error) : resolve(),
+    ));
+    assert.equal(await service.reconcileInterruptedRuns(), 0);
+    assert.equal((await service.getRun(run.run_id)).status, "running");
+  });
+
+  it("adds lease and review columns to a prior run table idempotently without rewriting rows", async () => {
+    const legacy = new Database();
+    legacy.db = new sqlite3.Database(":memory:");
+    try {
+      await new Promise((resolve, reject) => legacy.db.run(
+        "CREATE TABLE post_call_workflow_runs (run_id TEXT PRIMARY KEY, status TEXT, updated_at DATETIME)",
+        (error) => error ? reject(error) : resolve(),
+      ));
+      await new Promise((resolve, reject) => legacy.db.run(
+        "INSERT INTO post_call_workflow_runs (run_id, status, updated_at) VALUES ('legacy-run', 'running', '2000-01-01 00:00:00')",
+        (error) => error ? reject(error) : resolve(),
+      ));
+      await legacy.ensurePostCallWorkflowRunColumns();
+      await legacy.ensurePostCallWorkflowRunColumns();
+      const columns = await new Promise((resolve, reject) => legacy.db.all(
+        "PRAGMA table_info(post_call_workflow_runs)",
+        (error, rows) => error ? reject(error) : resolve(rows),
+      ));
+      const row = await new Promise((resolve, reject) => legacy.db.get(
+        "SELECT run_id, status FROM post_call_workflow_runs WHERE run_id = 'legacy-run'",
+        (error, value) => error ? reject(error) : resolve(value),
+      ));
+      assert.ok(columns.some((column) => column.name === "execution_owner"));
+      assert.ok(columns.some((column) => column.name === "review_decision"));
+      assert.equal(row.status, "running");
+    } finally {
+      await new Promise((resolve) => legacy.db.close(resolve));
+    }
+  });
+
+  it("adds nullable workflow and call business scope columns without rewriting legacy rows", async () => {
+    const legacy = new Database();
+    legacy.db = new sqlite3.Database(":memory:");
+    try {
+      await new Promise((resolve, reject) => legacy.db.exec(
+        "CREATE TABLE post_call_workflow_definitions (workflow_id TEXT, version INTEGER, status TEXT, trigger_event TEXT); CREATE TABLE post_call_workflow_events (event_id TEXT, event_key TEXT, status TEXT, updated_at TEXT); CREATE TABLE calls (call_sid TEXT); INSERT INTO post_call_workflow_definitions VALUES ('legacy', 1, 'approved', 'post_call.completed');",
+        (error) => error ? reject(error) : resolve(),
+      ));
+      await legacy.ensurePostCallWorkflowScopeColumns();
+      await legacy.ensurePostCallWorkflowScopeColumns();
+      await legacy.ensureCallColumns(["business_id"]);
+      const definition = await new Promise((resolve, reject) => legacy.db.get(
+        "SELECT workflow_id, status, business_id FROM post_call_workflow_definitions WHERE workflow_id = 'legacy'",
+        (error, row) => error ? reject(error) : resolve(row),
+      ));
+      const columns = await new Promise((resolve, reject) => legacy.db.all(
+        "PRAGMA table_info(calls)", (error, rows) => error ? reject(error) : resolve(rows),
+      ));
+      assert.deepEqual(definition, { workflow_id: "legacy", status: "approved", business_id: null });
+      assert.ok(columns.some((column) => column.name === "business_id"));
+    } finally {
+      await new Promise((resolve) => legacy.db.close(resolve));
+    }
+>>>>>>> 95a068c (updated)
   });
 });

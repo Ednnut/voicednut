@@ -179,6 +179,7 @@ const MAILER_VM_KEYS = [
 ] as const satisfies readonly (keyof DashboardVm)[];
 
 const PROVIDER_VM_KEYS = [
+  'request',
   'providerReadinessTotals',
   'providerDegradedCount',
   'providerReadinessPercent',

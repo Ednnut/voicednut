@@ -32,6 +32,152 @@ test('renders the admin dashboard using local fixtures', async ({ page }) => {
   await expect(page.getByRole('heading', { name: 'Vapi web call test' })).toBeVisible();
   await expect(page.getByText('No live templates', { exact: true })).toBeVisible();
   await expect(page.getByRole('button', { name: 'Start browser call' })).toBeDisabled();
+  await expect(page.getByRole('heading', { name: 'Cartesia operations' })).toBeVisible();
+  await expect(page.getByText('Managed Agents', { exact: true })).toBeVisible();
+  await expect(page.getByText('Disabled by server', { exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Review transcript and summary' })).toBeVisible();
+});
+
+test('loads Cartesia call transcript only after an explicit private-data review confirmation', async ({ page }) => {
+  let acceptReview = false;
+  page.on('dialog', async (dialog) => {
+    expect(dialog.message()).toContain('private Cartesia transcript and summary');
+    if (acceptReview) await dialog.accept();
+    else await dialog.dismiss();
+  });
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto('/#/provider');
+  const reviewButton = page.getByRole('button', { name: 'Review transcript and summary' });
+  await reviewButton.click();
+  await expect(page.getByRole('region', { name: 'Cartesia private call review' })).toHaveCount(0);
+  acceptReview = true;
+  await reviewButton.click();
+  await expect(page.getByRole('region', { name: 'Cartesia private call review' })).toBeVisible();
+  await expect(page.getByText('Fixture summary: the caller requested a follow-up.')).toBeVisible();
+  await expect(page.getByText('Please call me tomorrow.')).toBeVisible();
+  await page.getByRole('button', { name: 'Refresh Cartesia status' }).click();
+  const audit = page.getByRole('list', { name: 'Cartesia private call review audit events' });
+  await expect(audit).toBeVisible();
+  await expect(audit).toContainText('call_fixture_001');
+  await expect(audit).toContainText('Operator 12345');
+  await expect(audit).not.toContainText('Please call me tomorrow.');
+  const dimensions = await page.evaluate(() => ({
+    viewport: document.documentElement.clientWidth,
+    document: document.documentElement.scrollWidth,
+  }));
+  expect(dimensions.document, 'Cartesia private review should not overflow at mobile width').toBeLessThanOrEqual(dimensions.viewport + 1);
+});
+
+test('loads business-scoped Cartesia history for a selected business', async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto('/#/provider');
+  await page.getByLabel('Business ID for scoped Cartesia call history').fill('fixture-business');
+  await page.getByRole('button', { name: 'Load business call history' }).click();
+  await expect(page.getByText('Business-scoped history for fixture-business.')).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Review transcript and summary' })).toBeVisible();
+  let approved = false;
+  page.once('dialog', async (dialog) => {
+    approved = true;
+    await dialog.accept();
+  });
+  await page.getByRole('button', { name: 'Review transcript and summary' }).click();
+  await expect(page.getByRole('region', { name: 'Cartesia private call review' })).toBeVisible();
+  expect(approved).toBe(true);
+});
+
+test('previews and confirms a Cartesia inbound agent assignment with fixture-only requests', async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto('/#/provider');
+  await page.getByLabel('Cartesia phone number for assignment').selectOption('pn_fixture_01');
+  await page.getByLabel('Target Cartesia agent ID').fill('agent_fixture_next');
+  await page.getByRole('button', { name: 'Preview assignment' }).click();
+  const preview = page.getByRole('region', { name: 'Cartesia phone assignment preview' });
+  await expect(preview).toBeVisible();
+  await expect(preview).toContainText('agent_fixture_01 → agent_fixture_next');
+  page.once('dialog', async (dialog) => {
+    expect(dialog.message()).toContain('Change inbound routing');
+    expect(dialog.message()).toContain('agent_fixture_01');
+    expect(dialog.message()).toContain('agent_fixture_next');
+    await dialog.accept();
+  });
+  await preview.getByRole('button', { name: 'Confirm inbound assignment' }).click();
+  await expect(page.getByRole('status').filter({ hasText: 'Cartesia confirmed the phone assignment.' })).toBeVisible();
+  await page.getByRole('button', { name: 'Refresh Cartesia status' }).click();
+  await expect(page.getByRole('list', { name: 'Cartesia phone number inventory' }).getByRole('listitem')).toContainText('Updated fixture agent');
+  const audit = page.getByRole('list', { name: 'Cartesia admin action audit events' });
+  await expect(audit).toBeVisible();
+  await expect(audit).toContainText('succeeded');
+  await expect(audit).toContainText('agent_fixture_next');
+  await expect(audit).toContainText('Operator 12345');
+  await expect(audit).not.toContainText('+15555550123');
+  const phoneAudit = page.getByRole('region', { name: 'Cartesia phone-number operation audit' });
+  await expect(phoneAudit).toBeVisible();
+  await expect(phoneAudit).toContainText('shared admin token cannot identify an individual operator');
+  await expect(phoneAudit).toContainText('No Cartesia phone-number operation events have been recorded.');
+  const providerAudit = page.getByRole('region', { name: 'Cartesia provider operation audit' });
+  await expect(providerAudit).toBeVisible();
+  await expect(providerAudit).toContainText('No Cartesia provider operation events have been recorded.');
+  const callAudit = page.getByRole('region', { name: 'Cartesia call operation audit' });
+  await expect(callAudit).toBeVisible();
+  await expect(callAudit).toContainText('No Cartesia call operation events have been recorded.');
+  const dimensions = await page.evaluate(() => ({
+    viewport: document.documentElement.clientWidth,
+    document: document.documentElement.scrollWidth,
+  }));
+  expect(dimensions.document, 'Cartesia assignment controls should not overflow at mobile width').toBeLessThanOrEqual(dimensions.viewport + 1);
+});
+
+test('configures Cartesia as an explicit draft agent runtime with a validated hosted agent ID', async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto('/#/content');
+  await expect(page.locator('#va-view-stage-root').getByRole('heading', { name: 'AI Agent Studio' })).toBeVisible();
+  await page.getByRole('button', { name: 'Refresh Scripts' }).click();
+  const agentRow = page.locator('li').filter({ hasText: 'Welcome Script' });
+  await agentRow.getByRole('button', { name: 'Select' }).click();
+  await page.getByLabel('Voice agent runtime').selectOption('cartesia_line');
+  await expect(page.getByLabel('Cartesia hosted agent ID')).toBeVisible();
+  await expect(page.getByText(/runs only for a live script when both server gates are enabled/i)).toBeVisible();
+  await page.getByLabel('Cartesia hosted agent ID').fill('agent_bad');
+  await page.getByRole('button', { name: 'Save Draft' }).click();
+  await expect(page.getByText('Enter a valid Cartesia hosted agent ID before saving.')).toBeVisible();
+  const dimensions = await page.evaluate(() => ({
+    viewport: document.documentElement.clientWidth,
+    document: document.documentElement.scrollWidth,
+  }));
+  expect(dimensions.document, 'Cartesia runtime editor should not overflow at mobile width').toBeLessThanOrEqual(dimensions.viewport + 1);
+});
+
+test('builds and approves a business-scoped post-call workflow in local fixtures', async ({ page }) => {
+  let confirmation = '';
+  page.on('dialog', async (dialog) => {
+    confirmation = dialog.message();
+    await dialog.accept();
+  });
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto('/#/content');
+  await expect(page.getByRole('heading', { name: 'Post-call workflow builder' })).toBeVisible();
+  await page.getByLabel('Business ID').fill('qa-business');
+  await page.getByRole('button', { name: 'Load business workflows' }).click();
+  await expect(page.getByText('No versions yet. Create a draft to begin.')).toBeVisible();
+
+  await page.getByLabel('Workflow ID').fill('qa_follow_up');
+  await page.getByLabel('Name', { exact: true }).fill('QA follow-up');
+  await page.getByLabel('Trigger event').fill('post_call_completed');
+  await page.getByLabel('Step 1 type').selectOption('action');
+  await page.getByLabel('Step 1 action').selectOption('send_email');
+  await page.getByLabel('Email text').fill('Thank you for your time.');
+  await page.getByRole('button', { name: 'Save draft version' }).click();
+  await expect(page.getByText(/Draft version 1 saved/)).toBeVisible();
+  await expect(page.getByLabel('Workflow version')).toContainText('draft');
+  await page.getByRole('button', { name: 'Approve selected draft' }).click();
+  expect(confirmation).toContain('Matching post_call_completed events can then run its email, CRM, or ticket actions.');
+  await expect(page.getByText('Workflow version approved. Matching events may now start it.')).toBeVisible();
+  await expect(page.getByText('approved · v1')).toBeVisible();
+  const dimensions = await page.evaluate(() => ({
+    viewport: document.documentElement.clientWidth,
+    document: document.documentElement.scrollWidth,
+  }));
+  expect(dimensions.document, 'Workflow editor should not overflow at mobile width').toBeLessThanOrEqual(dimensions.viewport + 1);
 });
 
 test('exposes CALL-E status lookup only after a local call ID is supplied', async ({ page }) => {

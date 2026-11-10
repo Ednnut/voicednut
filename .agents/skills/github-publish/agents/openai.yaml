@@ -1,0 +1,4 @@
+interface:
+  display_name: "GitHub Publish"
+  short_description: "Commit and push reviewed repo changes"
+  default_prompt: "Use $github-publish to commit and push the intended repository changes to main. Default commit message: updated."

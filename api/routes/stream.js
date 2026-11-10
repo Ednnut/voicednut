@@ -7,6 +7,7 @@ class StreamService extends EventEmitter {
     this.ws = websocket;
     this.expectedAudioIndex = 0;
     this.audioBuffer = {};
+    this.chunkBuffer = new Map();
     this.streamSid = '';
     const interval = Number(options.audioTickIntervalMs);
     this.audioTickIntervalMs = Number.isFinite(interval) && interval > 0 ? interval : 160;
@@ -32,26 +33,46 @@ class StreamService extends EventEmitter {
       return;
     }
 
-    if (normalizedIndex < this.expectedAudioIndex) {
+    this.bufferChunk(normalizedIndex, audio, true);
+  }
+
+  bufferChunk (index, audio, done = false) {
+    const normalizedIndex = Number(index);
+    if (!Number.isFinite(normalizedIndex) || normalizedIndex < this.expectedAudioIndex) return;
+    if (!audio && !done) return;
+    if (normalizedIndex === this.expectedAudioIndex && this.chunkBuffer.has(normalizedIndex)) {
+      const buffered = this.chunkBuffer.get(normalizedIndex);
+      if (audio) buffered.chunks.push(audio);
+      buffered.done = buffered.done || done;
+      for (const chunk of buffered.chunks.splice(0)) this.sendAudio(chunk);
+      if (buffered.done) {
+        this.chunkBuffer.delete(normalizedIndex);
+        this.expectedAudioIndex += 1;
+        this.drainChunkBuffer();
+      }
       return;
     }
-
-    if (Object.keys(this.audioBuffer).length >= this.maxBufferedChunks) {
-      this.audioBuffer = {};
-      this.expectedAudioIndex = normalizedIndex;
+    if (normalizedIndex > this.expectedAudioIndex) {
+      const buffered = this.chunkBuffer.get(normalizedIndex) || { chunks: [], done: false };
+      if (audio) buffered.chunks.push(audio);
+      buffered.done = buffered.done || done;
+      this.chunkBuffer.set(normalizedIndex, buffered);
+      if (this.chunkBuffer.size > this.maxBufferedChunks) this.chunkBuffer.delete(Math.max(...this.chunkBuffer.keys()));
+      return;
     }
+    if (audio) this.sendAudio(audio);
+    if (!done) return;
+    this.expectedAudioIndex += 1;
+    this.drainChunkBuffer();
+  }
 
-    if(normalizedIndex === this.expectedAudioIndex) {
-      this.sendAudio(audio);
-      this.expectedAudioIndex++;
-
-      while(Object.prototype.hasOwnProperty.call(this.audioBuffer, this.expectedAudioIndex)) {
-        const bufferedAudio = this.audioBuffer[this.expectedAudioIndex];
-        this.sendAudio(bufferedAudio);
-        this.expectedAudioIndex++;
-      }
-    } else {
-      this.audioBuffer[normalizedIndex] = audio;
+  drainChunkBuffer () {
+    while (this.chunkBuffer.has(this.expectedAudioIndex)) {
+      const next = this.chunkBuffer.get(this.expectedAudioIndex);
+      for (const chunk of next.chunks) this.sendAudio(chunk);
+      if (!next.done) break;
+      this.chunkBuffer.delete(this.expectedAudioIndex);
+      this.expectedAudioIndex += 1;
     }
   }
 
@@ -156,9 +177,12 @@ class StreamService extends EventEmitter {
     }, this.audioTickIntervalMs);
   }
 
-  flush () {
+  flush (options = {}) {
     this.audioBuffer = {};
-    this.expectedAudioIndex = 0;
+    this.chunkBuffer.clear();
+    if (Number.isInteger(options.nextExpectedIndex) && options.nextExpectedIndex >= 0) {
+      this.expectedAudioIndex = options.nextExpectedIndex;
+    }
     if (this.audioTickTimer) {
       clearInterval(this.audioTickTimer);
       this.audioTickTimer = null;

@@ -12,7 +12,11 @@ import {
 import { Link } from '@/components/Link/Link.tsx';
 import { AdminPageIntro } from '@/components/admin-dashboard/AdminPageIntro';
 import { DashboardWorkflowContractCard } from '@/components/admin-dashboard/DashboardWorkflowContractCard';
+<<<<<<< HEAD
 import { CallECampaignRehearsalPanel } from './CallECampaignRehearsalPanel';
+=======
+import { PostCallWorkflowBuilder } from '@/pages/AdminDashboard/PostCallWorkflowBuilder';
+>>>>>>> 95a068c (updated)
 import { useDashboardHaptic } from '@/hooks/admin-dashboard/useDashboardHaptic';
 import {
   UiActionBar,
@@ -165,6 +169,8 @@ export function ScriptStudioPage({ visible, vm, initialLane = 'call' }: ScriptSt
   const [agentRuntimeConfigInput, setAgentRuntimeConfigInput] = useState<string>('');
   const [scriptVoiceModelInput, setScriptVoiceModelInput] = useState<string>('');
   const [voiceAgentSettingsEnabled, setVoiceAgentSettingsEnabled] = useState(false);
+  const [voiceAgentRuntimeProvider, setVoiceAgentRuntimeProvider] = useState('deepgram');
+  const [cartesiaAgentIdInput, setCartesiaAgentIdInput] = useState('');
   const [voiceAgentLanguage, setVoiceAgentLanguage] = useState('en');
   const [voiceAgentListenModel, setVoiceAgentListenModel] = useState('nova-2');
   const [voiceAgentThinkProvider, setVoiceAgentThinkProvider] = useState('open_ai');
@@ -232,6 +238,8 @@ export function ScriptStudioPage({ visible, vm, initialLane = 'call' }: ScriptSt
       setAgentRuntimeConfigInput('');
       setScriptVoiceModelInput('');
       setVoiceAgentSettingsEnabled(false);
+      setVoiceAgentRuntimeProvider('deepgram');
+      setCartesiaAgentIdInput('');
       return;
     }
     const config = asRecord(selectedCallScript.agent_config);
@@ -239,9 +247,12 @@ export function ScriptStudioPage({ visible, vm, initialLane = 'call' }: ScriptSt
     const voiceModel = toText(selectedCallScript.voice_model, '');
     setScriptVoiceModelInput(voiceModel);
     const voiceSettings = asRecord(config.voice_agent_settings);
+    const runtimeProvider = toText(voiceSettings.provider, 'deepgram').trim().toLowerCase();
     const language = toText(voiceSettings.language, voiceModel.endsWith('-es') ? 'es' : 'en');
     const thinkProvider = toText(voiceSettings.think_provider, 'open_ai');
-    setVoiceAgentSettingsEnabled(Object.keys(voiceSettings).length > 0 || voiceModel.endsWith('-es'));
+    setVoiceAgentRuntimeProvider(runtimeProvider === 'cartesia_line' ? 'cartesia_line' : 'deepgram');
+    setCartesiaAgentIdInput(toText(voiceSettings.agent_id, ''));
+    setVoiceAgentSettingsEnabled(runtimeProvider === 'cartesia_line' || Object.keys(voiceSettings).length > 0 || voiceModel.endsWith('-es'));
     setVoiceAgentLanguage(language);
     setVoiceAgentListenModel(toText(voiceSettings.listen_model, language === 'es' ? 'flux-general-multi' : 'nova-2'));
     setVoiceAgentThinkProvider(thinkProvider);
@@ -356,6 +367,23 @@ export function ScriptStudioPage({ visible, vm, initialLane = 'call' }: ScriptSt
       ? undefined
       : scriptVoiceModelInput || null;
     if (voiceAgentSettingsEnabled) {
+      if (voiceAgentRuntimeProvider === 'cartesia_line') {
+        const agentId = cartesiaAgentIdInput.trim();
+        if (!/^agent_[A-Za-z0-9_-]{6,128}$/.test(agentId)) {
+          setStudioError('Enter a valid Cartesia hosted agent ID before saving.');
+          return;
+        }
+        agentConfig = {
+          ...(agentConfig || {}),
+          schema_version: 6,
+          voice_agent_settings: {
+            provider: 'cartesia_line',
+            agent_id: agentId,
+          },
+        };
+        void saveCallScriptDraft(agentConfig, voiceModelUpdate);
+        return;
+      }
       agentConfig = {
         ...(agentConfig || {}),
         schema_version: 6,
@@ -840,6 +868,7 @@ export function ScriptStudioPage({ visible, vm, initialLane = 'call' }: ScriptSt
         ]}
       />
       <DashboardWorkflowContractCard moduleId="content" />
+      {initialLane === 'call' ? <PostCallWorkflowBuilder /> : null}
       <UiCard>
         <div className="va-ops-card-header">
           <div className="va-ops-card-headline">
@@ -1033,60 +1062,90 @@ export function ScriptStudioPage({ visible, vm, initialLane = 'call' }: ScriptSt
                 value={scriptObjectiveTagsInput}
                 onChange={(event) => setScriptObjectiveTagsInput(event.target.value)}
               />
-              <label className="va-field-label" htmlFor="script-voice-model">Deepgram speech voice</label>
+              <label className="va-field-label" htmlFor="voice-agent-runtime-provider">Voice agent runtime</label>
               <UiSelect
-                id="script-voice-model"
-                aria-label="Deepgram speech voice"
-                value={scriptVoiceModelInput}
+                id="voice-agent-runtime-provider"
+                aria-label="Voice agent runtime"
+                value={voiceAgentRuntimeProvider}
                 onChange={(event) => {
-                  const model = event.target.value;
-                  setScriptVoiceModelInput(model);
-                  if (!model) {
-                    setVoiceAgentLanguage('en');
-                    setVoiceAgentListenModel('nova-2');
-                  } else if (model.endsWith('-es')) {
-                    setVoiceAgentSettingsEnabled(true);
-                    setVoiceAgentLanguage('es');
-                    setVoiceAgentListenModel('flux-general-multi');
-                  } else if (model.endsWith('-en')) {
-                    setVoiceAgentLanguage('en');
-                    if (!CALL_AGENT_LISTEN_MODEL_OPTIONS.some((option) => option.id === voiceAgentListenModel && option.languages.includes('en'))) {
-                      setVoiceAgentListenModel('nova-2');
-                    }
-                  }
+                  const provider = event.target.value;
+                  setVoiceAgentRuntimeProvider(provider);
+                  if (provider === 'cartesia_line') setVoiceAgentSettingsEnabled(true);
                 }}
               >
-                <option value="">Use configured profile voice</option>
-                {scriptVoiceModelInput && !CALL_FALLBACK_VOICE_MODELS.some((voice) => voice.id === scriptVoiceModelInput) && (
-                  <option value={scriptVoiceModelInput}>Keep existing voice ({scriptVoiceModelInput})</option>
-                )}
-                {CALL_FALLBACK_VOICE_MODELS.map((voice) => (
-                  <option key={voice.id} value={voice.id}>{voice.label} · {voice.style}</option>
-                ))}
+                <option value="deepgram">VOICEDNUT managed runtime · Deepgram</option>
+                <option value="cartesia_line">Cartesia hosted Managed Agent · Twilio stream</option>
               </UiSelect>
-              <label className="va-checkbox-label">
-                <input
-                  type="checkbox"
-                  aria-label="Override Deepgram Voice Agent settings for this script"
-                  checked={voiceAgentSettingsEnabled}
-                  onChange={(event) => {
-                    const enabled = event.target.checked;
-                    setVoiceAgentSettingsEnabled(enabled);
-                    if (enabled && !scriptVoiceModelInput.endsWith(`-${voiceAgentLanguage}`)) {
-                      setScriptVoiceModelInput(voiceAgentLanguage === 'es'
-                        ? 'aura-2-celeste-es'
-                        : 'aura-2-andromeda-en');
-                    }
-                    if (!enabled && voiceAgentLanguage === 'es') {
-                      setVoiceAgentLanguage('en');
-                      setVoiceAgentListenModel('nova-2');
-                      setScriptVoiceModelInput('aura-2-andromeda-en');
-                    }
-                  }}
-                />
-                Override Deepgram language and model settings for this script
-              </label>
-              <label className="va-field-label" htmlFor="voice-agent-language">Agent language</label>
+              {voiceAgentRuntimeProvider === 'cartesia_line' ? (
+                <>
+                  <label className="va-field-label" htmlFor="cartesia-agent-id">Cartesia hosted agent ID</label>
+                  <UiInput
+                    id="cartesia-agent-id"
+                    aria-label="Cartesia hosted agent ID"
+                    placeholder="agent_…"
+                    value={cartesiaAgentIdInput}
+                    onChange={(event) => setCartesiaAgentIdInput(event.target.value)}
+                  />
+                  <p className="va-muted-copy">
+                    Cartesia runs only for a live script when both server gates are enabled. The hosted agent owns its configured prompt, greeting, voice, and tools; this script’s prompt and opening message are not injected into the Cartesia session. Saving creates a draft and does not activate the runtime.
+                  </p>
+                </>
+              ) : (
+                <>
+                  <label className="va-field-label" htmlFor="script-voice-model">Deepgram speech voice</label>
+                  <UiSelect
+                    id="script-voice-model"
+                    aria-label="Deepgram speech voice"
+                    value={scriptVoiceModelInput}
+                    onChange={(event) => {
+                      const model = event.target.value;
+                      setScriptVoiceModelInput(model);
+                      if (!model) {
+                        setVoiceAgentLanguage('en');
+                        setVoiceAgentListenModel('nova-2');
+                      } else if (model.endsWith('-es')) {
+                        setVoiceAgentSettingsEnabled(true);
+                        setVoiceAgentLanguage('es');
+                        setVoiceAgentListenModel('flux-general-multi');
+                      } else if (model.endsWith('-en')) {
+                        setVoiceAgentLanguage('en');
+                        if (!CALL_AGENT_LISTEN_MODEL_OPTIONS.some((option) => option.id === voiceAgentListenModel && option.languages.includes('en'))) {
+                          setVoiceAgentListenModel('nova-2');
+                        }
+                      }
+                    }}
+                  >
+                    <option value="">Use configured profile voice</option>
+                    {scriptVoiceModelInput && !CALL_FALLBACK_VOICE_MODELS.some((voice) => voice.id === scriptVoiceModelInput) && (
+                      <option value={scriptVoiceModelInput}>Keep existing voice ({scriptVoiceModelInput})</option>
+                    )}
+                    {CALL_FALLBACK_VOICE_MODELS.map((voice) => (
+                      <option key={voice.id} value={voice.id}>{voice.label} · {voice.style}</option>
+                    ))}
+                  </UiSelect>
+                  <label className="va-checkbox-label">
+                    <input
+                      type="checkbox"
+                      aria-label="Override Deepgram Voice Agent settings for this script"
+                      checked={voiceAgentSettingsEnabled}
+                      onChange={(event) => {
+                        const enabled = event.target.checked;
+                        setVoiceAgentSettingsEnabled(enabled);
+                        if (enabled && !scriptVoiceModelInput.endsWith(`-${voiceAgentLanguage}`)) {
+                          setScriptVoiceModelInput(voiceAgentLanguage === 'es'
+                            ? 'aura-2-celeste-es'
+                            : 'aura-2-andromeda-en');
+                        }
+                        if (!enabled && voiceAgentLanguage === 'es') {
+                          setVoiceAgentLanguage('en');
+                          setVoiceAgentListenModel('nova-2');
+                          setScriptVoiceModelInput('aura-2-andromeda-en');
+                        }
+                      }}
+                    />
+                    Override Deepgram language and model settings for this script
+                  </label>
+                  <label className="va-field-label" htmlFor="voice-agent-language">Agent language</label>
               <UiSelect
                 id="voice-agent-language"
                 aria-label="Agent language"
@@ -1137,6 +1196,8 @@ export function ScriptStudioPage({ visible, vm, initialLane = 'call' }: ScriptSt
                 ))}
               </UiSelect>
               <p className="va-muted-copy">Settings are disabled by default. The selected language, recognition model, reasoning model, and explicit speech voice are validated together. Only Deepgram managed reasoning models are listed; custom endpoints and credentials are not accepted here. Spanish requires the Spanish Celeste voice. Edit the prompt and opening message in the selected language yourself.</p>
+                </>
+              )}
               <UiTextarea
                 aria-label="Agent runtime configuration JSON"
                 placeholder={'{"schema_version":6,"approved_tools":[],"voice_agent_settings":{"language":"en","listen_model":"nova-2","think_provider":"open_ai","think_model":"gpt-4o-mini"},"business_context":{"business_name":"Example business","facts":[{"label":"Support hours","value":"Weekdays, 9 AM to 5 PM"}]},"escalation_policy":{"allowed_outcomes":["review_case"],"default_outcome":"review_case"},"tool_failure_policy":{"on_tool_error":"end_call"},"handoff_policy":{"enabled":false,"confirmation":"dtmf_1"}}'}
@@ -1145,7 +1206,7 @@ export function ScriptStudioPage({ visible, vm, initialLane = 'call' }: ScriptSt
                 rows={5}
               />
               <p className="va-muted-copy">
-                Approved tool names are checked against this agent’s generated tools; an empty list denies all tools. Business context is bounded reference data, not instructions. An escalation policy can choose only review-case or secure-follow-up outcomes and cannot schedule callbacks. The optional schema-v4 tool failure policy can keep the agent running or end the active call with the standard error closing; it never retries a failed tool. Schema-v5 handoff is Twilio-only, requires a live script, verified stream authentication, and a fixed E.164 destination approved by your organization; transfer starts only after the caller presses 1 and pressing 2 cancels. Schema-v6 supports validated Deepgram language and model selections. Handoff is disabled by default. Do not include secrets or customer data. Leave blank for existing profile policy behavior. Timeout must be 1000–30000 ms and cannot exceed the server limit.
+                Approved tool names are checked against this agent’s generated tools; an empty list denies all tools. Business context is bounded reference data, not instructions. An escalation policy can choose only review-case or secure-follow-up outcomes and cannot schedule callbacks. The optional schema-v4 tool failure policy can keep the agent running or end the active call with the standard error closing; it never retries a failed tool. Schema-v5 handoff is Twilio-only, requires a live script, verified stream authentication, and a fixed E.164 destination approved by your organization; transfer starts only after the caller presses 1 and pressing 2 cancels. Schema-v6 supports validated Deepgram settings or an explicit Cartesia hosted agent ID. The runtime selector above owns voice_agent_settings when saving; other JSON fields stay editable. Handoff is disabled by default. Do not include secrets or customer data. Leave blank for existing profile policy behavior. Timeout must be 1000–30000 ms and cannot exceed the server limit.
               </p>
               <UiTextarea
                 placeholder="Review note / approval reason"

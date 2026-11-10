@@ -252,6 +252,7 @@ export interface ProviderSwitchPlan {
 }
 
 export interface DashboardVm {
+  request: <T>(path: string, options?: RequestInit) => Promise<T>;
   hasCapability: (capability: string) => boolean;
   isFeatureEnabled: (flag: string, fallback?: boolean) => boolean;
   asRecord: (value: unknown) => JsonRecord;

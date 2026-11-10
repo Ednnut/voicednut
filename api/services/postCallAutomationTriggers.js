@@ -104,6 +104,7 @@ function buildPaymentAutomationPayload({ provider, result, session }) {
   const customer = deriveCustomerFromSession(session || {});
   return {
     trigger_event: "payment_succeeded",
+    business_id: normalizeText(session?.business_id, 120) || null,
     call_sid: callSid || null,
     idempotency_key: `payment:${normalizedProvider}:${eventId || resourceId || status || "unknown"}`,
     payment_state: "paid",
@@ -160,6 +161,7 @@ function buildCallCompletionAutomationPayload({
   };
   return {
     trigger_event: "post_call_completed",
+    business_id: normalizeText(callRecord.business_id || callRecord.businessId, 120) || null,
     call_sid: callSid,
     idempotency_key: `call-completed:${callSid}`,
     call_outcome: finalStatus,
@@ -257,9 +259,12 @@ async function runPostCallAutomationTrigger({
   callSid,
 }) {
   const effectiveCallSid = normalizeText(callSid || payload?.call_sid || payload?.callSid, 160);
-  if (!service || typeof service.evaluateAndRun !== "function") {
+  const hasAutomationService = service && typeof service.evaluateAndRun === "function";
+  const hasWorkflowService = workflowService && typeof workflowService.enqueueEvent === "function";
+  if (!hasAutomationService && !hasWorkflowService) {
     return { ok: false, skipped: true, reason: "service_unavailable" };
   }
+<<<<<<< HEAD
   let workflowResult = null;
   if (workflowService && typeof workflowService.trigger === "function") {
     try {
@@ -271,6 +276,43 @@ async function runPostCallAutomationTrigger({
       });
     }
   }
+=======
+  let workflowResult = { trigger_event: payload?.trigger_event || null, matched: 0, runs: [] };
+  let workflowFailed = false;
+  if (hasWorkflowService) {
+    try {
+      workflowResult = await workflowService.enqueueEvent(payload || {});
+    } catch (_) {
+      workflowFailed = true;
+    }
+    workflowResult = workflowResult && typeof workflowResult === "object"
+      ? workflowResult
+      : { trigger_event: payload?.trigger_event || null, matched: 0, runs: [] };
+    workflowFailed = workflowFailed || (Array.isArray(workflowResult.runs) && workflowResult.runs.some((run) => run?.status === "failed"));
+    if (workflowFailed) {
+      logger?.error?.("post_call_workflow_trigger_failed", {
+        call_sid: effectiveCallSid || null,
+        trigger_event: payload?.trigger_event || null,
+        error_code: "workflow_trigger_failed",
+      });
+      if (effectiveCallSid && db && typeof db.updateCallState === "function") {
+        await db.updateCallState(effectiveCallSid, "post_call_workflow_trigger_failed", {
+          trigger_event: payload?.trigger_event || null,
+          error_code: "workflow_trigger_failed",
+          at: new Date().toISOString(),
+        }).catch(() => {});
+      }
+    }
+  }
+  if (!hasAutomationService) {
+    return {
+      ok: !workflowFailed,
+      skipped: !(workflowResult.accepted === true || Number(workflowResult.matched) > 0),
+      reason: workflowFailed ? "workflow_trigger_failed" : undefined,
+      workflow_result: workflowResult,
+    };
+  }
+>>>>>>> 95a068c (updated)
   try {
     const result = await service.evaluateAndRun(payload || {});
     if (effectiveCallSid && db && typeof db.updateCallState === "function") {
@@ -286,21 +328,47 @@ async function runPostCallAutomationTrigger({
                 deduped: run.deduped === true,
               }))
             : [],
+          workflow_matched: Number(workflowResult.matched) || 0,
+          workflow_event_id: workflowResult.event_id || null,
+          workflow_runs: Array.isArray(workflowResult.runs)
+            ? workflowResult.runs.map((run) => ({
+                workflow_id: run.workflow_id,
+                workflow_version: run.workflow_version,
+                run_id: run.run_id || null,
+                status: run.status,
+                error_code: run.error_code || null,
+              }))
+            : [],
           at: new Date().toISOString(),
         })
         .catch(() => {});
     }
     if (effectiveCallSid && webhookService && typeof webhookService.addLiveEvent === "function") {
       const matched = Number(result.matched) || 0;
+      const workflowMatched = Number(workflowResult.matched) || 0;
+      const workflowQueued = workflowResult.accepted === true;
+      const message = matched > 0 && workflowQueued
+        ? `Automation ran ${matched} rule${matched === 1 ? "" : "s"}; workflow event queued`
+        : matched > 0 && workflowMatched > 0
+        ? `Automation ran ${matched} rule${matched === 1 ? "" : "s"}; started ${workflowMatched} workflow${workflowMatched === 1 ? "" : "s"}`
+        : matched > 0
+          ? `Automation ran ${matched} rule${matched === 1 ? "" : "s"}`
+          : workflowMatched > 0
+            ? `Started ${workflowMatched} workflow${workflowMatched === 1 ? "" : "s"}`
+            : workflowQueued
+              ? "Workflow event queued"
+            : "Automation checked: no matching rules";
       webhookService.addLiveEvent(
         effectiveCallSid,
-        matched > 0
-          ? `Automation ran ${matched} rule${matched === 1 ? "" : "s"}`
-          : "Automation checked: no matching rules",
-        { force: matched > 0 },
+        message,
+        { force: matched > 0 || workflowMatched > 0 || workflowQueued },
       );
     }
+<<<<<<< HEAD
     return { ok: true, result, workflow_result: workflowResult };
+=======
+    return { ok: !workflowFailed, result, workflow_result: workflowResult, workflow_error: workflowFailed };
+>>>>>>> 95a068c (updated)
   } catch (error) {
     logger?.error?.("post_call_automation_trigger_failed", {
       call_sid: effectiveCallSid || null,
@@ -319,7 +387,7 @@ async function runPostCallAutomationTrigger({
     if (effectiveCallSid && webhookService && typeof webhookService.addLiveEvent === "function") {
       webhookService.addLiveEvent(effectiveCallSid, "Automation failed", { force: true });
     }
-    return { ok: false, error: error?.message || "automation_failed" };
+    return { ok: false, error: error?.message || "automation_failed", workflow_result: workflowResult, workflow_error: workflowFailed };
   }
 }
 
@@ -332,7 +400,13 @@ async function maybeRunPaymentAutomation({ provider, result, ctx = {}, logger = 
   }
   const db = typeof ctx.getDb === "function" ? ctx.getDb() : ctx.db;
   const session = await resolvePaymentSession({ db, provider, result });
-  const payload = buildPaymentAutomationPayload({ provider, result, session });
+  let scopedSession = session;
+  const linkedCallSid = normalizeText(session?.call_sid || session?.callSid, 160);
+  if (linkedCallSid && typeof db?.getCall === "function") {
+    const call = await db.getCall(linkedCallSid).catch(() => null);
+    scopedSession = { ...session, business_id: call?.business_id || null };
+  }
+  const payload = buildPaymentAutomationPayload({ provider, result, session: scopedSession });
   if (!payload.call_sid) {
     logger?.warn?.("post_call_payment_automation_skipped", {
       provider: normalizeStatus(provider),
@@ -342,8 +416,17 @@ async function maybeRunPaymentAutomation({ provider, result, ctx = {}, logger = 
     return { ok: false, skipped: true, reason: "missing_call_sid" };
   }
   return runPostCallAutomationTrigger({
+<<<<<<< HEAD
     service: ctx.postCallAutomationService,
     workflowService: ctx.postCallWorkflowExecutionService,
+=======
+    service: typeof ctx.getPostCallAutomationService === "function"
+      ? ctx.getPostCallAutomationService()
+      : ctx.postCallAutomationService,
+    workflowService: typeof ctx.getPostCallWorkflowExecutionService === "function"
+      ? ctx.getPostCallWorkflowExecutionService()
+      : ctx.postCallWorkflowExecutionService,
+>>>>>>> 95a068c (updated)
     webhookService: ctx.webhookService,
     db,
     logger,

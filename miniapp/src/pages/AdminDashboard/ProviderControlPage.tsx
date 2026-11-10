@@ -4,6 +4,7 @@ import { selectProviderPageVm } from './vmSelectors';
 import { AdminPageIntro } from '@/components/admin-dashboard/AdminPageIntro';
 import { LoadingTelemetryCard } from '@/components/admin-dashboard/DashboardStateCards';
 import { VapiWebCallPanel } from './VapiWebCallPanel';
+import { CartesiaOperationsPanel } from './CartesiaOperationsPanel';
 import {
   UiActionBar,
   UiBadge,
@@ -24,6 +25,7 @@ export function ProviderControlPage({ visible, vm }: ProviderControlPageProps) {
   if (!visible) return null;
 
   const {
+    request,
     providerReadinessTotals,
     providerDegradedCount,
     providerReadinessPercent,
@@ -371,6 +373,7 @@ export function ProviderControlPage({ visible, vm }: ProviderControlPageProps) {
         {renderProviderSection('email')}
         <VapiWebCallPanel />
       </section>
+      <CartesiaOperationsPanel request={request} />
     </>
   );
 }

@@ -1458,6 +1458,7 @@ export function AdminDashboardPage() {
   });
 
   const providerVmSection = buildProviderVmSection({
+    request,
     providerReadinessTotals,
     providerDegradedCount,
     providerReadinessPercent,

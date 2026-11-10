@@ -96,6 +96,7 @@ docs/*
 !docs/phase1-audit.md
 !docs/phase2-architecture-matrix.md
 !docs/phase3-provider-template-abstractions.md
+!docs/cartesia.md
 !docs/phase4-vapi-foundation.md
 !docs/phase5-template-integration.md
 !docs/phase6-vapi-events.md

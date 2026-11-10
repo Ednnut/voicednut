@@ -7,6 +7,7 @@ import {
 type DashboardFixtureRole = 'admin' | 'operator' | 'viewer';
 
 let fixtureCallTemplateVersion = 2;
+<<<<<<< HEAD
 let workflowFixtureVersion = 1;
 let workflowFixtureVersions: Record<string, unknown>[] = [
   {
@@ -49,6 +50,12 @@ const WORKFLOW_FIXTURE_ACTIONS = new Set<string>([
   DASHBOARD_ACTION_CONTRACTS.WORKFLOW_RUNS,
   DASHBOARD_ACTION_CONTRACTS.WORKFLOW_RUN_GET,
 ]);
+=======
+let fixtureWorkflowVersions: Array<Record<string, unknown>> = [];
+let cartesiaFixtureReviewAudit: Array<Record<string, unknown>> = [];
+let cartesiaFixtureAdminActionAudit: Array<Record<string, unknown>> = [];
+let cartesiaFixturePhoneAgentId = 'agent_fixture_01';
+>>>>>>> 95a068c (updated)
 
 const DASHBOARD_ALL_CAPS = [
   'dashboard_view',
@@ -829,6 +836,194 @@ function resolveDashboardFixtureActionData(
 export function resolveDashboardFixtureRequest(path: string, options: RequestInit = {}): unknown {
   const nowIso = new Date().toISOString();
   const role = resolveDashboardFixtureRole();
+  const cartesiaReviewMatch = path.match(/^\/miniapp\/cartesia\/calls\/([^/]+)\/review$/);
+  if (cartesiaReviewMatch && String(options.method || 'GET').toUpperCase() === 'POST') {
+    let body: Record<string, unknown> = {};
+    try { body = asRecord(JSON.parse(typeof options.body === 'string' ? options.body : '{}')); } catch { body = {}; }
+    const businessScopedAccess = body.business_id === 'fixture-business' && ['admin', 'operator'].includes(role);
+    const globalAdminAccess = body.business_id === undefined && role === 'admin';
+    if (body.confirm_private_data_review !== true || (!businessScopedAccess && !globalAdminAccess)) {
+      return { success: false, code: 'miniapp_capability_denied', error: 'Call-history access is required' };
+    }
+    cartesiaFixtureReviewAudit = [{
+      id: Date.now(),
+      actorTelegramId: '12345',
+      businessId: typeof body.business_id === 'string' ? body.business_id : null,
+      providerCallId: decodeURIComponent(cartesiaReviewMatch[1]),
+      outcome: 'allowed',
+      reasonCode: null,
+      createdAt: nowIso,
+    }, ...cartesiaFixtureReviewAudit].slice(0, 25);
+    return {
+      success: true,
+      call: {
+        provider: 'cartesia',
+        providerCallId: decodeURIComponent(cartesiaReviewMatch[1]),
+        agentId: 'agent_fixture_01',
+        status: 'completed',
+        direction: 'outbound',
+        fromNumberMasked: '+•••••••0100',
+        toNumberMasked: '+•••••••0123',
+        telephonyAccountType: 'cartesia',
+        summary: 'Fixture summary: the caller requested a follow-up.',
+        transcript: [{ role: 'user', text: 'Please call me tomorrow.', startTimestamp: 1, endTimestamp: 2 }],
+        transcriptTruncated: false,
+        zdrEnabled: false,
+        endReason: 'agent_hangup',
+      },
+      request_id: 'fixture_cartesia_review',
+    };
+  }
+  if (path.startsWith('/miniapp/cartesia/overview')) {
+    const businessId = new URL(path, 'http://localhost').searchParams.get('business_id');
+    const businessScopedAccess = businessId === 'fixture-business' && ['admin', 'operator'].includes(role);
+    const globalAdminAccess = !businessId && role === 'admin';
+    return {
+      success: true,
+      status: {
+        enabled: false,
+        configured: false,
+        apiVersion: '2026-08-14',
+        dispatchEnabled: false,
+        lineRuntimeEnabled: false,
+        lineDataHandlingReviewed: false,
+        ttsProvider: 'other',
+        sttProvider: 'other',
+        callHistoryAvailable: businessScopedAccess || globalAdminAccess,
+        phoneAssignmentAvailable: globalAdminAccess,
+        reviewAuditAvailable: globalAdminAccess,
+        adminActionAuditAvailable: globalAdminAccess,
+        phoneNumberOperationAuditAvailable: globalAdminAccess,
+        providerOperationAuditAvailable: globalAdminAccess,
+        callOperationAuditAvailable: globalAdminAccess,
+      },
+      business_id: businessScopedAccess ? businessId : null,
+      reviewAudit: globalAdminAccess ? cartesiaFixtureReviewAudit : [],
+      adminActionAudit: globalAdminAccess ? cartesiaFixtureAdminActionAudit : [],
+      phoneNumberOperationAudit: [],
+      providerOperationAudit: [],
+      callOperationAudit: [],
+      capabilities: [
+        { layer: 'managed_agents', name: 'outbound_call', platform: 'implemented' },
+        { layer: 'managed_agents', name: 'scheduled_call_batch', platform: 'planned' },
+        { layer: 'managed_agents', name: 'inbound_call', platform: 'planned' },
+        { layer: 'line', name: 'managed_agent_websocket', platform: 'implemented' },
+        { layer: 'speech', name: 'sonic_tts', platform: 'implemented' },
+        { layer: 'speech', name: 'ink_stt', platform: 'implemented' },
+      ],
+      phoneNumbers: globalAdminAccess ? [{
+        id: 'pn_fixture_01',
+        label: 'Fixture support line',
+        number: '+15555550123',
+        ownership: 'twilio_imported',
+        agent: { id: cartesiaFixturePhoneAgentId, name: cartesiaFixturePhoneAgentId === 'agent_fixture_01' ? 'Fixture support agent' : 'Updated fixture agent' },
+        provider: { id: 'provider_fixture_01', type: 'twilio', label: 'Fixture Twilio' },
+      }] : [],
+      telephonyProviders: [],
+      calls: businessScopedAccess || globalAdminAccess ? [{
+        localCallId: 'cartesia_local_fixture_01',
+        providerCallId: 'call_fixture_001',
+        agentId: 'agent_fixture_01',
+        phoneNumberMasked: '+•••••••0123',
+        direction: 'outbound',
+        status: 'completed',
+        startTime: '2026-11-04T12:00:00.000Z',
+        endTime: '2026-11-04T12:00:12.000Z',
+        telephonyAccountType: 'cartesia',
+      }] : [],
+      warnings: [],
+      request_id: 'fixture_cartesia_overview',
+    };
+  }
+  const cartesiaAssignmentMatch = path.match(/^\/miniapp\/cartesia\/phone-numbers\/([^/]+)\/assignment(?:\/(preview))?$/);
+  if (cartesiaAssignmentMatch) {
+    if (role !== 'admin' || cartesiaAssignmentMatch[1] !== 'pn_fixture_01') {
+      return { success: false, code: 'miniapp_capability_denied', error: 'Global admin access is required' };
+    }
+    let body: Record<string, unknown> = {};
+    try { body = asRecord(JSON.parse(typeof options.body === 'string' ? options.body : '{}')); } catch { body = {}; }
+    const targetAgentId = typeof body.agent_id === 'string' ? body.agent_id : null;
+    if (cartesiaAssignmentMatch[2] === 'preview' && String(options.method || 'GET').toUpperCase() === 'POST') {
+      return {
+        success: true,
+        preview: {
+          phoneNumberId: 'pn_fixture_01',
+          number: '+15555550123',
+          currentAgentId: cartesiaFixturePhoneAgentId,
+          targetAgentId,
+          requiresChange: cartesiaFixturePhoneAgentId !== targetAgentId,
+          requestFingerprint: 'f'.repeat(64),
+        },
+      };
+    }
+    if (!cartesiaAssignmentMatch[2] && String(options.method || 'GET').toUpperCase() === 'PUT' &&
+        body.approved === true && body.confirmed_fingerprint === 'f'.repeat(64) && typeof body.idempotency_key === 'string') {
+      const previousAgentId = cartesiaFixturePhoneAgentId || null;
+      cartesiaFixturePhoneAgentId = targetAgentId || '';
+      cartesiaFixtureAdminActionAudit = [
+        {
+          id: Date.now() + 1,
+          actorTelegramId: '12345',
+          action: 'phone_agent_assignment',
+          resourceType: 'phone_number',
+          resourceId: 'pn_fixture_01',
+          outcome: 'succeeded',
+          previousAgentId,
+          targetAgentId,
+          createdAt: nowIso,
+        },
+        {
+          id: Date.now(),
+          actorTelegramId: '12345',
+          action: 'phone_agent_assignment',
+          resourceType: 'phone_number',
+          resourceId: 'pn_fixture_01',
+          outcome: 'requested',
+          previousAgentId: null,
+          targetAgentId,
+          createdAt: nowIso,
+        },
+        ...cartesiaFixtureAdminActionAudit,
+      ].slice(0, 25);
+      return { success: true, assignment: { phoneNumberId: 'pn_fixture_01', agentId: targetAgentId, changed: true, idempotentReplay: false } };
+    }
+    return { success: false, code: 'cartesia_phone_assignment_invalid', error: 'A valid assignment preview is required' };
+  }
+  const workflowBusinessMatch = path.match(/^\/miniapp\/businesses\/([^/]+)\/post-call\//);
+  if (workflowBusinessMatch) {
+    const businessId = decodeURIComponent(workflowBusinessMatch[1]);
+    const method = String(options.method || 'GET').toUpperCase();
+    if (path.endsWith('/workflows') && method === 'GET') return { success: true, versions: fixtureWorkflowVersions };
+    if (path.endsWith('/workflow-runs') && method === 'GET') return { success: true, runs: [] };
+    if (path.endsWith('/workflows') && method === 'POST') {
+      let definition: Record<string, unknown> = {};
+      try { definition = asRecord(JSON.parse(typeof options.body === 'string' ? options.body : '{}')); } catch { definition = {}; }
+      const workflowId = toText(definition.workflow_id, 'fixture_workflow');
+      const prior = fixtureWorkflowVersions.filter((version) => version.workflow_id === workflowId);
+      const version = {
+        ...definition,
+        workflow_id: workflowId,
+        version: prior.length + 1,
+        business_id: businessId,
+        status: 'draft',
+        definition,
+      };
+      fixtureWorkflowVersions = [version, ...fixtureWorkflowVersions];
+      return { success: true, version };
+    }
+    const approvalMatch = path.match(/\/workflows\/([^/]+)\/versions\/(\d+)\/approve$/);
+    if (approvalMatch && method === 'POST') {
+      const workflowId = decodeURIComponent(approvalMatch[1]);
+      const versionNumber = Number(approvalMatch[2]);
+      fixtureWorkflowVersions = fixtureWorkflowVersions.map((version) =>
+        version.workflow_id === workflowId && version.version === versionNumber
+          ? { ...version, status: 'approved' }
+          : version,
+      );
+      return { success: true, version: fixtureWorkflowVersions.find((version) => version.workflow_id === workflowId && version.version === versionNumber) };
+    }
+    return { success: false, error: { code: 'post_call_workflow_fixture_not_found', message: 'Fixture workflow route not found' } };
+  }
   if (path === '/miniapp/bootstrap' || path === '/miniapp/jobs/poll') {
     return createDashboardFixturePayload(nowIso, role);
   }

@@ -302,11 +302,12 @@ class PostCallWorkflowDefinitionService {
     return { ...row, definition };
   }
 
-  async createDraft(input, actor = "admin_token") {
+  async createDraft(input, actor = "admin_token", businessId = undefined) {
     const definition = normalizeWorkflowDefinition(input);
     if (!this.db || typeof this.db.createPostCallWorkflowDefinitionDraft !== "function") {
       fail("Workflow definition persistence is not available", "service_unavailable");
     }
+<<<<<<< HEAD
     if (typeof this.db.getLatestPostCallWorkflowDefinition === "function") {
       const latest = await this.db.getLatestPostCallWorkflowDefinition(definition.workflow_id);
       if (latest && String(latest.business_id || "") !== String(definition.business_id || "")) {
@@ -316,6 +317,17 @@ class PostCallWorkflowDefinitionService {
     const row = await this.db.createPostCallWorkflowDefinitionDraft({
       workflow_id: definition.workflow_id,
       business_id: definition.business_id,
+=======
+    const scope = businessId === undefined ? (input.business_id ?? null) : businessId;
+    if (scope !== null && !/^[A-Za-z0-9._:-]{1,120}$/.test(String(scope))) fail("business_id is invalid");
+    const previous = await this.db.getLatestPostCallWorkflowDefinition(definition.workflow_id);
+    if (previous && (previous.business_id || null) !== (scope || null)) {
+      fail("workflow_id is already assigned to another business", "conflict");
+    }
+    const row = await this.db.createPostCallWorkflowDefinitionDraft({
+      workflow_id: definition.workflow_id,
+      business_id: scope,
+>>>>>>> 95a068c (updated)
       name: definition.name,
       trigger_event: definition.trigger_event,
       schema_version: definition.schema_version,
@@ -325,17 +337,19 @@ class PostCallWorkflowDefinitionService {
     return this.hydrate(row);
   }
 
-  async listVersions(workflowId, limit = 100) {
+  async listVersions(workflowId, limit = 100, businessId = undefined) {
     if (!this.db || typeof this.db.listPostCallWorkflowDefinitions !== "function") {
       fail("Workflow definition persistence is not available", "service_unavailable");
     }
     const normalizedId = workflowId ? String(workflowId).trim() : "";
     if (normalizedId && !/^[A-Za-z0-9][A-Za-z0-9_-]{0,119}$/.test(normalizedId)) fail("workflow_id is invalid");
-    const rows = await this.db.listPostCallWorkflowDefinitions({ workflow_id: normalizedId || undefined, limit });
+    const filters = { workflow_id: normalizedId || undefined, limit };
+    if (businessId !== undefined) filters.business_id = businessId;
+    const rows = await this.db.listPostCallWorkflowDefinitions(filters);
     return rows.map((row) => this.hydrate(row));
   }
 
-  async approveVersion(workflowId, version, actor = "admin_token") {
+  async approveVersion(workflowId, version, actor = "admin_token", businessId = undefined) {
     const normalizedId = String(workflowId || "").trim();
     const normalizedVersion = Number(version);
     if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,119}$/.test(normalizedId)) fail("workflow_id is invalid");
@@ -343,12 +357,12 @@ class PostCallWorkflowDefinitionService {
     if (!this.db || typeof this.db.getPostCallWorkflowDefinition !== "function") {
       fail("Workflow definition persistence is not available", "service_unavailable");
     }
-    const existing = await this.db.getPostCallWorkflowDefinition(normalizedId, normalizedVersion);
+    const existing = await this.db.getPostCallWorkflowDefinition(normalizedId, normalizedVersion, businessId);
     if (!existing) fail("Workflow definition version was not found", "not_found");
     if (existing.status !== "draft") fail("Only draft workflow versions can be approved", "conflict");
-    const changed = await this.db.approvePostCallWorkflowDefinition(normalizedId, normalizedVersion, actor);
+    const changed = await this.db.approvePostCallWorkflowDefinition(normalizedId, normalizedVersion, actor, businessId);
     if (!changed) fail("Workflow definition changed before approval; refresh and review it", "conflict");
-    return this.hydrate(await this.db.getPostCallWorkflowDefinition(normalizedId, normalizedVersion));
+    return this.hydrate(await this.db.getPostCallWorkflowDefinition(normalizedId, normalizedVersion, businessId));
   }
 }
 
@@ -359,4 +373,5 @@ module.exports = {
   BUSINESS_SCOPED_TRIGGER_EVENTS,
   RESULT_CLASSIFICATION_LABELS,
   normalizeWorkflowDefinition,
+  assertSafeData,
 };

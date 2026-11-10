@@ -7,7 +7,8 @@ const {
 const CALL_AGENT_SCHEMA_VERSION = 1;
 const CALL_AGENT_PROVIDER_CAPABILITY_SCHEMA_VERSION = 1;
 const CALL_AGENT_HANDOFF_CONFIG_VERSION = 5;
-const CALL_AGENT_RUNTIME_CONFIG_VERSION = 6;
+const CALL_AGENT_PREVIOUS_RUNTIME_CONFIG_VERSION = 6;
+const CALL_AGENT_RUNTIME_CONFIG_VERSION = 7;
 const LEGACY_CALL_AGENT_RUNTIME_CONFIG_VERSION = 1;
 const CALL_AGENT_BUSINESS_CONTEXT_CONFIG_VERSION = 2;
 const CALL_AGENT_ESCALATION_CONFIG_VERSION = 3;
@@ -212,6 +213,48 @@ function normalizeCallAgentDeepgramSettings(value, errors, { voiceModel } = {}) 
   };
 }
 
+function normalizeCallAgentVoiceSettings(value, errors, { voiceModel } = {}) {
+  const provider = typeof value?.provider === 'string'
+    ? value.provider.trim().toLowerCase()
+    : 'deepgram';
+  if (provider !== 'cartesia_line') {
+    if (value?.provider !== undefined && provider !== 'deepgram') {
+      errors.push('voice_agent_settings.provider must be deepgram or cartesia_line.');
+    }
+    if (provider === 'deepgram' && value?.provider !== undefined) {
+      const deepgramSettings = { ...value };
+      delete deepgramSettings.provider;
+      return normalizeCallAgentDeepgramSettings(deepgramSettings, errors, { voiceModel });
+    }
+    return normalizeCallAgentDeepgramSettings(value, errors, { voiceModel });
+  }
+  if (Object.keys(value).some((key) => !['provider', 'agent_id'].includes(key))) {
+    errors.push('Cartesia Line voice_agent_settings contains unsupported fields.');
+  }
+  const agentId = typeof value.agent_id === 'string' ? value.agent_id.trim() : '';
+  if (!/^agent_[A-Za-z0-9_-]{6,128}$/.test(agentId)) {
+    errors.push('Cartesia Line voice_agent_settings.agent_id must be a valid hosted agent ID.');
+  }
+  return {
+    provider: 'cartesia_line',
+    ...(agentId ? { agent_id: agentId } : {}),
+  };
+}
+
+function normalizeCallAgentSpeechSettings(value, errors) {
+  if (value === undefined) return undefined;
+  if (!value || typeof value !== 'object' || Array.isArray(value) ||
+      Object.keys(value).some((key) => !['provider', 'voice_id'].includes(key))) {
+    errors.push('speech_settings must contain only provider and voice_id.');
+    return null;
+  }
+  const provider = String(value.provider || '').trim().toLowerCase();
+  const voiceId = String(value.voice_id || '').trim();
+  if (provider !== 'cartesia') errors.push('speech_settings.provider must be cartesia.');
+  if (!/^[A-Za-z0-9_-]{1,200}$/.test(voiceId)) errors.push('speech_settings.voice_id is invalid.');
+  return { provider: 'cartesia', voice_id: voiceId };
+}
+
 function resolveCallAgentToolFailureAction(policy) {
   if (!policy) return null;
   return policy.on_tool_error === 'continue' ? 'continue' : 'end_call';
@@ -271,7 +314,8 @@ function validateCallAgentRuntimeConfig(value, { availableToolNames, voiceModel 
   const isEscalationSchema = schemaVersion === CALL_AGENT_ESCALATION_CONFIG_VERSION;
   const isToolFailureSchema = schemaVersion === CALL_AGENT_TOOL_FAILURE_CONFIG_VERSION;
   const isHandoffSchema = schemaVersion === CALL_AGENT_HANDOFF_CONFIG_VERSION;
-  if (!isLegacySchema && !isBusinessContextSchema && !isEscalationSchema && !isToolFailureSchema && !isHandoffSchema && schemaVersion !== CALL_AGENT_RUNTIME_CONFIG_VERSION) {
+  const isPreviousRuntimeSchema = schemaVersion === CALL_AGENT_PREVIOUS_RUNTIME_CONFIG_VERSION;
+  if (!isLegacySchema && !isBusinessContextSchema && !isEscalationSchema && !isToolFailureSchema && !isHandoffSchema && !isPreviousRuntimeSchema && schemaVersion !== CALL_AGENT_RUNTIME_CONFIG_VERSION) {
     errors.push('Unsupported agent runtime configuration schema version.');
   }
   const allowedFields = isLegacySchema
@@ -284,7 +328,9 @@ function validateCallAgentRuntimeConfig(value, { availableToolNames, voiceModel 
           ? ['schema_version', 'approved_tools', 'tool_timeout_ms', 'business_context', 'escalation_policy', 'tool_failure_policy']
           : isHandoffSchema
             ? ['schema_version', 'approved_tools', 'tool_timeout_ms', 'business_context', 'escalation_policy', 'tool_failure_policy', 'handoff_policy']
-            : ['schema_version', 'approved_tools', 'tool_timeout_ms', 'business_context', 'escalation_policy', 'tool_failure_policy', 'handoff_policy', 'voice_agent_settings'];
+            : isPreviousRuntimeSchema
+              ? ['schema_version', 'approved_tools', 'tool_timeout_ms', 'business_context', 'escalation_policy', 'tool_failure_policy', 'handoff_policy', 'voice_agent_settings']
+              : ['schema_version', 'approved_tools', 'tool_timeout_ms', 'business_context', 'escalation_policy', 'tool_failure_policy', 'handoff_policy', 'voice_agent_settings', 'speech_settings'];
   if (Object.keys(value).some((key) => !allowedFields.includes(key))) {
     errors.push('Agent runtime configuration contains unsupported fields.');
   }
@@ -297,8 +343,8 @@ function validateCallAgentRuntimeConfig(value, { availableToolNames, voiceModel 
   if (value.tool_failure_policy !== undefined && schemaVersion < CALL_AGENT_TOOL_FAILURE_CONFIG_VERSION) {
     errors.push('tool_failure_policy requires runtime configuration schema version 4.');
   }
-  const canInheritToolPolicy = schemaVersion === CALL_AGENT_RUNTIME_CONFIG_VERSION
-    && value.voice_agent_settings !== undefined
+  const canInheritToolPolicy = (schemaVersion === CALL_AGENT_RUNTIME_CONFIG_VERSION || isPreviousRuntimeSchema)
+    && (value.voice_agent_settings !== undefined || value.speech_settings !== undefined)
     && value.approved_tools === undefined;
   const approvedTools = value.approved_tools;
   if (!canInheritToolPolicy && (!Array.isArray(approvedTools) || approvedTools.length > 100)) {
@@ -338,11 +384,17 @@ function validateCallAgentRuntimeConfig(value, { availableToolNames, voiceModel 
   const handoffPolicy = schemaVersion >= CALL_AGENT_HANDOFF_CONFIG_VERSION
     ? normalizeCallAgentHandoffPolicy(value.handoff_policy, errors)
     : undefined;
-  if (value.voice_agent_settings !== undefined && schemaVersion !== CALL_AGENT_RUNTIME_CONFIG_VERSION) {
+  if (value.voice_agent_settings !== undefined && schemaVersion !== CALL_AGENT_RUNTIME_CONFIG_VERSION && !isPreviousRuntimeSchema) {
     errors.push('voice_agent_settings requires runtime configuration schema version 6.');
   }
-  const voiceAgentSettings = schemaVersion === CALL_AGENT_RUNTIME_CONFIG_VERSION
-    ? normalizeCallAgentDeepgramSettings(value.voice_agent_settings, errors, { voiceModel })
+  const voiceAgentSettings = schemaVersion === CALL_AGENT_RUNTIME_CONFIG_VERSION || isPreviousRuntimeSchema
+    ? normalizeCallAgentVoiceSettings(value.voice_agent_settings, errors, { voiceModel })
+    : undefined;
+  if (value.speech_settings !== undefined && schemaVersion !== CALL_AGENT_RUNTIME_CONFIG_VERSION) {
+    errors.push('speech_settings requires runtime configuration schema version 7.');
+  }
+  const speechSettings = schemaVersion === CALL_AGENT_RUNTIME_CONFIG_VERSION
+    ? normalizeCallAgentSpeechSettings(value.speech_settings, errors)
     : undefined;
   const normalized = errors.length ? null : {
     schema_version: schemaVersion,
@@ -353,6 +405,7 @@ function validateCallAgentRuntimeConfig(value, { availableToolNames, voiceModel 
     ...(toolFailurePolicy === undefined ? {} : { tool_failure_policy: toolFailurePolicy }),
     ...(handoffPolicy === undefined ? {} : { handoff_policy: handoffPolicy }),
     ...(voiceAgentSettings === undefined ? {} : { voice_agent_settings: voiceAgentSettings }),
+    ...(speechSettings === undefined ? {} : { speech_settings: speechSettings }),
   };
   return { valid: errors.length === 0, errors: Object.freeze(errors), normalized };
 }

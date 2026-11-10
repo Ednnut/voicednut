@@ -109,7 +109,8 @@ async function handleHelp(ctx) {
                 '🧭 /admin — open the Mini App admin console',
                 '🧰 /scripts — manage reusable prompts',
                 '🍃 /persona — sculpt adaptive agents',
-                '🔀 /provider — view or switch voice providers'
+                '🔀 /provider — view or switch voice providers',
+                '🧭 /cartesia — view Cartesia status; preview/apply a script voice profile'
             ];
             helpSections.push(`<b>Admin Toolkit</b>\n${formatLines(adminList)}`);
         }

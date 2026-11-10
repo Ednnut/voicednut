@@ -110,6 +110,39 @@ describe('call agent runtime configuration persistence', () => {
     assert.equal(stored.voice_model, 'aura-2-celeste-es');
   });
 
+  it('round trips schema-v7 Cartesia speech profiles in the existing agent config column', async () => {
+    const config = {
+      schema_version: 7,
+      speech_settings: { provider: 'cartesia', voice_id: 'voice-test_01' },
+    };
+    const templateId = await db.createCallTemplate({
+      name: 'Cartesia Sonic profile',
+      prompt: 'Provide concise appointment support.',
+      first_message: 'Hello.',
+      agent_config: config,
+    });
+    const stored = await db.getCallTemplateById(templateId);
+    assert.deepEqual(JSON.parse(stored.agent_config_json), config);
+  });
+
+  it('supports optimistic version checks when updating a call template', async () => {
+    const id = await db.createCallTemplate({
+      name: 'Version guarded profile',
+      prompt: 'Help with scheduling.',
+      first_message: 'Hello.',
+      agent_config: { schema_version: 7, speech_settings: { provider: 'cartesia', voice_id: 'voice_before' } },
+    });
+    const current = await db.getCallTemplateById(id);
+    const updated = { schema_version: 7, speech_settings: { provider: 'cartesia', voice_id: 'voice_after' } };
+
+    assert.equal(await db.updateCallTemplate(id, { agent_config: updated }, current.version), 1);
+    assert.equal(await db.updateCallTemplate(id, { name: 'Stale write' }, current.version), 0);
+    const stored = await db.getCallTemplateById(id);
+    assert.equal(stored.name, 'Version guarded profile');
+    assert.equal(stored.version, current.version + 1);
+    assert.deepEqual(JSON.parse(stored.agent_config_json), updated);
+  });
+
   it('reapplies the additive config column migration to an older template schema', async () => {
     await new Promise((resolve, reject) => {
       db.db.run('ALTER TABLE call_templates DROP COLUMN agent_config_json', (error) => {

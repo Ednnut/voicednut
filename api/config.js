@@ -66,6 +66,12 @@ function parseList(rawValue) {
     .filter(Boolean);
 }
 
+function parseBoundedInteger(rawValue, fallback, min, max) {
+  const parsed = Number(rawValue);
+  if (!Number.isSafeInteger(parsed)) return fallback;
+  return Math.max(min, Math.min(max, parsed));
+}
+
 function parseNumericMap(rawValue, options = {}) {
   const min = Number.isFinite(Number(options.min)) ? Number(options.min) : -Infinity;
   const max = Number.isFinite(Number(options.max)) ? Number(options.max) : Infinity;
@@ -1149,6 +1155,7 @@ module.exports = {
   },
   callE,
   cartesia: {
+<<<<<<< HEAD
     enabled: cartesiaEnabled,
     dispatchEnabled: readBooleanEnv("CARTESIA_DISPATCH_ENABLED", false),
     agentRuntimeEnabled: readBooleanEnv("CARTESIA_AGENT_RUNTIME_ENABLED", false),
@@ -1160,6 +1167,31 @@ module.exports = {
     webhookSecret: readEnv("CARTESIA_WEBHOOK_SECRET") || "",
     webhookUrl: readEnv("CARTESIA_WEBHOOK_URL") || "",
     requestTimeoutMs: Number(readEnv("CARTESIA_API_TIMEOUT_MS") || "12000"),
+=======
+    enabled: readBooleanEnv("CARTESIA_MANAGED_AGENTS_ENABLED", false),
+    apiKey: String(readEnv("CARTESIA_API_KEY") || "").trim(),
+    apiVersion: String(readEnv("CARTESIA_API_VERSION") || "2026-08-14").trim(),
+    lineAgentEnabled: readBooleanEnv("CARTESIA_LINE_AGENT_ENABLED", false),
+    lineDataHandlingReviewed: readBooleanEnv("CARTESIA_LINE_DATA_HANDLING_REVIEWED", false),
+    timeoutMs: Math.max(
+      1000,
+      Math.min(30000, Number(readEnv("CARTESIA_MANAGED_AGENTS_TIMEOUT_MS") || 10000)),
+    ),
+    dispatchEnabled: readBooleanEnv("CARTESIA_DISPATCH_ENABLED", false),
+    batchDispatchEnabled: readBooleanEnv("CARTESIA_BATCH_DISPATCH_ENABLED", false),
+    batchRetentionEnabled: readBooleanEnv("CARTESIA_BATCH_RETENTION_ENABLED", false),
+    batchRetentionDays: parseBoundedInteger(readEnv("CARTESIA_BATCH_RETENTION_DAYS"), 0, 0, 3650),
+    batchReconciliationEnabled: readBooleanEnv("CARTESIA_BATCH_RECONCILIATION_ENABLED", false),
+    batchReconciliationIntervalMs: parseBoundedInteger(readEnv("CARTESIA_BATCH_RECONCILIATION_INTERVAL_MS"), 60000, 15000, 900000),
+    batchReconciliationBatchSize: parseBoundedInteger(readEnv("CARTESIA_BATCH_RECONCILIATION_BATCH_SIZE"), 5, 1, 10),
+    phoneNumberMutationsEnabled: readBooleanEnv("CARTESIA_PHONE_NUMBER_MUTATIONS_ENABLED", false),
+    phoneNumberProvisioningEnabled: readBooleanEnv("CARTESIA_PHONE_NUMBER_PROVISIONING_ENABLED", false),
+    sipProviderMutationsEnabled: readBooleanEnv("CARTESIA_SIP_PROVIDER_MUTATIONS_ENABLED", false),
+    telephonyProviderMutationsEnabled: readBooleanEnv("CARTESIA_TELEPHONY_PROVIDER_MUTATIONS_ENABLED", false),
+    webhookMutationsEnabled: readBooleanEnv("CARTESIA_WEBHOOK_MUTATIONS_ENABLED", false),
+    allowedDestinations: parseList(readEnv("CARTESIA_ALLOWED_DESTINATIONS")),
+    webhookSecret: String(readEnv("CARTESIA_WEBHOOK_SECRET") || "").trim(),
+>>>>>>> 95a068c (updated)
   },
   twilio: {
     accountSid: ensure("TWILIO_ACCOUNT_SID"),
@@ -1451,6 +1483,20 @@ module.exports = {
           voiceAgentDefaults.autoCanary.maxNoAudioFallbackRate,
         failClosedOnBreach: voiceAgentDefaults.autoCanary.failClosedOnBreach,
       },
+    },
+  },
+  transcription: {
+    provider: String(readEnv("STT_PROVIDER") || "deepgram").trim().toLowerCase(),
+  },
+  tts: {
+    provider: String(readEnv("TTS_PROVIDER") || "deepgram").trim().toLowerCase(),
+    cartesia: {
+      apiKey: String(readEnv("CARTESIA_API_KEY") || "").trim(),
+      voiceId: String(readEnv("CARTESIA_VOICE_ID") || "").trim(),
+      model: String(readEnv("CARTESIA_TTS_MODEL") || "sonic-3.6").trim(),
+      apiVersion: String(readEnv("CARTESIA_API_VERSION") || "2026-08-14").trim(),
+      timeoutMs: Math.max(1000, Math.min(30000, Number(readEnv("CARTESIA_TTS_TIMEOUT_MS") || 10000))),
+      fallbackToDeepgram: readBooleanEnv("CARTESIA_TTS_FALLBACK_TO_DEEPGRAM", true),
     },
   },
   server: {

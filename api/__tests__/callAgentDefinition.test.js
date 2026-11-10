@@ -11,6 +11,25 @@ const {
 } = require('../services/callAgentDefinition');
 
 describe('call agent definition validation', () => {
+  it('accepts a versioned Cartesia speech profile independently from conversational runtime settings', () => {
+    const result = validateCallAgentRuntimeConfig({
+      schema_version: 7,
+      speech_settings: { provider: 'cartesia', voice_id: 'voice-test_01' },
+    });
+    assert.equal(result.valid, true);
+    assert.deepEqual(result.normalized.speech_settings, {
+      provider: 'cartesia', voice_id: 'voice-test_01',
+    });
+    assert.equal(validateCallAgentRuntimeConfig({
+      schema_version: 7,
+      speech_settings: { provider: 'deepgram', voice_id: 'voice-test_01' },
+    }).valid, false);
+    assert.equal(validateCallAgentRuntimeConfig({
+      schema_version: 6,
+      speech_settings: { provider: 'cartesia', voice_id: 'voice-test_01' },
+    }).valid, false);
+  });
+
   it('accepts an existing call template as a versioned agent definition', () => {
     const result = validateCallAgentDefinition({
       name: 'Appointment helper',
@@ -267,6 +286,31 @@ describe('call agent runtime configuration validation', () => {
       },
     }, { voiceModel: 'aura-2-celeste-es' });
     assert.equal(spanish.valid, true);
+  });
+
+  it('validates Cartesia hosted agent selection without requiring Deepgram model settings', () => {
+    const result = validateCallAgentRuntimeConfig({
+      schema_version: 6,
+      approved_tools: [],
+      voice_agent_settings: {
+        provider: 'cartesia_line',
+        agent_id: 'agent_1234567890',
+      },
+    });
+    assert.equal(result.valid, true);
+    assert.deepEqual(result.normalized.voice_agent_settings, {
+      provider: 'cartesia_line',
+      agent_id: 'agent_1234567890',
+    });
+    const invalid = validateCallAgentRuntimeConfig({
+      schema_version: 6,
+      approved_tools: [],
+      voice_agent_settings: {
+        provider: 'cartesia_line',
+        agent_id: 'https://example.test/agent',
+      },
+    });
+    assert.equal(invalid.valid, false);
   });
 
   it('rejects mismatched Deepgram language, model, speech voice, and reasoning model settings', () => {

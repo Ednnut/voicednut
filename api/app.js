@@ -17,6 +17,8 @@ const { StreamService } = require("./routes/stream");
 const { TranscriptionService } = require("./routes/transcription");
 const { TextToSpeechService } = require("./routes/tts");
 const { VoiceAgentBridge } = require("./routes/voiceAgentBridge");
+const { CartesiaLineAgentSession } = require("./services/cartesiaLineAgentSession");
+const { resolveCartesiaLineRuntime } = require("./services/cartesiaLineRuntimePolicy");
 const {
   resolveCallAgentHandoffPolicy,
   exposeCallAgentHandoffAction,
@@ -140,6 +142,7 @@ const { OutboundCallSafetyService } = require("./services/outboundCallSafetyServ
 const { registerCallEContactPolicyRoutes } = require("./services/callEContactPolicyRoutes");
 const { CallEOperatorConfirmationService } = require("./services/callEOperatorConfirmationService");
 const { CallEDispatchService, approvedFingerprintFromEnv } = require("./services/callEDispatchService");
+<<<<<<< HEAD
 const { CallECampaignService } = require("./services/callECampaignService");
 const { CallECampaignMissionService } = require("./services/callECampaignMissionService");
 const { CallECampaignMissionWorker } = require("./services/callECampaignMissionWorker");
@@ -155,6 +158,20 @@ const { CallEGoalRunService } = require("./services/callEGoalRunService");
 const { createCallECampaignRouteHandlers } = require("./services/callECampaignRouteHandlers");
 const { createCallEActorAssertionMiddleware, verifyCallEActorAssertion } = require("./services/callEActorAssertion");
 const { CallEGoalPlannerService } = require("./services/callEGoalPlannerService");
+=======
+const { createCartesiaClient } = require("./services/cartesiaClient");
+const { CartesiaCallService } = require("./services/cartesiaCallService");
+const { CartesiaBatchService } = require("./services/cartesiaBatchService");
+const { CartesiaPhoneNumberService } = require("./services/cartesiaPhoneNumberService");
+const { CartesiaTelephonyProviderService } = require("./services/cartesiaTelephonyProviderService");
+const { CartesiaSpeechService } = require("./services/cartesiaSpeechService");
+const { createCartesiaWebhookHandler } = require("./services/cartesiaWebhookService");
+const { CartesiaWebhookConfigService } = require("./services/cartesiaWebhookConfigService");
+const { registerCartesiaCallRoutes } = require("./services/cartesiaCallRoutes");
+const { registerCartesiaDashboardRoutes } = require("./services/cartesiaDashboardRoutes");
+const { registerCartesiaSpeechRoutes } = require("./services/cartesiaSpeechRoutes");
+const { registerCartesiaSpeechProfileRoutes } = require("./services/cartesiaSpeechProfileRoutes");
+>>>>>>> 95a068c (updated)
 const {
   CALL_AGENT_SCHEMA_VERSION,
   validateCallAgentDefinition,
@@ -354,11 +371,14 @@ let crmContactSyncService;
 let postCallAutomationService;
 let postCallWorkflowDefinitionService;
 let postCallWorkflowExecutionService;
+<<<<<<< HEAD
 let callECampaignMissionWorker = null;
 let callECampaignRetentionWorker = null;
 let callEMissionAlertWorker = null;
 let callEMissionAutomationWorker = null;
 let businessIntegrationConnectionService;
+=======
+>>>>>>> 95a068c (updated)
 const sttFallbackCalls = new Set();
 const streamTimeoutCalls = new Set();
 const inboundRateBuckets = new Map();
@@ -1173,20 +1193,39 @@ function selectTwilioVoiceRuntime(callSid, callConfig) {
   const runtimeConfig = getEffectiveVoiceAgentRuntimeConfig();
   const mode = normalizeVoiceRuntimeMode(runtimeConfig.mode);
   const enabled = runtimeConfig.enabled === true;
+  const cartesiaLineRuntime = resolveCartesiaLineRuntime(callConfig, {
+    lineAgentEnabled: config.cartesia?.lineAgentEnabled === true,
+    dataHandlingReviewed: config.cartesia?.lineDataHandlingReviewed === true,
+    apiKey: config.cartesia?.apiKey,
+  });
+  const requestedRuntimeProvider = String(
+    callConfig?.script_policy?.agent_config?.voice_agent_settings?.provider || "deepgram",
+  ).trim().toLowerCase();
+  if (requestedRuntimeProvider === "cartesia_line" && !cartesiaLineRuntime.selected) {
+    return {
+      mode: "legacy",
+      useVoiceAgent: false,
+      reason: cartesiaLineRuntime.reason,
+      runtimeProvider: "cartesia_line",
+    };
+  }
+  const runtimeProvider = cartesiaLineRuntime.selected ? "cartesia_line" : "deepgram";
   if (!enabled || mode === "legacy") {
     return {
       mode: "legacy",
       useVoiceAgent: false,
       reason: enabled ? "mode_legacy" : "voice_agent_disabled",
+      runtimeProvider,
     };
   }
 
-  if (isVoiceAgentCircuitOpen()) {
+  if (runtimeProvider !== "cartesia_line" && isVoiceAgentCircuitOpen()) {
     return {
       mode: "legacy",
       useVoiceAgent: false,
       reason: "voice_agent_circuit_open",
       forcedLegacyUntilMs: voiceAgentForcedLegacyUntilMs,
+      runtimeProvider,
     };
   }
 
@@ -1198,6 +1237,7 @@ function selectTwilioVoiceRuntime(callSid, callConfig) {
       mode: "legacy",
       useVoiceAgent: false,
       reason: "provider_not_supported",
+      runtimeProvider,
     };
   }
 
@@ -1207,6 +1247,18 @@ function selectTwilioVoiceRuntime(callSid, callConfig) {
       mode: "legacy",
       useVoiceAgent: false,
       reason: "digit_capture_active",
+      runtimeProvider,
+    };
+  }
+
+  // Cartesia is wired through the legacy audio bridge. Deepgram's managed
+  // Voice Agent session owns its own speech provider and cannot use this TTS adapter.
+  if (runtimeProvider !== "cartesia_line" && config.tts?.provider === "cartesia") {
+    return {
+      mode: "legacy",
+      useVoiceAgent: false,
+      reason: "cartesia_tts_requires_legacy_bridge",
+      runtimeProvider,
     };
   }
 
@@ -1215,6 +1267,7 @@ function selectTwilioVoiceRuntime(callSid, callConfig) {
       mode: "voice_agent",
       useVoiceAgent: true,
       reason: "forced_voice_agent_mode",
+      runtimeProvider,
     };
   }
 
@@ -1224,6 +1277,7 @@ function selectTwilioVoiceRuntime(callSid, callConfig) {
       mode: "legacy",
       useVoiceAgent: false,
       reason: "canary_zero",
+      runtimeProvider,
     };
   }
 
@@ -1233,6 +1287,7 @@ function selectTwilioVoiceRuntime(callSid, callConfig) {
     mode: selected ? "voice_agent" : "legacy",
     useVoiceAgent: selected,
     reason: selected ? "canary_selected" : "canary_skipped",
+    runtimeProvider,
     canaryBucket: bucket,
     canaryPercent,
   };
@@ -1900,7 +1955,7 @@ function validateTemplateAgentRuntimeConfig(template, config, options = {}) {
       ? [VAPI_BUSINESS_CONTEXT_TOOL_ID]
       : [],
   );
-  const runtimeConfig = config?.schema_version === 6 && !Array.isArray(config.approved_tools)
+  const runtimeConfig = [6, 7].includes(config?.schema_version) && !Array.isArray(config.approved_tools)
     ? { ...config, approved_tools: availableToolNames }
     : config;
   const validation = validateCallAgentRuntimeConfig(runtimeConfig, {
@@ -4229,6 +4284,7 @@ async function ensureCallRecord(
           .filter(Boolean),
       ),
       direction,
+      business_id: callConfig.business_id || null,
     });
     const callCreatedState = buildCallCreatedState({
       inbound,
@@ -8859,7 +8915,8 @@ function parseMiniAppCallScriptPath(pathname = "") {
 
 function getMiniAppScriptActor(options = {}) {
   const requestId = String(options.requestId || "").trim();
-  return requestId ? `miniapp:${requestId}` : "miniapp";
+  const actor = String(options.actor || "miniapp").trim() || "miniapp";
+  return requestId ? `${actor}:${requestId}` : actor;
 }
 
 async function runMiniAppCallScriptLocalBridgeInternal(options = {}) {
@@ -9070,8 +9127,22 @@ async function runMiniAppCallScriptLocalBridgeInternal(options = {}) {
       Object.assign(updates, objectiveMetadata.normalized);
       warnings = [...warnings, ...objectiveMetadata.warnings];
 
-      const updatedRows = await db.updateCallTemplate(scriptId, updates);
+      const expectedVersion = Number.isSafeInteger(options.expectedVersion) && options.expectedVersion > 0
+        ? options.expectedVersion
+        : null;
+      const updatedRows = await db.updateCallTemplate(scriptId, updates, expectedVersion);
       if (!updatedRows) {
+        if (expectedVersion !== null && await db.getCallTemplateById(scriptId)) {
+          return {
+            ok: false,
+            status: 409,
+            data: {
+              success: false,
+              code: "CALL_SCRIPT_VERSION_CONFLICT",
+              error: "Call script changed while the update was being applied",
+            },
+          };
+        }
         return {
           ok: false,
           status: 404,
@@ -9819,8 +9890,13 @@ function captureRawBody(req, _res, buf) {
 
 // CALL-E terminal snapshots may include transcripts; keep their larger bounded parser isolated to this path.
 app.use("/api/webhooks/call-e", express.json({ limit: "10mb", verify: captureRawBody }));
+<<<<<<< HEAD
 // Cartesia lifecycle events can carry final transcript payloads; bound them separately from small JSON APIs.
 app.use("/webhook/cartesia", express.json({ limit: "5mb", verify: captureRawBody }));
+=======
+// Cartesia supports batches up to 5,000 recipients; keep their larger request body capped and path-scoped.
+app.use("/api/cartesia/call-batches", express.json({ limit: "512kb", verify: captureRawBody }));
+>>>>>>> 95a068c (updated)
 app.use(express.json({ verify: captureRawBody }));
 app.use(express.urlencoded({ extended: true, verify: captureRawBody }));
 
@@ -9874,6 +9950,18 @@ const callEReconciliationLimiter = rateLimit({
   legacyHeaders: false,
 });
 const callEWebhookLimiter = rateLimit({
+  windowMs: 60000,
+  max: 60,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+const cartesiaCallLimiter = rateLimit({
+  windowMs: 60000,
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+const cartesiaWebhookLimiter = rateLimit({
   windowMs: 60000,
   max: 60,
   standardHeaders: true,
@@ -14855,6 +14943,7 @@ function startBackgroundWorkers() {
   if (backgroundWorkersStarted) return;
   backgroundWorkersStarted = true;
 
+<<<<<<< HEAD
   postCallWorkflowExecutionService?.start();
 
   if (config.cartesia?.dispatchEnabled === true && typeof db?.listDueCartesiaCampaigns === "function") {
@@ -14950,6 +15039,27 @@ function startBackgroundWorkers() {
     } else {
       console.info('CALL-E scheduled missions, review escalations, and report digests started.');
     }
+=======
+  if (config.cartesia?.batchReconciliationEnabled === true) {
+    const runCartesiaBatchReconciliation = () => {
+      cartesiaBatchService.runReconciliationWorker().then((result) => {
+        if (result?.scanned > 0) {
+          console.log('cartesia_batch_reconciliation_run', {
+            scanned: result.scanned,
+            reconciled: result.reconciled,
+            failed: result.failed,
+            exhausted: result.exhausted,
+          });
+        }
+      }).catch(() => {
+        console.error('cartesia_batch_reconciliation_worker_failed');
+      });
+    };
+    const intervalMs = config.cartesia.batchReconciliationIntervalMs || 60000;
+    const timer = setInterval(runCartesiaBatchReconciliation, intervalMs);
+    if (typeof timer.unref === 'function') timer.unref();
+    runCartesiaBatchReconciliation();
+>>>>>>> 95a068c (updated)
   }
 
   setInterval(() => {
@@ -14991,6 +15101,18 @@ function startBackgroundWorkers() {
       console.error("❌ Call job processor error:", error);
     });
   }, config.callJobs?.intervalMs || 5000);
+
+  setInterval(() => {
+    Promise.all([
+      postCallWorkflowExecutionService?.reconcileInterruptedRuns() || 0,
+      postCallWorkflowExecutionService?.reconcilePendingEvents() || 0,
+    ]).then(([reconciledRuns, queuedEvents]) => {
+      if (reconciledRuns > 0) console.warn("Interrupted post-call workflow runs require review", { count: reconciledRuns });
+      if (queuedEvents > 0) console.log("Pending post-call workflow events queued", { count: queuedEvents });
+    }).catch(() => {
+      console.error("❌ Post-call workflow reconciliation failed");
+    });
+  }, 60_000);
 
   processCallJobs().catch((error) => {
     console.error("❌ Initial call job processor error:", error);
@@ -15323,18 +15445,33 @@ async function startServer(options = {}) {
       logger: console,
     });
     postCallWorkflowDefinitionService = new PostCallWorkflowDefinitionService({ db });
+<<<<<<< HEAD
     businessIntegrationConnectionService = new BusinessIntegrationConnectionService({
       db,
       secretResolver: new BusinessIntegrationSecretResolver(),
     });
+=======
+>>>>>>> 95a068c (updated)
     postCallWorkflowExecutionService = new PostCallWorkflowExecutionService({
       db,
       definitionService: postCallWorkflowDefinitionService,
       automationService: postCallAutomationService,
+<<<<<<< HEAD
       enabled: config.postCallWorkflows?.enabled === true,
       pollMs: config.postCallWorkflows?.pollIntervalMs,
       logger: console,
     });
+=======
+    });
+    const reconciledWorkflowRuns = await postCallWorkflowExecutionService.reconcileInterruptedRuns();
+    if (reconciledWorkflowRuns > 0) {
+      console.warn("Interrupted post-call workflow runs require review", { count: reconciledWorkflowRuns });
+    }
+    const queuedWorkflowEvents = await postCallWorkflowExecutionService.reconcilePendingEvents();
+    if (queuedWorkflowEvents > 0) {
+      console.log("Pending post-call workflow events queued", { count: queuedWorkflowEvents });
+    }
+>>>>>>> 95a068c (updated)
     const defaultAutomationRules = await postCallAutomationService.ensureDefaultRules();
     if (defaultAutomationRules.installed > 0) {
       console.log(
@@ -15595,6 +15732,7 @@ app.ws("/connection", (ws, req) => {
     let gptService;
     let voiceAgentBridge = null;
     let voiceRuntimeMode = "legacy";
+    let voiceAgentRuntimeProvider = "deepgram";
     let voiceAgentRuntimeErrorCount = 0;
     let voiceAgentNoAudioTimer = null;
     let voiceAgentLastAudioAt = 0;
@@ -15608,7 +15746,12 @@ app.ws("/connection", (ws, req) => {
       console.error("Stream service error:", error);
     });
     const transcriptionService = new TranscriptionService();
-    const ttsService = new TextToSpeechService({});
+    const ttsService = new TextToSpeechService({
+      streamPlayback: config.tts?.provider === "cartesia",
+      voiceId: callConfig?.script_policy?.agent_config?.speech_settings?.provider === "cartesia"
+        ? callConfig.script_policy.agent_config.speech_settings.voice_id
+        : null,
+    });
     // Prewarm TTS to reduce first-synthesis delay (silent)
     ttsService
       .generate(
@@ -15635,7 +15778,9 @@ app.ws("/connection", (ws, req) => {
       voiceAgentRuntimeFallbackInProgress = true;
       clearVoiceAgentNoAudioTimer();
       try {
-        recordVoiceAgentCircuitEvent("runtime_fallback", callSid, reason);
+        if (voiceAgentRuntimeProvider !== "cartesia_line") {
+          recordVoiceAgentCircuitEvent("runtime_fallback", callSid, reason);
+        }
         recordVoiceAgentRuntimeEvent(
           mapVoiceAgentFallbackKind(reason),
           callSid,
@@ -15646,6 +15791,8 @@ app.ws("/connection", (ws, req) => {
         } catch {}
         voiceAgentBridge = null;
         voiceRuntimeMode = "legacy";
+        const previousRuntimeProvider = voiceAgentRuntimeProvider;
+        voiceAgentRuntimeProvider = "deepgram";
         const session = activeCalls.get(callSid);
         if (session) {
           session.voiceRuntime = "legacy";
@@ -15653,7 +15800,7 @@ app.ws("/connection", (ws, req) => {
         }
         await db
           .updateCallState(callSid, "voice_runtime_fallback", {
-            from: "voice_agent",
+            from: previousRuntimeProvider,
             to: "legacy",
             reason,
             at: new Date().toISOString(),
@@ -15699,6 +15846,9 @@ app.ws("/connection", (ws, req) => {
       }
       voiceAgentLastBargeClearAt = now;
       marks = [];
+      try {
+        ttsService.cancelStreaming();
+      } catch {}
       try {
         streamService.flush();
       } catch {}
@@ -16049,7 +16199,7 @@ app.ws("/connection", (ws, req) => {
             conversationProfile: sessionProfile,
             callSid,
           });
-          if (resolvedDeepgramVoiceModel) {
+          if (resolvedDeepgramVoiceModel && ttsService.provider === "deepgram") {
             ttsService.voiceModel = resolvedDeepgramVoiceModel;
           }
           const intentLine = `Call intent: ${callConfig?.script || "general"} | profile: ${sessionProfile || "general"} | purpose: ${callConfig?.purpose || sessionProfile || "general"} | business: ${callConfig?.business_context?.business_id || callConfig?.business_id || "unspecified"}. Keep replies concise and on-task.`;
@@ -16059,6 +16209,8 @@ app.ws("/connection", (ws, req) => {
           voiceRuntimeMode = runtimeDecision.mode;
 
           if (runtimeDecision.useVoiceAgent) {
+            voiceAgentRuntimeProvider = runtimeDecision.runtimeProvider || "deepgram";
+            const isCartesiaLineRuntime = voiceAgentRuntimeProvider === "cartesia_line";
             const voiceAgentConfig = getEffectiveVoiceAgentRuntimeConfig();
             const voiceAgentSpeakModel = resolveDeepgramVoiceModel(callConfig, {
               conversationProfile: sessionProfile,
@@ -16078,10 +16230,9 @@ app.ws("/connection", (ws, req) => {
             const rawGreeting = String(
               callConfig?.first_message || DEFAULT_INBOUND_FIRST_MESSAGE,
             );
-            const greetingText =
-              callConfig?.initial_prompt_played === true
-                ? ""
-                : sanitizeVoiceOutputText(rawGreeting, {
+            const greetingText = isCartesiaLineRuntime || callConfig?.initial_prompt_played === true
+              ? ""
+              : sanitizeVoiceOutputText(rawGreeting, {
                     maxChars: FIRST_MESSAGE_TTS_MAX_CHARS,
                     fallbackText: DEFAULT_INBOUND_FIRST_MESSAGE,
                   }).text;
@@ -16113,7 +16264,18 @@ app.ws("/connection", (ws, req) => {
               voiceAgentOverrides.listen_model || voiceAgentConfig.listenModel || "nova-2";
 
             try {
-              voiceAgentBridge = new VoiceAgentBridge({
+              if (isCartesiaLineRuntime) {
+                voiceAgentBridge = new CartesiaLineAgentSession({
+                  apiKey: config.cartesia?.apiKey,
+                  agentId: voiceAgentOverrides.agent_id,
+                  apiVersion: config.cartesia?.apiVersion,
+                  inputFormat: "mulaw_8000",
+                  outputDelivery: "speaking_pace",
+                  continuousInput: true,
+                  connectTimeoutMs: Number(voiceAgentConfig.settingsTimeoutMs) || 8000,
+                });
+              } else {
+                voiceAgentBridge = new VoiceAgentBridge({
                 apiKey: config.deepgram?.apiKey,
                 logPrefix: `voice-agent:${callSid}`,
                 managedThinkOnly: voiceAgentConfig.managedThinkOnly !== false,
@@ -16171,6 +16333,7 @@ app.ws("/connection", (ws, req) => {
                   },
                 },
               });
+              }
 
               voiceAgentBridge.on("audio", ({ base64, bytes }) => {
                 clearVoiceAgentNoAudioTimer();
@@ -16190,6 +16353,10 @@ app.ws("/connection", (ws, req) => {
                   }).catch(() => {});
                 }
                 streamService.buffer(null, base64);
+              });
+
+              voiceAgentBridge.on("clear", () => {
+                clearOutgoingAudioForBargeIn("cartesia_line_audio_output_clear");
               });
 
               voiceAgentBridge.on("conversationText", async ({ role, content }) => {
@@ -16430,6 +16597,12 @@ app.ws("/connection", (ws, req) => {
                   `⚠️ Voice agent error: ${error?.message || "runtime_error"}`,
                   { force: true },
                 );
+                if (voiceAgentRuntimeProvider === "cartesia_line") {
+                  if (error?.retryable !== true) {
+                    void switchVoiceAgentToLegacy("cartesia_line_runtime_error");
+                  }
+                  return;
+                }
                 const cfg = getVoiceAgentCircuitConfig();
                 if (cfg.enabled) {
                   recordVoiceAgentCircuitEvent(
@@ -16443,12 +16616,15 @@ app.ws("/connection", (ws, req) => {
                 }
               });
 
-              await voiceAgentBridge.connect();
+              const runtimeSession = await voiceAgentBridge.connect();
               voiceAgentRuntimeErrorCount = 0;
               voiceAgentLastAudioAt = 0;
-              voiceAgentLastUserSpeechAt = 0;
+              voiceAgentLastUserSpeechAt = isCartesiaLineRuntime ? Date.now() : 0;
               await db.updateCallState(callSid, "voice_runtime_selected", {
                 mode: "voice_agent",
+                runtime_provider: voiceAgentRuntimeProvider,
+                provider_call_id: runtimeSession?.callId || null,
+                provider_agent_version_id: runtimeSession?.agentVersionId || null,
                 reason: runtimeDecision.reason,
                 canary_bucket: runtimeDecision.canaryBucket ?? null,
                 canary_percent: runtimeDecision.canaryPercent ?? null,
@@ -16469,11 +16645,13 @@ app.ws("/connection", (ws, req) => {
               }
               webhookService.addLiveEvent(
                 callSid,
-                "🧠 Voice runtime:  Voicednut Agent (managed think)",
+                voiceAgentRuntimeProvider === "cartesia_line"
+                  ? "🧠 Voice runtime: Cartesia hosted agent"
+                  : "🧠 Voice runtime: Voicednut Agent (managed think)",
                 { force: true },
               );
               console.log(
-                `Voice runtime selected: deepgram_voice_agent (${runtimeDecision.reason})`,
+                `Voice runtime selected: ${voiceAgentRuntimeProvider} (${runtimeDecision.reason})`,
               );
             } catch (voiceAgentError) {
               console.error("Voice agent setup failed:", voiceAgentError);
@@ -16482,11 +16660,13 @@ app.ws("/connection", (ws, req) => {
                 callSid,
                 voiceAgentError?.message || "setup_failed",
               );
-              recordVoiceAgentCircuitEvent(
-                "settings_failure",
-                callSid,
-                voiceAgentError?.message || "setup_failed",
-              );
+              if (voiceAgentRuntimeProvider !== "cartesia_line") {
+                recordVoiceAgentCircuitEvent(
+                  "settings_failure",
+                  callSid,
+                  voiceAgentError?.message || "setup_failed",
+                );
+              }
               try {
                 voiceAgentBridge?.close();
               } catch {}
@@ -17144,9 +17324,15 @@ app.ws("/connection", (ws, req) => {
             }
             markStreamMediaSeen(callSid);
             if (voiceRuntimeMode === "voice_agent" && voiceAgentBridge) {
+              if (voiceAgentRuntimeProvider === "cartesia_line" &&
+                msg?.media?.track !== "inbound") {
+                return;
+              }
               const sent = voiceAgentBridge.sendAudioBase64(msg.media.payload);
               if (sent) {
-                voiceAgentLastUserSpeechAt = Date.now();
+                if (voiceAgentRuntimeProvider !== "cartesia_line") {
+                  voiceAgentLastUserSpeechAt = Date.now();
+                }
                 scheduleVoiceAgentNoAudioWatchdog();
               }
               return;
@@ -17176,9 +17362,15 @@ app.ws("/connection", (ws, req) => {
               }
               if (handoffInput?.handled) {
                 if (handoffInput.agent_message) {
-                  voiceAgentBridge?.injectAgentMessage?.(
-                    handoffInput.agent_message,
-                  );
+                  if (voiceAgentRuntimeProvider === "cartesia_line") {
+                    for (const digit of String(digits)) {
+                      voiceAgentBridge?.sendDtmf?.(digit);
+                    }
+                  } else {
+                    voiceAgentBridge?.injectAgentMessage?.(
+                      handoffInput.agent_message,
+                    );
+                  }
                 }
                 return;
               }
@@ -17188,7 +17380,20 @@ app.ws("/connection", (ws, req) => {
               source: "twilio_dtmf",
               reason: "dtmf_input",
             });
-            if (shouldFallbackVoiceAgentOnDtmf(voiceRuntimeMode)) {
+            const activeCallConfig = callConfigurations.get(callSid) || callConfig || {};
+            const digitCaptureActive = isCaptureActiveConfig(activeCallConfig) ||
+              digitService?.hasPlan?.(callSid) || digitService?.hasExpectation?.(callSid);
+            if (voiceRuntimeMode === "voice_agent" &&
+              voiceAgentRuntimeProvider === "cartesia_line" &&
+              !digitCaptureActive) {
+              const dtmfDigits = [...String(digits)];
+              if (dtmfDigits.length > 0 && dtmfDigits.every((digit) => /^[0-9*#]$/.test(digit))) {
+                for (const digit of dtmfDigits) voiceAgentBridge?.sendDtmf?.(digit);
+              }
+              return;
+            }
+            if (shouldFallbackVoiceAgentOnDtmf(voiceRuntimeMode) &&
+              voiceAgentRuntimeProvider !== "cartesia_line") {
               webhookService.addLiveEvent(
                 callSid,
                 `🔢 Keypad: ${digits} (voice agent -> legacy fallback)`,
@@ -17452,6 +17657,28 @@ app.ws("/connection", (ws, req) => {
       }
     });
 
+    transcriptionService.on("speechStart", () => {
+      if (!isInitialized) {
+        return;
+      }
+      clearSilenceTimer(callSid);
+      markGreetingRecoveryProgress(callSid, "twilio_speech_start");
+      setCallPhase(callSid, "active", {
+        source: "twilio_speech_start",
+        reason: "user_speaking",
+      });
+      if (callSid) {
+        sttLastFrameAt.set(callSid, Date.now());
+      }
+      webhookService
+        .setLiveCallPhase(callSid, "user_speaking")
+        .catch(() => {});
+      if (marks.length > 0) {
+        console.log("Speech start detected, clearing stream".red);
+        clearOutgoingAudioForBargeIn("cartesia_ink_turn_start");
+      }
+    });
+
     transcriptionService.on("transcription", async (text) => {
       try {
         if (!text || !gptService || !isInitialized) {
@@ -17627,6 +17854,18 @@ app.ws("/connection", (ws, req) => {
         }).catch(() => {});
       }
       streamService.buffer(responseIndex, audio);
+    });
+
+    ttsService.on("speech_chunk", (responseIndex, audio) => {
+      const level = estimateAudioLevelFromBase64(audio);
+      webhookService.setLiveCallPhase(callSid, "agent_speaking", { level }).catch(() => {});
+      streamService.bufferChunk(responseIndex, audio, false);
+    });
+    ttsService.on("speech_complete", (responseIndex, _label, _icount, metadata = {}) => {
+      if (metadata.incomplete) {
+        console.warn("Cartesia TTS stream ended after partial audio; skipping fallback playback");
+      }
+      streamService.bufferChunk(responseIndex, null, true);
     });
 
     streamService.on("audiosent", (markLabel) => {
@@ -17837,6 +18076,9 @@ app.ws("/vonage/stream", async (ws, req) => {
     const ttsService = new TextToSpeechService({
       encoding: vonageAudioSpec.ttsEncoding,
       sampleRate: vonageAudioSpec.sampleRate,
+      voiceId: callConfig?.script_policy?.agent_config?.speech_settings?.provider === "cartesia"
+        ? callConfig.script_policy.agent_config.speech_settings.voice_id
+        : null,
     });
     ttsService
       .generate(
@@ -18493,6 +18735,9 @@ app.ws("/plivo/stream", async (ws, req) => {
     const ttsService = new TextToSpeechService({
       encoding: plivoAudioSpec.ttsEncoding,
       sampleRate: plivoAudioSpec.sampleRate,
+      voiceId: callConfig?.script_policy?.agent_config?.speech_settings?.provider === "cartesia"
+        ? callConfig.script_policy.agent_config.speech_settings.voice_id
+        : null,
     });
     ttsService
       .generate(
@@ -25518,6 +25763,7 @@ app.post(
   }),
 );
 
+<<<<<<< HEAD
 app.get("/api/call-scripts/:id/vapi-tools", requireAdminToken, async (req, res) => {
   try {
     const service = new VapiToolPolicyService({ db });
@@ -25551,6 +25797,117 @@ app.put("/api/call-scripts/:id/vapi-tools", requireAdminToken, async (req, res) 
     const status = Number.isInteger(error?.status) ? error.status : 500;
     return res.status(status).json({ success: false, error: status >= 500 ? "Failed to update Vapi tool policy" : error.message, code: error?.code || "vapi_tool_policy_failed" });
   }
+=======
+const cartesiaClient = createCartesiaClient(config.cartesia);
+const cartesiaCallService = new CartesiaCallService({
+  client: cartesiaClient,
+  db,
+  enabled: config.cartesia?.enabled === true,
+  dispatchEnabled: config.cartesia?.dispatchEnabled === true,
+  allowedDestinations: config.cartesia?.allowedDestinations || [],
+});
+const cartesiaBatchService = new CartesiaBatchService({
+  client: cartesiaClient,
+  callService: cartesiaCallService,
+  db,
+  enabled: config.cartesia?.enabled === true,
+  dispatchEnabled: config.cartesia?.batchDispatchEnabled === true,
+  retentionEnabled: config.cartesia?.batchRetentionEnabled === true,
+  retentionDays: config.cartesia?.batchRetentionDays || 0,
+  reconciliationEnabled: config.cartesia?.batchReconciliationEnabled === true,
+  reconciliationIntervalMs: config.cartesia?.batchReconciliationIntervalMs || 60000,
+  reconciliationBatchSize: config.cartesia?.batchReconciliationBatchSize || 5,
+});
+const cartesiaPhoneNumberService = new CartesiaPhoneNumberService({
+  client: cartesiaClient,
+  db,
+  enabled: config.cartesia?.enabled === true,
+  mutationsEnabled: config.cartesia?.phoneNumberMutationsEnabled === true,
+  provisioningEnabled: config.cartesia?.phoneNumberProvisioningEnabled === true,
+});
+const cartesiaTelephonyProviderService = new CartesiaTelephonyProviderService({
+  client: cartesiaClient,
+  db,
+  enabled: config.cartesia?.enabled === true,
+  sipMutationsEnabled: config.cartesia?.sipProviderMutationsEnabled === true,
+  providerMutationsEnabled: config.cartesia?.telephonyProviderMutationsEnabled === true,
+  fingerprintSecret: config.cartesia?.apiKey,
+});
+const cartesiaWebhookConfigService = new CartesiaWebhookConfigService({
+  client: cartesiaClient,
+  db,
+  enabled: config.cartesia?.enabled === true,
+  mutationsEnabled: config.cartesia?.webhookMutationsEnabled === true,
+  webhookSecret: config.cartesia?.webhookSecret,
+  fingerprintSecret: config.cartesia?.apiKey,
+  publicWebhookUrl: config.server?.hostname
+    ? `https://${config.server.hostname}/api/webhooks/cartesia`
+    : '',
+});
+registerCartesiaCallRoutes(app, {
+  client: cartesiaClient,
+  service: cartesiaCallService,
+  batchService: cartesiaBatchService,
+  phoneNumberService: cartesiaPhoneNumberService,
+  telephonyProviderService: cartesiaTelephonyProviderService,
+  webhookConfigService: cartesiaWebhookConfigService,
+  db,
+  requireAdminToken,
+  limiter: cartesiaCallLimiter,
+  webhookLimiter: cartesiaWebhookLimiter,
+  webhookSecret: config.cartesia?.webhookSecret,
+  webhookHandler: createCartesiaWebhookHandler({
+    db,
+    webhookSecret: config.cartesia?.webhookSecret,
+  }),
+});
+const cartesiaSpeechService = new CartesiaSpeechService();
+registerCartesiaSpeechRoutes(app, {
+  service: cartesiaSpeechService,
+  requireAdminToken,
+  limiter: cartesiaCallLimiter,
+});
+registerCartesiaSpeechProfileRoutes(app, {
+  requireAdminToken,
+  limiter: cartesiaCallLimiter,
+  getTemplate: async (scriptId) => normalizeScriptTemplateRecord(await db.getCallTemplateById(scriptId)),
+  validateAgentConfig: (template, agentConfig) => validateTemplateAgentRuntimeConfig(template, agentConfig),
+  updateProfile: ({ scriptId, expectedVersion, agentConfig, confirmedFingerprint, idempotencyKey, requestId }) =>
+    runMiniAppCallScriptMutationWithIdempotency({
+      action: "cartesia_speech_profile",
+      target: scriptId,
+      payload: {
+        expected_version: expectedVersion,
+        agent_config: agentConfig,
+        confirmed_fingerprint: confirmedFingerprint,
+      },
+      idempotencyKey,
+      requestId,
+      execute: () => runMiniAppCallScriptLocalBridgeInternal({
+        method: "PUT",
+        path: `/api/call-scripts/${scriptId}`,
+        body: { agent_config: agentConfig },
+        requestId,
+        actor: "admin_api",
+        expectedVersion,
+      }),
+    }),
+});
+registerCartesiaDashboardRoutes(app, {
+  client: cartesiaClient,
+  callService: cartesiaCallService,
+  phoneNumberService: cartesiaPhoneNumberService,
+  telephonyProviderService: cartesiaTelephonyProviderService,
+  speechService: cartesiaSpeechService,
+  db,
+  requireMiniAppSession,
+  requireMiniAppCapability,
+  limiter: cartesiaCallLimiter,
+  lineAgentEnabled: config.cartesia?.lineAgentEnabled === true,
+  lineDataHandlingReviewed: config.cartesia?.lineDataHandlingReviewed === true,
+  ttsProvider: config.tts?.provider,
+  sttProvider: config.transcription?.provider,
+>>>>>>> 95a068c (updated)
 });
 
 app.post(
@@ -27721,6 +28078,26 @@ async function processCallJobs() {
               );
             }
           }
+        } else if (job.job_type === "post_call_workflow_resume") {
+          if (!postCallWorkflowExecutionService || !payload?.run_id) {
+            throw new Error("post_call_workflow_resume requires an initialized workflow service and run_id");
+          }
+          await runWithTimeout(
+            postCallWorkflowExecutionService.resumeRun(String(payload.run_id)),
+            jobTimeoutMs,
+            `workflow run ${payload.run_id}`,
+            "call_job_timeout",
+          );
+        } else if (job.job_type === "post_call_workflow_event") {
+          if (!postCallWorkflowExecutionService || !payload?.event_id) {
+            throw new Error("post_call_workflow_event requires an initialized workflow service and event_id");
+          }
+          await runWithTimeout(
+            postCallWorkflowExecutionService.processEvent(String(payload.event_id)),
+            jobTimeoutMs,
+            `workflow event ${payload.event_id}`,
+            "call_job_timeout",
+          );
         } else {
           throw new Error(`Unsupported job type ${job.job_type}`);
         }
@@ -28642,6 +29019,7 @@ async function placeOutboundCall(payload, hostOverride = null) {
         functionSystem.functions.map((f) => f.function.name),
       ),
       direction: "outbound",
+      business_id: business_id || null,
     });
     const callCreatedState = buildCallCreatedState({
       customer_name: customer_name || null,
@@ -29552,15 +29930,20 @@ app.post("/email/templates/select", requireOutboundAuthorization, async (req, re
 });
 
 registerPostCallWorkflowDefinitionRoutes(app, {
+  db,
   getService: () => postCallWorkflowDefinitionService,
   getExecutionService: () => postCallWorkflowExecutionService,
+<<<<<<< HEAD
   requireAdminToken,
   sendApiError,
 });
 
 registerBusinessIntegrationConnectionRoutes(app, {
   getService: () => businessIntegrationConnectionService,
+=======
+>>>>>>> 95a068c (updated)
   requireAdminToken,
+  requireMiniAppSession,
   sendApiError,
 });
 
@@ -33594,7 +33977,12 @@ registerWebhookRoutes(app, {
   endCallForProvider,
   webhookService,
   postCallAutomationService,
+<<<<<<< HEAD
   postCallWorkflowExecutionService,
+=======
+  getPostCallAutomationService: () => postCallAutomationService,
+  getPostCallWorkflowExecutionService: () => postCallWorkflowExecutionService,
+>>>>>>> 95a068c (updated)
   buildVonageTalkHangupNcco,
   buildVonageUnavailableNcco,
   buildTwilioStreamTwiml,

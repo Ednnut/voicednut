@@ -420,6 +420,7 @@ const {
   renderProviderMenu,
   renderProviderConfirm,
 } = require("./commands/provider");
+<<<<<<< HEAD
 const { registerCallResultsCommand, handleCallResults } = require("./commands/callResults");
 const { registerCallQualityCommand } = require("./commands/callQuality");
 const { registerCallMissionsCommands, callMissionCreateFlow } = require("./commands/callMissions");
@@ -427,6 +428,9 @@ const { callEOperationFlow, registerCallEOperations, renderCallECenter } = requi
 const { vapiOperationFlow, registerVapiCommand, renderVapiCenter } = require("./commands/vapiOperations");
 const { cartesiaOperationFlow, registerCartesiaCommand, renderCartesiaCenter } = require("./commands/cartesiaOperations");
 const { cartesiaStudioFlow, renderCartesiaStudio } = require("./commands/cartesiaStudio");
+=======
+const { registerCartesiaCommand } = require("./commands/cartesia");
+>>>>>>> 95a068c (updated)
 const {
   addUserFlow,
   promoteFlow,
@@ -517,6 +521,7 @@ registerMenuCommand(bot);
 registerGuideCommand(bot);
 registerApiCommands(bot);
 registerProviderCommand(bot);
+registerCartesiaCommand(bot);
 bot.command("admin", handleAdminMiniAppCommand);
 const API_BASE = config.apiUrl;
 const MENU_EXEMPT_CALLBACK_PREFIXES = ["alert:", "lc:", "tr:", "rca:", "retry:", "recap:"];
@@ -1348,8 +1353,12 @@ const TELEGRAM_COMMANDS = [
   { command: "scripts", description: "Manage call & SMS scripts (admin only)" },
   { command: "persona", description: "Manage personas (admin only)" },
   { command: "provider", description: "Manage call provider (admin only)" },
+<<<<<<< HEAD
   { command: "vapi", description: "Vapi operations and call controls (admin only)" },
   { command: "cartesia", description: "Cartesia Managed Agents operations (admin only)" },
+=======
+  { command: "cartesia", description: "View Cartesia server status (admin only)" },
+>>>>>>> 95a068c (updated)
   { command: "callerflags", description: "Manage caller flags (admin only)" },
   { command: "users", description: "Manage users (admin only)" },
   { command: "admin", description: "Open Mini App admin console" },
