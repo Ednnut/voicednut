@@ -94,6 +94,7 @@ const MODULE_COMPONENTS: Record<DashboardModule, LazyExoticComponent<ModulePageC
   workflows: PostCallWorkflowPage,
 };
 
+
 interface DashboardFocusedModulePaneProps {
   activeModule: DashboardModule;
   moduleVm: DashboardVm;

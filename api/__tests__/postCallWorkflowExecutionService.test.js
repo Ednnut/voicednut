@@ -120,6 +120,23 @@ describe("PostCallWorkflowExecutionService", () => {
     assert.equal(stored.includes("private token"), false);
   });
 
+  it("returns workflow run details without stored trigger payloads", async () => {
+    const { service, runs } = createHarness();
+    const created = await service.trigger({
+      trigger_event: "post_call_completed",
+      idempotency_key: "safe-run-detail",
+      call_sid: "call_safe_detail",
+      transcript: [{ text: "private transcript" }],
+    });
+    const runId = created.runs[0].run_id;
+    assert.ok(runs.get(runId).payload_json);
+
+    const run = await service.getRun(runId);
+    assert.equal(run.payload_json, undefined);
+    assert.equal(JSON.stringify(run).includes("private transcript"), false);
+    assert.equal(JSON.stringify(run).includes("payload_json"), false);
+  });
+
   it("routes business call-completion events only to definitions for the same business", async () => {
     const definition = makeDefinition([{ id: "done", type: "end" }]);
     definition.business_id = "biz-42";

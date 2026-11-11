@@ -41,6 +41,8 @@ async function handleHelp(ctx) {
             '🧭 /callplan — plan a CALL-E template and check consent/compatibility without dialing',
             '📜 /calllog — browse recent calls, search, and events',
             ...(isOwner ? ['📊 /callresults — recent CALL-E execution and result readiness summaries'] : []),
+            ...(isOwner ? ['🧭 /workflowruns [status] — recent post-call workflow run status (read-only, private chat)'] : []),
+            ...(isOwner ? ['🔎 /workflowrun <run_id> — sanitized post-call workflow step audit (read-only, private chat)'] : []),
             ...(isOwner ? ['🧾 /callresult <call_id> — view one validated structured result in a private chat'] : []),
             ...(isOwner ? ['🔄 /callreconcile <call_id> — refresh saved CALL-E status and event cursors; no call is started or canceled'] : []),
             ...(isOwner ? ['🔎 /callquality <call_id> — deterministic, content-free conversation signals'] : []),

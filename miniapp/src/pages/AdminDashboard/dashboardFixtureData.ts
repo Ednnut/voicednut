@@ -7,8 +7,55 @@ import {
 type DashboardFixtureRole = 'admin' | 'operator' | 'viewer';
 
 let fixtureCallTemplateVersion = 2;
-<<<<<<< HEAD
 let workflowFixtureVersion = 1;
+const WORKFLOW_BRANCH_FIXTURE_DEFINITION = {
+  schema_version: 1,
+  workflow_id: 'fixture_branch_roundtrip',
+  business_id: null,
+  template_id: null,
+  template_version: null,
+  result_classifications: [],
+  name: 'Fixture branch round-trip',
+  trigger_event: 'post_call_completed',
+  start_step_id: 'route',
+  steps: [
+    {
+      id: 'route',
+      type: 'branch',
+      condition: {
+        all: [
+          { field: 'status', equals: 'completed' },
+          { field: 'priority', in: ['vip', 'rush'] },
+        ],
+      },
+      true_step_id: 'send_followup',
+      false_step_id: 'wait',
+    },
+    {
+      id: 'send_followup',
+      type: 'action',
+      action_type: 'send_email',
+      config: {
+        to: 'qa@example.invalid',
+        from: 'noreply@example.invalid',
+        provider: 'stub',
+        subject: 'Follow up',
+        text: 'Thank you for your time.',
+        html: '<p>Thank you for your time.</p>',
+        script_id: 'follow_up_template',
+        template_id: 'email_template_1',
+        select_template: true,
+        template_context: { customer: 'QA' },
+        variables: { greeting: 'Hello' },
+        metadata: { source: 'fixture' },
+        is_marketing: false,
+      },
+      next_step_id: 'finish',
+    },
+    { id: 'wait', type: 'wait', seconds: 30, next_step_id: 'finish' },
+    { id: 'finish', type: 'end' },
+  ],
+};
 let workflowFixtureVersions: Record<string, unknown>[] = [
   {
     workflow_id: 'fixture_post_call_review',
@@ -18,9 +65,38 @@ let workflowFixtureVersions: Record<string, unknown>[] = [
     status: 'approved',
     created_at: '2026-01-15T12:00:00.000Z',
   },
+  {
+    workflow_id: WORKFLOW_BRANCH_FIXTURE_DEFINITION.workflow_id,
+    version: 1,
+    name: WORKFLOW_BRANCH_FIXTURE_DEFINITION.name,
+    trigger_event: WORKFLOW_BRANCH_FIXTURE_DEFINITION.trigger_event,
+    status: 'approved',
+    created_at: '2026-01-16T12:00:00.000Z',
+    definition: WORKFLOW_BRANCH_FIXTURE_DEFINITION,
+  },
+  {
+    workflow_id: 'fixture_unsupported_workflow',
+    version: 1,
+    name: 'Fixture unsupported workflow',
+    trigger_event: 'post_call_completed',
+    status: 'approved',
+    created_at: '2026-01-17T12:00:00.000Z',
+    definition: {
+      ...WORKFLOW_BRANCH_FIXTURE_DEFINITION,
+      workflow_id: 'fixture_unsupported_workflow',
+      name: 'Fixture unsupported workflow',
+      steps: WORKFLOW_BRANCH_FIXTURE_DEFINITION.steps.map((step) => step.id === 'send_followup'
+        ? { ...step, config: { ...step.config, unsupported_action_option: true } }
+        : step),
+    },
+  },
 ];
+let fixtureWorkflowVersions: Array<Record<string, unknown>> = [];
 let callECampaignFixtureSequence = 1;
 let callECampaignFixtureRows: Array<Record<string, unknown>> = [];
+let cartesiaFixtureReviewAudit: Array<Record<string, unknown>> = [];
+let cartesiaFixtureAdminActionAudit: Array<Record<string, unknown>> = [];
+let cartesiaFixturePhoneAgentId = 'agent_fixture_01';
 
 const WORKFLOW_FIXTURE_RUN_ID = 'workflow_run_fixture_001';
 const WORKFLOW_FIXTURE_RUN = {
@@ -50,12 +126,6 @@ const WORKFLOW_FIXTURE_ACTIONS = new Set<string>([
   DASHBOARD_ACTION_CONTRACTS.WORKFLOW_RUNS,
   DASHBOARD_ACTION_CONTRACTS.WORKFLOW_RUN_GET,
 ]);
-=======
-let fixtureWorkflowVersions: Array<Record<string, unknown>> = [];
-let cartesiaFixtureReviewAudit: Array<Record<string, unknown>> = [];
-let cartesiaFixtureAdminActionAudit: Array<Record<string, unknown>> = [];
-let cartesiaFixturePhoneAgentId = 'agent_fixture_01';
->>>>>>> 95a068c (updated)
 
 const DASHBOARD_ALL_CAPS = [
   'dashboard_view',
@@ -470,6 +540,7 @@ function resolveDashboardFixtureActionData(
         trigger_event: toText(definition.trigger_event, 'post_call_completed'),
         status: 'draft',
         created_at: nowIso,
+        definition,
       };
       workflowFixtureVersions = [version, ...workflowFixtureVersions];
       return { version };

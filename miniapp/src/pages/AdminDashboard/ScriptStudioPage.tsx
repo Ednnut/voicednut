@@ -12,11 +12,8 @@ import {
 import { Link } from '@/components/Link/Link.tsx';
 import { AdminPageIntro } from '@/components/admin-dashboard/AdminPageIntro';
 import { DashboardWorkflowContractCard } from '@/components/admin-dashboard/DashboardWorkflowContractCard';
-<<<<<<< HEAD
 import { CallECampaignRehearsalPanel } from './CallECampaignRehearsalPanel';
-=======
 import { PostCallWorkflowBuilder } from '@/pages/AdminDashboard/PostCallWorkflowBuilder';
->>>>>>> 95a068c (updated)
 import { useDashboardHaptic } from '@/hooks/admin-dashboard/useDashboardHaptic';
 import {
   UiActionBar,
@@ -1399,7 +1396,7 @@ export function ScriptStudioPage({ visible, vm, initialLane = 'call' }: ScriptSt
               <CallECampaignRehearsalPanel
                 templateId={selectedCallScriptId}
                 templateName={toText(selectedCallScript?.name, `Template ${selectedCallScriptId}`)}
-                businessId={toText(selectedCallScript?.business_id, '')}
+                businessId={toText(asRecord(selectedCallScript).business_id, '')}
                 resultSchemaJson={callEResultSchemaInput}
                 onPreview={previewCallECampaignRecipient}
                 onCampaignAction={runCallECampaignAction}

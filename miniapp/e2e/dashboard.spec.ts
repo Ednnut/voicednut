@@ -180,6 +180,45 @@ test('builds and approves a business-scoped post-call workflow in local fixtures
   expect(dimensions.document, 'Workflow editor should not overflow at mobile width').toBeLessThanOrEqual(dimensions.viewport + 1);
 });
 
+test('shows the read-only mission monitor in the workflow dashboard', async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto('/#/workflows');
+  await expect(page.getByRole('heading', { name: 'Mission monitoring' })).toBeVisible();
+  await expect(page.getByRole('region', { name: 'Mission monitoring overview' })).toBeVisible();
+  await expect(page.getByRole('table', { name: 'Mission monitoring step timeline' })).toContainText('send_followup');
+  await expect(page.getByRole('table', { name: 'Mission monitoring step timeline' })).toContainText('provider_timeout');
+  await expect(page.getByRole('region', { name: 'Mission monitoring overview' })).not.toContainText('FIXTURE_PRIVATE');
+  await expect(page.getByRole('region', { name: 'Mission monitoring overview' }).getByRole('button', { name: /dispatch|override|retry|approve|advance/i })).toHaveCount(0);
+  const dimensions = await page.evaluate(() => ({
+    viewport: document.documentElement.clientWidth,
+    document: document.documentElement.scrollWidth,
+  }));
+  expect(dimensions.document, 'Mission monitor should not overflow at mobile width').toBeLessThanOrEqual(dimensions.viewport + 1);
+});
+
+test('shows persisted workflow review status without exposing mutation controls or private payloads', async ({ page }) => {
+  for (const viewport of [
+    { width: 390, height: 844 },
+    { width: 1280, height: 800 },
+  ]) {
+    await page.setViewportSize(viewport);
+    await page.goto('/#/workflows');
+    const review = page.getByRole('region', { name: 'Review controls' });
+    await expect(review.getByRole('heading', { name: 'Review controls' })).toBeVisible();
+    await expect(review.getByRole('table', { name: 'Review queue table' })).toContainText('workflow_run_fixture_001');
+    await expect(review.getByRole('table', { name: 'Review queue table' }).getByText('Needs review')).toBeVisible();
+    await expect(review.getByRole('list', { name: 'Review exceptions list' })).toContainText('send_followup');
+    await expect(review.getByRole('list', { name: 'Review exceptions list' })).toContainText('provider_timeout');
+    await expect(review).not.toContainText('FIXTURE_PRIVATE');
+    await expect(review.getByRole('button', { name: /approve|retry|cancel|dispatch|advance/i })).toHaveCount(0);
+    const dimensions = await page.evaluate(() => ({
+      viewport: document.documentElement.clientWidth,
+      document: document.documentElement.scrollWidth,
+    }));
+    expect(dimensions.document, `Review controls should not overflow at ${viewport.width}px`).toBeLessThanOrEqual(dimensions.viewport + 1);
+  }
+});
+
 test('exposes CALL-E status lookup only after a local call ID is supplied', async ({ page }) => {
   for (const viewport of [
     { width: 390, height: 844 },
@@ -437,7 +476,17 @@ test('platform admin can save workflow drafts and review sanitized run metadata 
   await expect(saveButton).toBeFocused();
   await page.keyboard.press('Enter');
   await expect(page.getByRole('status').filter({ hasText: 'Draft saved:' })).toBeVisible();
-  await expect(page.getByText('Browser fixture workflow')).toBeVisible();
+  await expect(page.getByRole('list', { name: 'Workflow versions' }).getByText('Browser fixture workflow').first()).toBeVisible();
+
+  await page.getByLabel('New step type').selectOption('branch');
+  await page.getByRole('button', { name: 'Add step' }).click();
+  await page.getByLabel('Condition JSON').fill(JSON.stringify({ all: [
+    { field: 'status', equals: 'completed' },
+    { field: 'priority', in: ['vip', 'rush'] },
+  ] }, null, 2));
+  await expect(page.getByLabel('Condition field')).toHaveCount(0);
+  await page.getByRole('button', { name: 'Save draft' }).click();
+  await expect(page.getByRole('status').filter({ hasText: 'Draft saved:' })).toBeVisible();
 
   await page.getByRole('button', { name: 'Inspect run workflow_run_fixture_001' }).click();
   await expect(page.getByRole('heading', { name: 'Step audit' })).toBeVisible();
@@ -455,6 +504,110 @@ test('platform admin can save workflow drafts and review sanitized run metadata 
       document: document.documentElement.scrollWidth,
     }));
     expect(dimensions.document, `Horizontal overflow at ${viewport.width}px`).toBeLessThanOrEqual(dimensions.viewport + 1);
+  }
+});
+
+test('preserves supported branch graphs and action settings when a saved workflow is edited', async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto('/?fixtureRole=admin#/workflows');
+  await expect(page.locator('#va-view-stage-root').getByRole('heading', { name: 'Post-call workflows' })).toBeVisible();
+
+  const versions = page.getByRole('list', { name: 'Workflow versions' });
+  const branchVersion = versions.getByRole('listitem').filter({ hasText: 'Fixture branch round-trip' });
+  await branchVersion.getByRole('button', { name: 'Use as starting point' }).click();
+  const conditionEditor = page.getByLabel('Condition JSON');
+  const actionConfig = page.getByLabel('Action configuration (JSON object)');
+  await expect(conditionEditor).toBeVisible();
+  await expect(actionConfig).toBeVisible();
+  expect(JSON.parse(await conditionEditor.inputValue())).toEqual({
+    all: [
+      { field: 'status', equals: 'completed' },
+      { field: 'priority', in: ['vip', 'rush'] },
+    ],
+  });
+  const originalConfig = JSON.parse(await actionConfig.inputValue());
+  expect(originalConfig).toMatchObject({
+    from: 'noreply@example.invalid',
+    html: '<p>Thank you for your time.</p>',
+    script_id: 'follow_up_template',
+    template_id: 'email_template_1',
+    select_template: true,
+    template_context: { customer: 'QA' },
+    variables: { greeting: 'Hello' },
+    metadata: { source: 'fixture' },
+    is_marketing: false,
+  });
+
+  const editedCondition = JSON.parse(await conditionEditor.inputValue());
+  editedCondition.all[0].equals = 'connected';
+  await conditionEditor.fill(JSON.stringify(editedCondition, null, 2));
+  await page.getByRole('button', { name: 'Save draft' }).click();
+  await expect(page.getByRole('status').filter({ hasText: 'Draft saved: fixture_branch_roundtrip version 2.' })).toBeVisible();
+
+  const savedVersion = versions.getByRole('listitem').filter({ hasText: 'fixture_branch_roundtrip · v2' });
+  await savedVersion.getByRole('button', { name: 'Use as starting point' }).click();
+  expect(JSON.parse(await conditionEditor.inputValue())).toEqual({
+    all: [
+      { field: 'status', equals: 'connected' },
+      { field: 'priority', in: ['vip', 'rush'] },
+    ],
+  });
+  expect(JSON.parse(await actionConfig.inputValue())).toEqual(originalConfig);
+
+  const unsupportedVersion = versions.getByRole('listitem').filter({ hasText: 'Fixture unsupported workflow' });
+  await unsupportedVersion.getByRole('button', { name: 'Use as starting point' }).click();
+  await expect(page.getByText('This saved version contains unsupported or invalid fields and cannot be edited safely.')).toBeVisible();
+  await expect(conditionEditor).toHaveCount(1);
+  expect(JSON.parse(await actionConfig.inputValue())).toEqual(originalConfig);
+
+  await savedVersion.getByRole('button', { name: 'Use as starting point' }).click();
+  await page.getByLabel('When true').selectOption('route');
+  await page.getByRole('button', { name: 'Save draft' }).click();
+  await expect(page.getByText('Workflow paths cannot contain loops (check “route”).')).toBeVisible();
+
+  for (const viewport of [
+    { width: 390, height: 844 },
+    { width: 1280, height: 800 },
+  ]) {
+    await page.setViewportSize(viewport);
+    await conditionEditor.focus();
+    await expect(conditionEditor).toBeFocused();
+    const dimensions = await page.evaluate(() => ({
+      viewport: document.documentElement.clientWidth,
+      document: document.documentElement.scrollWidth,
+    }));
+    expect(dimensions.document, `Workflow editor should not overflow at ${viewport.width}px`).toBeLessThanOrEqual(dimensions.viewport + 1);
+  }
+});
+
+test('authors two distinct branch paths with separate end steps', async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto('/?fixtureRole=admin#/workflows');
+  await expect(page.locator('#va-view-stage-root').getByRole('heading', { name: 'Post-call workflows' })).toBeVisible();
+
+  await page.getByLabel('Workflow ID').fill('browser_branch_paths');
+  await page.getByLabel('Workflow name').fill('Browser branch paths');
+  await page.getByLabel('New step type').selectOption('branch');
+  await page.getByRole('button', { name: 'Add step' }).click();
+  await page.getByLabel('New step type').selectOption('end');
+  await page.getByRole('button', { name: 'Add step' }).click();
+  await page.getByLabel('When true').selectOption('finish_2');
+  await page.getByLabel('When false').selectOption('finish_3');
+  await expect(page.getByLabel('Remove end step finish_2')).toBeEnabled();
+  await expect(page.getByLabel('Remove end step finish_3')).toBeEnabled();
+  await page.getByRole('button', { name: 'Save draft' }).click();
+  await expect(page.getByRole('status').filter({ hasText: 'Draft saved: browser_branch_paths version 2.' })).toBeVisible();
+
+  for (const viewport of [
+    { width: 390, height: 844 },
+    { width: 1280, height: 800 },
+  ]) {
+    await page.setViewportSize(viewport);
+    const dimensions = await page.evaluate(() => ({
+      viewport: document.documentElement.clientWidth,
+      document: document.documentElement.scrollWidth,
+    }));
+    expect(dimensions.document, `Workflow editor should not overflow at ${viewport.width}px`).toBeLessThanOrEqual(dimensions.viewport + 1);
   }
 });
 

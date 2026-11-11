@@ -2,6 +2,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const sqlite3 = require('sqlite3').verbose();
 const Database = require('../db/db');
 const { CartesiaPhoneNumberService, normalizePhoneNumber } = require('../services/cartesiaPhoneNumberService');
 const { CartesiaApiError } = require('../services/cartesiaClient');
@@ -22,7 +23,10 @@ function createHarness(overrides = {}) {
   let deletes = 0;
   const calls = [];
   const rows = new Map();
+  const scopes = new Map();
+  const scopeOperations = new Map();
   const db = {
+    async hasActiveCallEBusinessOperator() { return true; },
     async getOutboundCallIdempotency(key) { return rows.get(key) || null; },
     async reserveOutboundCallIdempotency(payload) {
       if (rows.has(payload.idempotency_key)) return { reserved: false };
@@ -36,6 +40,26 @@ function createHarness(overrides = {}) {
         response_payload: payload.response_payload ? JSON.stringify(payload.response_payload) : null,
       });
       return 1;
+    },
+    async getCartesiaPhoneNumberBusinessScope(id) { return scopes.get(id) || null; },
+    async getCartesiaPhoneBusinessScopeOperation(key) { return scopeOperations.get(key) || null; },
+    async applyCartesiaPhoneNumberBusinessScope(input) {
+      const current = scopes.get(input.phone_number_id);
+      if (Number(current?.revision || 0) !== input.expected_revision) {
+        throw Object.assign(new Error('changed'), { code: 'cartesia_phone_business_scope_changed', status: 409 });
+      }
+      const result = {
+        phoneNumberId: input.phone_number_id, businessId: input.business_id,
+        phoneNumber: input.phone_number, agentId: input.agent_id,
+        revision: Number(current?.revision || 0) + (current?.business_id === input.business_id ? 0 : 1),
+        changed: current?.business_id !== input.business_id, idempotentReplay: false,
+      };
+      scopes.set(input.phone_number_id, { ...result, updated_by: input.actor_id });
+      scopeOperations.set(input.idempotency_key, {
+        request_fingerprint: input.request_fingerprint,
+        response_payload: JSON.stringify(result),
+      });
+      return result;
     },
   };
   const client = {
@@ -102,6 +126,34 @@ describe('Cartesia phone number service', () => {
       idempotency_key: 'assignment-key-01',
     }), { code: 'cartesia_phone_number_confirmation_mismatch' });
     assert.equal(calls.some(([operation]) => operation === 'update'), false);
+  });
+
+  it('scopes an assigned number to a business with preview binding and safe idempotent replay', async () => {
+    const { service, calls, setCurrent } = createHarness();
+    const preview = await service.prepareBusinessScope('pn_test_01', 'business-01');
+    assert.equal(preview.phoneNumber, '+15555550123');
+    assert.equal(preview.agentId, 'agent_old');
+    assert.equal(preview.currentBusinessId, null);
+    const input = {
+      phoneNumberId: 'pn_test_01',
+      business_id: 'business-01',
+      approved: true,
+      confirmed_fingerprint: preview.requestFingerprint,
+      idempotency_key: 'scope-key-0001',
+      actor_id: 'shared_admin_token',
+    };
+    const saved = await service.setBusinessScope(input);
+    assert.equal(saved.changed, true);
+    assert.equal(saved.businessId, 'business-01');
+    const callsAfterSave = calls.length;
+    setCurrent({ ...initialNumber, agent: { id: 'agent_changed' } });
+    const replay = await service.setBusinessScope(input);
+    assert.equal(replay.idempotentReplay, true);
+    assert.equal(replay.agentId, 'agent_old');
+    assert.equal(calls.length, callsAfterSave);
+    await assert.rejects(service.setBusinessScope({
+      ...input, confirmed_fingerprint: 'f'.repeat(64),
+    }), { code: 'cartesia_idempotency_conflict' });
   });
 
   it('keeps assignment mutations disabled unless the independent gate is enabled', async () => {
@@ -171,6 +223,177 @@ describe('Cartesia phone number service', () => {
       assert.equal(first.changed, true);
       assert.equal(replay.idempotentReplay, true);
       assert.equal(updates, 1);
+    } finally {
+      await new Promise((resolve) => db.db.close(resolve));
+      [dbPath, `${dbPath}-wal`, `${dbPath}-shm`].forEach((file) => { try { fs.unlinkSync(file); } catch (_) {} });
+    }
+  });
+
+  it('migrates legacy call metadata and keeps inbound business scope immutable across retries', async () => {
+    const dbPath = path.join(os.tmpdir(), `voicednut-cartesia-business-scope-${Date.now()}-${Math.random()}.sqlite`);
+    const legacy = new sqlite3.Database(dbPath);
+    await new Promise((resolve, reject) => legacy.run(
+      `CREATE TABLE cartesia_calls (
+        local_call_id TEXT PRIMARY KEY, provider_call_id TEXT UNIQUE NOT NULL, business_id TEXT,
+        agent_id TEXT NOT NULL, from_number_id TEXT, phone_number TEXT,
+        direction TEXT CHECK(direction IS NULL OR direction IN ('inbound', 'outbound')),
+        status TEXT NOT NULL CHECK(status IN ('created', 'started', 'completed', 'failed')),
+        start_time TEXT, end_time TEXT, end_reason TEXT,
+        telephony_account_type TEXT CHECK(telephony_account_type IS NULL OR telephony_account_type IN ('cartesia', 'twilio', 'sip_trunk')),
+        last_event_timestamp TEXT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      )`,
+      (error) => error ? reject(error) : resolve(),
+    ));
+    await new Promise((resolve, reject) => legacy.run(
+      `INSERT INTO cartesia_calls (
+        local_call_id, provider_call_id, agent_id, phone_number, direction, status
+      ) VALUES ('cartesia_ac_legacy', 'ac_legacy', 'agent_test_01', '+15555550999', 'inbound', 'completed')`,
+      (error) => error ? reject(error) : resolve(),
+    ));
+    await new Promise((resolve, reject) => legacy.run(
+      `CREATE TABLE cartesia_phone_number_business_scopes (
+        phone_number_id TEXT PRIMARY KEY, business_id TEXT NOT NULL,
+        phone_number TEXT NOT NULL, agent_id TEXT NOT NULL,
+        revision INTEGER NOT NULL DEFAULT 1, updated_by TEXT NOT NULL,
+        updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+      )`,
+      (error) => error ? reject(error) : resolve(),
+    ));
+    const legacyScopeTime = new Date(Date.now() - 60000).toISOString();
+    await new Promise((resolve, reject) => legacy.run(
+      `INSERT INTO cartesia_phone_number_business_scopes (
+        phone_number_id, business_id, phone_number, agent_id, revision, updated_by, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      ['pn_test_01', 'business-01', '+15555550123', 'agent_test_01', 1, 'legacy_admin', legacyScopeTime],
+      (error) => error ? reject(error) : resolve(),
+    ));
+    await new Promise((resolve, reject) => legacy.close((error) => error ? reject(error) : resolve()));
+    let db = new Database();
+    db.dbPath = dbPath;
+    await db.initialize();
+    try {
+      await db.grantCallEBusinessOperator({ business_id: 'business-01', telegram_id: '7001', role: 'call_operator' });
+      await db.grantCallEBusinessOperator({ business_id: 'business-02', telegram_id: '7002', role: 'call_operator' });
+      assert.equal(await db.hasActiveCallEBusinessOperator('business-01'), true);
+      assert.equal(await db.hasActiveCallEBusinessOperator('business-missing'), false);
+      const businessGuard = new CartesiaPhoneNumberService({
+        client: { isConfigured: () => true, async getPhoneNumber() { return structuredClone(initialNumber); } },
+        db, enabled: true, mutationsEnabled: true,
+      });
+      await assert.rejects(businessGuard.prepareBusinessScope('pn_test_01', 'business-missing'), {
+        code: 'cartesia_phone_business_scope_business_unknown',
+      });
+      const columns = await new Promise((resolve, reject) => db.db.all(
+        'PRAGMA table_info(cartesia_calls)',
+        (error, rows) => error ? reject(error) : resolve(new Set(rows.map((row) => row.name))),
+      ));
+      assert.equal(columns.has('business_scope_resolved'), true);
+
+      const scopeInput = {
+        phone_number_id: 'pn_test_01', business_id: 'business-01',
+        phone_number: '+15555550123', agent_id: 'agent_test_01',
+        expected_revision: 1, actor_id: 'shared_admin_token',
+        idempotency_key: 'scope-sqlite-01', request_fingerprint: 'a'.repeat(64),
+      };
+      const saved = await db.applyCartesiaPhoneNumberBusinessScope(scopeInput);
+      assert.equal(saved.revision, 1);
+      assert.equal((await db.applyCartesiaPhoneNumberBusinessScope(scopeInput)).idempotentReplay, true);
+      const firstScope = await db.getCartesiaPhoneNumberBusinessScope('pn_test_01');
+      const earlierCallStartTime = new Date(Date.parse(firstScope.updated_at) + 30000).toISOString();
+      const audit = await db.listCartesiaAuditEvents({ limit: 10 });
+      assert.equal(audit.some((event) =>
+        event.source === 'phone_business_scope' &&
+        event.business_id === 'business-01' &&
+        event.resource_id === 'pn_test_01'
+      ), true);
+      assert.equal((await db.resolveCartesiaInboundCallScope({
+        agent_id: 'agent_test_01', phone_number: '+15555550123',
+        call_start_time: earlierCallStartTime,
+      })).business_id, 'business-01');
+      assert.equal(await db.resolveCartesiaInboundCallScope({
+        agent_id: 'other_agent', phone_number: '+15555550123',
+        call_start_time: earlierCallStartTime,
+      }), null);
+      assert.equal(await db.resolveCartesiaInboundCallScope({
+        agent_id: 'agent_test_01', phone_number: '+15555550123',
+      }), null);
+
+      await db.upsertCartesiaCallRecord({
+        local_call_id: 'cartesia_ac_mapped', provider_call_id: 'ac_mapped',
+        agent_id: 'agent_test_01', business_id: 'business-01',
+        from_number_id: 'pn_test_01', phone_number: '+15555550999',
+        direction: 'inbound', status: 'started',
+        business_scope_resolved: true,
+        event_timestamp: '2026-11-04T12:00:00.000Z',
+      });
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      await db.applyCartesiaPhoneNumberBusinessScope({
+        ...scopeInput,
+        business_id: 'business-02',
+        expected_revision: 1,
+        idempotency_key: 'scope-sqlite-02',
+        request_fingerprint: 'b'.repeat(64),
+      });
+      const secondScope = await db.getCartesiaPhoneNumberBusinessScope('pn_test_01');
+      const laterCallStartTime = new Date(Date.parse(secondScope.updated_at) + 5).toISOString();
+      assert.equal((await db.resolveCartesiaInboundCallScope({
+        agent_id: 'agent_test_01', phone_number: '+15555550123',
+        call_start_time: earlierCallStartTime,
+      })).business_id, 'business-01');
+      assert.equal((await db.resolveCartesiaInboundCallScope({
+        agent_id: 'agent_test_01', phone_number: '+15555550123',
+        call_start_time: laterCallStartTime,
+      })).business_id, 'business-02');
+      await db.upsertCartesiaCallRecord({
+        local_call_id: 'cartesia_ac_mapped', provider_call_id: 'ac_mapped',
+        agent_id: 'agent_test_01', business_id: 'business-02',
+        from_number_id: 'pn_test_01', phone_number: '+15555550999',
+        direction: 'inbound', status: 'completed',
+        business_scope_resolved: true,
+        event_timestamp: '2026-11-04T12:01:00.000Z',
+      });
+      await db.upsertCartesiaCallRecord({
+        local_call_id: 'cartesia_ac_unmapped', provider_call_id: 'ac_unmapped',
+        agent_id: 'agent_test_01', direction: 'inbound', status: 'started',
+        business_scope_resolved: true,
+        event_timestamp: '2026-11-04T12:00:00.000Z',
+      });
+      await db.upsertCartesiaCallRecord({
+        local_call_id: 'cartesia_ac_legacy', provider_call_id: 'ac_legacy',
+        agent_id: 'agent_test_01', business_id: 'business-01',
+        from_number_id: 'pn_test_01', phone_number: '+15555550999',
+        direction: 'inbound', status: 'completed',
+        business_scope_resolved: true,
+        event_timestamp: '2026-11-04T12:01:00.000Z',
+      });
+      const rows = await new Promise((resolve, reject) => db.db.all(
+        'SELECT provider_call_id, business_id, from_number_id, business_scope_resolved FROM cartesia_calls ORDER BY provider_call_id',
+        (error, result) => error ? reject(error) : resolve(result),
+      ));
+      assert.deepEqual(rows, [
+        { provider_call_id: 'ac_legacy', business_id: null, from_number_id: null, business_scope_resolved: 1 },
+        { provider_call_id: 'ac_mapped', business_id: 'business-01', from_number_id: 'pn_test_01', business_scope_resolved: 1 },
+        { provider_call_id: 'ac_unmapped', business_id: null, from_number_id: null, business_scope_resolved: 1 },
+      ]);
+      assert.equal(await db.getCartesiaCallBusinessScope('ac_mapped'), 'business-01');
+      assert.equal(await db.getCartesiaCallBusinessScope('ac_unmapped'), null);
+      assert.equal(await db.getCartesiaCallBusinessScope('ac_legacy'), null);
+      await assert.rejects(db.applyCartesiaPhoneNumberBusinessScope({
+        ...scopeInput, business_id: 'business-03', expected_revision: 1,
+        idempotency_key: 'scope-sqlite-03', request_fingerprint: 'c'.repeat(64),
+      }), { code: 'cartesia_phone_business_scope_changed' });
+      await new Promise((resolve) => db.db.close(resolve));
+      db = new Database();
+      db.dbPath = dbPath;
+      await db.initialize();
+      const persistedScope = await db.getCartesiaPhoneNumberBusinessScope('pn_test_01');
+      assert.equal(persistedScope.business_id, 'business-02');
+      const persistedCalls = await new Promise((resolve, reject) => db.db.get(
+        'SELECT COUNT(*) AS count FROM cartesia_calls',
+        (error, row) => error ? reject(error) : resolve(row.count),
+      ));
+      assert.equal(persistedCalls, 3);
     } finally {
       await new Promise((resolve) => db.db.close(resolve));
       [dbPath, `${dbPath}-wal`, `${dbPath}-shm`].forEach((file) => { try { fs.unlinkSync(file); } catch (_) {} });

@@ -72,6 +72,21 @@ describe("CartesiaOutboundCallService", () => {
     }), { code: "cartesia_agent_source_not_ready" });
   });
 
+  it("prevents a business from placing outbound calls through another business's scoped number", async () => {
+    const { service, state } = makeHarness({
+      db: {
+        async getCartesiaPhoneNumberBusinessScope() {
+          return { business_id: "biz-other", agent_id: "agent_1" };
+        },
+      },
+    });
+    await assert.rejects(service.createApproval({
+      ...input,
+      confirmation_phrase: buildCartesiaConfirmationPhrase(input),
+    }), { code: "cartesia_phone_business_scope_conflict" });
+    assert.equal(state.calls, 0);
+  });
+
   it("runs business safety and durable idempotency before one provider submission", async () => {
     const { service, state } = makeHarness();
     const approval = await service.createApproval({ ...input, confirmation_phrase: buildCartesiaConfirmationPhrase(input) });

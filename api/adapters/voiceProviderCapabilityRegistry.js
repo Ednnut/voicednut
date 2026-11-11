@@ -77,8 +77,9 @@ const VOICE_PROVIDER_CAPABILITY_REGISTRY = deepFreeze({
         ),
         call_audio_read: capability(
           PROVIDER_CONTRACT_STATES.DOCUMENTED,
-          PLATFORM_CAPABILITY_STATES.PLANNED,
+          PLATFORM_CAPABILITY_STATES.IMPLEMENTED,
           "https://docs.cartesia.ai/api-reference/agents/calls/download-call-audio",
+          "Admin-only download enforces business scope, ended-call status, retention checks, and a 25 MiB response limit.",
         ),
         managed_agent_websocket: capability(
           PROVIDER_CONTRACT_STATES.DOCUMENTED,
@@ -230,8 +231,9 @@ const VOICE_PROVIDER_CAPABILITY_REGISTRY = deepFreeze({
         ),
         realtime_stt_manual_turns: capability(
           PROVIDER_CONTRACT_STATES.DOCUMENTED,
-          PLATFORM_CAPABILITY_STATES.PLANNED,
+          PLATFORM_CAPABILITY_STATES.IMPLEMENTED,
           "https://docs.cartesia.ai/api-reference/stt/websocket",
+          "Bounded uploaded PCM uses the manual WebSocket endpoint and explicit finalize/close commands; this is not live microphone streaming.",
         ),
         batch_stt: capability(
           PROVIDER_CONTRACT_STATES.DOCUMENTED,

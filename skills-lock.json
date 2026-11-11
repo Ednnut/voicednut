@@ -1,6 +1,18 @@
 {
   "version": 1,
   "skills": {
+    "audience-targeting": {
+      "source": "hubspot/agent-cli-skills",
+      "sourceType": "github",
+      "skillPath": "audience-targeting/SKILL.md",
+      "computedHash": "4ab91bdb3b4d93686c3a9c1032b50a18045866f2c1fd3886a001184f403d1bd7"
+    },
+    "bulk-operations": {
+      "source": "hubspot/agent-cli-skills",
+      "sourceType": "github",
+      "skillPath": "bulk-operations/SKILL.md",
+      "computedHash": "c3fadee7f3405982ecd523b32e2f4b2e5ea6514e8dff15aad5dd1fac391d17ad"
+    },
     "cartesia-api": {
       "source": "cartesia-ai/skills",
       "sourceType": "github",
@@ -12,6 +24,108 @@
       "sourceType": "github",
       "skillPath": "skills/cartesia-line/SKILL.md",
       "computedHash": "c9ea8f7da7bfb679f13792e21cc5d0ec6433c4f0f5dba45ede5fdb52bd8abe5a"
+    },
+    "communication-history": {
+      "source": "hubspot/agent-cli-skills",
+      "sourceType": "github",
+      "skillPath": "communication-history/SKILL.md",
+      "computedHash": "73ab6d0dce112ee5fb2adc31156454fd74473ab188ce21c18f690de0f988b261"
+    },
+    "conversation-history-brief": {
+      "source": "hubspot/agent-cli-skills",
+      "sourceType": "github",
+      "skillPath": "conversation-history-brief/SKILL.md",
+      "computedHash": "a4496e6706e5b3abfbced564c224b8de9a0275d48fa74800560967139089f327"
+    },
+    "conversation-inbox-triage": {
+      "source": "hubspot/agent-cli-skills",
+      "sourceType": "github",
+      "skillPath": "conversation-inbox-triage/SKILL.md",
+      "computedHash": "f197ecc5122d943dfbd8ce98e9dda877f614cd4af1a31fcbdce806a421d131d5"
+    },
+    "crm-data-quality": {
+      "source": "hubspot/agent-cli-skills",
+      "sourceType": "github",
+      "skillPath": "crm-data-quality/SKILL.md",
+      "computedHash": "d9db9c32edbb14938fab6b7861dea3179ae8a60f83c44070afaa5f163907b293"
+    },
+    "crm-lookup": {
+      "source": "hubspot/agent-cli-skills",
+      "sourceType": "github",
+      "skillPath": "crm-lookup/SKILL.md",
+      "computedHash": "f0472029c4b02ad67f90e01b6e20871ddc93e84c495da69c39f3e190f29dd460"
+    },
+    "custom-object-management": {
+      "source": "hubspot/agent-cli-skills",
+      "sourceType": "github",
+      "skillPath": "custom-object-management/SKILL.md",
+      "computedHash": "c712851e905619e059adadff115d4233de37edcb8d45e57e17dd70a1cfefc523"
+    },
+    "customer-retention": {
+      "source": "hubspot/agent-cli-skills",
+      "sourceType": "github",
+      "skillPath": "customer-retention/SKILL.md",
+      "computedHash": "c6cf706d6bf997d5cf646bc99cab1fae75d1a1b83ea79afc384617b0aa99471e"
+    },
+    "data-enrichment": {
+      "source": "hubspot/agent-cli-skills",
+      "sourceType": "github",
+      "skillPath": "data-enrichment/SKILL.md",
+      "computedHash": "46b023f1b66ed0be06cb82268983ac9e5c0bd8cdab16b46f304db622a92c1a27"
+    },
+    "deal-management": {
+      "source": "hubspot/agent-cli-skills",
+      "sourceType": "github",
+      "skillPath": "deal-management/SKILL.md",
+      "computedHash": "61cd0b4d606bd4b42e5d1b1f626349e8ea1a9d527d11543a9622a26c2a0fb69d"
+    },
+    "quote-to-cash": {
+      "source": "hubspot/agent-cli-skills",
+      "sourceType": "github",
+      "skillPath": "quote-to-cash/SKILL.md",
+      "computedHash": "f436e0bd58cc85de90f8ca1c182825be06b3a6364ddc256fd35cc5de8e81185a"
+    },
+    "sales-execution": {
+      "source": "hubspot/agent-cli-skills",
+      "sourceType": "github",
+      "skillPath": "sales-execution/SKILL.md",
+      "computedHash": "4cc72decfbb58d832f31c06b7ed3888296e85394cb8b68a74c17ea2d15ce7fd2"
+    },
+    "sales-reporting": {
+      "source": "hubspot/agent-cli-skills",
+      "sourceType": "github",
+      "skillPath": "sales-reporting/SKILL.md",
+      "computedHash": "d4a7bb43c9ba97d84a063ce6b8c4234e02c92eebc5dcc4dfd560562670b2bad7"
+    },
+    "team-ownership": {
+      "source": "hubspot/agent-cli-skills",
+      "sourceType": "github",
+      "skillPath": "team-ownership/SKILL.md",
+      "computedHash": "ef0824f31d53adeee7a6ee0c3de27762ba92c6a7b1af4cb584722bff647e59a5"
+    },
+    "ticket-resolution": {
+      "source": "hubspot/agent-cli-skills",
+      "sourceType": "github",
+      "skillPath": "ticket-resolution/SKILL.md",
+      "computedHash": "5a86c9b799c871c9580039aaaf202429a3f8f792a7e6756be79e8f07f9fffd4a"
+    },
+    "visitor-identification": {
+      "source": "hubspot/agent-cli-skills",
+      "sourceType": "github",
+      "skillPath": "visitor-identification/SKILL.md",
+      "computedHash": "22c485d1b730d13f3a8a16ecda7a9ea80b905d334ebebb23df8e0f89f12190d3"
+    },
+    "work": {
+      "source": "hubspot/agent-cli-skills",
+      "sourceType": "github",
+      "skillPath": "work/SKILL.md",
+      "computedHash": "4a855fdd66176d4391f58a1ef8e9af8e008a5ceefa53a79780f0845f04559844"
+    },
+    "workflow-automation": {
+      "source": "hubspot/agent-cli-skills",
+      "sourceType": "github",
+      "skillPath": "workflow-automation/SKILL.md",
+      "computedHash": "dd10f95fab71e11a85846f26168bfdd6432dadaec8a88b4e6b9b0bf340ddea64"
     }
   }
 }

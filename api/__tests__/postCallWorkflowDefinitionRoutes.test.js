@@ -91,16 +91,25 @@ describe("Post-call workflow definition routes", () => {
     assert.equal(response.status, 403);
     assert.equal(calls.length, 0);
 
+    response = await dispatch("GET", "/post-call/workflows/runs/:run_id", { params: { run_id: "run_1" } });
+    assert.equal(response.status, 403);
+    assert.equal(calls.length, 0);
+
     const headers = { "x-admin": "authorized" };
     response = await dispatch("GET", "/post-call/workflows/runs", { headers, query: { status: "waiting_approval", limit: "10" } });
     assert.equal(response.status, 200);
     assert.deepEqual(calls[0], ["runs", { workflow_id: undefined, status: "waiting_approval", trigger_reference: undefined, limit: "10" }]);
 
+    response = await dispatch("GET", "/post-call/workflows/runs/:run_id", { headers, params: { run_id: "run_1" } });
+    assert.equal(response.status, 200);
+    assert.equal(response.body.run.run_id, "run_1");
+    assert.deepEqual(calls[1], ["getRun", "run_1", undefined]);
+
     response = await dispatch("POST", "/post-call/workflows/runs/:run_id/approve", { headers, params: { run_id: "run_1" } });
     assert.equal(response.body.run.status, "queued");
     response = await dispatch("POST", "/post-call/workflows/runs/:run_id/cancel", { headers, params: { run_id: "run_1" } });
     assert.equal(response.body.run.status, "canceled");
-    assert.deepEqual(calls.slice(1), [["approveRun", "run_1", "admin_token"], ["cancelRun", "run_1", "admin_token"]]);
+    assert.deepEqual(calls.slice(2), [["approveRun", "run_1", "admin_token"], ["cancelRun", "run_1", "admin_token"]]);
   });
 
   it("passes a requested workflow filter to the global version list", async () => {

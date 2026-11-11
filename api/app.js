@@ -131,6 +131,7 @@ const {
   canFailoverAfterProviderError,
 } = require("./adapters/voiceProviderRegistry");
 const CallEVoiceAdapter = require("./adapters/CallEVoiceAdapter");
+const CartesiaVoiceAdapter = require("./adapters/CartesiaVoiceAdapter");
 const { buildTwilioOutboundCallPayload } = require("./adapters/twilioVoiceCallPayload");
 const { previewCallETemplate } = require("./adapters/callETemplateAdapter");
 const { buildCallEDeploymentStatus, createCallEClientFromEnv, getCallEProviderHealth } = require("./services/callEClient");
@@ -14730,6 +14731,10 @@ function getVoiceProviderRegistry() {
     cancelTaskCall: ({ providerCallId }) => createCallEClientFromEnv().cancelCall(providerCallId),
     getCall: ({ providerCallId }) => createCallEClientFromEnv().getCall(providerCallId),
     listCallEvents: ({ providerCallId, ...options }) => createCallEClientFromEnv().listCallEvents(providerCallId, options),
+  }));
+
+  registry.register("cartesia", new CartesiaVoiceAdapter({
+    createOutboundCall: (request) => createCartesiaOutboundCallService().createOutboundCall(request),
   }));
 
   voiceProviderRegistry = registry;

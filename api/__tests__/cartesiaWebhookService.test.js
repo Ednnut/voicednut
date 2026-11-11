@@ -49,6 +49,7 @@ describe('Cartesia call lifecycle webhook', () => {
     assert.equal(event.type, 'call_completed');
     assert.equal(event.callRecord.direction, 'inbound');
     assert.equal(event.callRecord.phone_number, '+15555550123');
+    assert.equal(event.callRecord.destination_phone_number, '+15555550001');
     assert.equal(event.callRecord.status, 'completed');
     assert.equal(JSON.stringify(event).includes('private text'), false);
     assert.equal(JSON.stringify(event).includes('private summary'), false);
@@ -105,8 +106,59 @@ describe('Cartesia call lifecycle webhook', () => {
     assert.equal(duplicate.statusCode, 204);
     assert.equal(calls.length, 2);
     assert.equal(calls[0].local_call_id, 'cartesia_ac_test_01');
-    assert.equal(calls[0].business_id, undefined);
+    assert.equal(calls[0].business_id, null);
+    assert.equal(calls[0].business_scope_resolved, false);
     assert.equal(Object.hasOwn(calls[0], 'transcript'), false);
+  });
+
+  it('resolves inbound tenant scope from the trusted called-number, agent, and call start time', async () => {
+    let saved;
+    let resolution;
+    const handler = createCartesiaWebhookHandler({
+      webhookSecret: WEBHOOK_SECRET,
+      db: {
+        async recordCartesiaWebhookReceipt() { return { inserted: true }; },
+        async resolveCartesiaInboundCallScope(input) {
+          resolution = input;
+          return { business_id: 'business-trusted', phone_number_id: 'pn_test_01' };
+        },
+        async upsertCartesiaCallRecord(payload) { saved = payload; },
+      },
+    });
+    const req = {
+      headers: { 'x-webhook-secret': WEBHOOK_SECRET },
+      body: { ...callEvent(), business_id: 'business-attacker' },
+    };
+    const res = responseRecorder();
+    await handler(req, res);
+    assert.equal(res.statusCode, 204);
+    assert.deepEqual(resolution, {
+      agent_id: 'agent_test_01',
+      phone_number: '+15555550001',
+      call_start_time: '2026-11-04T11:59:00.000Z',
+    });
+    assert.equal(saved.business_id, 'business-trusted');
+    assert.equal(saved.from_number_id, 'pn_test_01');
+    assert.equal(saved.business_scope_resolved, true);
+  });
+
+  it('leaves inbound calls unscoped when trusted historical scope cannot be resolved', async () => {
+    let saved;
+    const handler = createCartesiaWebhookHandler({
+      webhookSecret: WEBHOOK_SECRET,
+      db: {
+        async recordCartesiaWebhookReceipt() { return { inserted: true }; },
+        async resolveCartesiaInboundCallScope() { return null; },
+        async upsertCartesiaCallRecord(payload) { saved = payload; },
+      },
+    });
+    const res = responseRecorder();
+    await handler({ headers: { 'x-webhook-secret': WEBHOOK_SECRET }, body: callEvent() }, res);
+
+    assert.equal(res.statusCode, 204);
+    assert.equal(saved.business_id, null);
+    assert.equal(saved.from_number_id, null);
+    assert.equal(saved.business_scope_resolved, false);
   });
 
   it('rejects reuse of a webhook request ID with a different event payload', async () => {

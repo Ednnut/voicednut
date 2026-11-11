@@ -144,6 +144,96 @@ class CartesiaPhoneNumberService {
     return normalizePhoneNumber(await this.client.getPhoneNumber(id), id);
   }
 
+  async prepareBusinessScope(phoneNumberId, businessId) {
+    this.ensureEnabled();
+    const id = this.normalizeId(phoneNumberId);
+    const business = String(businessId || '').trim();
+    if (!/^[A-Za-z0-9._:-]{1,120}$/.test(business)) {
+      throw phoneNumberError('cartesia_phone_business_scope_invalid', 'A valid business ID is required');
+    }
+    if (typeof this.db?.getCartesiaPhoneNumberBusinessScope !== 'function') {
+      throw phoneNumberError('cartesia_phone_business_scope_unavailable', 'Cartesia business-scope storage is unavailable', 503);
+    }
+    if (typeof this.db?.hasActiveCallEBusinessOperator !== 'function') {
+      throw phoneNumberError('cartesia_phone_business_scope_unavailable', 'Cartesia business validation is unavailable', 503);
+    }
+    if (!await this.db.hasActiveCallEBusinessOperator(business)) {
+      throw phoneNumberError('cartesia_phone_business_scope_business_unknown', 'The target business has no active call operator', 404);
+    }
+    const phoneNumber = await this.get(id);
+    const agentId = phoneNumber.agent?.id || null;
+    if (!agentId) {
+      throw phoneNumberError('cartesia_phone_business_scope_agent_required', 'Assign the phone number to a Cartesia agent before setting its business scope', 409);
+    }
+    const currentScope = await this.db.getCartesiaPhoneNumberBusinessScope(id);
+    const revision = Number(currentScope?.revision || 0);
+    const requestFingerprint = crypto.createHash('sha256').update(JSON.stringify({
+      phoneNumberId: id,
+      phoneNumber: phoneNumber.number,
+      agentId,
+      businessId: business,
+      currentBusinessId: currentScope?.business_id || null,
+      revision,
+    })).digest('hex');
+    return Object.freeze({
+      phoneNumberId: id,
+      phoneNumber: phoneNumber.number,
+      agentId,
+      businessId: business,
+      currentBusinessId: currentScope?.business_id || null,
+      revision,
+      requestFingerprint,
+    });
+  }
+
+  async setBusinessScope(input = {}) {
+    this.ensureEnabled();
+    if (!this.mutationsEnabled) {
+      throw phoneNumberError('cartesia_phone_number_mutations_disabled', 'Cartesia phone number changes are disabled', 503);
+    }
+    const phoneNumberId = this.normalizeId(input.phoneNumberId || input.phone_number_id);
+    const businessId = String(input.businessId || input.business_id || '').trim();
+    const idempotencyKey = this.normalizeIdempotencyKey(input.idempotencyKey || input.idempotency_key);
+    const confirmedFingerprint = String(input.confirmedFingerprint || input.confirmed_fingerprint || '').trim().toLowerCase();
+    const actorId = String(input.actorId || input.actor_id || '').trim();
+    if (input.approved !== true || !/^[a-f0-9]{64}$/.test(confirmedFingerprint)) {
+      throw phoneNumberError('cartesia_phone_number_confirmation_mismatch', 'Explicit approval and the business-scope preview fingerprint are required', 409);
+    }
+    if (!/^[A-Za-z0-9._:-]{1,120}$/.test(actorId)) {
+      throw phoneNumberError('cartesia_phone_business_scope_invalid', 'A valid audited actor is required');
+    }
+    if (typeof this.db?.applyCartesiaPhoneNumberBusinessScope !== 'function') {
+      throw phoneNumberError('cartesia_phone_business_scope_unavailable', 'Cartesia business-scope storage is unavailable', 503);
+    }
+    if (typeof this.db?.getCartesiaPhoneBusinessScopeOperation === 'function') {
+      const existing = await this.db.getCartesiaPhoneBusinessScopeOperation(idempotencyKey);
+      if (existing) {
+        if (existing.request_fingerprint !== confirmedFingerprint) {
+          throw phoneNumberError('cartesia_idempotency_conflict', 'Cartesia business-scope idempotency key was already used for a different operation', 409);
+        }
+        let stored;
+        try { stored = JSON.parse(existing.response_payload); } catch {
+          throw phoneNumberError('cartesia_idempotency_state_invalid', 'Cartesia business-scope idempotency state is invalid', 409);
+        }
+        return { ...stored, idempotentReplay: true };
+      }
+    }
+    const preview = await this.prepareBusinessScope(phoneNumberId, businessId);
+    if (confirmedFingerprint !== preview.requestFingerprint) {
+      throw phoneNumberError('cartesia_phone_number_confirmation_mismatch', 'Approval must match the current phone-number business-scope preview', 409);
+    }
+    return this.db.applyCartesiaPhoneNumberBusinessScope({
+      phone_number_id: preview.phoneNumberId,
+      business_id: preview.businessId,
+      phone_number: preview.phoneNumber,
+      agent_id: preview.agentId,
+      expected_revision: preview.revision,
+      actor_id: actorId,
+      idempotency_key: idempotencyKey,
+      request_fingerprint: preview.requestFingerprint,
+    });
+  }
+
   normalizeId(value) {
     const id = String(value || '').trim();
     if (!/^[A-Za-z0-9_-]{1,200}$/.test(id)) {

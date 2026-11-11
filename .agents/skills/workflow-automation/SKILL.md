@@ -1,0 +1,133 @@
+---
+name: workflow-automation
+description: List, inspect, create, update, and delete HubSpot workflows (v4 flows API) from the `hubspot` agent CLI, not the `hs` developer CLI. Classic v3 contact-based workflows are not covered.
+triggers:
+  - "workflow"
+  - "automation"
+  - "automated flow"
+  - "enrollment trigger"
+  - "find workflow by name"
+  - "duplicate workflow"
+  - "update workflow"
+  - "delete workflow"
+  - "create a workflow"
+  - "create a workflow with the hubspot cli"
+  - "build an automation"
+  - "does the cli support workflows"
+---
+
+## Which CLI
+
+Two different HubSpot CLIs share a confusing resemblance — don't mix them up:
+
+- **`hubspot`** — the HubSpot **agent CLI** that this skill library targets. It manages CRM data and automation, and it **does** have native workflow commands: `hubspot workflows list|get|create|update|delete`.
+- **`hs`** — the HubSpot **developer CLI** (`@hubspot/cli`), for building dev projects: themes, modules, serverless functions, UI extensions, and private apps (`hs project`, `hs upload`, `hs create`). It does **not** create or manage workflow records.
+
+To create or manage a workflow, use `hubspot workflows ...` — not `hs`.
+
+If anything here ever drifts, `hubspot workflows --help` and `hs --help` are authoritative.
+
+## Resources
+
+| File | When to use |
+|---|---|
+| `resources/workflow-json-reference.md` | Body shape for create/update — the action graph, branching/convergence, enrollment, full-PUT pitfall |
+| `resources/example-contact-flow.json` | Minimal valid `CONTACT_FLOW` skeleton for `hubspot workflows create --file` |
+| `resources/example-branching-flow.json` | Illustrates branch convergence — two paths pointing `connection.nextActionId` at one shared downstream action |
+
+## Source of truth
+
+`hubspot workflows --help` lists five subcommands: `list`, `get`, `create`, `update`, `delete`. There is **no `search`** — finding by name is `list | jq`. For JSONL piping, pagination, and destructive dry-run/digest/confirm patterns, this skill builds on `bulk-operations/SKILL.md` — re-read that first.
+
+## Auth — OAuth login or service key
+
+**Every `hubspot workflows` command works with both `hubspot auth login` (user OAuth) and `HUBSPOT_ACCESS_TOKEN` (a service key).** The v4 flows API accepts user tokens; the `automation` scope it needs is now part of the CLI app's requestable scopes, so a plain `hubspot auth login` is enough:
+
+```bash
+hubspot auth login          # user OAuth — grant the "automation" scope when prompted
+# or
+export HUBSPOT_ACCESS_TOKEN=<service-key>   # create at Settings → Integrations → Service keys
+hubspot workflows list
+```
+
+If a user token 403s with a missing-scope error, re-run `hubspot auth login` so the newly added `automation` scope is granted.
+
+## 1. List + find by name
+
+```bash
+hubspot workflows list                       # JSONL: id, name, isEnabled, type, objectTypeId, revisionId
+hubspot workflows list --format table        # for human scanning
+
+# Find by name — case-insensitive substring
+hubspot workflows list | jq -c 'select(.name | test("Welcome"; "i"))'
+
+# Exact match
+hubspot workflows list | jq -c 'select(.name == "MQL Nurture")'
+```
+
+List reads `/automation/v4/flows` only. Classic contact-based workflows from `/automation/v3/workflows` are not returned, so an empty result does not necessarily indicate a missing automation scope. V4 results are paginated at 100 per call; loop with `--after` until `meta.next` is empty — see `bulk-operations/SKILL.md` "Pagination". See `resources/json-patterns.md` in `bulk-operations` for more `jq` filters.
+
+## 2. Get + read shape
+
+```bash
+hubspot workflows get 12345678                            # one
+hubspot workflows get 12345678 87654321                   # batch positional
+printf '%s\n' 12345678 87654321 | hubspot workflows get   # batch stdin
+hubspot workflows get 12345678 > workflow.json            # save for editing
+```
+
+Get returns the full body (`actions`, `enrollmentCriteria`, `revisionId`, …) — the shape required by create/update. See `resources/workflow-json-reference.md`.
+
+## 3. Create from JSON
+
+```bash
+hubspot workflows create --file workflow.json --dry-run
+hubspot workflows create --file workflow.json
+cat workflow.json | hubspot workflows create         # stdin also works
+```
+
+Set `type` (`CONTACT_FLOW` or `PLATFORM_FLOW`), `flowType` (`WORKFLOW`), and `objectTypeId` (e.g. `0-1` for contacts) — all required on create. See `resources/workflow-json-reference.md` for the body shape and `resources/example-contact-flow.json` for the minimal template. **Easiest path: `get` an existing similar workflow as a starting template** rather than hand-writing the JSON.
+
+**Pitfall: `create --dry-run` does not validate the body.** It prints the standard dry-run preview (`mutation_kind`, `target`, `impact`) and makes no API call — a green dry-run proves only that the input is well-formed JSON, not that it's a valid create (a body missing `type`/`flowType`/`objectTypeId`/`actions` still returns `ok:true`, and the preview does not echo the body back). The only real validation is the live `create`. By contrast, `update --dry-run` does reject a body missing required fields like `revisionId`.
+
+**Branching and convergence.** A `LIST_BRANCH` action forks the path on filter criteria; each branch — and the `defaultBranch` — carries a `connection` to the action it continues to. Because connections target actions by `nextActionId`, **branches can converge**: point two branches at the same `actionId` and both paths continue to one shared action, no duplication. See the branching section of `resources/workflow-json-reference.md` and `resources/example-branching-flow.json`.
+
+## 4. Update — full PUT, get-modify-put round-trip
+
+Update is a **full replace**. The body must include `revisionId` (from `get`) and `type`. Read-only fields (`createdAt`, `updatedAt`, `dataSources`) are stripped automatically. Update is gated: dry-run first, then re-run with `--digest <hash> --confirm <flowId>`.
+
+```bash
+# 1. Fetch current state
+hubspot workflows get 12345678 > workflow.json
+
+# 2. Edit workflow.json (preserve revisionId, type, and any field you want to keep)
+
+# 3. Dry-run — emits a digest
+hubspot workflows update 12345678 --file workflow.json --dry-run
+
+# 4. Apply — confirm value is the flow id
+hubspot workflows update 12345678 --file workflow.json \
+  --digest blast-xxxxxxxx --confirm 12345678
+```
+
+**Pitfall:** partial bodies silently clear fields. Sending only `actions` will wipe `enrollmentCriteria`. Always start from the full `get` response.
+
+## 5. Delete — destructive, link to bulk safety flow
+
+```bash
+# 1. Dry-run — emits a digest + the confirm hint
+hubspot workflows delete 12345678 --dry-run
+
+# 2. Re-run with digest + confirm. Confirm value is the workflow's NAME, not its id.
+hubspot workflows delete 12345678 --digest blast-xxxxxxxx --confirm "New lead routing"
+```
+
+The dry-run output includes an `apply_command_hint` — copy the exact confirm string from there to avoid quoting surprises. Workflows cannot be restored through the automation API after deletion; check `hubspot history --since 1h` for an audit record. The full safety pattern (digest, 5-minute expiry, history recovery) is documented in `bulk-operations/SKILL.md` "Safe destructive workflow".
+
+## Known limitations
+
+- `list` covers only v4 flows. Classic contact-based workflows from `/automation/v3/workflows` are not returned.
+- No `hubspot workflows search` — `list | jq` is the workaround.
+- `hubspot segments` provides CRM lists (`list`, `get`, `create`, `update`, `update-filters`, `delete`, `restore`, `members-list` / `members-add` / `members-remove`). List-membership enrollment triggers are part of the workflow body (`enrollmentCriteria`), so configure them through `hubspot workflows create` / `update` — get the list ID with `hubspot segments list` / `get` and copy the `enrollmentCriteria` shape from a real `workflows get` (see `resources/workflow-json-reference.md`). No UI step required.
+- Sales Hub sequences are a separate surface from workflows: `hubspot sequences` reads them (`list --user-id <id>`, `get <id> --user-id <id>`, `enrollments <contact_id>`) but is read-only — no create/update/delete/enroll, and it is not a CRM object type (Sales Hub Professional+, `automation.sequences.read` scope). Workflow create/update/delete stays under `hubspot workflows`. This surface grows; recheck `hubspot --help` / `CHANGELOG.md` before assuming an API is missing.
+- `dataSources` is read-only — cannot be rewired via update.

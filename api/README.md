@@ -391,56 +391,36 @@ Voice calls and SMS conversations automatically fall back to the default adaptiv
 ## Setting up for Development
 
 ### Prerequisites
-Sign up for the following services and get an API key for each:
-- [Deepgram](https://console.deepgram.com/signup)
-- [OpenAI](https://platform.openai.com/signup)
+Use Node.js 24 and npm. For local development, the API can start without provider credentials; add credentials only for integrations you plan to use.
 
-If you're hosting the app locally, we also recommend using a tunneling service like [ngrok](https://ngrok.com) so that Twilio can forward audio to your app.
-
-### 1. Start Ngrok
-Start an [ngrok](https://ngrok.com) tunnel for port `3000`:
+### 1. Configure the minimal local environment
+If you don't already have a local `.env`, copy `.env.example` to `.env`, then replace the `API_SECRET` placeholder with a unique value (for example, generate one with `openssl rand -hex 32`). Keep `.env` local and never commit it. The `.env.advanced.example` file lists optional integration and runtime settings.
 
 ```bash
-ngrok http 3000
-```
-Ngrok will give you a unique URL, like `abc123.ngrok.io`. Copy the URL without http:// or https://. You'll need this URL in the next step.
-
-### 2. Configure Environment Variables
-Copy `.env.example` to `.env` and configure the minimal variables first.
-If you need runtime tuning, copy specific overrides from `.env.advanced.example`.
-
-```bash
-# Your ngrok or server URL
-# E.g. 123.ngrok.io or myserver.fly.dev (exlude https://)
-SERVER="yourserverdomain.com"
-
-# Service API Keys
-OPENROUTER_API_KEY="YOUR-OPENROUTER-API-KEY"
-DEEPGRAM_API_KEY="YOUR-DEEPGRAM-API-KEY"
-API_SECRET="change-me"
-
-# Configure your Twilio credentials if you want
-# to make test calls using '$ npm test'.
-TWILIO_ACCOUNT_SID="YOUR-ACCOUNT-SID"
-TWILIO_AUTH_TOKEN="YOUR-AUTH-TOKEN"
-FROM_NUMBER='+12223334444'
+if [ ! -f .env ]; then cp .env.example .env; fi
 ```
 
-### 3. Install Dependencies with NPM
+Set `SERVER` to your public HTTPS hostname only when configuring provider webhooks. A tunnel such as [ngrok](https://ngrok.com) is optional for local webhook testing.
+
+### 2. Install Dependencies with NPM
 Install the necessary packages:
 
 ```bash
-npm install
+npm ci
 ```
 
-### 4. Start Your Server in Development Mode
+### 3. Start Your Server in Development Mode
 Run the following command:
 ```bash
 npm run dev
 ```
 This will start your app using `nodemon` so that any changes to your code automatically refreshes and restarts the server.
 
-### 5. Configure an Incoming Phone Number
+### 4. Optional: Enable the Default Voice Flow
+
+The minimal environment only starts the API. To enable the default Twilio voice flow and its AI/transcription services, add `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `FROM_NUMBER`, `DEEPGRAM_API_KEY`, and `OPENROUTER_API_KEY` to `.env`. Configure `SERVER` with the public HTTPS hostname when setting up provider webhooks.
+
+### 5. Optional: Configure an Incoming Phone Number
 
 Connect a phone number using the [Twilio Console](https://console.twilio.com/us1/develop/phone-numbers/manage/incoming).
 

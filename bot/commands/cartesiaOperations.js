@@ -9,7 +9,7 @@ const { buildCallbackData } = require('../utils/actions');
 const { escapeHtml, renderMenu } = require('../utils/ui');
 const { startOperation, ensureOperationActive } = require('../utils/sessionState');
 
-const ACTIONS = new Set(['CARTESIA_CALL', 'CARTESIA_RECONCILE', 'CARTESIA_CALLS', 'CARTESIA_REVIEW_QUEUE', 'CARTESIA_REVIEW_RULES', 'CARTESIA_CAMPAIGN', 'CARTESIA_CAMPAIGN_STATUS', 'CARTESIA_CAMPAIGN_RECONCILE', 'CARTESIA_BATCH_RECONCILE', 'CARTESIA_BATCH_CANCEL', 'CARTESIA_BATCH_RETRY', 'CARTESIA_AGENT_HEALTH', 'CARTESIA_AGENT_RUNTIME']);
+const ACTIONS = new Set(['CARTESIA_CALL', 'CARTESIA_RECONCILE', 'CARTESIA_CALLS', 'CARTESIA_REVIEW_QUEUE', 'CARTESIA_REVIEW_RULES', 'CARTESIA_CAMPAIGN', 'CARTESIA_CAMPAIGN_STATUS', 'CARTESIA_CAMPAIGN_RECONCILE', 'CARTESIA_BATCH_RECONCILE', 'CARTESIA_BATCH_CANCEL', 'CARTESIA_BATCH_RETRY', 'CARTESIA_AGENT_HEALTH', 'CARTESIA_AGENT_RUNTIME', 'CARTESIA_BUSINESS_SCOPE']);
 const BUSINESS_ID_PATTERN = /^[A-Za-z0-9._:-]{1,120}$/;
 const IDENTIFIER_PATTERN = /^[A-Za-z0-9._:-]{1,200}$/;
 const DESTINATION_PATTERN = /^\+[1-9]\d{7,14}$/;
@@ -38,6 +38,7 @@ function buildCartesiaKeyboard(ctx) {
     .text('🧭 Post-call review rules', buildCallbackData(ctx, 'CARTESIA_REVIEW_RULES')).row()
     .text('🩺 Agent & deployment health', buildCallbackData(ctx, 'CARTESIA_AGENT_HEALTH')).row()
     .text('🔌 Managed Agent runtime', buildCallbackData(ctx, 'CARTESIA_AGENT_RUNTIME')).row()
+    .text('🏢 Assign number to a business', buildCallbackData(ctx, 'CARTESIA_BUSINESS_SCOPE')).row()
     .text('🔎 Reconcile a call', buildCallbackData(ctx, 'CARTESIA_RECONCILE')).row()
     .text('⬅️ Main menu', buildCallbackData(ctx, 'MENU'));
 }
@@ -726,6 +727,54 @@ async function runCartesiaCampaign(conversation, ctx, ensureActive) {
   }
 }
 
+async function runCartesiaBusinessScope(conversation, ctx, ensureActive) {
+  const phoneNumberId = await askInput(conversation, ctx, 'Enter the Cartesia phone-number ID to scope to one business.', ensureActive);
+  if (phoneNumberId === null) return;
+  if (!/^[A-Za-z0-9_-]{1,200}$/.test(phoneNumberId)) {
+    await ctx.reply('Business scoping canceled. The phone-number ID format is invalid.');
+    return;
+  }
+  const businessId = await askInput(conversation, ctx, 'Enter the VOICEDNUT business ID that owns this inbound number.', ensureActive);
+  if (businessId === null) return;
+  if (!BUSINESS_ID_PATTERN.test(businessId)) {
+    await ctx.reply('Business scoping canceled. The business ID format is invalid.');
+    return;
+  }
+
+  const path = `/api/cartesia/phone-numbers/${encodeURIComponent(phoneNumberId)}/business-scope`;
+  const previewResponse = await httpClient.post(ctx, `${apiRoot()}${path}/preview`, { business_id: businessId }, { timeout: 15000 });
+  ensureActive();
+  const preview = previewResponse?.data?.preview;
+  if (!preview || preview.phoneNumberId !== phoneNumberId || preview.businessId !== businessId ||
+      !/^[A-Za-z0-9_-]{1,200}$/.test(String(preview.agentId || '')) ||
+      !/^[a-f0-9]{64}$/.test(String(preview.requestFingerprint || ''))) {
+    throw new Error('Cartesia returned an invalid business-scope preview.');
+  }
+  const lastFour = String(preview.phoneNumber || '').replace(/\D/g, '').slice(-4);
+  const phrase = `SET CARTESIA BUSINESS SCOPE ${phoneNumberId} TO ${businessId}`;
+  const confirmation = await askInput(conversation, ctx,
+    `This will make inbound calls to ••••${lastFour || '????'} from agent ${preview.agentId} visible only to business ${businessId}. Current scope: ${preview.currentBusinessId || 'unassigned'}. To approve this local tenant mapping, type exactly: ${phrase}`,
+    ensureActive);
+  if (confirmation === null) return;
+  if (confirmation !== phrase) {
+    await ctx.reply('Business-scope change canceled. No mapping was saved.');
+    return;
+  }
+
+  const result = await httpClient.put(ctx, `${apiRoot()}${path}`, {
+    business_id: businessId,
+    approved: true,
+    confirmed_fingerprint: preview.requestFingerprint,
+    idempotency_key: `scope-${crypto.randomUUID()}`,
+  }, { timeout: 15000 });
+  ensureActive();
+  const scope = result?.data?.scope;
+  if (!scope || scope.phoneNumberId !== phoneNumberId || scope.businessId !== businessId) {
+    throw new Error('Cartesia business-scope confirmation did not match the approved mapping.');
+  }
+  await ctx.reply(`Inbound number ••••${lastFour || '????'} is now scoped to business ${businessId}. ${scope.idempotentReplay ? 'The saved operation was confirmed.' : 'The mapping was saved.'}`);
+}
+
 async function cartesiaOperationFlow(conversation, ctx) {
   const access = await getAccessProfile(ctx);
   if (!access?.isAdmin) {
@@ -768,6 +817,11 @@ async function cartesiaOperationFlow(conversation, ctx) {
   }
   if (action === 'CARTESIA_AGENT_RUNTIME') {
     await runCartesiaAgentRuntime(conversation, ctx, ensureActive);
+    return;
+  }
+  if (action === 'CARTESIA_BUSINESS_SCOPE') {
+    try { await runCartesiaBusinessScope(conversation, ctx, ensureActive); }
+    catch (error) { await ctx.reply(httpClient.getUserMessage(error, 'Cartesia business scoping failed. Refresh the number mapping before trying again.')); }
     return;
   }
   if (action === 'CARTESIA_CAMPAIGN_STATUS') {
@@ -963,6 +1017,7 @@ module.exports = {
     formatAgentHealth,
     runCartesiaAgentHealth,
     runCartesiaAgentRuntime,
+    runCartesiaBusinessScope,
     formatPhoneNumberChoices,
     askChoice,
     maskDestination,

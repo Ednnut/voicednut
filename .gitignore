@@ -121,3 +121,6 @@ docs/*
 miniapp/test-results/
 miniapp/playwright-report/
 **/.pnpm-store/
+
+# HubSpot link folder
+.hs

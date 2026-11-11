@@ -297,6 +297,12 @@ class CartesiaOutboundCallService {
     if (!agent || !agent.phoneNumbers.some((phone) => phone.id === input.fromNumberId)) {
       throw serviceError("cartesia_agent_source_not_ready", "Select an active Cartesia agent and one of its attached phone numbers", 409);
     }
+    if (typeof this.db?.getCartesiaPhoneNumberBusinessScope === "function") {
+      const scope = await this.db.getCartesiaPhoneNumberBusinessScope(input.fromNumberId);
+      if (scope && (scope.business_id !== input.businessId || scope.agent_id !== input.agentId)) {
+        throw serviceError("cartesia_phone_business_scope_conflict", "This Cartesia phone number is assigned to a different business or agent", 409);
+      }
+    }
     return agent;
   }
 

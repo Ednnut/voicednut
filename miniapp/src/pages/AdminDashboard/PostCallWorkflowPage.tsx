@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useState } from 'react';
 
 import { AdminPageIntro } from '@/components/admin-dashboard/AdminPageIntro';
+import { MissionMonitoringPage } from '@/pages/AdminDashboard/MissionMonitoringPage';
+import { ReviewControlsPage } from '@/pages/AdminDashboard/ReviewControlsPage';
 import {
   UiBadge,
   UiButton,
@@ -60,9 +62,25 @@ const STARTER_DEFINITION: WorkflowDefinition = {
   steps: [{ id: 'finish', type: 'end' }],
 };
 
-const STEP_TYPE_OPTIONS: WorkflowStepType[] = ['approval', 'wait', 'branch', 'action'];
+const STEP_TYPE_OPTIONS: WorkflowStepType[] = ['approval', 'wait', 'branch', 'action', 'end'];
 const ACTION_TYPE_OPTIONS = ['send_email', 'crm_sync', 'create_ticket'];
 const CLASSIFICATION_LABELS: ResultClassificationLabel[] = ['positive', 'negative', 'neutral', 'requires_review', 'unknown'];
+const WORKFLOW_ROOT_KEYS = new Set([
+  'schema_version', 'workflow_id', 'business_id', 'template_id', 'template_version',
+  'result_classifications', 'name', 'trigger_event', 'start_step_id', 'steps',
+]);
+const ACTION_CONFIG_KEYS: Record<string, Set<string>> = {
+  send_email: new Set([
+    'to', 'from', 'provider', 'subject', 'text', 'html', 'script_id', 'template_id',
+    'select_template', 'template_context', 'variables', 'metadata', 'is_marketing',
+  ]),
+  crm_sync: new Set(['provider', 'metadata']),
+  create_ticket: new Set(['provider', 'contact_id', 'summary', 'metadata']),
+};
+
+function hasOnlyKeys(value: Record<string, unknown>, keys: Set<string>): boolean {
+  return Object.keys(value).every((key) => keys.has(key));
+}
 
 function asRows(value: unknown): Record<string, unknown>[] {
   return Array.isArray(value)
@@ -83,18 +101,61 @@ function formatLabel(value: unknown, fallback = 'n/a'): string {
 
 function asDefinition(value: unknown): WorkflowDefinition | null {
   const record = asRecord(value);
+  if (!hasOnlyKeys(record, WORKFLOW_ROOT_KEYS) || record.schema_version !== 1) return null;
+  if (!Array.isArray(record.steps) || record.steps.some((step) => !step || typeof step !== 'object' || Array.isArray(step))) return null;
+  if (typeof record.start_step_id !== 'string') return null;
   const steps = asRows(record.steps).map((step) => ({
     ...step,
-    id: String(step.id || ''),
-    type: String(step.type || 'end') as WorkflowStepType,
+    id: typeof step.id === 'string' ? step.id : '',
+    type: (typeof step.type === 'string' ? step.type : 'end') as WorkflowStepType,
   })) as WorkflowStep[];
-  if (!record.workflow_id || !record.name || !record.trigger_event || !steps.length) return null;
-  const trigger = String(record.trigger_event) as WorkflowTrigger;
+  if (typeof record.workflow_id !== 'string' || typeof record.name !== 'string' ||
+      typeof record.trigger_event !== 'string' || !steps.length) return null;
+  const trigger = record.trigger_event as WorkflowTrigger;
   if (!['post_call_completed', 'post_call_outcome_classified', 'call_e_result_ready'].includes(trigger)) return null;
+  const rawSteps = asRows(record.steps);
+  for (const step of rawSteps) {
+    const type = typeof step.type === 'string' ? step.type : '';
+    if (typeof step.id !== 'string' || !step.id.trim()) return null;
+    const allowedKeys = {
+      action: new Set(['id', 'type', 'action_type', 'config', 'next_step_id']),
+      approval: new Set(['id', 'type', 'next_step_id']),
+      branch: new Set(['id', 'type', 'condition', 'true_step_id', 'false_step_id']),
+      wait: new Set(['id', 'type', 'seconds', 'next_step_id']),
+      end: new Set(['id', 'type']),
+    }[type];
+    if (!allowedKeys || !hasOnlyKeys(step, allowedKeys)) return null;
+    if (type === 'branch' && (validateBranchCondition(step.condition) ||
+        typeof step.true_step_id !== 'string' || typeof step.false_step_id !== 'string')) return null;
+    if (type === 'action') {
+      const actionType = typeof step.action_type === 'string' ? step.action_type : '';
+      const config = asRecord(step.config);
+      if (!ACTION_CONFIG_KEYS[actionType] || !step.config || typeof step.config !== 'object' ||
+          Array.isArray(step.config) || !hasOnlyKeys(config, ACTION_CONFIG_KEYS[actionType]) ||
+          typeof step.next_step_id !== 'string') return null;
+    }
+    if (['approval', 'wait'].includes(type) && typeof step.next_step_id !== 'string') return null;
+    if (type === 'wait' && (!Number.isSafeInteger(step.seconds) || Number(step.seconds) < 1 || Number(step.seconds) > 2592000)) return null;
+  }
+  const rawClassifications = record.result_classifications;
+  if (rawClassifications !== undefined && !Array.isArray(rawClassifications)) return null;
+  for (const entry of (Array.isArray(rawClassifications) ? rawClassifications : [])) {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return null;
+    const rule = entry as Record<string, unknown>;
+    if (!hasOnlyKeys(rule, new Set(['id', 'field', 'enum_index', 'label'])) ||
+        typeof rule.id !== 'string' || typeof rule.field !== 'string' ||
+        !Number.isSafeInteger(rule.enum_index) || typeof rule.label !== 'string' ||
+        !CLASSIFICATION_LABELS.includes(rule.label as ResultClassificationLabel)) return null;
+  }
+  if (record.business_id !== undefined && record.business_id !== null && typeof record.business_id !== 'string') return null;
+  if (record.template_id !== undefined && record.template_id !== null &&
+      (!Number.isSafeInteger(record.template_id) || Number(record.template_id) < 1)) return null;
+  if (record.template_version !== undefined && record.template_version !== null &&
+      (!Number.isSafeInteger(record.template_version) || Number(record.template_version) < 1)) return null;
   return {
     schema_version: 1,
-    workflow_id: String(record.workflow_id),
-    name: String(record.name),
+    workflow_id: record.workflow_id,
+    name: record.name,
     trigger_event: trigger,
     business_id: typeof record.business_id === 'string' ? record.business_id : undefined,
     template_id: Number.isSafeInteger(record.template_id) && Number(record.template_id) > 0 ? Number(record.template_id) : undefined,
@@ -105,7 +166,7 @@ function asDefinition(value: unknown): WorkflowDefinition | null {
       enum_index: Number.isSafeInteger(rule.enum_index) ? Number(rule.enum_index) : -1,
       label: CLASSIFICATION_LABELS.includes(rule.label as ResultClassificationLabel) ? rule.label as ResultClassificationLabel : 'unknown',
     })),
-    start_step_id: String(record.start_step_id || steps[0].id),
+    start_step_id: typeof record.start_step_id === 'string' ? record.start_step_id : steps[0].id,
     steps,
   };
 }
@@ -126,7 +187,62 @@ function createStep(type: WorkflowStepType, id: string, nextId: string): Workflo
   return { id, type };
 }
 
-function validateDraft(definition: WorkflowDefinition, configTexts: Record<string, string>): string {
+function isEditableSimpleBranchCondition(condition: unknown): boolean {
+  if (typeof condition === 'string') {
+    try {
+      condition = JSON.parse(condition) as unknown;
+    } catch {
+      return false;
+    }
+  }
+  if (!condition || typeof condition !== 'object' || Array.isArray(condition)) return false;
+  const record = condition as Record<string, unknown>;
+  const keys = Object.keys(record);
+  return keys.length === 2 && keys.includes('field') &&
+    ((typeof record.field === 'string' && typeof record.exists === 'boolean') ||
+      (typeof record.field === 'string' && typeof record.equals === 'string'));
+}
+
+function validateBranchCondition(condition: unknown, stepId?: string, depth = 0): string {
+  if (depth > 8) return stepId ? `Branch condition for “${stepId}” is nested too deeply.` : 'Branch condition is nested too deeply.';
+  if (!condition || typeof condition !== 'object' || Array.isArray(condition)) {
+    return stepId ? `Branch condition for “${stepId}” must be a JSON object.` : 'Branch condition must be a JSON object.';
+  }
+  const record = condition as Record<string, unknown>;
+  const keys = Object.keys(record);
+  if (keys.length === 1 && ['all', 'any'].includes(keys[0])) {
+    const clauses = record[keys[0]];
+    if (!Array.isArray(clauses) || clauses.length < 1 || clauses.length > 20) {
+      return stepId ? `Branch group for “${stepId}” must contain between 1 and 20 clauses.` : 'Branch group must contain between 1 and 20 clauses.';
+    }
+    for (const clause of clauses) {
+      const error = validateBranchCondition(clause, stepId, depth + 1);
+      if (error) return error;
+    }
+    return '';
+  }
+  const operatorKeys = keys.filter((key) => ['exists', 'equals', 'in', 'includes'].includes(key));
+  if (keys.length !== 2 || !keys.includes('field') || operatorKeys.length !== 1) {
+    return stepId ? `Complete the condition for branch step “${stepId}”.` : 'Complete the branch condition.';
+  }
+  const field = typeof record.field === 'string' ? record.field.trim() : '';
+  if (!/^[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)*$/.test(field)) {
+    return stepId ? `Condition field for “${stepId}” is invalid.` : 'Condition field is invalid.';
+  }
+  const operator = operatorKeys[0];
+  const value = record[operator];
+  if (operator === 'exists' && typeof value !== 'boolean') return stepId ? `Branch condition “${stepId}” must use a boolean exists value.` : 'Branch condition exists must be boolean.';
+  if (operator === 'includes' && (typeof value !== 'string' || value.length > 256)) return stepId ? `Branch condition “${stepId}” must use a string value of 256 characters or fewer.` : 'Branch condition includes must be a string of 256 characters or fewer.';
+  if (operator === 'in' && (!Array.isArray(value) || value.length < 1 || value.length > 50 || value.some((entry) => !['string', 'number', 'boolean'].includes(typeof entry)))) {
+    return stepId ? `Branch condition “${stepId}” must contain 1 to 50 scalar values.` : 'Branch condition in must contain 1 to 50 scalar values.';
+  }
+  if (operator === 'equals' && value !== null && !['string', 'number', 'boolean'].includes(typeof value)) {
+    return stepId ? `Branch condition “${stepId}” equals must use a scalar value.` : 'Branch condition equals must use a scalar value.';
+  }
+  return '';
+}
+
+function validateDraft(definition: WorkflowDefinition, configTexts: Record<string, string>, conditionTexts: Record<string, string>): string {
   if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,119}$/.test(definition.workflow_id.trim())) return 'Workflow ID must start with a letter or number and use at most 120 letters, numbers, underscores, or hyphens.';
   if (!definition.name.trim() || definition.name.trim().length > 160) return 'Enter a workflow name up to 160 characters.';
   if (definition.trigger_event === 'call_e_result_ready' && !/^[A-Za-z0-9._:-]{1,120}$/.test(String(definition.business_id || '').trim())) return 'Enter the business ID for this CALL-E result-ready workflow.';
@@ -163,8 +279,15 @@ function validateDraft(definition: WorkflowDefinition, configTexts: Record<strin
     if (step.type === 'wait' && (!Number.isSafeInteger(step.seconds) || Number(step.seconds) < 1 || Number(step.seconds) > 2592000)) return `Wait step “${step.id}” must be between 1 second and 30 days.`;
     if (step.type === 'wait') totalWaitSeconds += Number(step.seconds);
     if (step.type === 'branch') {
-      const condition = asRecord(step.condition);
-      if (typeof condition.field !== 'string' || !condition.field.trim() || (!('exists' in condition) && !('equals' in condition))) return `Complete the condition for branch step “${step.id}”.`;
+      let parsedCondition: unknown;
+      try {
+        parsedCondition = JSON.parse(conditionTexts[step.id] ?? JSON.stringify(step.condition || { field: 'result_status', exists: true }));
+      } catch {
+        return `Branch condition for “${step.id}” must be valid JSON.`;
+      }
+      const conditionError = validateBranchCondition(parsedCondition, step.id);
+      if (conditionError) return conditionError;
+      step.condition = parsedCondition as Record<string, unknown>;
     }
     if (step.type === 'action') {
       try {
@@ -204,6 +327,7 @@ export function PostCallWorkflowPage({ visible, vm }: PostCallWorkflowPageProps)
   const { investigationBusy, investigationError, runInvestigationAction } = useInvestigationAction(vm.invokeAction);
   const [definition, setDefinition] = useState<WorkflowDefinition>(STARTER_DEFINITION);
   const [configTexts, setConfigTexts] = useState<Record<string, string>>({});
+  const [conditionTexts, setConditionTexts] = useState<Record<string, string>>({});
   const [addStepType, setAddStepType] = useState<WorkflowStepType>('approval');
   const [versions, setVersions] = useState<WorkflowVersion[]>([]);
   const [runs, setRuns] = useState<WorkflowRun[]>([]);
@@ -245,6 +369,11 @@ export function PostCallWorkflowPage({ visible, vm }: PostCallWorkflowPageProps)
     let suffix = definition.steps.length + 1;
     while (used.has(`step_${suffix}`) || used.has(`finish_${suffix}`)) suffix += 1;
     const nextId = `finish_${suffix}`;
+    if (addStepType === 'end') {
+      setDefinition((current) => ({ ...current, steps: [...current.steps, { id: nextId, type: 'end' }] }));
+      setFormError('');
+      return;
+    }
     const priorEnd = definition.steps[terminalIndex];
     const inserted = createStep(addStepType, priorEnd.id, nextId);
     setDefinition((current) => ({
@@ -252,13 +381,17 @@ export function PostCallWorkflowPage({ visible, vm }: PostCallWorkflowPageProps)
       steps: [...current.steps.map((step) => step.id === priorEnd.id ? inserted : step), { id: nextId, type: 'end' }],
     }));
     setConfigTexts((current) => ({ ...current, [priorEnd.id]: '{}' }));
+    if (addStepType === 'branch') setConditionTexts((current) => ({ ...current, [priorEnd.id]: JSON.stringify({ field: 'result_status', exists: true }, null, 2) }));
     setFormError('');
   };
 
   const removeStep = (stepId: string) => {
     const step = definition.steps.find((candidate) => candidate.id === stepId);
-    if (!step || step.type === 'end') return;
-    const fallback = step.next_step_id || step.true_step_id || step.false_step_id || definition.steps.find((candidate) => candidate.type === 'end')?.id;
+    const endSteps = definition.steps.filter((candidate) => candidate.type === 'end');
+    if (!step || (step.type === 'end' && endSteps.length <= 1)) return;
+    const fallback = (step.type === 'end' ? endSteps.find((candidate) => candidate.id !== stepId)?.id : undefined)
+      || step.next_step_id || step.true_step_id || step.false_step_id
+      || endSteps.find((candidate) => candidate.id !== stepId)?.id;
     const remaining = definition.steps.filter((candidate) => candidate.id !== stepId).map((candidate) => {
       if (candidate.next_step_id === stepId) return { ...candidate, next_step_id: fallback };
       if (candidate.true_step_id === stepId || candidate.false_step_id === stepId) {
@@ -276,16 +409,22 @@ export function PostCallWorkflowPage({ visible, vm }: PostCallWorkflowPageProps)
       delete next[stepId];
       return next;
     });
+    setConditionTexts((current) => {
+      const next = { ...current };
+      delete next[stepId];
+      return next;
+    });
   };
 
   const loadVersion = (version: WorkflowVersion) => {
     const loaded = asDefinition(version.definition);
     if (!loaded) {
-      setFormError('This saved version cannot be loaded into the visual editor.');
+      setFormError('This saved version contains unsupported or invalid fields and cannot be edited safely.');
       return;
     }
     setDefinition(loaded);
     setConfigTexts(Object.fromEntries(loaded.steps.filter((step) => step.type === 'action').map((step) => [step.id, JSON.stringify(step.config || {}, null, 2)])));
+    setConditionTexts(Object.fromEntries(loaded.steps.filter((step) => step.type === 'branch').map((step) => [step.id, JSON.stringify(step.condition || { field: 'result_status', exists: true }, null, 2)])));
     setFormError('');
     setNotice(`Loaded ${loaded.workflow_id} v${formatLabel(version.version)} as an editable starting point. Saving creates a new draft.`);
   };
@@ -303,7 +442,7 @@ export function PostCallWorkflowPage({ visible, vm }: PostCallWorkflowPageProps)
       result_classifications: callEResultTrigger ? (definition.result_classifications || []).map((rule) => ({ ...rule })) : undefined,
       steps: definition.steps.map((step) => ({ ...step })),
     };
-    const validationError = validateDraft(draft, configTexts);
+    const validationError = validateDraft(draft, configTexts, conditionTexts);
     if (validationError) {
       setFormError(validationError);
       return;
@@ -330,6 +469,7 @@ export function PostCallWorkflowPage({ visible, vm }: PostCallWorkflowPageProps)
   const error = formError || investigationError;
   const selectedSteps = asRows(selectedRun?.steps) as WorkflowAuditStep[];
   const stepIds = definition.steps.map((step) => step.id);
+  const endStepCount = definition.steps.filter((step) => step.type === 'end').length;
   const targetOptions = (current: string | undefined) => (
     <>
       <option value="">Choose a step</option>
@@ -339,6 +479,8 @@ export function PostCallWorkflowPage({ visible, vm }: PostCallWorkflowPageProps)
 
   return (
     <>
+      <MissionMonitoringPage visible={visible} vm={vm} />
+      <ReviewControlsPage visible={visible} vm={vm} />
       <AdminPageIntro
         eyebrow="Automation"
         title="Post-call workflows"
@@ -401,7 +543,7 @@ export function PostCallWorkflowPage({ visible, vm }: PostCallWorkflowPageProps)
           <div className="va-inline-tools" aria-label="Add workflow step">
             <label className="va-field-label" htmlFor="workflow-add-step">New step type</label>
             <UiSelect id="workflow-add-step" value={addStepType} onChange={(event) => setAddStepType(event.target.value as WorkflowStepType)}>
-              {STEP_TYPE_OPTIONS.map((type) => <option key={type} value={type} disabled={callEResultTrigger && type === 'action'}>{type === 'approval' ? 'Human approval' : type === 'wait' ? 'Wait' : type === 'branch' ? 'Branch' : 'External action'}</option>)}
+              {STEP_TYPE_OPTIONS.map((type) => <option key={type} value={type} disabled={callEResultTrigger && type === 'action'}>{type === 'approval' ? 'Human approval' : type === 'wait' ? 'Wait' : type === 'branch' ? 'Branch' : type === 'end' ? 'End' : 'External action'}</option>)}
             </UiSelect>
             <UiButton variant="secondary" disabled={busy || definition.steps.length >= 50 || (callEResultTrigger && addStepType === 'action')} onClick={addStep}>Add step</UiButton>
           </div>
@@ -432,6 +574,12 @@ export function PostCallWorkflowPage({ visible, vm }: PostCallWorkflowPageProps)
                         delete next[oldId];
                         return next;
                       });
+                      setConditionTexts((current) => {
+                        if (!(oldId in current)) return current;
+                        const next = { ...current, [newId]: current[oldId] };
+                        delete next[oldId];
+                        return next;
+                      });
                     }} /></div>
                     <div><label className="va-field-label" htmlFor={`workflow-step-type-${index}`}>Step type</label><UiSelect id={`workflow-step-type-${index}`} value={step.type} disabled={step.type === 'end'} onChange={(event) => {
                       const type = event.target.value as WorkflowStepType;
@@ -439,6 +587,7 @@ export function PostCallWorkflowPage({ visible, vm }: PostCallWorkflowPageProps)
                       const next = createStep(type, step.id, step.next_step_id || definition.steps.find((candidate) => candidate.type === 'end' && candidate.id !== step.id)?.id || step.id);
                       updateStep(step.id, next);
                       if (type === 'action') setConfigTexts((current) => ({ ...current, [step.id]: '{}' }));
+                      if (type === 'branch') setConditionTexts((current) => ({ ...current, [step.id]: JSON.stringify(next.condition || { field: 'result_status', exists: true }, null, 2) }));
                     }}>
                       <option value="end">End</option><option value="approval">Human approval</option><option value="wait">Wait</option><option value="branch">Branch</option><option value="action" disabled={callEResultTrigger}>External action</option>
                     </UiSelect></div>
@@ -446,12 +595,39 @@ export function PostCallWorkflowPage({ visible, vm }: PostCallWorkflowPageProps)
                   {step.type === 'wait' ? <><label className="va-field-label" htmlFor={`workflow-wait-${index}`}>Wait seconds</label><UiInput id={`workflow-wait-${index}`} type="number" min={1} max={2592000} value={step.seconds || 1} onChange={(event) => updateStep(step.id, { seconds: Number(event.target.value) })} /><label className="va-field-label" htmlFor={`workflow-next-${index}`}>Next step</label><UiSelect id={`workflow-next-${index}`} value={step.next_step_id || ''} onChange={(event) => updateStep(step.id, { next_step_id: event.target.value })}>{targetOptions(step.next_step_id)}</UiSelect></> : null}
                   {step.type === 'approval' ? <><label className="va-field-label" htmlFor={`workflow-next-${index}`}>Next step after approval</label><UiSelect id={`workflow-next-${index}`} value={step.next_step_id || ''} onChange={(event) => updateStep(step.id, { next_step_id: event.target.value })}>{targetOptions(step.next_step_id)}</UiSelect></> : null}
                   {step.type === 'branch' ? <>
-                    <label className="va-field-label" htmlFor={`workflow-branch-field-${index}`}>Condition field</label><UiInput id={`workflow-branch-field-${index}`} value={String(step.condition?.field || '')} maxLength={160} placeholder="result_status" onChange={(event) => updateStep(step.id, { condition: { ...step.condition, field: event.target.value } })} />
-                    <label className="va-field-label" htmlFor={`workflow-branch-operator-${index}`}>Condition operator</label><UiSelect id={`workflow-branch-operator-${index}`} value={'exists' in (step.condition || {}) ? 'exists' : 'equals'} onChange={(event) => {
-                      const field = String(step.condition?.field || '');
-                      updateStep(step.id, { condition: event.target.value === 'exists' ? { field, exists: true } : { field, equals: '' } });
+                    {isEditableSimpleBranchCondition(conditionTexts[step.id] ?? step.condition) ? <>
+                    <label className="va-field-label" htmlFor={`workflow-branch-field-${index}`}>Condition field</label><UiInput id={`workflow-branch-field-${index}`} value={typeof step.condition?.field === 'string' ? step.condition.field : ''} maxLength={160} placeholder="result_status" onChange={(event) => {
+                      const nextCondition = { ...(step.condition ?? {} as Record<string, unknown>), field: event.target.value } as Record<string, unknown>;
+                      if (!('exists' in nextCondition) && !('equals' in nextCondition) && !('in' in nextCondition) && !('includes' in nextCondition) && !('all' in nextCondition) && !('any' in nextCondition)) {
+                        nextCondition.exists = true;
+                      }
+                      updateStep(step.id, { condition: nextCondition });
+                      setConditionTexts((current) => ({ ...current, [step.id]: JSON.stringify(nextCondition, null, 2) }));
+                    }} />
+                    <label className="va-field-label" htmlFor={`workflow-branch-operator-${index}`}>Condition operator</label><UiSelect id={`workflow-branch-operator-${index}`} value={step.condition && typeof step.condition === 'object' && 'exists' in step.condition ? 'exists' : 'equals'} onChange={(event) => {
+                      const field = typeof step.condition?.field === 'string' ? step.condition.field : '';
+                      const nextCondition = (event.target.value === 'exists' ? { field, exists: true } : { field, equals: '' }) as Record<string, unknown>;
+                      updateStep(step.id, { condition: nextCondition });
+                      setConditionTexts((current) => ({ ...current, [step.id]: JSON.stringify(nextCondition, null, 2) }));
                     }}><option value="exists">Field exists</option><option value="equals">Equals text</option></UiSelect>
-                    {'equals' in (step.condition || {}) ? <><label className="va-field-label" htmlFor={`workflow-branch-value-${index}`}>Expected value</label><UiInput id={`workflow-branch-value-${index}`} value={String(step.condition?.equals ?? '')} maxLength={256} onChange={(event) => updateStep(step.id, { condition: { ...step.condition, equals: event.target.value } })} /></> : null}
+                    {'equals' in (step.condition || {}) ? <><label className="va-field-label" htmlFor={`workflow-branch-value-${index}`}>Expected value</label><UiInput id={`workflow-branch-value-${index}`} value={typeof step.condition?.equals === 'string' ? step.condition.equals : ''} maxLength={256} onChange={(event) => {
+                      const nextCondition = { ...(step.condition ?? {} as Record<string, unknown>), equals: event.target.value } as Record<string, unknown>;
+                      updateStep(step.id, { condition: nextCondition });
+                      setConditionTexts((current) => ({ ...current, [step.id]: JSON.stringify(nextCondition, null, 2) }));
+                    }} /></> : null}
+                    </> : null}
+                    <label className="va-field-label" htmlFor={`workflow-branch-condition-json-${index}`}>Condition JSON</label>
+                    <UiTextarea id={`workflow-branch-condition-json-${index}`} value={conditionTexts[step.id] ?? JSON.stringify(step.condition || { field: 'result_status', exists: true }, null, 2)} rows={6} maxLength={16000} onChange={(event) => {
+                      const value = event.target.value;
+                      setConditionTexts((current) => ({ ...current, [step.id]: value }));
+                      try {
+                        const parsed = JSON.parse(value) as Record<string, unknown>;
+                        updateStep(step.id, { condition: parsed });
+                      } catch {
+                        // Keep the raw JSON text until it parses cleanly.
+                      }
+                    }} />
+                    <p className="va-field-hint">Use full branch conditions such as {`{"field":"status","equals":"completed"}`} or {`{"all":[{"field":"status","equals":"completed"},{"field":"priority","in":["vip","rush"]}]}`}. The server accepts the same condition grammar used for runtime branch evaluation.</p>
                     <div className="va-grid"><div><label className="va-field-label" htmlFor={`workflow-branch-true-${index}`}>When true</label><UiSelect id={`workflow-branch-true-${index}`} value={step.true_step_id || ''} onChange={(event) => updateStep(step.id, { true_step_id: event.target.value })}>{targetOptions(step.true_step_id)}</UiSelect></div><div><label className="va-field-label" htmlFor={`workflow-branch-false-${index}`}>When false</label><UiSelect id={`workflow-branch-false-${index}`} value={step.false_step_id || ''} onChange={(event) => updateStep(step.id, { false_step_id: event.target.value })}>{targetOptions(step.false_step_id)}</UiSelect></div></div>
                   </> : null}
                   {step.type === 'action' ? <>
@@ -459,7 +635,10 @@ export function PostCallWorkflowPage({ visible, vm }: PostCallWorkflowPageProps)
                     <label className="va-field-label" htmlFor={`workflow-action-config-${index}`}>Action configuration (JSON object)</label><UiTextarea id={`workflow-action-config-${index}`} value={configTexts[step.id] ?? JSON.stringify(step.config || {}, null, 2)} rows={4} maxLength={16000} onChange={(event) => setConfigTexts((current) => ({ ...current, [step.id]: event.target.value }))} />
                     <label className="va-field-label" htmlFor={`workflow-next-${index}`}>Next step</label><UiSelect id={`workflow-next-${index}`} value={step.next_step_id || ''} onChange={(event) => updateStep(step.id, { next_step_id: event.target.value })}>{targetOptions(step.next_step_id)}</UiSelect>
                   </> : null}
-                  {step.type !== 'end' ? <div className="va-inline-tools"><UiButton variant="plain" disabled={busy} aria-label={`Remove step ${step.id}`} onClick={() => removeStep(step.id)}>Remove step</UiButton></div> : <p className="va-field-hint">End of this workflow path.</p>}
+                  {step.type !== 'end' ? <div className="va-inline-tools"><UiButton variant="plain" disabled={busy} aria-label={`Remove step ${step.id}`} onClick={() => removeStep(step.id)}>Remove step</UiButton></div> : <>
+                    <p className="va-field-hint">End of this workflow path.</p>
+                    <UiButton variant="plain" disabled={busy || endStepCount <= 1} aria-label={`Remove end step ${step.id}`} onClick={() => removeStep(step.id)}>Remove end step</UiButton>
+                  </>}
                 </fieldset>
               </li>
             ))}

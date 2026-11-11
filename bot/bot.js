@@ -421,6 +421,7 @@ const {
   renderProviderConfirm,
 } = require("./commands/provider");
 const { registerCallResultsCommand, handleCallResults } = require("./commands/callResults");
+const { registerPostCallWorkflowCommands } = require("./commands/postCallWorkflows");
 const { registerCallQualityCommand } = require("./commands/callQuality");
 const { registerCallMissionsCommands, callMissionCreateFlow } = require("./commands/callMissions");
 const { callEOperationFlow, registerCallEOperations, renderCallECenter } = require("./commands/callEOperations");
@@ -498,6 +499,7 @@ registerCallCommand(bot);
 registerCallPlanCommand(bot);
 registerCallCampaignsCommand(bot);
 registerCallResultsCommand(bot);
+registerPostCallWorkflowCommands(bot);
 registerCallQualityCommand(bot);
 registerCallMissionsCommands(bot);
 registerCallEOperations(bot);
@@ -1333,6 +1335,8 @@ const TELEGRAM_COMMANDS = [
   { command: "callcampaigninfo", description: "Show CALL-E campaign fingerprint and approval audit (private chat)" },
   { command: "callcampaignreview", description: "Approve or reject a CALL-E campaign (policy manager only)" },
   { command: "callresults", description: "Recent CALL-E result status summaries (admin only)" },
+  { command: "workflowruns", description: "Recent post-call workflow run status (admin only)" },
+  { command: "workflowrun", description: "Sanitized post-call workflow step audit (admin only)" },
   { command: "callresult", description: "View one validated CALL-E structured result (private chat)" },
   { command: "callreconcile", description: "Refresh CALL-E call and event state (business-scoped, no dial)" },
   { command: "callquality", description: "CALL-E transcript and result quality signals (admin only)" },

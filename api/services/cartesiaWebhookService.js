@@ -84,6 +84,7 @@ function normalizeCartesiaWebhookEvent(body) {
       provider_call_id: providerCallId,
       agent_id: agentId,
       phone_number: direction === 'inbound' ? from : direction === 'outbound' ? to : (to || from),
+      destination_phone_number: direction === 'inbound' ? to : null,
       direction,
       status: CALL_EVENT_STATUS[type],
       start_time: startTime,
@@ -159,7 +160,32 @@ function createCartesiaWebhookHandler(options = {}) {
       }
       // Reapply idempotently on duplicate delivery so a prior partial DB failure
       // cannot permanently lose a call state update.
-      if (event.callRecord) await db.upsertCartesiaCallRecord(event.callRecord);
+      if (event.callRecord) {
+        let scope = null;
+        let businessScopeResolved = false;
+        if (event.callRecord.direction === 'inbound') {
+          if (typeof db.resolveCartesiaInboundCallScope === 'function') {
+            scope = await db.resolveCartesiaInboundCallScope({
+              agent_id: event.callRecord.agent_id,
+              phone_number: event.callRecord.destination_phone_number,
+              call_start_time: event.callRecord.start_time,
+            });
+          }
+          businessScopeResolved = Boolean(scope?.business_id && scope?.phone_number_id);
+        } else if (event.callRecord.direction === 'outbound' && typeof db.getCartesiaCallBusinessScope === 'function') {
+          const businessId = await db.getCartesiaCallBusinessScope(event.callRecord.provider_call_id);
+          if (businessId) {
+            scope = { business_id: businessId };
+            businessScopeResolved = true;
+          }
+        }
+        await db.upsertCartesiaCallRecord({
+          ...event.callRecord,
+          business_id: scope?.business_id || null,
+          from_number_id: scope?.phone_number_id || null,
+          business_scope_resolved: businessScopeResolved,
+        });
+      }
       return res.status(204).end();
     } catch {
       return res.status(503).json({ success: false, code: 'cartesia_webhook_processing_failed' });

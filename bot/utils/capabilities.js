@@ -46,6 +46,7 @@ const CAPABILITY_RULES = {
   caller_flags_manage: ['admin'],
   call_e_plan: ['user', 'admin'],
   call_e_admin: ['admin'],
+  post_call_workflows_view: ['admin'],
   admin_panel: ['admin']
 };
 
@@ -79,7 +80,9 @@ const COMMAND_CAPABILITIES = {
   domainstats: 'status_admin',
   health: 'health',
   ping: 'health',
-  calle: 'call_e_plan'
+  calle: 'call_e_plan',
+  workflowruns: 'post_call_workflows_view',
+  workflowrun: 'post_call_workflows_view'
 };
 
 const ACTION_CAPABILITIES = [

@@ -162,6 +162,7 @@ class EnhancedDatabase {
         this.emailQueueColumnsEnsured = false;
         this.outboundRateLastCleanupMs = 0;
         this.callECampaignWriteChain = Promise.resolve();
+        this.cartesiaPhoneScopeWriteChain = Promise.resolve();
     }
 
     async applyConnectionPragmas() {
@@ -193,6 +194,7 @@ class EnhancedDatabase {
                     .then(() => this.createEnhancedTables())
                     .then(() => this.ensureOutboundContactDispatchCartesiaProvider())
                     .then(() => this.ensureOutboundCallBusinessScopeColumn())
+                    .then(() => this.ensureCartesiaCallBusinessScopeResolutionColumn())
                     .then(() => this.ensureCartesiaCampaignProgressColumns())
                     .then(() => this.ensureCartesiaCampaignRecipientLimit())
                     .then(() => this.ensureCartesiaVoiceGovernanceColumns())
@@ -936,6 +938,7 @@ class EnhancedDatabase {
                 from_number_id TEXT,
                 phone_number TEXT,
                 direction TEXT CHECK(direction IS NULL OR direction IN ('inbound', 'outbound')),
+                business_scope_resolved INTEGER NOT NULL DEFAULT 0 CHECK(business_scope_resolved IN (0, 1)),
                 status TEXT NOT NULL CHECK(status IN ('created', 'started', 'completed', 'failed')),
                 start_time TEXT,
                 end_time TEXT,
@@ -944,6 +947,40 @@ class EnhancedDatabase {
                 last_event_timestamp TEXT,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )`,
+
+            `CREATE TABLE IF NOT EXISTS cartesia_phone_number_business_scopes (
+                phone_number_id TEXT PRIMARY KEY,
+                business_id TEXT NOT NULL,
+                phone_number TEXT NOT NULL,
+                agent_id TEXT NOT NULL,
+                revision INTEGER NOT NULL DEFAULT 1,
+                updated_by TEXT NOT NULL,
+                updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )`,
+            `CREATE TABLE IF NOT EXISTS cartesia_phone_number_business_scope_history (
+                phone_number_id TEXT NOT NULL,
+                revision INTEGER NOT NULL,
+                business_id TEXT NOT NULL,
+                phone_number TEXT NOT NULL,
+                agent_id TEXT NOT NULL,
+                effective_from TEXT NOT NULL,
+                PRIMARY KEY(phone_number_id, revision)
+            )`,
+            `INSERT OR IGNORE INTO cartesia_phone_number_business_scope_history
+                (phone_number_id, revision, business_id, phone_number, agent_id, effective_from)
+             SELECT phone_number_id, revision, business_id, phone_number, agent_id, updated_at
+             FROM cartesia_phone_number_business_scopes`,
+            `CREATE TABLE IF NOT EXISTS cartesia_phone_business_scope_operations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                idempotency_key TEXT NOT NULL UNIQUE,
+                phone_number_id TEXT NOT NULL,
+                from_business_id TEXT,
+                to_business_id TEXT NOT NULL,
+                actor_id TEXT NOT NULL,
+                request_fingerprint TEXT NOT NULL,
+                response_payload TEXT NOT NULL,
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
             )`,
 
             // Durable Cartesia batch snapshots. Recipient rows intentionally omit
@@ -1746,6 +1783,7 @@ class EnhancedDatabase {
             'CREATE INDEX IF NOT EXISTS idx_calls_phone_number ON calls(phone_number)',
             'CREATE INDEX IF NOT EXISTS idx_cartesia_calls_business_created ON cartesia_calls(business_id, created_at DESC)',
             'CREATE INDEX IF NOT EXISTS idx_cartesia_calls_status_updated ON cartesia_calls(status, updated_at DESC)',
+            'CREATE INDEX IF NOT EXISTS idx_cartesia_phone_scope_history_lookup ON cartesia_phone_number_business_scope_history(phone_number, agent_id, effective_from)',
             'CREATE INDEX IF NOT EXISTS idx_cartesia_batches_business_created ON cartesia_call_batches(business_id, created_at DESC)',
             'CREATE INDEX IF NOT EXISTS idx_cartesia_batches_reconciliation_due ON cartesia_call_batches(status, reconcile_next_at, reconcile_lease_until)',
             'CREATE INDEX IF NOT EXISTS idx_cartesia_batch_recipients_batch_status ON cartesia_call_batch_recipients(provider_batch_id, provider_status)',
@@ -1916,6 +1954,41 @@ class EnhancedDatabase {
         ));
         if (!columns.has('business_id')) await new Promise((resolve, reject) => this.db.run(
             'ALTER TABLE outbound_call_idempotency ADD COLUMN business_id TEXT', (error) => error ? reject(error) : resolve(),
+        ));
+    }
+
+    async ensureCartesiaCallBusinessScopeResolutionColumn() {
+        const columns = await new Promise((resolve, reject) => this.db.all(
+            'PRAGMA table_info(cartesia_calls)', (error, rows) => error ? reject(error) : resolve(new Set((rows || []).map((row) => row.name))),
+        ));
+        if (!columns.has('business_scope_resolved')) await new Promise((resolve, reject) => this.db.run(
+            'ALTER TABLE cartesia_calls ADD COLUMN business_scope_resolved INTEGER NOT NULL DEFAULT 0 CHECK(business_scope_resolved IN (0, 1))',
+            (error) => error ? reject(error) : resolve(),
+        ));
+        await new Promise((resolve, reject) => this.db.run(
+            `UPDATE cartesia_calls SET business_scope_resolved = 1
+             WHERE business_scope_resolved = 0 AND (direction = 'inbound' OR business_id IS NOT NULL)`,
+            (error) => error ? reject(error) : resolve(),
+        ));
+        await new Promise((resolve, reject) => this.db.run(
+            `CREATE TRIGGER IF NOT EXISTS cartesia_inbound_scope_insert_guard
+             AFTER INSERT ON cartesia_calls
+             WHEN NEW.direction = 'inbound' AND NEW.business_scope_resolved = 0
+             BEGIN
+                 UPDATE cartesia_calls SET business_scope_resolved = 1
+                 WHERE local_call_id = NEW.local_call_id AND business_scope_resolved = 0;
+             END`,
+            (error) => error ? reject(error) : resolve(),
+        ));
+        await new Promise((resolve, reject) => this.db.run(
+            `CREATE TRIGGER IF NOT EXISTS cartesia_inbound_scope_update_guard
+             AFTER UPDATE ON cartesia_calls
+             WHEN NEW.direction = 'inbound' AND NEW.business_scope_resolved = 0
+             BEGIN
+                 UPDATE cartesia_calls SET business_scope_resolved = 1
+                 WHERE local_call_id = NEW.local_call_id AND business_scope_resolved = 0;
+             END`,
+            (error) => error ? reject(error) : resolve(),
         ));
     }
 
@@ -5798,11 +5871,154 @@ class EnhancedDatabase {
         if (!/^[A-Za-z0-9._:-]{1,200}$/.test(callId)) return null;
         const rows = await new Promise((resolve, reject) => this.db.all(
             `SELECT business_id FROM outbound_call_idempotency WHERE provider = 'cartesia' AND call_sid = ? AND status = 'completed' AND business_id IS NOT NULL
-             UNION SELECT c.business_id FROM cartesia_campaign_recipients r JOIN cartesia_campaigns c ON c.campaign_id = r.campaign_id WHERE r.provider_call_id = ?`,
-            [callId, callId], (error, values) => error ? reject(error) : resolve(values || []),
+             UNION SELECT c.business_id FROM cartesia_campaign_recipients r JOIN cartesia_campaigns c ON c.campaign_id = r.campaign_id WHERE r.provider_call_id = ?
+             UNION SELECT business_id FROM cartesia_calls WHERE provider_call_id = ? AND business_id IS NOT NULL`,
+            [callId, callId, callId], (error, values) => error ? reject(error) : resolve(values || []),
         ));
         const businesses = [...new Set(rows.map((row) => String(row.business_id || '')).filter(Boolean))];
         return businesses.length === 1 ? businesses[0] : null;
+    }
+
+    async getCartesiaPhoneNumberBusinessScope(phoneNumberId) {
+        const id = String(phoneNumberId || '').trim();
+        if (!/^[A-Za-z0-9_-]{1,200}$/.test(id)) return null;
+        return new Promise((resolve, reject) => this.db.get(
+            `SELECT phone_number_id, business_id, phone_number, agent_id, revision, updated_by, updated_at
+             FROM cartesia_phone_number_business_scopes WHERE phone_number_id = ?`,
+            [id], (error, row) => error ? reject(error) : resolve(row || null),
+        ));
+    }
+
+    async getCartesiaPhoneBusinessScopeOperation(idempotencyKey) {
+        const key = String(idempotencyKey || '').trim();
+        if (!/^[A-Za-z0-9._:-]{8,100}$/.test(key)) return null;
+        return new Promise((resolve, reject) => this.db.get(
+            `SELECT request_fingerprint, response_payload
+             FROM cartesia_phone_business_scope_operations WHERE idempotency_key = ?`,
+            [key], (error, row) => error ? reject(error) : resolve(row || null),
+        ));
+    }
+
+    async resolveCartesiaInboundCallScope(input = {}) {
+        const agentId = String(input.agent_id || '').trim();
+        const phoneNumber = String(input.phone_number || '').trim();
+        const callStartTime = String(input.call_start_time || '').trim();
+        const parsedCallStartTime = Date.parse(callStartTime);
+        if (!/^[A-Za-z0-9_-]{1,200}$/.test(agentId) ||
+            !/^\+[1-9]\d{7,14}$/.test(phoneNumber) ||
+            !/(?:Z|[+-]\d{2}:\d{2})$/i.test(callStartTime) ||
+            !Number.isFinite(parsedCallStartTime)) return null;
+        const normalizedCallStartTime = new Date(parsedCallStartTime).toISOString();
+        const rows = await new Promise((resolve, reject) => this.db.all(
+            `SELECT phone_number_id, business_id
+             FROM cartesia_phone_number_business_scope_history
+             WHERE phone_number = ? AND agent_id = ?
+               AND julianday(effective_from) = (
+                   SELECT MAX(julianday(effective_from))
+                   FROM cartesia_phone_number_business_scope_history
+                   WHERE phone_number = ? AND agent_id = ?
+                     AND julianday(effective_from) <= julianday(?)
+               )
+             LIMIT 2`,
+            [phoneNumber, agentId, phoneNumber, agentId, normalizedCallStartTime],
+            (error, values) => error ? reject(error) : resolve(values || []),
+        ));
+        return rows.length === 1 ? rows[0] : null;
+    }
+
+    async applyCartesiaPhoneNumberBusinessScope(input = {}) {
+        const phoneNumberId = String(input.phone_number_id || '').trim();
+        const businessId = String(input.business_id || '').trim();
+        const phoneNumber = String(input.phone_number || '').trim();
+        const agentId = String(input.agent_id || '').trim();
+        const actorId = String(input.actor_id || '').trim();
+        const idempotencyKey = String(input.idempotency_key || '').trim();
+        const requestFingerprint = String(input.request_fingerprint || '').trim().toLowerCase();
+        const expectedRevision = Number(input.expected_revision);
+        if (!/^[A-Za-z0-9_-]{1,200}$/.test(phoneNumberId) || !/^[A-Za-z0-9._:-]{1,120}$/.test(businessId) ||
+            !/^\+[1-9]\d{7,14}$/.test(phoneNumber) || !/^[A-Za-z0-9_-]{1,200}$/.test(agentId) ||
+            !/^[A-Za-z0-9._:-]{8,100}$/.test(idempotencyKey) || !/^[a-f0-9]{64}$/.test(requestFingerprint) ||
+            !Number.isSafeInteger(expectedRevision) || expectedRevision < 0 || !actorId) {
+            throw Object.assign(new Error('Cartesia phone-number business scope is invalid'), { code: 'cartesia_phone_business_scope_invalid', status: 400 });
+        }
+
+        let release;
+        const previous = this.cartesiaPhoneScopeWriteChain;
+        this.cartesiaPhoneScopeWriteChain = new Promise((resolve) => { release = resolve; });
+        await previous;
+        try {
+            await new Promise((resolve, reject) => this.db.run('BEGIN IMMEDIATE', (error) => error ? reject(error) : resolve()));
+            const existing = await new Promise((resolve, reject) => this.db.get(
+                'SELECT request_fingerprint, response_payload FROM cartesia_phone_business_scope_operations WHERE idempotency_key = ?',
+                [idempotencyKey], (error, row) => error ? reject(error) : resolve(row || null),
+            ));
+            if (existing) {
+                if (existing.request_fingerprint !== requestFingerprint) {
+                    throw Object.assign(new Error('Cartesia business-scope idempotency key was reused'), { code: 'cartesia_idempotency_conflict', status: 409 });
+                }
+                const replay = JSON.parse(existing.response_payload);
+                await new Promise((resolve, reject) => this.db.run('COMMIT', (error) => error ? reject(error) : resolve()));
+                return { ...replay, idempotentReplay: true };
+            }
+
+            const current = await new Promise((resolve, reject) => this.db.get(
+                `SELECT phone_number_id, business_id, phone_number, agent_id, revision, updated_by, updated_at
+                 FROM cartesia_phone_number_business_scopes WHERE phone_number_id = ?`,
+                [phoneNumberId], (error, row) => error ? reject(error) : resolve(row || null),
+            ));
+            const currentRevision = Number(current?.revision || 0);
+            if (currentRevision !== expectedRevision) {
+                throw Object.assign(new Error('Cartesia phone-number business scope changed after preview; refresh and approve again'), {
+                    code: 'cartesia_phone_business_scope_changed', status: 409,
+                });
+            }
+            const changed = current?.business_id !== businessId ||
+                current?.phone_number !== phoneNumber || current?.agent_id !== agentId;
+            const revision = currentRevision + (changed ? 1 : 0);
+            if (changed) {
+                const effectiveFrom = await new Promise((resolve, reject) => this.db.get(
+                    "SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now') AS effective_from",
+                    (error, row) => error ? reject(error) : resolve(row?.effective_from),
+                ));
+                if (!effectiveFrom) throw new Error('Could not timestamp Cartesia phone-number scope update');
+                await new Promise((resolve, reject) => this.db.run(
+                    `INSERT INTO cartesia_phone_number_business_scope_history
+                        (phone_number_id, revision, business_id, phone_number, agent_id, effective_from)
+                     VALUES (?, ?, ?, ?, ?, ?)`,
+                    [phoneNumberId, revision, businessId, phoneNumber, agentId, effectiveFrom],
+                    (error) => error ? reject(error) : resolve(),
+                ));
+                await new Promise((resolve, reject) => this.db.run(
+                    `INSERT INTO cartesia_phone_number_business_scopes
+                        (phone_number_id, business_id, phone_number, agent_id, revision, updated_by, updated_at)
+                     VALUES (?, ?, ?, ?, ?, ?, ?)
+                     ON CONFLICT(phone_number_id) DO UPDATE SET
+                        business_id = excluded.business_id, phone_number = excluded.phone_number,
+                        agent_id = excluded.agent_id, revision = excluded.revision,
+                        updated_by = excluded.updated_by, updated_at = excluded.updated_at`,
+                    [phoneNumberId, businessId, phoneNumber, agentId, revision, actorId, effectiveFrom],
+                    (error) => error ? reject(error) : resolve(),
+                ));
+            }
+            const result = {
+                phoneNumberId, businessId, phoneNumber, agentId, revision, changed,
+                idempotentReplay: false,
+            };
+            await new Promise((resolve, reject) => this.db.run(
+                `INSERT INTO cartesia_phone_business_scope_operations
+                    (idempotency_key, phone_number_id, from_business_id, to_business_id, actor_id, request_fingerprint, response_payload)
+                 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+                [idempotencyKey, phoneNumberId, current?.business_id || null, businessId, actorId, requestFingerprint, JSON.stringify(result)],
+                (error) => error ? reject(error) : resolve(),
+            ));
+            await new Promise((resolve, reject) => this.db.run('COMMIT', (error) => error ? reject(error) : resolve()));
+            return result;
+        } catch (error) {
+            await new Promise((resolve) => this.db.run('ROLLBACK', () => resolve()));
+            throw error;
+        } finally {
+            release();
+        }
     }
 
     async listDueCartesiaCampaigns(input = {}) {
@@ -6300,6 +6516,22 @@ class EnhancedDatabase {
                 },
             );
         });
+    }
+
+    async hasActiveCallEBusinessOperator(businessId) {
+        const normalizedBusinessId = String(businessId || "").trim();
+        if (!/^[A-Za-z0-9._:-]{1,120}$/.test(normalizedBusinessId)) return false;
+        return new Promise((resolve, reject) => this.db.get(
+            `SELECT 1 AS present
+             FROM call_e_business_operator_events current_access
+             WHERE current_access.business_id = ? AND current_access.event_type = 'access_granted'
+               AND current_access.id = (
+                   SELECT MAX(latest.id) FROM call_e_business_operator_events latest
+                   WHERE latest.business_id = current_access.business_id AND latest.telegram_id = current_access.telegram_id
+               )
+             LIMIT 1`,
+            [normalizedBusinessId], (error, row) => error ? reject(error) : resolve(Boolean(row)),
+        ));
     }
 
     async createBusinessIntegrationConnection(input = {}) {
@@ -9386,6 +9618,7 @@ class EnhancedDatabase {
         const endReason = String(payload.end_reason || '').trim().slice(0, 100) || null;
         const accountType = String(payload.telephony_account_type || '').trim().toLowerCase() || null;
         const eventTimestamp = String(payload.event_timestamp || new Date().toISOString()).trim();
+        const businessScopeResolved = payload.business_scope_resolved === true;
         if (!/^cartesia_[A-Za-z0-9_-]{1,200}$/.test(localCallId) ||
             !/^[A-Za-z0-9_-]{1,200}$/.test(providerCallId) ||
             !/^[A-Za-z0-9_-]{1,200}$/.test(agentId) ||
@@ -9400,16 +9633,25 @@ class EnhancedDatabase {
             const sql = `
                 INSERT INTO cartesia_calls (
                     local_call_id, provider_call_id, business_id, agent_id,
-                    from_number_id, phone_number, direction, status,
+                    from_number_id, phone_number, direction, business_scope_resolved, status,
                     start_time, end_time, end_reason, telephony_account_type,
                     last_event_timestamp, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                 ON CONFLICT(provider_call_id) DO UPDATE SET
-                    business_id = COALESCE(cartesia_calls.business_id, excluded.business_id),
+                    business_id = CASE
+                        WHEN cartesia_calls.business_scope_resolved = 1 OR cartesia_calls.business_id IS NOT NULL
+                        THEN cartesia_calls.business_id
+                        ELSE excluded.business_id
+                    END,
                     agent_id = excluded.agent_id,
-                    from_number_id = COALESCE(cartesia_calls.from_number_id, excluded.from_number_id),
+                    from_number_id = CASE
+                        WHEN cartesia_calls.business_scope_resolved = 1 OR cartesia_calls.from_number_id IS NOT NULL
+                        THEN cartesia_calls.from_number_id
+                        ELSE excluded.from_number_id
+                    END,
                     phone_number = COALESCE(cartesia_calls.phone_number, excluded.phone_number),
                     direction = COALESCE(cartesia_calls.direction, excluded.direction),
+                    business_scope_resolved = MAX(cartesia_calls.business_scope_resolved, excluded.business_scope_resolved),
                     status = CASE
                         WHEN cartesia_calls.status IN ('completed', 'failed') THEN cartesia_calls.status
                         WHEN cartesia_calls.last_event_timestamp IS NOT NULL
@@ -9426,7 +9668,7 @@ class EnhancedDatabase {
             `;
             this.db.run(sql, [
                 localCallId, providerCallId, businessId, agentId, fromNumberId,
-                phoneNumber, direction, status, startTime, endTime, endReason,
+                phoneNumber, direction, businessScopeResolved ? 1 : 0, status, startTime, endTime, endReason,
                 accountType, eventTimestamp,
             ], function (err) {
                 if (err) return reject(err);
@@ -9740,6 +9982,7 @@ class EnhancedDatabase {
             'batch_retention_worker',
             'call_operation',
             'call_review',
+            'phone_business_scope',
             'phone_number_operation',
             'provider_operation',
             'webhook_assignment',
@@ -9797,6 +10040,13 @@ class EnhancedDatabase {
                            resource_id, outcome, reason_code, NULL AS business_id,
                            target_agent_id
                     FROM cartesia_phone_number_operation_audit
+                    UNION ALL
+                    SELECT id, 'phone_business_scope' AS source, created_at,
+                           'admin_api' AS actor_type, actor_id,
+                           'phone_business_scope_assignment' AS action, 'phone_number' AS resource_type,
+                           phone_number_id AS resource_id, 'succeeded' AS outcome, NULL AS reason_code,
+                           to_business_id AS business_id, NULL AS target_agent_id
+                    FROM cartesia_phone_business_scope_operations
                     UNION ALL
                     SELECT id, 'provider_operation' AS source, created_at,
                            actor_type, actor_id, action, 'provider' AS resource_type,

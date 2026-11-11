@@ -55,6 +55,20 @@ describe("PostCallWorkflowDefinitionService", () => {
     assert.equal(normalizeWorkflowDefinition(definition).trigger_event, "post_call_completed");
   });
 
+  it("accepts nested branch conditions and preserves supported action settings", () => {
+    const definition = normalizeWorkflowDefinition(validDefinition({
+      steps: [
+        { id: "route", type: "branch", condition: { all: [{ field: "outcome", equals: "completed" }, { field: "priority", in: ["vip", "rush"] }] }, true_step_id: "email", false_step_id: "stop" },
+        { id: "email", type: "action", action_type: "send_email", config: { subject: "Follow up", template_context: { customer: "Acme" }, variables: { greeting: "hello" } }, next_step_id: "done" },
+        { id: "stop", type: "end" },
+        { id: "done", type: "end" },
+      ],
+      start_step_id: "route",
+    }));
+    assert.deepEqual(definition.steps[0].condition, { all: [{ field: "outcome", equals: "completed" }, { field: "priority", in: ["vip", "rush"] }] });
+    assert.deepEqual(definition.steps[1].config, { subject: "Follow up", template_context: { customer: "Acme" }, variables: { greeting: "hello" } });
+  });
+
   it("binds business-scoped builder drafts to the authenticated business", async () => {
     const draft = await service.createDraft(validDefinition(), "123456", "biz-42");
     assert.equal(draft.business_id, "biz-42");

@@ -22,6 +22,7 @@ const {
     normalizeCampaignSchedule, campaignSubmitPhrase,
     runCartesiaAgentRuntime, runCartesiaCallOperations, formatCallDetails, formatCallTranscript, formatCampaignOutcomes,
     formatCampaignStatus,
+    runCartesiaBusinessScope,
   },
 } = require('./cartesiaOperations');
 
@@ -40,6 +41,7 @@ test('Cartesia operations expose guarded single-call and batch campaign actions'
   assert.equal(ACTIONS.has('CARTESIA_AGENT_RUNTIME'), true);
   assert.equal(ACTIONS.has('CARTESIA_REVIEW_RULES'), true);
   assert.equal(ACTIONS.has('CARTESIA_REVIEW_QUEUE'), true);
+  assert.equal(ACTIONS.has('CARTESIA_BUSINESS_SCOPE'), true);
 });
 
 test('Cartesia menu uses signed callback data for the call action', () => {
@@ -68,6 +70,83 @@ test('Cartesia menu uses signed callback data for the call action', () => {
   assert.match(health.text, /health/i);
   assert.ok(keyboard.inline_keyboard.flat().some((button) => /CARTESIA_AGENT_RUNTIME/.test(button.callback_data)));
   assert.ok(keyboard.inline_keyboard.flat().some((button) => /CARTESIA_REVIEW_RULES/.test(button.callback_data)));
+  assert.ok(keyboard.inline_keyboard.flat().some((button) => /CARTESIA_BUSINESS_SCOPE/.test(button.callback_data)));
+});
+
+test('Cartesia business-scope workflow previews and explicitly approves a private tenant mapping', async () => {
+  const originalPost = httpClient.post;
+  const originalPut = httpClient.put;
+  const requests = [];
+  const replies = [];
+  const phoneNumberId = 'pn_test_01';
+  const businessId = 'business-01';
+  const fingerprint = 'a'.repeat(64);
+  httpClient.post = async (_ctx, url, body, options) => {
+    requests.push({ method: 'post', url, body, options });
+    return { data: { preview: {
+      phoneNumberId, phoneNumber: '+15555550123', agentId: 'agent_test_01',
+      businessId, currentBusinessId: null, requestFingerprint: fingerprint,
+    } } };
+  };
+  httpClient.put = async (_ctx, url, body, options) => {
+    requests.push({ method: 'put', url, body, options });
+    return { data: { scope: { phoneNumberId, businessId, idempotentReplay: false } } };
+  };
+  const answers = [
+    { message: { text: phoneNumberId } },
+    { message: { text: businessId } },
+    { message: { text: `SET CARTESIA BUSINESS SCOPE ${phoneNumberId} TO ${businessId}` } },
+  ];
+  const ctx = {
+    from: { id: 7001 }, chat: { type: 'private' },
+    session: { accessProfile: { isAdmin: true, checkedAt: Date.now() }, cartesiaOperationAction: 'CARTESIA_BUSINESS_SCOPE' },
+    async reply(message) { replies.push(String(message)); },
+  };
+  try {
+    await cartesiaOperationFlow({ async wait() { return answers.shift(); } }, ctx);
+  } finally {
+    httpClient.post = originalPost;
+    httpClient.put = originalPut;
+  }
+  assert.equal(requests.length, 2);
+  assert.match(requests[0].url, /\/business-scope\/preview$/);
+  assert.deepEqual(requests[0].body, { business_id: businessId });
+  assert.match(requests[1].url, /\/business-scope$/);
+  assert.equal(requests[1].body.approved, true);
+  assert.equal(requests[1].body.confirmed_fingerprint, fingerprint);
+  assert.match(requests[1].body.idempotency_key, /^scope-[\da-f-]{36}$/);
+  assert.match(JSON.stringify(replies), /••••0123/);
+  assert.doesNotMatch(JSON.stringify(replies), /\+15555550123/);
+});
+
+test('Cartesia business-scope workflow cancels without a write when the exact phrase is not provided', async () => {
+  const originalPost = httpClient.post;
+  const originalPut = httpClient.put;
+  let writes = 0;
+  httpClient.post = async () => ({ data: { preview: {
+    phoneNumberId: 'pn_test_01', phoneNumber: '+15555550123', agentId: 'agent_test_01',
+    businessId: 'business-01', currentBusinessId: null, requestFingerprint: 'b'.repeat(64),
+  } } });
+  httpClient.put = async () => { writes += 1; return { data: {} }; };
+  const answers = [
+    { message: { text: 'pn_test_01' } },
+    { message: { text: 'business-01' } },
+    { message: { text: 'yes' } },
+  ];
+  const replies = [];
+  const ctx = {
+    from: { id: 7001 }, chat: { type: 'private' },
+    session: { accessProfile: { isAdmin: true, checkedAt: Date.now() }, cartesiaOperationAction: 'CARTESIA_BUSINESS_SCOPE' },
+    async reply(message) { replies.push(String(message)); },
+  };
+  try {
+    await cartesiaOperationFlow({ async wait() { return answers.shift(); } }, ctx);
+  } finally {
+    httpClient.post = originalPost;
+    httpClient.put = originalPut;
+  }
+  assert.equal(writes, 0);
+  assert.match(replies.join('\n'), /canceled/i);
 });
 
 test('Cartesia review formatting escapes transcript content and campaign outcomes are readable', () => {

@@ -31,7 +31,7 @@ describe("voice provider capability registry", () => {
     assert.equal(isVoiceProviderCapabilityImplemented("cartesia", "sonic", "voice_catalog_read"), true);
     assert.equal(isVoiceProviderCapabilityImplemented("cartesia", "ink", "batch_stt"), true);
     assert.equal(isVoiceProviderCapabilityImplemented("cartesia", "ink", "realtime_stt_auto_turns"), true);
-    assert.equal(isVoiceProviderCapabilityImplemented("cartesia", "ink", "realtime_stt_manual_turns"), false);
+    assert.equal(isVoiceProviderCapabilityImplemented("cartesia", "ink", "realtime_stt_manual_turns"), true);
   });
 
   it("exposes implemented Cartesia phone management and verified provider lifecycle operations", () => {
@@ -40,6 +40,7 @@ describe("voice provider capability registry", () => {
     assert.equal(isVoiceProviderCapabilityImplemented("cartesia", "managed_agents", "phone_number_list_import_and_assignment"), true);
     assert.equal(isVoiceProviderCapabilityImplemented("cartesia", "managed_agents", "phone_number_provisioning"), true);
     assert.equal(isVoiceProviderCapabilityImplemented("cartesia", "managed_agents", "phone_number_release"), true);
+    assert.equal(isVoiceProviderCapabilityImplemented("cartesia", "managed_agents", "call_audio_read"), true);
     assert.equal(isVoiceProviderCapabilityImplemented("cartesia", "managed_agents", "twilio_provider_link"), true);
     assert.equal(isVoiceProviderCapabilityImplemented("cartesia", "managed_agents", "sip_trunk_provider_link"), false);
     assert.equal(isVoiceProviderCapabilityImplemented("cartesia", "managed_agents", "telephony_provider_inventory_read"), true);

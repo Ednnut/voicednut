@@ -28,6 +28,7 @@ const CARTESIA_AUDIT_SOURCES = new Set([
   'batch_retention_worker',
   'call_operation',
   'call_review',
+  'phone_business_scope',
   'phone_number_operation',
   'provider_operation',
   'webhook_assignment',
@@ -511,6 +512,42 @@ function registerCartesiaCallRoutes(app, options = {}) {
         getTargetAgentId: (result) => result?.agentId,
         send: (result) => res.json({ success: true, assignment: result }),
       });
+    });
+
+    app.post('/api/cartesia/phone-numbers/:phoneNumberId/business-scope/preview', requireAdminToken, limiter, async (req, res) => {
+      const body = isPlainObject(req.body) ? req.body : {};
+      if (rejectUnknownFields(body, new Set(['business_id'])) || !Object.hasOwn(body, 'business_id')) {
+        return res.status(400).json({ success: false, code: 'cartesia_phone_business_scope_invalid', error: 'business_id is required' });
+      }
+      try {
+        return res.json({
+          success: true,
+          preview: await phoneNumberService.prepareBusinessScope(req.params.phoneNumberId, body.business_id),
+        });
+      } catch (error) {
+        return respondWithError(res, error);
+      }
+    });
+
+    app.put('/api/cartesia/phone-numbers/:phoneNumberId/business-scope', requireAdminToken, limiter, async (req, res) => {
+      const body = isPlainObject(req.body) ? req.body : {};
+      const allowed = new Set(['business_id', 'approved', 'confirmed_fingerprint', 'idempotency_key']);
+      if (rejectUnknownFields(body, allowed) || !Object.hasOwn(body, 'business_id')) {
+        return res.status(400).json({ success: false, code: 'cartesia_phone_business_scope_invalid', error: 'Unsupported or missing phone business-scope fields' });
+      }
+      try {
+        const scope = await phoneNumberService.setBusinessScope({
+          phoneNumberId: req.params.phoneNumberId,
+          business_id: body.business_id,
+          approved: body.approved,
+          confirmed_fingerprint: body.confirmed_fingerprint,
+          idempotency_key: body.idempotency_key,
+          actor_id: 'shared_admin_token',
+        });
+        return res.json({ success: true, scope });
+      } catch (error) {
+        return respondWithError(res, error);
+      }
     });
   }
 

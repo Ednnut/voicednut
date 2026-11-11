@@ -22,6 +22,17 @@ function createApp(overrides = {}) {
     async releaseNumber(input) { operations.push(['release', input]); return { phoneNumberId: input.phoneNumberId, deleted: true }; },
     async prepareAssignment(id, agentId) { operations.push(['preview', id, agentId]); return { phoneNumberId: id, targetAgentId: agentId, requestFingerprint: 'a'.repeat(64) }; },
     async assignAgent(input) { operations.push(['assign', input]); return { phoneNumberId: input.phoneNumberId, previousAgentId: 'agent_old_01', agentId: input.agent_id, changed: true }; },
+    async prepareBusinessScope(id, businessId) {
+      operations.push(['scope_preview', id, businessId]);
+      return {
+        phoneNumberId: id, phoneNumber: '+15555550123', agentId: 'agent_test',
+        businessId, currentBusinessId: null, revision: 0, requestFingerprint: 'f'.repeat(64),
+      };
+    },
+    async setBusinessScope(input) {
+      operations.push(['scope_set', input]);
+      return { phoneNumberId: input.phoneNumberId, businessId: input.business_id, idempotentReplay: false };
+    },
   };
   const db = overrides.db || {
     async recordCartesiaPhoneNumberOperationAudit(event) {
@@ -61,6 +72,35 @@ describe('Cartesia phone number routes', () => {
     assert.equal((await request(app).get('/api/cartesia/phone-numbers')).status, 403);
     assert.equal((await request(app).get('/api/cartesia/phone-numbers/pn_test_01')).status, 403);
     assert.equal((await request(app).post('/api/cartesia/phone-numbers/pn_test_01/assignment/preview').send({ agent_id: null })).status, 403);
+    assert.equal((await request(app).post('/api/cartesia/phone-numbers/pn_test_01/business-scope/preview').send({ business_id: 'biz-1' })).status, 403);
+    assert.equal((await request(app).put('/api/cartesia/phone-numbers/pn_test_01/business-scope').send({ business_id: 'biz-1' })).status, 403);
+  });
+
+  it('requires admin access and exact preview approval for trusted business scope changes', async () => {
+    const { app, operations } = createApp();
+    const headers = { 'x-admin-token': 'test-admin' };
+    const preview = await request(app)
+      .post('/api/cartesia/phone-numbers/pn_test_01/business-scope/preview')
+      .set(headers).send({ business_id: 'business-01' });
+    const saved = await request(app)
+      .put('/api/cartesia/phone-numbers/pn_test_01/business-scope')
+      .set(headers).send({
+        business_id: 'business-01',
+        approved: true,
+        confirmed_fingerprint: 'f'.repeat(64),
+        idempotency_key: 'scope-route-key-01',
+      });
+    const invalid = await request(app)
+      .put('/api/cartesia/phone-numbers/pn_test_01/business-scope')
+      .set(headers).send({ business_id: 'business-01', approved: true, force: true });
+    assert.equal(preview.status, 200);
+    assert.equal(preview.body.preview.agentId, 'agent_test');
+    assert.equal(saved.status, 200);
+    assert.equal(saved.body.scope.businessId, 'business-01');
+    assert.equal(invalid.status, 400);
+    assert.deepEqual(operations[0], ['scope_preview', 'pn_test_01', 'business-01']);
+    assert.equal(operations[1][0], 'scope_set');
+    assert.equal(operations[1][1].actor_id, 'shared_admin_token');
   });
 
   it('exposes bounded inventory, detail, preview and approved mutation contracts', async () => {
