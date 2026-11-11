@@ -10031,7 +10031,7 @@ app.use((req, res, next) => {
 // Register routes only after app initialization and shared request middleware.
 registerVapiWebCallRoutes();
 
-const PORT = config.server?.port || 3000;
+const PORT = config.server?.port || 1337;
 
 // Enhanced call configurations with function context
 const callConfigurations = new Map();

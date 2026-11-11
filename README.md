@@ -203,7 +203,7 @@ TWILIO_AUTH_TOKEN=your_auth_token
 FROM_NUMBER=+1234567890
 
 # Server Configuration
-PORT=3000
+PORT=1337
 SERVER=your-domain.com
 
 # OpenRouter AI Configuration
@@ -227,7 +227,7 @@ TELEGRAM_BOT_TOKEN=your_telegram_bot_token
 BOT_TOKEN=1234567890:ABCdefGHIjklMNOpqrsTUVwxyz
 ADMIN_TELEGRAM_ID=123456789
 ADMIN_TELEGRAM_USERNAME=your_username
-API_URL=http://localhost:3000
+API_URL=http://127.0.0.1:1337
 ```
 
 ## 📖 API Documentation

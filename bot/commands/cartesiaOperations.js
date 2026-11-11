@@ -6,7 +6,8 @@ const config = require('../config');
 const httpClient = require('../utils/httpClient');
 const { getAccessProfile } = require('../utils/capabilities');
 const { buildCallbackData } = require('../utils/actions');
-const { escapeHtml, renderMenu } = require('../utils/ui');
+const { escapeHtml, escapeMarkdown, renderMenu } = require('../utils/ui');
+const { askOptionWithButtons } = require('../utils/persona');
 const { startOperation, ensureOperationActive } = require('../utils/sessionState');
 
 const ACTIONS = new Set(['CARTESIA_CALL', 'CARTESIA_RECONCILE', 'CARTESIA_CALLS', 'CARTESIA_REVIEW_QUEUE', 'CARTESIA_REVIEW_RULES', 'CARTESIA_CAMPAIGN', 'CARTESIA_CAMPAIGN_STATUS', 'CARTESIA_CAMPAIGN_RECONCILE', 'CARTESIA_BATCH_RECONCILE', 'CARTESIA_BATCH_CANCEL', 'CARTESIA_BATCH_RETRY', 'CARTESIA_AGENT_HEALTH', 'CARTESIA_AGENT_RUNTIME', 'CARTESIA_BUSINESS_SCOPE']);
@@ -843,10 +844,9 @@ async function cartesiaOperationFlow(conversation, ctx) {
   }
 
   try {
-    const businessInput = await askInput(conversation, ctx, 'Enter the business ID with current call-operator membership.', ensureActive);
-    if (businessInput === null) return;
+    const businessInput = String(config.defaultBusinessId || '').trim();
     if (!BUSINESS_ID_PATTERN.test(businessInput)) {
-      await ctx.reply('Cartesia call canceled. The business ID format is invalid.');
+      await ctx.reply('Cartesia calls are not configured. Set DEFAULT_BUSINESS_ID to the business used for Cartesia calls, then try again.');
       return;
     }
     if (ctx.session?.cartesiaCallPending) {
@@ -855,7 +855,10 @@ async function cartesiaOperationFlow(conversation, ctx) {
     }
     let agents;
     try {
-      const inventory = await httpClient.get(ctx, `${apiRoot()}/api/cartesia/agents`, { timeout: 15000 });
+      const inventory = await httpClient.get(ctx, `${apiRoot()}/api/cartesia/agents`, {
+        params: { actor_id: String(ctx.from?.id || '') },
+        timeout: 15000,
+      });
       agents = buildAgentChoices(inventory?.data?.agents);
     } catch (error) {
       await ctx.reply(httpClient.getUserMessage(error, 'Cartesia agent inventory is unavailable. No call was submitted.'));
@@ -865,21 +868,53 @@ async function cartesiaOperationFlow(conversation, ctx) {
       await ctx.reply('No active Cartesia agent with an attached source number is ready. Check the Cartesia account setup. No call was submitted.');
       return;
     }
-    const agentChoice = await askChoice(conversation, ctx, 'Choose the Cartesia Managed Agent:', formatAgentChoices(agents), ensureActive);
-    if (agentChoice === null) return;
-    if (agentChoice < 0 || agentChoice >= agents.length) {
+    const agentOptions = agents.map((agent, index) => ({
+      id: String(index),
+      label: `${agent.name || 'Cartesia agent'}${agent.deploymentCount ? ` · ${agent.deploymentCount} deployments` : ''}`,
+    }));
+    const agentSelection = await askOptionWithButtons(
+      conversation,
+      ctx,
+      '📞 Choose the Cartesia agent for this call:',
+      [...agentOptions, { id: 'cancel', label: '❌ Cancel' }],
+      { prefix: 'cartesia-call-agent', columns: 1, ensureActive },
+    );
+    if (!agentSelection || agentSelection.id === 'cancel') {
+      await ctx.reply('Cartesia call canceled. No call was submitted.');
+      return;
+    }
+    const agentIndex = Number(agentSelection.id);
+    if (!Number.isInteger(agentIndex) || agentIndex < 0 || agentIndex >= agents.length) {
       await ctx.reply('Cartesia call canceled. Choose one of the listed agents.');
       return;
     }
-    const selectedAgent = agents[agentChoice];
+    const selectedAgent = agents[agentIndex];
     const attachedNumbers = selectedAgent.phoneNumbers.filter((phone) => IDENTIFIER_PATTERN.test(String(phone?.id || '')));
-    const phoneChoice = await askChoice(conversation, ctx, 'Choose one of this agent’s attached source numbers:', formatPhoneNumberChoices(attachedNumbers), ensureActive);
-    if (phoneChoice === null) return;
-    if (phoneChoice < 0 || phoneChoice >= attachedNumbers.length) {
+    if (!attachedNumbers.length) {
+      await ctx.reply('The selected Cartesia agent has no usable source number. No call was submitted.');
+      return;
+    }
+    const phoneOptions = attachedNumbers.map((phone, index) => ({
+      id: String(index),
+      label: phone.displayNumber || `Cartesia source number ${index + 1}`,
+    }));
+    const phoneSelection = await askOptionWithButtons(
+      conversation,
+      ctx,
+      '📲 Choose the outgoing Cartesia number:',
+      [...phoneOptions, { id: 'cancel', label: '❌ Cancel' }],
+      { prefix: 'cartesia-call-number', columns: 1, ensureActive },
+    );
+    if (!phoneSelection || phoneSelection.id === 'cancel') {
+      await ctx.reply('Cartesia call canceled. No call was submitted.');
+      return;
+    }
+    const phoneIndex = Number(phoneSelection.id);
+    if (!Number.isInteger(phoneIndex) || phoneIndex < 0 || phoneIndex >= attachedNumbers.length) {
       await ctx.reply('Cartesia call canceled. Choose one of the listed source numbers.');
       return;
     }
-    const selectedPhone = attachedNumbers[phoneChoice];
+    const selectedPhone = attachedNumbers[phoneIndex];
     const agentId = String(selectedAgent.id);
     const fromNumberId = String(selectedPhone.id);
 
@@ -890,22 +925,7 @@ async function cartesiaOperationFlow(conversation, ctx) {
       return;
     }
     const input = { businessId: businessInput, destination, agentId, fromNumberId };
-    const dynamicVariablesText = await askInput(conversation, ctx,
-      'Optional Cartesia dynamic variables as a JSON object (up to 20 scalar values, 2,000 characters total). Use {} for none. These values are sent to Cartesia for this call; do not include secrets.', ensureActive);
-    if (dynamicVariablesText === null) return;
-    let dynamicVariables;
-    try {
-      dynamicVariables = normalizeDynamicVariables(JSON.parse(dynamicVariablesText));
-      if (!dynamicVariablesText.trim().startsWith('{') || Object.keys(dynamicVariables).length > 20 ||
-          Object.values(dynamicVariables).some((value) => !['string', 'number', 'boolean'].includes(typeof value) || String(value).length > 300)) {
-        throw new Error('invalid variables');
-      }
-    } catch {
-      await ctx.reply('Cartesia call canceled. Dynamic variables must be a JSON object with scalar values.');
-      return;
-    }
-    if (JSON.stringify(dynamicVariables) === '{}') dynamicVariables = {};
-    const callInput = { ...input, dynamicVariables };
+    const dynamicVariables = {};
     const requestKey = `cartesia:${crypto.randomUUID()}`;
     if (!REQUEST_KEY_PATTERN.test(requestKey)) {
       await ctx.reply('Cartesia call canceled. The generated request key is invalid.');
@@ -913,10 +933,17 @@ async function cartesiaOperationFlow(conversation, ctx) {
     }
 
     const phrase = buildCallConfirmationPhrase({ destination, fromNumberId, agentId, dynamicVariables });
-    const confirmation = await askInput(conversation, ctx,
-      `This will place a real outbound phone call and may incur charges. The server will enforce operator access and recorded consent. Dynamic variable keys: ${Object.keys(dynamicVariables).join(', ') || 'none'}. Values are bound to the approval and are not shown again. Type this exact phrase to approve: ${phrase}`,
-      ensureActive);
-    if (confirmation !== phrase) {
+    const confirmation = await askOptionWithButtons(
+      conversation,
+      ctx,
+      `Review this call before submitting:\nBusiness: ${escapeMarkdown(businessInput)}\nAgent: ${escapeMarkdown(selectedAgent.name || agentId)}\nFrom: ${escapeMarkdown(selectedPhone.displayNumber || fromNumberId)}\nTo: ${escapeMarkdown(destination)}\n\nThis places a real outbound call and may incur charges. The API checks operator access and recorded consent.`,
+      [
+        { id: 'confirm', label: '✅ Confirm and call' },
+        { id: 'cancel', label: '❌ Cancel' },
+      ],
+      { prefix: 'cartesia-call-confirm', columns: 1, ensureActive },
+    );
+    if (!confirmation || confirmation.id !== 'confirm') {
       await ctx.reply('Cartesia call canceled. No call was submitted.');
       return;
     }
@@ -939,7 +966,7 @@ async function cartesiaOperationFlow(conversation, ctx) {
       agent_id: agentId,
       from_number_id: fromNumberId,
       idempotency_key: requestKey,
-      confirmation_phrase: confirmation,
+      confirmation_phrase: phrase,
       dynamic_variables: dynamicVariables,
     }, { timeout: 15000 });
     const approvalToken = String(approvalResponse?.data?.approval_token || '').trim();

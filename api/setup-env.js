@@ -61,7 +61,7 @@ const SECTIONS = [
   {
     comments: ['# Server configuration'],
     fields: [
-      { key: 'PORT', prompt: 'API Port', defaultValue: '3000' },
+      { key: 'PORT', prompt: 'API Port', defaultValue: '1337' },
       { key: 'SERVER', prompt: 'Public server hostname (optional)' },
       { key: 'CORS_ORIGINS', prompt: 'Comma-separated CORS origins (optional)' },
     ],
