@@ -18,7 +18,8 @@ function normalizeProviders(status = {}) {
     const supportedValues = Array.isArray(status.supported_providers) && status.supported_providers.length > 0
         ? status.supported_providers
         : SUPPORTED_PROVIDERS;
-    const supported = Array.from(new Set(supportedValues.map((item) => String(item).toLowerCase()))).filter(Boolean);
+    const supported = Array.from(new Set(supportedValues.map((item) => String(item).toLowerCase())))
+        .filter((provider) => Boolean(provider) && provider !== 'cartesia');
     const active = typeof status.provider === 'string' ? status.provider.toLowerCase() : '';
     return { supported, active };
 }
@@ -28,7 +29,7 @@ function buildCallReadinessMap(status = {}) {
     return {
         twilio: typeof callReadiness.twilio === 'boolean' ? callReadiness.twilio : !!status.twilio_ready,
         plivo: typeof callReadiness.plivo === 'boolean' ? callReadiness.plivo : !!status.plivo_ready,
-        vonage: typeof callReadiness.vonage === 'boolean' ? callReadiness.vonage : !!status.vonage_ready
+        vonage: typeof callReadiness.vonage === 'boolean' ? callReadiness.vonage : !!status.vonage_ready,
     };
 }
 
@@ -62,7 +63,8 @@ function formatReadinessMatrix(status = {}) {
         ...(callState.supported_providers || SUPPORTED_PROVIDERS),
         ...(smsState.supported_providers || []),
         ...(emailState.supported_providers || [])
-    ])).map((item) => String(item || '').toLowerCase()).filter(Boolean);
+    ])).map((item) => String(item || '').toLowerCase())
+        .filter((provider) => Boolean(provider) && provider !== 'cartesia');
     if (!providers.length) {
         return section('🧪 Readiness Matrix', ['No provider readiness data available.']);
     }
@@ -87,6 +89,7 @@ function formatProviderStatus(status) {
     const supportedValues = Array.isArray(status.supported_providers) && status.supported_providers.length > 0
         ? status.supported_providers
         : SUPPORTED_PROVIDERS;
+    const filteredSupportedValues = supportedValues.filter((provider) => String(provider).toLowerCase() !== 'cartesia');
     const smsProvider = String(status.sms_provider || status.providers?.sms?.provider || 'unknown').toUpperCase();
     const emailProvider = String(status.email_provider || status.providers?.email?.provider || 'unknown').toUpperCase();
 
@@ -95,7 +98,7 @@ function formatProviderStatus(status) {
         buildLine('•', `Stored Default`, stored.toUpperCase()),
         buildLine('•', `SMS Provider`, smsProvider),
         buildLine('•', `Email Provider`, emailProvider),
-        buildLine('•', `Supported Backbones`, supportedValues.join(', ').toUpperCase())
+        buildLine('•', `Supported Backbones`, filteredSupportedValues.join(', ').toUpperCase())
     ];
     return [
         section('⚙️ Call Provider Settings', details),
@@ -106,7 +109,8 @@ function formatProviderStatus(status) {
 
 function buildProviderKeyboard(ctx, activeProvider = '', supportedProviders = []) {
     const keyboard = new InlineKeyboard();
-    const providers = supportedProviders.length ? supportedProviders : SUPPORTED_PROVIDERS;
+    const providers = (supportedProviders.length ? supportedProviders : SUPPORTED_PROVIDERS)
+        .filter((provider) => String(provider).toLowerCase() !== 'cartesia');
     providers.forEach((provider, index) => {
         const normalized = provider.toLowerCase();
         const isActive = normalized === activeProvider;

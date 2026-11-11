@@ -9,6 +9,7 @@ const PHONE_PATTERN = /^\+[1-9]\d{7,14}$/;
 const CARTESIA_CALL_STATUSES = new Set(["created", "started", "completed", "failed"]);
 const MAX_RECONCILIATION_AGE_MS = 24 * 60 * 60 * 1000;
 const DYNAMIC_VARIABLE_PATTERN = /^[A-Za-z][A-Za-z0-9_]{0,63}$/;
+const CALL_DEFAULTS_SETTING_PREFIX = "cartesia_call_defaults:";
 
 function normalizeDynamicVariables(value) {
   if (value === undefined || value === null || value === "") return {};
@@ -207,10 +208,11 @@ class CartesiaOutboundCallService {
       throw serviceError("cartesia_not_configured", "Cartesia agent inventory is unavailable", 503);
     }
     const response = await this.client.listAgents();
-    if (!Array.isArray(response?.summaries)) {
+    const agents = Array.isArray(response?.summaries) ? response.summaries : response?.data;
+    if (!Array.isArray(agents)) {
       throw serviceError("cartesia_agent_list_invalid", "Cartesia returned an invalid agent inventory", 502);
     }
-    return response.summaries.slice(0, 100).map((agent) => {
+    return agents.slice(0, 100).map((agent) => {
       const id = String(agent?.id || "").trim();
       if (!ID_PATTERN.test(id)) return null;
       const deleted = Boolean(agent?.deleted_at);
@@ -304,6 +306,74 @@ class CartesiaOutboundCallService {
       }
     }
     return agent;
+  }
+
+  normalizeCallDefaultsScope(input = {}) {
+    const businessId = String(input.businessId || input.business_id || "").trim();
+    const actorId = String(input.actorId || input.actor_id || "").trim();
+    if (!BUSINESS_ID_PATTERN.test(businessId) || !/^\d{1,20}$/.test(actorId)) {
+      throw serviceError("cartesia_call_defaults_scope_invalid", "A valid business and verified actor are required", 400);
+    }
+    return { businessId, actorId };
+  }
+
+  async authorizeCallDefaultsAccess(input = {}) {
+    const scope = this.normalizeCallDefaultsScope(input);
+    if (typeof this.outboundSafety?.authorizeActor !== "function") {
+      throw serviceError("cartesia_call_defaults_unavailable", "Cartesia business authorization is unavailable", 503);
+    }
+    await this.outboundSafety.authorizeActor({ business_id: scope.businessId, actor_id: scope.actorId });
+    return scope;
+  }
+
+  async getCallDefaults(input = {}) {
+    const { businessId } = await this.authorizeCallDefaultsAccess(input);
+    if (typeof this.db?.getSetting !== "function") {
+      throw serviceError("cartesia_call_defaults_unavailable", "Cartesia call-default storage is unavailable", 503);
+    }
+    let raw;
+    try {
+      raw = await this.db.getSetting(`${CALL_DEFAULTS_SETTING_PREFIX}${businessId}`);
+    } catch {
+      throw serviceError("cartesia_call_defaults_unavailable", "Cartesia call defaults could not be loaded", 503);
+    }
+    if (raw === null || raw === undefined || raw === "") {
+      return { agentId: null, fromNumberId: null };
+    }
+    let stored;
+    try {
+      stored = typeof raw === "string" ? JSON.parse(raw) : raw;
+    } catch {
+      throw serviceError("cartesia_call_defaults_invalid", "Stored Cartesia call defaults are invalid", 503);
+    }
+    const agentId = String(stored?.agent_id || "").trim();
+    const fromNumberId = String(stored?.from_number_id || "").trim();
+    if (!ID_PATTERN.test(agentId) || !ID_PATTERN.test(fromNumberId)) {
+      throw serviceError("cartesia_call_defaults_invalid", "Stored Cartesia call defaults are invalid", 503);
+    }
+    return { agentId, fromNumberId };
+  }
+
+  async setCallDefaults(input = {}) {
+    const { businessId } = this.normalizeCallDefaultsScope(input);
+    const agentId = String(input.agentId || input.agent_id || "").trim();
+    const fromNumberId = String(input.fromNumberId || input.from_number_id || "").trim();
+    if (!ID_PATTERN.test(agentId) || !ID_PATTERN.test(fromNumberId)) {
+      throw serviceError("cartesia_call_defaults_invalid", "A valid Cartesia agent and attached source number are required", 400);
+    }
+    await this.assertAgentSourceReady({ businessId, agentId, fromNumberId });
+    if (typeof this.db?.setSetting !== "function") {
+      throw serviceError("cartesia_call_defaults_unavailable", "Cartesia call-default storage is unavailable", 503);
+    }
+    try {
+      await this.db.setSetting(`${CALL_DEFAULTS_SETTING_PREFIX}${businessId}`, JSON.stringify({
+        agent_id: agentId,
+        from_number_id: fromNumberId,
+      }));
+    } catch {
+      throw serviceError("cartesia_call_defaults_unavailable", "Cartesia call defaults could not be saved", 503);
+    }
+    return { agentId, fromNumberId };
   }
 
   async listCallsForOperations(input = {}) {

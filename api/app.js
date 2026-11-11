@@ -31,7 +31,7 @@ const { createTwilioGatherHandler } = require("./routes/gather");
 const { registerCallRoutes } = require("./services/callRoutes");
 const { CartesiaClient } = require("./services/cartesiaClient");
 const { CartesiaOutboundCallService } = require("./services/cartesiaOutboundCallService");
-const { CartesiaCampaignService, confirmationPhrase: cartesiaCampaignConfirmationPhrase } = require("./services/cartesiaCampaignService");
+const { CartesiaCampaignService } = require("./services/cartesiaCampaignService");
 const { CartesiaStudioClient } = require("./services/cartesiaStudioClient");
 const { CartesiaAgentRuntime } = require("./services/cartesiaAgentRuntime");
 const { CartesiaTtsSessionRuntime } = require("./services/cartesiaTtsSessionRuntime");
@@ -14941,91 +14941,7 @@ function startBackgroundWorkers() {
   if (backgroundWorkersStarted) return;
   backgroundWorkersStarted = true;
 
-  const safeCartesiaWorkerErrorCode = (value, fallback) => {
-    const candidate = String(value || "");
-    return /^[a-z][a-z0-9_]{0,79}$/.test(candidate) ? candidate : fallback;
-  };
-
   postCallWorkflowExecutionService?.start();
-
-  if (config.cartesia?.batchDispatchEnabled === true && typeof db?.listDueCartesiaCampaigns === "function") {
-    let dispatchingDueCartesiaCampaigns = false;
-    let lastCartesiaDispatchObservationAt = 0;
-    const dispatchDueCartesiaCampaigns = async () => {
-      if (dispatchingDueCartesiaCampaigns) return;
-      dispatchingDueCartesiaCampaigns = true;
-      const startedAt = Date.now();
-      let scanned = 0;
-      let dispatched = 0;
-      let blocked = 0;
-      let failed = 0;
-      let uncertain = 0;
-      let skipped = 0;
-      try {
-        const now = new Date();
-        const due = await db.listDueCartesiaCampaigns({ now_iso: now.toISOString(), limit: 10 });
-        scanned = due.length;
-        for (const campaign of due) {
-          try {
-            const service = createCartesiaCampaignService();
-            const stored = await db.getCartesiaCampaign(campaign.campaign_id, campaign.business_id);
-            if (!stored || stored.campaign.status !== "approved") {
-              skipped += 1;
-              continue;
-            }
-            let result;
-            if (stored.campaign.dispatch_requested_at) {
-              result = await service.dispatchQueuedCampaign({ campaign_id: campaign.campaign_id, business_id: campaign.business_id });
-            } else {
-              result = await service.submit({
-                campaign_id: campaign.campaign_id,
-                business_id: campaign.business_id,
-                actor_id: String(campaign.approved_by || ""),
-                confirmation_phrase: cartesiaCampaignConfirmationPhrase(stored.campaign),
-              });
-              if (result?.queued_for_async_dispatch) {
-                result = await service.dispatchQueuedCampaign({ campaign_id: campaign.campaign_id, business_id: campaign.business_id });
-              }
-            }
-            if (result?.campaign?.status === "submitted") dispatched += 1;
-            else if (result?.campaign?.status === "blocked") blocked += 1;
-            else if (["unknown", "submitting"].includes(String(result?.campaign?.status || ""))) uncertain += 1;
-            else skipped += 1;
-          } catch (error) {
-            if (String(error?.code || "").includes("unresolved")) uncertain += 1;
-            else failed += 1;
-            console.warn("Cartesia scheduled campaign dispatch deferred or blocked", {
-              code: safeCartesiaWorkerErrorCode(error?.code, "cartesia_campaign_dispatch_failed"),
-            });
-          }
-        }
-        const completedAt = Date.now();
-        if (scanned > 0 || failed > 0 || completedAt - lastCartesiaDispatchObservationAt >= 5 * 60 * 1000) {
-          console.info("cartesia_campaign_dispatch_run", {
-            scanned,
-            dispatched,
-            blocked,
-            failed,
-            uncertain,
-            skipped,
-            scan_limit_reached: scanned === 10,
-            duration_ms: Math.max(0, completedAt - startedAt),
-          });
-          lastCartesiaDispatchObservationAt = completedAt;
-        }
-      } catch (error) {
-        console.error("Cartesia scheduled campaign worker failed", {
-          code: safeCartesiaWorkerErrorCode(error?.code, "worker_failed"),
-          duration_ms: Math.max(0, Date.now() - startedAt),
-        });
-      } finally {
-        dispatchingDueCartesiaCampaigns = false;
-      }
-    };
-    setInterval(dispatchDueCartesiaCampaigns, 30000).unref?.();
-    dispatchDueCartesiaCampaigns();
-    console.info("cartesia_campaign_dispatch_worker_started", { interval_ms: 30000 });
-  }
 
   const missionWorkerConfig = {
     enabled: config.callE?.missionWorkerEnabled === true,
@@ -15090,6 +15006,11 @@ function startBackgroundWorkers() {
       console.info('CALL-E scheduled missions, review escalations, and report digests started.');
     }
   }
+
+  const safeCartesiaWorkerErrorCode = (value, fallback) => {
+    const candidate = String(value || '');
+    return /^[a-z][a-z0-9_]{0,79}$/.test(candidate) ? candidate : fallback;
+  };
 
   if (config.cartesia?.batchReconciliationEnabled === true) {
     const runCartesiaBatchReconciliation = () => {
@@ -16167,6 +16088,10 @@ app.ws("/connection", (ws, req) => {
             callConfig = setup.callConfig || callConfig;
             functionSystem = setup.functionSystem || functionSystem;
           }
+
+          ttsService.configureSpeechProfile(
+            callConfig?.script_policy?.agent_config?.speech_settings,
+          );
 
           if (callConfig && hasDirection) {
             callConfig.inbound = isInbound;
@@ -18134,6 +18059,9 @@ app.ws("/vonage/stream", async (ws, req) => {
         ? callConfig.script_policy.agent_config.speech_settings.voice_id
         : null,
     });
+    ttsService.configureSpeechProfile(
+      callConfig?.script_policy?.agent_config?.speech_settings,
+    );
     ttsService
       .generate(
         { partialResponseIndex: null, partialResponse: "warming up" },
@@ -18793,6 +18721,9 @@ app.ws("/plivo/stream", async (ws, req) => {
         ? callConfig.script_policy.agent_config.speech_settings.voice_id
         : null,
     });
+    ttsService.configureSpeechProfile(
+      callConfig?.script_policy?.agent_config?.speech_settings,
+    );
     ttsService
       .generate(
         { partialResponseIndex: null, partialResponse: "warming up" },
@@ -25148,7 +25079,7 @@ function createCartesiaCampaignService() {
     db,
     outboundSafety: createOutboundCallSafetyService(),
     enabled: cartesiaManagedAgentsEnabled,
-    dispatchEnabled: config.cartesia?.batchDispatchEnabled === true,
+    dispatchEnabled: false,
     idempotencySecret: config.apiAuth?.hmacSecret,
     encryptionKeys: config.callE?.missionEncryptionKeys,
     encryptionKeyVersion: config.callE?.missionEncryptionKeyVersion || 1,
@@ -25861,7 +25792,7 @@ const cartesiaCallService = new CartesiaCallService({
   client: cartesiaClient,
   db,
   enabled: cartesiaManagedAgentsEnabled,
-  dispatchEnabled: config.cartesia?.dispatchEnabled === true,
+  dispatchEnabled: false,
   allowedDestinations: config.cartesia?.allowedDestinations || [],
 });
 const cartesiaBatchService = new CartesiaBatchService({
@@ -25869,7 +25800,7 @@ const cartesiaBatchService = new CartesiaBatchService({
   callService: cartesiaCallService,
   db,
   enabled: cartesiaManagedAgentsEnabled,
-  dispatchEnabled: config.cartesia?.batchDispatchEnabled === true,
+  dispatchEnabled: false,
   retentionEnabled: config.cartesia?.batchRetentionEnabled === true,
   retentionAutoEnabled: config.cartesia?.batchRetentionAutoEnabled === true,
   retentionDays: config.cartesia?.batchRetentionDays || 0,
@@ -25903,6 +25834,11 @@ const cartesiaWebhookConfigService = new CartesiaWebhookConfigService({
     ? `https://${config.server.hostname}/api/webhooks/cartesia`
     : '',
 });
+const cartesiaWebhookHandler = createCartesiaWebhookHandler({
+  db,
+  webhookSecret: config.cartesia?.webhookSecret,
+  enabled: cartesiaManagedAgentsEnabled,
+});
 registerCartesiaCallRoutes(app, {
   client: cartesiaClient,
   service: cartesiaCallService,
@@ -25915,10 +25851,7 @@ registerCartesiaCallRoutes(app, {
   limiter: cartesiaCallLimiter,
   webhookLimiter: cartesiaWebhookLimiter,
   webhookSecret: config.cartesia?.webhookSecret,
-  webhookHandler: createCartesiaWebhookHandler({
-    db,
-    webhookSecret: config.cartesia?.webhookSecret,
-  }),
+  webhookHandler: cartesiaWebhookHandler,
 });
 const cartesiaSpeechService = new CartesiaSpeechService();
 registerCartesiaSpeechRoutes(app, {
@@ -33645,6 +33578,8 @@ registerCallRoutes(app, {
   placeCartesiaOutboundCall: (input) => createCartesiaOutboundCallService().createOutboundCall(input),
   reconcileCartesiaOutboundCall: (input) => createCartesiaOutboundCallService().reconcileOutboundCall(input),
   listCartesiaAgents: () => createCartesiaOutboundCallService().listAgentInventory(),
+  getCartesiaCallDefaults: (input) => createCartesiaOutboundCallService().getCallDefaults(input),
+  setCartesiaCallDefaults: (input) => createCartesiaOutboundCallService().setCallDefaults(input),
   getCartesiaAgentDeploymentHealth: (input) => createCartesiaOutboundCallService().getAgentDeploymentHealth(input),
   listCartesiaCalls: (input) => createCartesiaOutboundCallService().listCallsForOperations(input),
   getCartesiaCall: (callId, options) => createCartesiaOutboundCallService().getCallForOperations(callId, options),
@@ -33698,7 +33633,7 @@ registerCartesiaStudioRoutes(app, {
   createCartesiaStudioService,
 }, express);
 
-registerCartesiaWebhookRoutes(app, { db, secret: config.cartesia?.webhookSecret, enabled: cartesiaManagedAgentsEnabled, limiter: callEWebhookLimiter });
+registerCartesiaWebhookRoutes(app, { handler: cartesiaWebhookHandler, limiter: callEWebhookLimiter });
 
 registerCartesiaKnowledgeBaseRoutes(app, {
   requireOutboundAuthorization,

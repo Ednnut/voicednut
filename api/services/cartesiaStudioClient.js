@@ -210,6 +210,15 @@ class CartesiaStudioClient {
     if (query.startingAfter && ID_PATTERN.test(String(query.startingAfter))) params.set("starting_after", String(query.startingAfter));
     return this.read(`/voices${params.size ? `?${params}` : ""}`, "voice_list");
   }
+  listModels(query = {}) {
+    const capability = String(query.capability || "").trim().toLowerCase();
+    if (capability && !new Set(["tts", "stt"]).has(capability)) {
+      throw studioError("cartesia_model_capability_invalid", "Model capability must be tts or stt", 400);
+    }
+    const params = new URLSearchParams();
+    if (capability) params.set("capability", capability);
+    return this.read(`/models${params.size ? `?${params}` : ""}`, "model_list");
+  }
   getVoice(id) { return this.read(`/voices/${encodedId(id, "voice")}`, "voice_lookup"); }
   updateVoice(id, input) { return this.write("PATCH", `/voices/${encodedId(id, "voice")}`, input, "voice_update"); }
   deleteVoice(id) { return this.request("DELETE", `/voices/${encodedId(id, "voice")}`, { operation: "voice_delete" }); }

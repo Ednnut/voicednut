@@ -9,15 +9,12 @@ const { buildCallbackData } = require('../utils/actions');
 const { escapeHtml, renderMenu } = require('../utils/ui');
 const { startOperation, ensureOperationActive } = require('../utils/sessionState');
 
-const ACTIONS = new Set(['CARTESIA_CALL', 'CARTESIA_RECONCILE', 'CARTESIA_CALLS', 'CARTESIA_REVIEW_QUEUE', 'CARTESIA_REVIEW_RULES', 'CARTESIA_CAMPAIGN', 'CARTESIA_CAMPAIGN_STATUS', 'CARTESIA_CAMPAIGN_RECONCILE', 'CARTESIA_BATCH_RECONCILE', 'CARTESIA_BATCH_CANCEL', 'CARTESIA_BATCH_RETRY', 'CARTESIA_AGENT_HEALTH', 'CARTESIA_AGENT_RUNTIME', 'CARTESIA_BUSINESS_SCOPE']);
+const ACTIONS = new Set(['CARTESIA_RECONCILE', 'CARTESIA_CALLS', 'CARTESIA_REVIEW_QUEUE', 'CARTESIA_REVIEW_RULES', 'CARTESIA_CAMPAIGN_STATUS', 'CARTESIA_CAMPAIGN_RECONCILE', 'CARTESIA_BATCH_RECONCILE', 'CARTESIA_BATCH_CANCEL', 'CARTESIA_AGENT_HEALTH', 'CARTESIA_AGENT_RUNTIME', 'CARTESIA_BUSINESS_SCOPE']);
 const BUSINESS_ID_PATTERN = /^[A-Za-z0-9._:-]{1,120}$/;
 const IDENTIFIER_PATTERN = /^[A-Za-z0-9._:-]{1,200}$/;
 const DESTINATION_PATTERN = /^\+[1-9]\d{7,14}$/;
 const REQUEST_KEY_PATTERN = /^[A-Za-z0-9._:-]{8,180}$/;
-const MAX_CARTESIA_CAMPAIGN_RECIPIENTS = 1000;
-const MAX_CARTESIA_CAMPAIGN_RECIPIENTS_PER_MESSAGE = 100;
 const CANCEL_WORDS = new Set(['cancel', 'exit', 'quit']);
-const SCHEDULE_PATTERN = /^\d{4}-\d{2}-\d{2}T(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d{1,9})?(?:Z|[+-](?:[01]\d|2[0-3]):[0-5]\d)$/i;
 
 function apiRoot() {
   return String(config.apiUrl || '').replace(/\/+$/, '');
@@ -25,14 +22,12 @@ function apiRoot() {
 
 function buildCartesiaKeyboard(ctx) {
   return new InlineKeyboard()
-    .text('📞 Place a single call', buildCallbackData(ctx, 'CARTESIA_CALL')).row()
-    .text('👥 Plan a batch campaign', buildCallbackData(ctx, 'CARTESIA_CAMPAIGN')).row()
+    .text('📞 Place a single call via /call', buildCallbackData(ctx, 'CALL')).row()
     .text('🔎 Check campaign status', buildCallbackData(ctx, 'CARTESIA_CAMPAIGN_STATUS')).row()
     .text('🔄 Refresh provider progress', buildCallbackData(ctx, 'CARTESIA_CAMPAIGN_RECONCILE')).row()
     .text('🔄 Reconcile batch progress', buildCallbackData(ctx, 'CARTESIA_BATCH_RECONCILE')).row()
     .text('🎛 Cartesia Studio', buildCallbackData(ctx, 'CARTESIA_STUDIO_CENTER')).row()
     .text('⛔ Cancel queued batch calls', buildCallbackData(ctx, 'CARTESIA_BATCH_CANCEL')).row()
-    .text('↻ Retry failed recipients', buildCallbackData(ctx, 'CARTESIA_BATCH_RETRY')).row()
     .text('📋 Recent calls', buildCallbackData(ctx, 'CARTESIA_CALLS')).row()
     .text('🧭 Post-call review queue', buildCallbackData(ctx, 'CARTESIA_REVIEW_QUEUE')).row()
     .text('🧭 Post-call review rules', buildCallbackData(ctx, 'CARTESIA_REVIEW_RULES')).row()
@@ -50,7 +45,7 @@ async function renderCartesiaCenter(ctx) {
     return;
   }
   await renderMenu(ctx,
-    '<b>Cartesia Operations</b>\nPlace one explicitly approved call through a Cartesia Managed Agent. The API checks business operator access, consent, suppression, quiet hours, emergency stop, and idempotency. Do not enter a destination unless you are authorized to call it.',
+    '<b>Cartesia Operations</b>\nManage Cartesia voice capabilities, review Cartesia call records, and manage existing Cartesia batches. Start every new single call with /call; the selected telephony provider carries the call, while a compatible script may select Cartesia speech.',
     buildCartesiaKeyboard(ctx), { parseMode: 'HTML' });
 }
 
@@ -66,35 +61,10 @@ function maskDestination(destination) {
   return `••••${String(destination || '').slice(-4)}`;
 }
 
-function buildConfirmationPhrase({ destination, fromNumberId, agentId }) {
-  return `PLACE CARTESIA CALL TO ${destination} FROM ${fromNumberId} WITH AGENT ${agentId}`;
-}
-
 function normalizeDynamicVariables(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
   return Object.fromEntries(Object.entries(value).sort(([left], [right]) => left.localeCompare(right))
     .map(([key, entry]) => [key, typeof entry === 'string' ? entry.trim() : entry]));
-}
-
-function normalizeCampaignSchedule(value, nowMs = Date.now()) {
-  if (String(value || '').trim().toLowerCase() === 'now') return null;
-  const text = String(value || '').trim();
-  if (!SCHEDULE_PATTERN.test(text)) return undefined;
-  const timestamp = Date.parse(text);
-  if (!Number.isFinite(timestamp) || timestamp <= nowMs || timestamp - nowMs > 24 * 60 * 60 * 1000) return undefined;
-  return new Date(timestamp).toISOString();
-}
-
-function campaignSubmitPhrase(campaign) {
-  return `SUBMIT CARTESIA CAMPAIGN ${campaign.campaign_id} WITH ${Number(campaign.ready_count)} RECIPIENTS${campaign.scheduled_at ? ` AT ${campaign.scheduled_at}` : ''}`;
-}
-
-function buildCallConfirmationPhrase({ destination, fromNumberId, agentId, dynamicVariables = {} }) {
-  const phrase = buildConfirmationPhrase({ destination, fromNumberId, agentId });
-  const variables = normalizeDynamicVariables(dynamicVariables);
-  if (!Object.keys(variables).length) return phrase;
-  const fingerprint = crypto.createHash('sha256').update(JSON.stringify(variables)).digest('hex').slice(0, 12);
-  return `${phrase} WITH VARIABLES ${fingerprint}`;
 }
 
 function pendingRequestMatches(pending, input) {
@@ -593,25 +563,6 @@ async function runCartesiaBatchControl(conversation, ctx, ensureActive, action) 
     if (!campaign || campaign.campaign_id !== pending.campaignId || campaign.provider_batch_id !== savedCampaign.provider_batch_id) {
       throw new Error('Fresh Cartesia batch reconciliation did not match the saved campaign.');
     }
-    if (action === 'CARTESIA_BATCH_RETRY') {
-      const retryStatuses = new Set(['failed', 'unanswered']);
-      const blockedStatuses = new Set(['completed', ...retryStatuses]);
-      const rows = campaign?.recipients || [];
-      const count = rows.filter((row) => retryStatuses.has(String(row.provider_status || '').toLowerCase())).length;
-      if (!campaign?.provider_batch_id || !['completed', 'failed'].includes(String(campaign.provider_status)) || !count || rows.some((row) => !blockedStatuses.has(String(row.provider_status || '').toLowerCase()))) {
-        await ctx.reply('Retry is unavailable: batch must be completed or failed and every recipient status must be recognized. Reconcile progress and review consent before retrying.'); return;
-      }
-      const retryNumber = Number(campaign.provider_retry_count) || 0;
-      const phrase = `RETRY CARTESIA CAMPAIGN ${campaign.campaign_id} BATCH ${campaign.provider_batch_id} RETRY ${retryNumber + 1} FOR ${count} RECIPIENTS`;
-      const confirmation = await askInput(conversation, ctx,
-        `This retries all failed or unanswered recipients. The API rechecks consent, suppression, quiet hours, cooldown, emergency stop, and daily limits. Type this exact phrase to confirm: ${phrase}`, ensureActive);
-      if (confirmation !== phrase) { await ctx.reply('Retry not confirmed. No batch operation was sent.'); return; }
-      const result = await httpClient.post(ctx, `${apiRoot()}/api/cartesia/campaigns/${encodeURIComponent(pending.campaignId)}/retry`,
-        { business_id: pending.businessId, confirmation_phrase: confirmation }, { timeout: 30000 });
-      ensureActive();
-      await ctx.reply(`Cartesia accepted a retry for ${Number(result?.data?.retried_recipient_count) || count} eligible recipient(s). Reconcile batch progress to confirm completion.`, { parse_mode: 'HTML' });
-      return;
-    }
     if (!campaign?.provider_batch_id || !['pending', 'in_progress'].includes(String(campaign.provider_status))) {
       await ctx.reply('This campaign has no confirmed queued batch to cancel. Reconcile its status before acting.'); return;
     }
@@ -624,107 +575,6 @@ async function runCartesiaBatchControl(conversation, ctx, ensureActive, action) 
     ensureActive();
     await ctx.reply(`Cartesia batch cancellation result: <b>${escapeHtml(result?.data?.campaign?.provider_status || 'check status')}</b>. Refresh batch progress to confirm.`, { parse_mode: 'HTML' });
   } catch (error) { await ctx.reply(httpClient.getUserMessage(error, 'The Cartesia batch action could not be confirmed. Reconcile the saved campaign before repeating an operation.')); }
-}
-
-async function runCartesiaCampaign(conversation, ctx, ensureActive) {
-  const businessId = await askInput(conversation, ctx, 'Enter the business ID with current call-operator membership.', ensureActive);
-  if (businessId === null) return;
-  if (!BUSINESS_ID_PATTERN.test(businessId)) { await ctx.reply('Campaign canceled. The business ID format is invalid.'); return; }
-  const inventory = await httpClient.get(ctx, `${apiRoot()}/api/cartesia/agents`, { timeout: 15000 });
-  const agents = buildAgentChoices(inventory?.data?.agents);
-  if (!agents.length) { await ctx.reply('No active Cartesia agent with an attached source number is available. No batch was submitted.'); return; }
-  const agentChoice = await askChoice(conversation, ctx, 'Choose the Cartesia Managed Agent:', formatAgentChoices(agents), ensureActive);
-  if (agentChoice === null) return;
-  if (agentChoice < 0 || agentChoice >= agents.length) { await ctx.reply('Campaign canceled. Choose one of the listed agents.'); return; }
-  const agent = agents[agentChoice];
-  const numbers = agent.phoneNumbers.filter((phone) => IDENTIFIER_PATTERN.test(String(phone?.id || '')));
-  const phoneChoice = await askChoice(conversation, ctx, 'Choose a source number attached to this agent:', formatPhoneNumberChoices(numbers), ensureActive);
-  if (phoneChoice === null) return;
-  if (phoneChoice < 0 || phoneChoice >= numbers.length) { await ctx.reply('Campaign canceled. Choose one of the listed source numbers.'); return; }
-  const name = await askInput(conversation, ctx, 'Enter a campaign name (up to 120 characters).', ensureActive);
-  if (name === null) return;
-  const rawDestinations = await askInput(conversation, ctx, 'Paste up to 100 authorized E.164 destinations, one per line. Recorded consent is required for every recipient.', ensureActive);
-  if (rawDestinations === null) return;
-  let destinationChunk = rawDestinations.split(/[\s,;]+/).filter(Boolean);
-  const destinations = [];
-  if (destinationChunk.length < 1 || destinationChunk.length > MAX_CARTESIA_CAMPAIGN_RECIPIENTS_PER_MESSAGE ||
-      destinationChunk.some((value) => !DESTINATION_PATTERN.test(value))) {
-    await ctx.reply('Campaign canceled. Provide 1–100 valid E.164 numbers, with no extra text.'); return;
-  }
-  destinations.push(...destinationChunk);
-  while (destinationChunk.length === MAX_CARTESIA_CAMPAIGN_RECIPIENTS_PER_MESSAGE && destinations.length < MAX_CARTESIA_CAMPAIGN_RECIPIENTS) {
-    const rawNextChunk = await askInput(conversation, ctx,
-      `Campaign currently has ${destinations.length} recipients. Paste another chunk of up to 100 authorized E.164 destinations, or type DONE. The total limit is 1,000.`, ensureActive);
-    if (rawNextChunk === null) return;
-    if (rawNextChunk.trim().toUpperCase() === 'DONE') break;
-    destinationChunk = rawNextChunk.split(/[\s,;]+/).filter(Boolean);
-    if (destinationChunk.length < 1 || destinationChunk.length > MAX_CARTESIA_CAMPAIGN_RECIPIENTS_PER_MESSAGE ||
-        destinations.length + destinationChunk.length > MAX_CARTESIA_CAMPAIGN_RECIPIENTS ||
-        destinationChunk.some((value) => !DESTINATION_PATTERN.test(value))) {
-      await ctx.reply('Campaign canceled. Each chunk must contain 1–100 valid E.164 numbers, with no more than 1,000 total.'); return;
-    }
-    destinations.push(...destinationChunk);
-  }
-  const concurrencyText = await askInput(conversation, ctx, 'Target concurrent calls (1–10). Enter 1 for the safest default.', ensureActive);
-  if (concurrencyText === null) return;
-  const concurrency = Number(concurrencyText);
-  if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > 10) { await ctx.reply('Campaign canceled. Concurrency must be an integer from 1 to 10.'); return; }
-  const variablesText = await askInput(conversation, ctx,
-    'Optional Cartesia dynamic variables as JSON: provide one object shared by all recipients, or an array with one object per recipient in the same order. Use {} for none. Do not include secrets.', ensureActive);
-  if (variablesText === null) return;
-  let variablePayload = {};
-  try {
-    const parsed = JSON.parse(variablesText);
-    if (Array.isArray(parsed)) {
-      if (parsed.length !== destinations.length || parsed.some((entry) => !entry || typeof entry !== 'object' || Array.isArray(entry))) throw new Error('invalid per-recipient variables');
-      variablePayload = { dynamic_variables_by_recipient: parsed.map(normalizeDynamicVariables) };
-    } else if (parsed && typeof parsed === 'object') {
-      variablePayload = { dynamic_variables: normalizeDynamicVariables(parsed) };
-    } else throw new Error('invalid variables');
-  } catch {
-    await ctx.reply('Campaign canceled. Variables must be one JSON object or one object per recipient.'); return;
-  }
-  const scheduleText = await askInput(conversation, ctx,
-    'When should Cartesia start dialing? Type now to start as soon as you approve, or enter a future RFC3339 timestamp with an explicit timezone (for example 2026-10-31T15:30:00-04:00). Scheduled starts are limited to the next 24 hours.', ensureActive);
-  if (scheduleText === null) return;
-  const scheduledAt = normalizeCampaignSchedule(scheduleText);
-  if (scheduledAt === undefined) { await ctx.reply('Campaign canceled. Use now or a valid future timestamp with an explicit timezone, no more than 24 hours ahead.'); return; }
-  const variableKeys = [...new Set((variablePayload.dynamic_variables_by_recipient || [variablePayload.dynamic_variables || {}]).flatMap((variables) => Object.keys(variables)))];
-  const requestKey = `cartesia:${crypto.randomUUID()}`;
-  const response = await httpClient.post(ctx, `${apiRoot()}/api/cartesia/campaigns`, {
-    business_id: businessId, request_key: requestKey, name: name.slice(0, 120), agent_id: agent.id,
-    from_number_id: numbers[phoneChoice].id, target_concurrency_limit: concurrency, destinations,
-    ...(scheduledAt ? { scheduled_at: scheduledAt } : {}), ...variablePayload,
-  }, { timeout: 30000 });
-  ensureActive();
-  const campaign = response?.data?.campaign;
-  if (!campaign?.campaign_id) throw new Error('The API did not return a saved campaign reference.');
-  if ((scheduledAt || null) !== (campaign.scheduled_at || null)) throw new Error('The API did not confirm the requested Cartesia campaign schedule.');
-  ctx.session.cartesiaCampaignPending = { businessId, campaignId: campaign.campaign_id };
-  const recipientRows = Array.isArray(campaign.recipients) ? campaign.recipients : [];
-  const recipients = recipientRows.slice(0, 10).map((row) => `${row.status === 'ready' ? '✓' : '×'} ${escapeHtml(row.destination_masked)}${row.reason_code && row.reason_code !== 'ready' ? ` (${escapeHtml(row.reason_code)})` : ''}`).join('\n');
-  const extraRecipients = Math.max(0, recipientRows.length - 10);
-  const variableKeyPreview = variableKeys.slice(0, 10).map(escapeHtml).join(', ') || 'none';
-  const extraVariableKeys = Math.max(0, variableKeys.length - 10);
-  await ctx.reply(`Saved Cartesia campaign <code>${escapeHtml(campaign.campaign_id)}</code>.\nReady: ${Number(campaign.ready_count)}/${Number(campaign.recipient_count)}\nDynamic variable keys: ${variableKeyPreview}${extraVariableKeys ? ` (+${extraVariableKeys} more)` : ''}\n${recipients || 'No recipient details returned.'}${extraRecipients ? `\n… ${extraRecipients} additional recipients omitted from this preview.` : ''}`, { parse_mode: 'HTML' });
-  if (Number(campaign.ready_count) !== Number(campaign.recipient_count) || Number(campaign.ready_count) < 1) {
-    await ctx.reply('The campaign has blocked recipients and cannot be submitted. Review consent and policy, then create a new campaign after resolving them.'); return;
-  }
-  const phrase = campaignSubmitPhrase(campaign);
-  const confirmation = await askInput(conversation, ctx,
-    `${campaign.scheduled_at ? `This saves the approved campaign locally for ${campaign.scheduled_at} UTC. VOICEDNUT will recheck current consent, quiet hours, emergency stop, and daily capacity immediately before releasing it to Cartesia. ` : Number(campaign.recipient_count) > 100 ? 'This queues the approved campaign for background dispatch; when processed it can initiate calls to every listed recipient. VOICEDNUT will recheck consent and business safety limits before release. ' : 'This submits one real Cartesia batch now and can initiate calls to every listed recipient. '}Confirm that you are authorized to contact all of them, then type this exact phrase: ${phrase}`,
-    ensureActive);
-  if (confirmation !== phrase) { await ctx.reply('Campaign approval canceled. No batch was submitted.'); return; }
-  try {
-    const submitted = await httpClient.post(ctx, `${apiRoot()}/api/cartesia/campaigns/${encodeURIComponent(campaign.campaign_id)}/submit`, {
-      business_id: businessId, confirmation_phrase: confirmation,
-    }, { timeout: 30000 });
-    ensureActive();
-    const saved = submitted?.data?.campaign;
-    await ctx.reply(`Cartesia campaign status: <b>${escapeHtml(saved?.status || 'unknown')}</b>\n${saved?.dispatch_queued || submitted?.data?.queued_for_async_dispatch ? 'Queued for asynchronous dispatch; consent and business safety limits will be checked before release.\n' : ''}${saved?.held_for_local_dispatch ? `Scheduled locally for <code>${escapeHtml(saved?.scheduled_at || '')}</code>; dispatch-time checks will run before Cartesia receives it.\n` : ''}Batch: <code>${escapeHtml(saved?.provider_batch_id || (saved?.held_for_local_dispatch || saved?.dispatch_queued || submitted?.data?.queued_for_async_dispatch ? 'not sent yet' : 'not confirmed'))}</code>\nUse “Check campaign status” to inspect the same saved campaign. Do not create another campaign if the result is unclear.`, { parse_mode: 'HTML' });
-  } catch (error) {
-    await ctx.reply(httpClient.getUserMessage(error, `Campaign submission result may be unresolved. Check status for ${campaign.campaign_id}; do not create a second campaign or submit with a new request key.`));
-  }
 }
 
 async function runCartesiaBusinessScope(conversation, ctx, ensureActive) {
@@ -782,6 +632,14 @@ async function cartesiaOperationFlow(conversation, ctx) {
     return;
   }
   const action = String(ctx.session?.cartesiaOperationAction || '');
+  if (action === 'CARTESIA_CALL') {
+    await ctx.reply('Start a single call with /call. The selected telephony provider carries it; Cartesia speech is selected through a compatible script profile.');
+    return;
+  }
+  if (action === 'CARTESIA_CAMPAIGN' || action === 'CARTESIA_BATCH_RETRY') {
+    await ctx.reply('Cartesia-managed dialing and batch retries are disabled. Start new calls with /call using the selected telephony provider; existing batches remain available for status, reconciliation, and cancellation.');
+    return;
+  }
   if (!ACTIONS.has(action)) {
     await ctx.reply('That Cartesia action expired. Reopen /cartesia and choose the action again.');
     return;
@@ -832,160 +690,9 @@ async function cartesiaOperationFlow(conversation, ctx) {
     await runCartesiaCampaignReconciliation(conversation, ctx, ensureActive);
     return;
   }
-  if (action === 'CARTESIA_BATCH_RECONCILE' || action === 'CARTESIA_BATCH_CANCEL' || action === 'CARTESIA_BATCH_RETRY') {
+  if (action === 'CARTESIA_BATCH_RECONCILE' || action === 'CARTESIA_BATCH_CANCEL') {
     await runCartesiaBatchControl(conversation, ctx, ensureActive, action);
     return;
-  }
-  if (action === 'CARTESIA_CAMPAIGN') {
-    try { await runCartesiaCampaign(conversation, ctx, ensureActive); }
-    catch (error) { await ctx.reply(httpClient.getUserMessage(error, 'Cartesia campaign planning failed. Check the saved campaign status before retrying any submission.')); }
-    return;
-  }
-
-  try {
-    const businessInput = await askInput(conversation, ctx, 'Enter the business ID with current call-operator membership.', ensureActive);
-    if (businessInput === null) return;
-    if (!BUSINESS_ID_PATTERN.test(businessInput)) {
-      await ctx.reply('Cartesia call canceled. The business ID format is invalid.');
-      return;
-    }
-    if (ctx.session?.cartesiaCallPending) {
-      await ctx.reply('A previous Cartesia request has an unresolved result. Choose “Reconcile a call” and resolve that exact request before starting another call.');
-      return;
-    }
-    let agents;
-    try {
-      const inventory = await httpClient.get(ctx, `${apiRoot()}/api/cartesia/agents`, { timeout: 15000 });
-      agents = buildAgentChoices(inventory?.data?.agents);
-    } catch (error) {
-      await ctx.reply(httpClient.getUserMessage(error, 'Cartesia agent inventory is unavailable. No call was submitted.'));
-      return;
-    }
-    if (!agents.length) {
-      await ctx.reply('No active Cartesia agent with an attached source number is ready. Check the Cartesia account setup. No call was submitted.');
-      return;
-    }
-    const agentChoice = await askChoice(conversation, ctx, 'Choose the Cartesia Managed Agent:', formatAgentChoices(agents), ensureActive);
-    if (agentChoice === null) return;
-    if (agentChoice < 0 || agentChoice >= agents.length) {
-      await ctx.reply('Cartesia call canceled. Choose one of the listed agents.');
-      return;
-    }
-    const selectedAgent = agents[agentChoice];
-    const attachedNumbers = selectedAgent.phoneNumbers.filter((phone) => IDENTIFIER_PATTERN.test(String(phone?.id || '')));
-    const phoneChoice = await askChoice(conversation, ctx, 'Choose one of this agent’s attached source numbers:', formatPhoneNumberChoices(attachedNumbers), ensureActive);
-    if (phoneChoice === null) return;
-    if (phoneChoice < 0 || phoneChoice >= attachedNumbers.length) {
-      await ctx.reply('Cartesia call canceled. Choose one of the listed source numbers.');
-      return;
-    }
-    const selectedPhone = attachedNumbers[phoneChoice];
-    const agentId = String(selectedAgent.id);
-    const fromNumberId = String(selectedPhone.id);
-
-    const destination = await askInput(conversation, ctx, 'Enter the authorized destination in E.164 format (for example +14155550123). Current recorded consent is required.', ensureActive);
-    if (destination === null) return;
-    if (!DESTINATION_PATTERN.test(destination)) {
-      await ctx.reply('Cartesia call canceled. Enter a valid E.164 destination.');
-      return;
-    }
-    const input = { businessId: businessInput, destination, agentId, fromNumberId };
-    const dynamicVariablesText = await askInput(conversation, ctx,
-      'Optional Cartesia dynamic variables as a JSON object (up to 20 scalar values, 2,000 characters total). Use {} for none. These values are sent to Cartesia for this call; do not include secrets.', ensureActive);
-    if (dynamicVariablesText === null) return;
-    let dynamicVariables;
-    try {
-      dynamicVariables = normalizeDynamicVariables(JSON.parse(dynamicVariablesText));
-      if (!dynamicVariablesText.trim().startsWith('{') || Object.keys(dynamicVariables).length > 20 ||
-          Object.values(dynamicVariables).some((value) => !['string', 'number', 'boolean'].includes(typeof value) || String(value).length > 300)) {
-        throw new Error('invalid variables');
-      }
-    } catch {
-      await ctx.reply('Cartesia call canceled. Dynamic variables must be a JSON object with scalar values.');
-      return;
-    }
-    if (JSON.stringify(dynamicVariables) === '{}') dynamicVariables = {};
-    const callInput = { ...input, dynamicVariables };
-    const requestKey = `cartesia:${crypto.randomUUID()}`;
-    if (!REQUEST_KEY_PATTERN.test(requestKey)) {
-      await ctx.reply('Cartesia call canceled. The generated request key is invalid.');
-      return;
-    }
-
-    const phrase = buildCallConfirmationPhrase({ destination, fromNumberId, agentId, dynamicVariables });
-    const confirmation = await askInput(conversation, ctx,
-      `This will place a real outbound phone call and may incur charges. The server will enforce operator access and recorded consent. Dynamic variable keys: ${Object.keys(dynamicVariables).join(', ') || 'none'}. Values are bound to the approval and are not shown again. Type this exact phrase to approve: ${phrase}`,
-      ensureActive);
-    if (confirmation !== phrase) {
-      await ctx.reply('Cartesia call canceled. No call was submitted.');
-      return;
-    }
-
-    const pending = {
-      ...input,
-      idempotencyKey: requestKey,
-      createdAt: Date.now(),
-    };
-    const actorId = String(ctx.from?.id || '');
-    if (!/^\d{1,20}$/.test(actorId)) {
-      await ctx.reply('Cartesia call canceled. A verified Telegram actor is required.');
-      return;
-    }
-
-    const approvalResponse = await httpClient.post(ctx, `${apiRoot()}/api/cartesia/call-approval`, {
-      business_id: businessInput,
-      actor_id: actorId,
-      destination,
-      agent_id: agentId,
-      from_number_id: fromNumberId,
-      idempotency_key: requestKey,
-      confirmation_phrase: confirmation,
-      dynamic_variables: dynamicVariables,
-    }, { timeout: 15000 });
-    const approvalToken = String(approvalResponse?.data?.approval_token || '').trim();
-    const requestFingerprint = String(approvalResponse?.data?.request_fingerprint || '').trim();
-    if (!approvalToken || approvalToken.length > 4096 || !/^[a-f0-9]{64}$/.test(requestFingerprint)) {
-      await ctx.reply('Cartesia approval was not issued. No call was submitted. Reopen /cartesia and reuse the same request if its outcome is unclear.');
-      return;
-    }
-    pending.requestFingerprint = requestFingerprint;
-    ctx.session.cartesiaCallPending = pending;
-
-    const result = await httpClient.post(ctx, `${apiRoot()}/outbound-call`, {
-      provider: 'cartesia',
-      business_id: businessInput,
-      actor_id: actorId,
-      user_chat_id: actorId,
-      number: destination,
-      agent_id: agentId,
-      from_number_id: fromNumberId,
-      dynamic_variables: dynamicVariables,
-      idempotency_key: requestKey,
-      approval_token: approvalToken,
-    }, { timeout: 30000, headers: { 'Idempotency-Key': requestKey } });
-    ensureActive();
-    const callId = String(result?.data?.provider_call_id || result?.data?.call_sid || '').trim();
-    const status = String(result?.data?.status || 'queued').trim().toLowerCase();
-    if (!callId || !/^[a-z0-9_-]{1,200}$/i.test(callId)) {
-      await ctx.reply(`Cartesia accepted the request, but did not return a usable call ID. Request key: <code>${escapeHtml(requestKey)}</code>. Do not submit a new request key until this request is reconciled.`, { parse_mode: 'HTML' });
-      return;
-    }
-    ctx.session.cartesiaCallPending = null;
-    await ctx.reply(
-      `Cartesia call submitted.\nCall: <code>${escapeHtml(callId)}</code>\nStatus: <b>${escapeHtml(status)}</b>\nDestination: ${escapeHtml(maskDestination(destination))}\nRequest key: <code>${escapeHtml(requestKey)}</code>\nThe provider accepted the request; this does not mean the call completed.`,
-      { parse_mode: 'HTML' },
-    );
-  } catch (error) {
-    const status = Number(error?.response?.status || 0);
-    if (status === 400 || status === 403 || status === 409) {
-      await ctx.reply(httpClient.getUserMessage(error, 'Cartesia rejected the call request. No new call was submitted.'));
-      return;
-    }
-    const pending = ctx.session?.cartesiaCallPending;
-    await ctx.reply(
-      `Cartesia call outcome is unclear. Do not use a new request key or submit a different call until an administrator reconciles it.${pending?.idempotencyKey ? `\nReuse this request key for reconciliation: <code>${escapeHtml(pending.idempotencyKey)}</code>` : ''}${pending?.requestFingerprint ? `\nSaved request fingerprint: <code>${escapeHtml(pending.requestFingerprint)}</code>` : ''}`,
-      { parse_mode: 'HTML' },
-    );
   }
 }
 
@@ -1003,13 +710,11 @@ function registerCartesiaCommand(bot) {
 module.exports = {
   ACTIONS,
   buildCartesiaKeyboard,
-  buildCallConfirmationPhrase,
   normalizeDynamicVariables,
   renderCartesiaCenter,
   registerCartesiaCommand,
   cartesiaOperationFlow,
   __testables: {
-    buildConfirmationPhrase,
     buildReconciliationPayload,
     buildAgentChoices,
     formatAgentChoices,
@@ -1033,9 +738,6 @@ module.exports = {
     formatCampaignStatus,
     runCartesiaCampaignStatus,
     runCartesiaCampaignReconciliation,
-    normalizeCampaignSchedule,
-    campaignSubmitPhrase,
     runCartesiaBatchControl,
-    runCartesiaCampaign,
   },
 };

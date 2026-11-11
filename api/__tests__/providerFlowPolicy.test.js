@@ -2,9 +2,16 @@ const assert = require("node:assert/strict");
 const {
   resolveProviderExecutionOrder,
   classifyProviderSubmissionState,
+  listProviderFlows,
+  providerSupportsFlow,
 } = require("../adapters/providerFlowPolicy");
 
 describe("provider execution circuit policy", () => {
+  it("does not advertise Cartesia as a telephony provider", () => {
+    assert.deepEqual(listProviderFlows("call", "cartesia"), []);
+    assert.equal(providerSupportsFlow("call", "cartesia", "outbound_voice"), false);
+  });
+
   it("treats client rejections as definitive and timeouts/server errors as ambiguous", () => {
     assert.equal(classifyProviderSubmissionState(422), "rejected");
     assert.equal(classifyProviderSubmissionState(429), "rejected");

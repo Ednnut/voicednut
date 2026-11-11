@@ -681,6 +681,30 @@ class CartesiaStudioService {
     const result = await this.client.listVoices({ isOwner: query.isOwner !== false, limit: query.limit, startingAfter: query.startingAfter });
     return { voices: listFrom(result, "voices", "data", "summaries").slice(0, 100).map(normalizeVoice).filter(Boolean) };
   }
+  async listModels(query = {}) {
+    const capability = safeText(query.capability, 12).toLowerCase();
+    if (capability && !new Set(["tts", "stt"]).has(capability)) {
+      throw serviceError("cartesia_model_capability_invalid", "Model capability must be tts or stt", 400);
+    }
+    if (typeof this.client?.listModels !== "function") {
+      throw serviceError("cartesia_models_unavailable", "Cartesia model catalog is unavailable", 503);
+    }
+    const result = await this.client.listModels(capability ? { capability } : {});
+    return {
+      models: listFrom(result, "data", "models").slice(0, 200).map((model) => {
+        const id = safeText(model?.id, 120);
+        const modelCapability = safeText(model?.capability, 12).toLowerCase();
+        if (!id || !new Set(["tts", "stt"]).has(modelCapability)) return null;
+        const modes = Array.isArray(model?.modes)
+          ? [...new Set(model.modes.map((mode) => safeText(mode, 32)).filter(Boolean))].slice(0, 12)
+          : [];
+        const supportedLanguages = Array.isArray(model?.supported_languages)
+          ? [...new Set(model.supported_languages.map((language) => safeText(language, 20)).filter(Boolean))].slice(0, 100)
+          : [];
+        return { id, capability: modelCapability, modes, supportedLanguages };
+      }).filter(Boolean),
+    };
+  }
   async getVoice(id) {
     const voice = normalizeVoice(await this.client.getVoice(safeId(id, "voice")));
     if (!voice) throw serviceError("cartesia_voice_response_invalid", "Cartesia returned an invalid voice", 502);

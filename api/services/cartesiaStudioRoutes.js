@@ -62,6 +62,7 @@ function registerCartesiaStudioRoutes(app, ctx = {}, express) {
   const root = '/api/cartesia/studio';
 
   app.get(`${root}/voices`, limiter, authorize, actor, handle(ctx, (studio, req) => studio.listVoices(req.query || {}), { message: 'Cartesia voices could not be listed' }));
+  app.get(`${root}/models`, limiter, authorize, actor, handle(ctx, (studio, req) => studio.listModels(req.query || {}), { message: 'Cartesia models could not be listed' }));
   app.get(`${root}/voices/:voiceId`, limiter, authorize, actor, handle(ctx, (studio, req) => studio.getVoice(req.params?.voiceId), { message: 'Cartesia voice details could not be loaded' }));
   app.get(`${root}/accents`, limiter, authorize, actor, handle(ctx, (studio, req) => studio.listAccents(req.query || {}), { message: 'Cartesia accents could not be listed' }));
   app.post(`${root}/voices/localize`, limiter, authorize, actor, handle(ctx, (studio, req) => {

@@ -8,7 +8,7 @@ const {
   isVoiceProviderCapabilityImplemented,
   listVoiceProviderCapabilities,
 } = require("../adapters/voiceProviderCapabilityRegistry");
-const { listSupportedProviders } = require("../adapters/providerFlowPolicy");
+const { listSupportedProviders, listProviderFlows } = require("../adapters/providerFlowPolicy");
 
 describe("voice provider capability registry", () => {
   it("separates Cartesia vendor support from VOICEDNUT implementation status", () => {
@@ -73,8 +73,9 @@ describe("voice provider capability registry", () => {
     assert.match(lineRuntime.note, /deployment CLI are Python based/);
   });
 
-  it("does not expose catalogued Cartesia features as executable telephony routing providers", () => {
+  it("keeps Cartesia capability inventory separate from telephony routing", () => {
     assert.deepEqual(listSupportedProviders("call"), ["twilio", "vonage", "plivo", "call_e"]);
+    assert.deepEqual(listProviderFlows("call", "cartesia"), []);
     assert.equal(getVoiceProviderMode("cartesia", "managed_agents").layer, "telephony_and_agent_runtime");
   });
 

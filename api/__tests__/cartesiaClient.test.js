@@ -200,9 +200,9 @@ describe("CartesiaClient", () => {
     let request;
     const client = new CartesiaClient({ enabled: true, dispatchEnabled: true, apiKey: "sk_car_test", fetch: async (url, options) => {
       request = { url, options };
-      return { ok: true, status: 200, json: async () => ({ summaries: [{ id: "agent_1", phone_numbers: [] }] }) };
+      return { ok: true, status: 200, json: async () => ({ data: [{ id: "agent_1", name: "Agent", description: null, version_id: "version_1" }], has_more: false, next_page: null }) };
     } });
-    assert.deepEqual(await client.listAgents(), { summaries: [{ id: "agent_1", phone_numbers: [] }] });
+    assert.deepEqual(await client.listAgents(), { data: [{ id: "agent_1", name: "Agent", description: null, version_id: "version_1" }], has_more: false, next_page: null });
     assert.equal(request.url, "https://api.cartesia.ai/v1/agents");
     assert.equal(request.options.method, "GET");
     assert.equal(request.options.headers["Cartesia-Version"], CARTESIA_API_VERSION);

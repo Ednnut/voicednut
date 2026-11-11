@@ -14,29 +14,27 @@ const httpClient = require('../utils/httpClient');
 const {
   ACTIONS,
   buildCartesiaKeyboard,
-  buildCallConfirmationPhrase,
   cartesiaOperationFlow,
   __testables: {
-    buildConfirmationPhrase, buildReconciliationPayload, buildAgentChoices, formatAgentChoices,
+    buildReconciliationPayload, buildAgentChoices, formatAgentChoices,
     formatPhoneNumberChoices, maskDestination, pendingRequestMatches,
-    normalizeCampaignSchedule, campaignSubmitPhrase,
     runCartesiaAgentRuntime, runCartesiaCallOperations, formatCallDetails, formatCallTranscript, formatCampaignOutcomes,
     formatCampaignStatus,
     runCartesiaBusinessScope,
   },
 } = require('./cartesiaOperations');
 
-test('Cartesia operations expose guarded single-call and batch campaign actions', () => {
-  assert.equal(ACTIONS.has('CARTESIA_CALL'), true);
+test('Cartesia operations keep single calls outside the Cartesia action set', () => {
+  assert.equal(ACTIONS.has('CARTESIA_CALL'), false);
   assert.equal(ACTIONS.has('CARTESIA_RECONCILE'), true);
   assert.equal(ACTIONS.has('CARTESIA_BATCH'), false);
   assert.equal(ACTIONS.has('CARTESIA_CALLS'), true);
-  assert.equal(ACTIONS.has('CARTESIA_CAMPAIGN'), true);
+  assert.equal(ACTIONS.has('CARTESIA_CAMPAIGN'), false);
   assert.equal(ACTIONS.has('CARTESIA_CAMPAIGN_STATUS'), true);
   assert.equal(ACTIONS.has('CARTESIA_CAMPAIGN_RECONCILE'), true);
   assert.equal(ACTIONS.has('CARTESIA_BATCH_RECONCILE'), true);
   assert.equal(ACTIONS.has('CARTESIA_BATCH_CANCEL'), true);
-  assert.equal(ACTIONS.has('CARTESIA_BATCH_RETRY'), true);
+  assert.equal(ACTIONS.has('CARTESIA_BATCH_RETRY'), false);
   assert.equal(ACTIONS.has('CARTESIA_AGENT_HEALTH'), true);
   assert.equal(ACTIONS.has('CARTESIA_AGENT_RUNTIME'), true);
   assert.equal(ACTIONS.has('CARTESIA_REVIEW_RULES'), true);
@@ -44,23 +42,21 @@ test('Cartesia operations expose guarded single-call and batch campaign actions'
   assert.equal(ACTIONS.has('CARTESIA_BUSINESS_SCOPE'), true);
 });
 
-test('Cartesia menu uses signed callback data for the call action', () => {
+test('Cartesia single-call action is not handled by the Cartesia operations flow', () => {
   const keyboard = buildCartesiaKeyboard({ session: {} });
   const callback = keyboard.inline_keyboard.flat().find((button) => button.text.includes('Place a single call'));
   assert.ok(callback);
-  assert.match(callback.callback_data, /CARTESIA_CALL/);
+  assert.match(callback.callback_data, /CALL/);
   const reconcile = keyboard.inline_keyboard.flat().find((button) => button.text.includes('Reconcile a call'));
   assert.ok(reconcile);
   assert.match(reconcile.callback_data, /CARTESIA_RECONCILE/);
   const calls = keyboard.inline_keyboard.flat().find((button) => button.text.includes('Recent calls'));
   assert.ok(calls);
   assert.match(calls.callback_data, /CARTESIA_CALLS/);
-  const campaign = keyboard.inline_keyboard.flat().find((button) => button.text.includes('Plan a batch campaign'));
-  assert.ok(campaign);
-  assert.match(campaign.callback_data, /CARTESIA_CAMPAIGN/);
+  assert.equal(keyboard.inline_keyboard.flat().some((button) => button.text.includes('Plan a batch campaign')), false);
   assert.ok(keyboard.inline_keyboard.flat().some((button) => /CARTESIA_BATCH_RECONCILE/.test(button.callback_data)));
   assert.ok(keyboard.inline_keyboard.flat().some((button) => /CARTESIA_BATCH_CANCEL/.test(button.callback_data)));
-  assert.ok(keyboard.inline_keyboard.flat().some((button) => /CARTESIA_BATCH_RETRY/.test(button.callback_data)));
+  assert.equal(keyboard.inline_keyboard.flat().some((button) => /CARTESIA_BATCH_RETRY/.test(button.callback_data)), false);
   const campaignReconcile = keyboard.inline_keyboard.flat().find((button) => button.callback_data.includes('CARTESIA_CAMPAIGN_RECONCILE'));
   assert.ok(campaignReconcile);
   assert.match(campaignReconcile.text, /provider progress/i);
@@ -258,7 +254,7 @@ test('interactive private admin health flow displays sanitized Cartesia deployme
   assert.doesNotMatch(replies.at(-1).text, /secret|private|build_logs/);
 });
 
-test('interactive Cartesia campaigns accept more than 25 recipients and bound preview output', async () => {
+test.skip('retired direct Cartesia campaign creation for more than 25 recipients', async () => {
   const originalGet = httpClient.get;
   const originalPost = httpClient.post;
   const requests = [];
@@ -293,7 +289,7 @@ test('interactive Cartesia campaigns accept more than 25 recipients and bound pr
   assert.ok(replies.every((message) => !destinations.some((destination) => message.includes(destination))));
 });
 
-test('interactive Cartesia campaigns collect recipient chunks and queue campaigns over 100', async () => {
+test.skip('retired direct Cartesia campaign creation for more than 100 recipients', async () => {
   const originalGet = httpClient.get;
   const originalPost = httpClient.post;
   const requests = [];
@@ -331,7 +327,7 @@ test('interactive Cartesia campaigns collect recipient chunks and queue campaign
   assert.ok(replies.some((message) => message.includes('Queued for asynchronous dispatch')));
 });
 
-test('interactive Cartesia campaigns reject more than 100 recipients before calling the API', async () => {
+test.skip('retired direct Cartesia campaign input validation', async () => {
   const originalGet = httpClient.get;
   const originalPost = httpClient.post;
   const requests = [];
@@ -354,7 +350,7 @@ test('interactive Cartesia campaigns reject more than 100 recipients before call
   assert.ok(replies.some((message) => message.includes('Provide 1–100 valid E.164 numbers')));
 });
 
-test('interactive Cartesia campaign requires the campaign-specific phrase before submitting', async () => {
+test.skip('retired direct Cartesia campaign submission', async () => {
   const originalGet = httpClient.get;
   const originalPost = httpClient.post;
   const requests = [];
@@ -396,17 +392,7 @@ test('interactive Cartesia campaign requires the campaign-specific phrase before
   assert.doesNotMatch(replies.join('\n'), /\+14155550123/);
 });
 
-test('campaign schedule helper requires an explicit timezone and caps starts at 24 hours', () => {
-  const now = Date.parse('2026-10-31T12:00:00Z');
-  assert.equal(normalizeCampaignSchedule('now', now), null);
-  assert.equal(normalizeCampaignSchedule('2026-10-31T15:00:00+02:00', now), '2026-10-31T13:00:00.000Z');
-  assert.equal(normalizeCampaignSchedule('2026-10-31T13:00:00', now), undefined);
-  assert.equal(normalizeCampaignSchedule('2026-11-01T12:00:01Z', now), undefined);
-  assert.equal(campaignSubmitPhrase({ campaign_id: 'cartesia_campaign_x', ready_count: 2, scheduled_at: '2026-10-31T15:00:00.000Z' }),
-    'SUBMIT CARTESIA CAMPAIGN cartesia_campaign_x WITH 2 RECIPIENTS AT 2026-10-31T15:00:00.000Z');
-});
-
-test('interactive scheduled campaign previews UTC time and binds it into exact approval', async () => {
+test.skip('retired direct Cartesia scheduled campaign submission', async () => {
   const originalGet = httpClient.get;
   const originalPost = httpClient.post;
   const requests = [];
@@ -444,7 +430,7 @@ test('interactive scheduled campaign previews UTC time and binds it into exact a
   assert.ok(preview >= 0 && approvalPrompt >= 0);
 });
 
-test('interactive batch cancellation and retry require exact campaign-bound approval', async () => {
+test('interactive batch cancellation remains enabled and retry is rejected', async () => {
   const originalGet = httpClient.get;
   const originalPost = httpClient.post;
   const requests = [];
@@ -475,15 +461,32 @@ test('interactive batch cancellation and retry require exact campaign-bound appr
     requests.length = 0;
     ctx.session.cartesiaOperationAction = 'CARTESIA_BATCH_RETRY';
     pendingCampaign.provider_status = 'completed';
-    const retryPhrase = `RETRY CARTESIA CAMPAIGN ${campaignId} BATCH batch_1 RETRY 1 FOR 1 RECIPIENTS`;
-    responses.push({ message: { text: retryPhrase } });
     await cartesiaOperationFlow({ async wait() { return responses.shift(); } }, ctx);
-    assert.equal(requests.length, 2);
-    assert.match(requests[0].url, /\/reconcile$/);
-    assert.match(requests[1].url, /\/retry$/);
-    assert.equal(requests[1].body.confirmation_phrase, retryPhrase);
-    assert.ok(replies.some((text) => text.includes('accepted a retry')));
+    assert.equal(requests.length, 0);
+    assert.ok(replies.some((text) => text.includes('batch retries are disabled')));
   } finally { httpClient.get = originalGet; httpClient.post = originalPost; }
+});
+
+test('stale campaign actions explain the unified call path without API requests', async () => {
+  const originalGet = httpClient.get;
+  const originalPost = httpClient.post;
+  const replies = [];
+  const requests = [];
+  httpClient.get = async () => { requests.push('GET'); return {}; };
+  httpClient.post = async () => { requests.push('POST'); return {}; };
+  for (const action of ['CARTESIA_CAMPAIGN', 'CARTESIA_BATCH_RETRY']) {
+    const ctx = {
+      from: { id: 7001 }, chat: { type: 'private' },
+      session: { accessProfile: { isAdmin: true, checkedAt: Date.now() }, cartesiaOperationAction: action },
+      async reply(message) { replies.push(String(message)); },
+    };
+    await cartesiaOperationFlow({ async wait() { return undefined; } }, ctx);
+  }
+  httpClient.get = originalGet;
+  httpClient.post = originalPost;
+  assert.deepEqual(requests, []);
+  assert.equal(replies.length, 2);
+  assert.ok(replies.every((message) => message.includes('/call') && message.includes('disabled')));
 });
 
 test('Cartesia call operations browse sanitized history and require call-specific cancellation confirmation', async () => {
@@ -607,121 +610,27 @@ test('agent selector shows only active agents with attached source numbers', () 
   assert.doesNotMatch(formatAgentChoices(choices), /No source|Invalid ID/);
 });
 
-test('interactive call flow verifies agent and source before asking for destination', async () => {
-  const originalGet = httpClient.get;
-  const originalPost = httpClient.post;
+test('legacy Cartesia single-call action cannot initiate a call from Cartesia operations', async () => {
   const calls = [];
-  const responses = [
-    { message: { text: 'biz-1' } },
-    { message: { text: '1' } },
-    { message: { text: '1' } },
-    { message: { text: '+14155550123' } },
-    { message: { text: '{}' } },
-    { message: { text: 'PLACE CARTESIA CALL TO +14155550123 FROM ap_number_1 WITH AGENT agent_1' } },
-  ];
   const replies = [];
   const ctx = {
     from: { id: 7001 }, chat: { type: 'private' },
     session: { accessProfile: { isAdmin: true, checkedAt: Date.now() }, cartesiaOperationAction: 'CARTESIA_CALL' },
     async reply(message) { replies.push(String(message)); },
   };
-  const conversation = { async wait() { return responses.shift(); } };
-  httpClient.get = async (_ctx, url) => {
-    calls.push({ method: 'GET', url });
-    return { data: { agents: [{ id: 'agent_1', name: 'Support', ready: true, phoneNumbers: [{ id: 'ap_number_1', displayNumber: '••••0111' }] }] } };
-  };
-  httpClient.post = async (_ctx, url, body) => {
-    calls.push({ method: 'POST', url, body });
-    if (url.endsWith('/api/cartesia/call-approval')) return { data: { approval_token: 'signed-approval-token', request_fingerprint: 'a'.repeat(64) } };
-    return { data: { provider_call_id: 'call_1', status: 'queued' } };
-  };
+  const originalGet = httpClient.get;
+  const originalPost = httpClient.post;
+  httpClient.get = async (_ctx, url) => calls.push({ method: 'GET', url });
+  httpClient.post = async (_ctx, url) => calls.push({ method: 'POST', url });
   try {
-    await cartesiaOperationFlow(conversation, ctx);
+    await cartesiaOperationFlow({ async wait() { throw new Error('No input should be requested'); } }, ctx);
   } finally {
     httpClient.get = originalGet;
     httpClient.post = originalPost;
   }
-  const sourcePromptIndex = replies.findIndex((message) => message.includes('Choose one of this agent'));
-  const destinationPromptIndex = replies.findIndex((message) => message.includes('Enter the authorized destination'));
-  assert.ok(sourcePromptIndex >= 0 && destinationPromptIndex > sourcePromptIndex);
-  assert.deepEqual(calls.map((call) => call.method), ['GET', 'POST', 'POST']);
-  assert.equal(calls[0].url.endsWith('/api/cartesia/agents'), true);
-  assert.equal(calls[1].body.agent_id, 'agent_1');
-  assert.equal(calls[1].body.from_number_id, 'ap_number_1');
-  assert.equal(calls[2].body.number, '+14155550123');
-  assert.equal(ctx.session.cartesiaCallPending, null);
-});
-
-test('interactive call flow binds optional dynamic variables into both approval and outbound dispatch', async () => {
-  const originalGet = httpClient.get;
-  const originalPost = httpClient.post;
-  const requests = [];
-  const replies = [];
-  const input = { destination: '+14155550123', fromNumberId: 'ap_number_1', agentId: 'agent_1', dynamicVariables: { first_name: 'Ada' } };
-  const responses = ['biz-1', '1', '1', input.destination, JSON.stringify(input.dynamicVariables), buildCallConfirmationPhrase(input)]
-    .map((text) => ({ message: { text } }));
-  const ctx = {
-    from: { id: 7001 }, chat: { type: 'private' },
-    session: { accessProfile: { isAdmin: true, checkedAt: Date.now() }, cartesiaOperationAction: 'CARTESIA_CALL' },
-    async reply(message) { replies.push(String(message)); },
-  };
-  httpClient.get = async () => ({ data: { agents: [{ id: 'agent_1', name: 'Support', ready: true, phoneNumbers: [{ id: 'ap_number_1' }] }] } });
-  httpClient.post = async (_ctx, url, body) => {
-    requests.push({ url, body });
-    return url.endsWith('/api/cartesia/call-approval') ? { data: { approval_token: 'approval', request_fingerprint: 'b'.repeat(64) } } : { data: { provider_call_id: 'call_1', status: 'queued' } };
-  };
-  try { await cartesiaOperationFlow({ async wait() { return responses.shift(); } }, ctx); }
-  finally { httpClient.get = originalGet; httpClient.post = originalPost; }
-  assert.equal(requests.length, 2);
-  assert.deepEqual(requests.map((request) => request.body.dynamic_variables), [input.dynamicVariables, input.dynamicVariables]);
-  assert.equal(requests[0].body.confirmation_phrase, buildCallConfirmationPhrase(input));
-  assert.doesNotMatch(replies.join('\n'), /Ada/);
-});
-
-test('uncertain Cartesia calls keep only a safe fingerprint in bot session for reconciliation', async () => {
-  const originalGet = httpClient.get;
-  const originalPost = httpClient.post;
-  const replies = [];
-  const input = { destination: '+14155550123', fromNumberId: 'ap_number_1', agentId: 'agent_1', dynamicVariables: { first_name: 'Ada' } };
-  const responses = ['biz-1', '1', '1', input.destination, JSON.stringify(input.dynamicVariables), buildCallConfirmationPhrase(input)]
-    .map((text) => ({ message: { text } }));
-  const ctx = {
-    from: { id: 7001 }, chat: { type: 'private' },
-    session: { accessProfile: { isAdmin: true, checkedAt: Date.now() }, cartesiaOperationAction: 'CARTESIA_CALL' },
-    async reply(message) { replies.push(String(message)); },
-  };
-  httpClient.get = async () => ({ data: { agents: [{ id: 'agent_1', name: 'Support', ready: true, phoneNumbers: [{ id: 'ap_number_1' }] }] } });
-  httpClient.post = async (_ctx, url) => {
-    if (url.endsWith('/api/cartesia/call-approval')) return { data: { approval_token: 'approval', request_fingerprint: 'c'.repeat(64) } };
-    throw new Error('network timeout');
-  };
-  try { await cartesiaOperationFlow({ async wait() { return responses.shift(); } }, ctx); }
-  finally { httpClient.get = originalGet; httpClient.post = originalPost; }
-  assert.equal(ctx.session.cartesiaCallPending.requestFingerprint, 'c'.repeat(64));
-  assert.equal(Object.hasOwn(ctx.session.cartesiaCallPending, 'dynamicVariables'), false);
-  assert.equal(Object.hasOwn(ctx.session.cartesiaCallPending, 'approvalToken'), false);
-  assert.doesNotMatch(JSON.stringify(ctx.session.cartesiaCallPending), /Ada/);
-  assert.match(replies.join('\n'), /Saved request fingerprint/);
-  const payload = buildReconciliationPayload(ctx.session.cartesiaCallPending, '7001');
-  assert.equal(payload.request_fingerprint, 'c'.repeat(64));
-  assert.equal(Object.hasOwn(payload, 'dynamic_variables'), false);
-});
-
-test('Cartesia approval phrase binds the exact destination, source number, and agent', () => {
-  assert.equal(
-    buildConfirmationPhrase({ destination: '+14155550123', fromNumberId: 'ap_number_1', agentId: 'agent_1' }),
-    'PLACE CARTESIA CALL TO +14155550123 FROM ap_number_1 WITH AGENT agent_1',
-  );
-});
-
-test('dynamic call variables are bound to the explicit bot confirmation fingerprint', () => {
-  const base = { destination: '+14155550123', fromNumberId: 'ap_number_1', agentId: 'agent_1' };
-  const first = buildCallConfirmationPhrase({ ...base, dynamicVariables: { first_name: 'Ada', tier: 'gold' } });
-  const reordered = buildCallConfirmationPhrase({ ...base, dynamicVariables: { tier: 'gold', first_name: 'Ada' } });
-  const changed = buildCallConfirmationPhrase({ ...base, dynamicVariables: { first_name: 'Ada', tier: 'silver' } });
-  assert.equal(first, reordered);
-  assert.notEqual(first, changed);
-  assert.match(first, /WITH VARIABLES [a-f0-9]{12}$/);
+  assert.deepEqual(calls, []);
+  assert.equal(ctx.session.cartesiaCallPending, undefined);
+  assert.match(replies.join('\n'), /Start a single call with \/call/i);
 });
 
 test('Cartesia operator summary masks the destination', () => {

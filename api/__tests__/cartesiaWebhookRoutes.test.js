@@ -1,36 +1,58 @@
 'use strict';
 
 const assert = require('node:assert/strict');
-const { createCartesiaWebhookHandler, normalizeEvent } = require('../services/cartesiaWebhookRoutes');
+const {
+  createCartesiaWebhookHandler,
+  normalizeEvent,
+  registerCartesiaWebhookRoutes,
+} = require('../services/cartesiaWebhookRoutes');
 
 function response() {
-  return { statusCode: 200, body: null, status(code) { this.statusCode = code; return this; }, json(body) { this.body = body; return this; } };
+  return {
+    statusCode: 200,
+    body: null,
+    status(code) { this.statusCode = code; return this; },
+    json(body) { this.body = body; return this; },
+    end() { this.ended = true; return this; },
+  };
 }
 
 const event = {
   type: 'call_completed', call_id: 'call_1', agent_id: 'agent_1', webhook_id: 'agent_webhook_1',
   webhook_request_id: 'webhook_req_1', timestamp: '2026-11-01T12:00:00.000Z',
-  call: { id: 'call_1', transcript: [{ role: 'user', text: 'sensitive transcript' }] },
+  call: {
+    id: 'call_1', agent_id: 'agent_1', status: 'completed',
+    start_time: '2026-11-01T11:59:00.000Z', end_time: '2026-11-01T12:00:00.000Z',
+    telephony_params: { direction: 'outbound', from: '+15555550001', to: '+15555550123' },
+    transcript: [{ role: 'user', text: 'sensitive transcript' }],
+  },
 };
 
 describe('Cartesia lifecycle webhook receiver', () => {
-  it('verifies the configured secret and durably deduplicates provider retries without storing transcript content', async () => {
-    const writes = [];
+  it('uses the shared call lifecycle handler and deduplicates retries without storing transcript content', async () => {
+    const receipts = [];
+    const calls = [];
     const handler = createCartesiaWebhookHandler({ enabled: true, secret: 'test-cartesia-webhook-secret-is-at-least-32', db: {
-      async recordCartesiaWebhookEvent(value) { writes.push(value); return { inserted: writes.length === 1, duplicate: writes.length > 1 }; },
+      async recordCartesiaWebhookReceipt(value) {
+        receipts.push(value);
+        return { inserted: receipts.length === 1, duplicate: receipts.length > 1, conflict: false };
+      },
+      async upsertCartesiaCallRecord(value) { calls.push(value); },
     } });
-    const req = { headers: { 'x-webhook-secret': 'test-cartesia-webhook-secret-is-at-least-32' }, body: event, rawBody: JSON.stringify(event) };
+    const req = { headers: { 'x-webhook-secret': 'test-cartesia-webhook-secret-is-at-least-32' }, body: event };
     const first = response();
     await handler(req, first);
     const retry = response();
     await handler(req, retry);
-    assert.equal(first.statusCode, 200);
-    assert.equal(first.body.duplicate, false);
-    assert.equal(retry.body.duplicate, true);
-    assert.equal(writes.length, 2);
-    assert.equal(writes[0].event_type, 'call_completed');
-    assert.match(writes[0].payload_hash, /^[a-f0-9]{64}$/);
-    assert.doesNotMatch(JSON.stringify(writes[0]), /sensitive transcript|transcript/);
+    assert.equal(first.statusCode, 204);
+    assert.equal(retry.statusCode, 204);
+    assert.equal(receipts.length, 2);
+    assert.equal(receipts[0].event_type, 'call_completed');
+    assert.match(receipts[0].payload_hash, /^[a-f0-9]{64}$/);
+    assert.equal(calls.length, 2);
+    assert.equal(calls[0].status, 'completed');
+    assert.doesNotMatch(JSON.stringify(receipts), /sensitive transcript|transcript/);
+    assert.doesNotMatch(JSON.stringify(calls), /sensitive transcript|transcript/);
   });
 
   it('rejects invalid secrets, malformed events, and unavailable storage without acknowledging them', async () => {
@@ -44,6 +66,17 @@ describe('Cartesia lifecycle webhook receiver', () => {
     const unavailable = response();
     await handler({ headers: { 'x-webhook-secret': 'test-cartesia-webhook-secret-is-at-least-32' }, body: event }, unavailable);
     assert.equal(unavailable.statusCode, 503);
-    assert.throws(() => normalizeEvent({ ...event, timestamp: 'yesterday' }), { code: 'cartesia_webhook_event_invalid' });
+    assert.throws(() => normalizeEvent({ ...event, timestamp: 'yesterday' }), { code: 'cartesia_webhook_invalid' });
+  });
+
+  it('registers the shared lifecycle handler for the legacy callback path', () => {
+    const registered = [];
+    const handler = async () => {};
+    const limiter = () => {};
+    registerCartesiaWebhookRoutes({ post(...args) { registered.push(args); } }, {
+      handler,
+      limiter,
+    });
+    assert.deepEqual(registered, [['/webhook/cartesia', limiter, handler]]);
   });
 });

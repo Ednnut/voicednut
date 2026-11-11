@@ -251,6 +251,13 @@ describe("CALL-E provider preflight", () => {
   });
 });
 
+describe("Cartesia provider preflight", () => {
+  it("does not register Cartesia as a telephony provider", async () => {
+    assert.equal(isProviderSupported("call", "cartesia"), false);
+    assert.equal(isProviderSupported("sms", "cartesia"), false);
+  });
+});
+
 describe("Stripe provider preflight", () => {
   it("registers Stripe as a payment-only preflight provider", () => {
     assert.equal(isProviderSupported("payment", "stripe"), true);

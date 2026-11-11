@@ -859,19 +859,10 @@ function registerCartesiaCallRoutes(app, options = {}) {
     });
 
     app.post('/api/cartesia/call-batches', requireAdminToken, limiter, async (req, res) => {
-      const body = isPlainObject(req.body) ? req.body : {};
-      const allowed = new Set(['business_id', 'name', 'from_number_id', 'agent_id', 'recipients', 'target_concurrency_limit', 'ringing_timeout_seconds', 'max_call_duration_minutes', 'approved', 'confirmed_fingerprint', 'idempotency_key']);
-      if (rejectUnknownFields(body, allowed)) return res.status(400).json({ success: false, code: 'cartesia_batch_invalid', error: 'Unsupported Cartesia batch fields' });
-      const fingerprint = String(body.confirmed_fingerprint || '').toLowerCase();
-      const shouldAudit = body.approved === true && /^[a-f0-9]{64}$/.test(fingerprint) && /^[A-Za-z0-9._:-]{8,100}$/.test(String(body.idempotency_key || ''));
-      return runAuditedCallOperation(options, res, {
-        shouldAudit,
-        action: 'outbound_call_dispatch',
-        resourceId: `pending:${fingerprint.slice(0, 40)}`,
-        requestFingerprint: fingerprint,
-        execute: () => batchService.createBatch({ ...body, confirmedFingerprint: body.confirmed_fingerprint }),
-        getResourceId: (result) => result?.id ? `batch:${result.id}` : undefined,
-        send: (result) => res.status(result.idempotentReplay ? 200 : 202).json({ success: true, batch: result }),
+      return res.status(409).json({
+        success: false,
+        code: 'cartesia_is_ai_capability',
+        error: 'Direct Cartesia batch dialing is retired. Start calls through /call using the selected telephony provider.',
       });
     });
 
@@ -1003,34 +994,10 @@ function registerCartesiaCallRoutes(app, options = {}) {
   }
 
   app.post('/api/cartesia/calls', requireAdminToken, limiter, async (req, res) => {
-    const body = isPlainObject(req.body) ? req.body : {};
-    const allowed = new Set([
-      'business_id', 'to_number', 'from_number_id', 'agent_id',
-      'dynamic_variables', 'ringing_timeout_seconds', 'max_call_duration_minutes',
-      'approved', 'confirmed_fingerprint', 'idempotency_key',
-    ]);
-    if (rejectUnknownFields(body, allowed)) {
-      return res.status(400).json({ success: false, code: 'cartesia_request_invalid', error: 'Unsupported Cartesia call fields' });
-    }
-    return runAuditedCallOperation(options, res, {
-      shouldAudit: isAuditReadyCallDispatch(body),
-      action: 'outbound_call_dispatch',
-      resourceId: `pending:${String(body.confirmed_fingerprint || '').slice(0, 40)}`,
-      requestFingerprint: String(body.confirmed_fingerprint || '').toLowerCase(),
-      execute: () => service.createOutboundCall({
-        business_id: body.business_id,
-        to_number: body.to_number,
-        from_number_id: body.from_number_id,
-        agent_id: body.agent_id,
-        dynamic_variables: body.dynamic_variables,
-        ringing_timeout_seconds: body.ringing_timeout_seconds,
-        max_call_duration_minutes: body.max_call_duration_minutes,
-        approved: body.approved,
-        confirmedFingerprint: body.confirmed_fingerprint,
-        idempotency_key: body.idempotency_key,
-      }),
-      getResourceId: (result) => result?.providerCallId,
-      send: (result) => res.status(result.idempotentReplay ? 200 : 202).json({ success: true, call: result }),
+    return res.status(409).json({
+      success: false,
+      code: 'cartesia_is_ai_capability',
+      error: 'Direct Cartesia dialing is retired. Start calls through /call using the selected telephony provider.',
     });
   });
 

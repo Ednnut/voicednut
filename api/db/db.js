@@ -11321,6 +11321,24 @@ class EnhancedDatabase {
         });
     }
 
+    async createEnhancedWebhookNotificationOnce(call_sid, notification_type, telegram_chat_id, priority = 'normal') {
+        return new Promise((resolve, reject) => {
+            this.db.run(
+                `INSERT INTO webhook_notifications (call_sid, notification_type, telegram_chat_id, priority, retry_count)
+                 SELECT ?, ?, ?, ?, 0
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM webhook_notifications
+                     WHERE call_sid = ? AND notification_type = ? AND telegram_chat_id = ?
+                 )`,
+                [call_sid, notification_type, telegram_chat_id, priority, call_sid, notification_type, telegram_chat_id],
+                function (error) {
+                    if (error) reject(error);
+                    else resolve(this.changes === 1);
+                },
+            );
+        });
+    }
+
     // Backward compatibility method
     async createWebhookNotification(call_sid, notification_type, telegram_chat_id) {
         return this.createEnhancedWebhookNotification(call_sid, notification_type, telegram_chat_id, 'normal');

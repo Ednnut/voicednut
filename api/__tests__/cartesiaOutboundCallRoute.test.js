@@ -22,46 +22,29 @@ function makeHandler(overrides = {}) {
     resolveHost: () => "api.example.test",
     config: { server: { hostname: "api.example.test" } },
     placeOutboundCall: async () => { throw new Error("legacy provider path must not run"); },
-    placeCartesiaOutboundCall: async () => ({ providerCallId: "agent_call_1", status: "queued", idempotentReplay: false }),
     buildErrorDetails: () => ({}),
     ...overrides,
   });
 }
 
 describe("Cartesia outbound call API contract", () => {
-  it("dispatches only an explicitly approved Cartesia Managed Agent request", async () => {
-    const seen = [];
-    const handler = makeHandler({ placeCartesiaOutboundCall: async (input) => {
-      seen.push(input);
-      return { providerCallId: "agent_call_1", status: "queued", idempotentReplay: true };
-    } });
-    const req = {
-      body: {
-        provider: "cartesia", business_id: "biz-1", actor_id: "7001", number: "+14155550123",
-        agent_id: "agent_1", from_number_id: "ap_number_1", idempotency_key: "cartesia-request-001", approval_token: "server-signed-token",
-      },
-      headers: {}, requestId: "req-1", callEActorId: "7001",
-    };
-    const res = makeResponse();
-    await handler(req, res);
-    assert.deepEqual(seen, [{
-      businessId: "biz-1", actorId: "7001", destination: "+14155550123", agentId: "agent_1",
-      fromNumberId: "ap_number_1", idempotencyKey: "cartesia-request-001", approvalToken: "server-signed-token",
-    }]);
-    assert.deepEqual(res.body, {
-      success: true, call_sid: "agent_call_1", provider_call_id: "agent_call_1", to: "+14155550123",
-      status: "queued", deduped: true, provider: "cartesia",
+  it("rejects Cartesia as a call provider without dispatching to any carrier", async () => {
+    let dispatched = false;
+    const handler = makeHandler({
+      placeOutboundCall: async () => { dispatched = true; },
+      placeCartesiaOutboundCall: async () => { dispatched = true; },
     });
-  });
-
-  it("rejects a missing approval before provider dispatch and never falls through", async () => {
-    let providerCalls = 0;
-    const handler = makeHandler({ placeCartesiaOutboundCall: async () => { providerCalls += 1; } });
-    const res = makeResponse();
-    await handler({ body: { provider: "cartesia", number: "+14155550123", business_id: "biz-1", agent_id: "agent_1", from_number_id: "ap_1", idempotency_key: "cartesia-request-001" }, headers: {} }, res);
-    assert.equal(providerCalls, 0);
-    assert.equal(res.statusCode, 403);
-    assert.equal(res.body.code, "cartesia_approval_required");
+    for (const body of [
+      { provider: "cartesia" },
+      { preferred_provider: "cartesia" },
+      { call_provider: "cartesia" },
+    ]) {
+      const res = makeResponse();
+      await handler({ body, headers: {}, requestId: "req-1" }, res);
+      assert.equal(dispatched, false);
+      assert.equal(res.statusCode, 400);
+      assert.equal(res.body.code, "cartesia_is_ai_capability");
+    }
   });
 
   it("registers the approval endpoint behind rate limiting, API authorization, and signed actor assertion", () => {
@@ -85,6 +68,71 @@ describe("Cartesia outbound call API contract", () => {
     assert.equal(handlers[1], authorization);
     assert.equal(handlers[2], actor);
     assert.equal(typeof handlers[3], "function");
+  });
+
+  it("reads business-scoped provider defaults and permits writes only for Cartesia admins", async () => {
+    const routes = new Map();
+    const app = {
+      post(path, ...handlers) { routes.set(`POST ${path}`, handlers); },
+      get(path, ...handlers) { routes.set(`GET ${path}`, handlers); },
+      patch() {},
+    };
+    const limiter = () => {};
+    const authorization = () => {};
+    const actorAssertion = () => {};
+    const stored = [];
+    registerCallRoutes(app, {
+      cartesiaApprovalLimiter: limiter,
+      requireOutboundAuthorization: authorization,
+      requireCallEActorAssertion: actorAssertion,
+      isCartesiaAdminActor: async (actorId) => actorId === "7001",
+      getCartesiaCallDefaults: async (input) => {
+        assert.deepEqual(input, { business_id: "biz-1", actor_id: "7001" });
+        return { agentId: "agent_1", fromNumberId: "ap_number_1" };
+      },
+      setCartesiaCallDefaults: async (input) => {
+        stored.push(input);
+        return { agentId: input.agent_id, fromNumberId: input.from_number_id };
+      },
+      sendApiError(res, status, code, message) { return res.status(status).json({ success: false, code, error: message }); },
+    });
+
+    const read = routes.get("GET /api/cartesia/provider-defaults");
+    assert.deepEqual(read.slice(0, 3), [limiter, authorization, actorAssertion]);
+    const readResponse = makeResponse();
+    await read[3]({ query: { business_id: "biz-1" }, callEActorId: "7001" }, readResponse);
+    assert.deepEqual(readResponse.body, {
+      success: true,
+      profile: { business_id: "biz-1", agent_id: "agent_1", from_number_id: "ap_number_1" },
+    });
+
+    const write = routes.get("POST /api/cartesia/provider-defaults");
+    assert.deepEqual(write.slice(0, 3), [limiter, authorization, actorAssertion]);
+    const denied = makeResponse();
+    await write[3]({
+      body: { business_id: "biz-1", agent_id: "agent_1", from_number_id: "ap_number_1" },
+      callEActorId: "7002",
+    }, denied);
+    assert.equal(denied.statusCode, 403);
+    assert.equal(stored.length, 0);
+
+    const written = makeResponse();
+    await write[3]({
+      body: { business_id: "biz-1", agent_id: "agent_1", from_number_id: "ap_number_1" },
+      callEActorId: "7001",
+    }, written);
+    assert.deepEqual(stored, [{
+      business_id: "biz-1", actor_id: "7001", agent_id: "agent_1", from_number_id: "ap_number_1",
+    }]);
+    assert.deepEqual(written.body, readResponse.body);
+
+    const invalid = makeResponse();
+    await write[3]({
+      body: { business_id: "biz-1", agent_id: "agent_1", from_number_id: "ap_number_1", approval_token: "must-not-be-persisted" },
+      callEActorId: "7001",
+    }, invalid);
+    assert.equal(invalid.statusCode, 400);
+    assert.equal(stored.length, 1);
   });
 
   it("registers reconciliation behind the same protected and rate-limited route boundary", async () => {
@@ -198,7 +246,7 @@ describe("Cartesia outbound call API contract", () => {
     assert.equal(allowed.body.campaign.status, "unknown");
   });
 
-  it('registers batch reconcile, cancel, and retry behind the protected Cartesia admin boundary', async () => {
+  it('keeps reconcile and cancel protected while rejecting campaign submit and batch retry', async () => {
     const routes = new Map();
     const app = { post(path, ...handlers) { routes.set(`POST ${path}`, handlers); }, get(path, ...handlers) { routes.set(`GET ${path}`, handlers); }, patch() {} };
     const limiter = () => {};
@@ -214,7 +262,7 @@ describe("Cartesia outbound call API contract", () => {
       sendApiError(res, status, code, message) { return res.status(status).json({ success: false, code, error: message }); },
     });
 
-    it('returns Accepted when an approved large campaign is durably queued for background dispatch', async () => {
+    it('rejects campaign submission without invoking the dispatch service', async () => {
       const routes = new Map();
       const app = { post(path, ...handlers) { routes.set(`POST ${path}`, handlers); }, get() {}, patch() {} };
       const limiter = () => {};
@@ -240,10 +288,20 @@ describe("Cartesia outbound call API contract", () => {
         body: { business_id: 'biz-1', confirmation_phrase: 'exact phrase' },
         callEActorId: '7001',
       }, res);
-      assert.equal(res.statusCode, 202);
-      assert.equal(res.body.queued_for_async_dispatch, true);
-      assert.equal(received.actor_id, '7001');
+      assert.equal(res.statusCode, 409);
+      assert.equal(res.body.code, 'cartesia_is_ai_capability');
+      assert.equal(received, undefined);
     });
+    const createHandlers = routes.get('POST /api/cartesia/campaigns');
+    assert.deepEqual(createHandlers.slice(0, 3), [limiter, authorization, actorAssertion]);
+    const campaignCreate = makeResponse();
+    await createHandlers[3]({
+      body: { business_id: 'biz-1', request_key: 'request-key-0001', destinations: ['+15555550123'] },
+      callEActorId: '7001',
+    }, campaignCreate);
+    assert.equal(campaignCreate.statusCode, 409);
+    assert.equal(campaignCreate.body.code, 'cartesia_is_ai_capability');
+
     const campaignId = `cartesia_campaign_${'a'.repeat(64)}`;
     for (const [operation, expectedName] of [['reconcile', 'reconcileCartesiaCampaign'], ['cancel', 'cancelCartesiaCampaignBatch'], ['retry', 'retryCartesiaCampaignBatch']]) {
       const path = `POST /api/cartesia/campaigns/:campaignId/${operation}`;
@@ -255,9 +313,10 @@ describe("Cartesia outbound call API contract", () => {
       assert.equal(denied.statusCode, 403);
       const allowed = makeResponse();
       await handlers[3]({ params: { campaignId }, body: { business_id: 'biz-1', confirmation_phrase: 'exact phrase' }, callEActorId: '7001' }, allowed);
-      assert.equal(allowed.statusCode, 200);
+      assert.equal(allowed.statusCode, operation === 'retry' ? 409 : 200);
+      if (operation === 'retry') assert.equal(allowed.body.code, 'cartesia_is_ai_capability');
     }
-    assert.deepEqual(received.map(([operation]) => operation), ['reconcile', 'cancel', 'retry']);
+    assert.deepEqual(received.map(([operation]) => operation), ['reconcile', 'cancel']);
     assert.ok(received.every(([, input]) => input.campaign_id === campaignId && input.business_id === 'biz-1' && input.actor_id === '7001'));
   });
 

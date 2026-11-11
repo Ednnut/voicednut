@@ -45,7 +45,7 @@ describe('Cartesia batch routes', () => {
     assert.equal((await request(app).post('/api/cartesia/call-batches/preview').send({})).status, 403);
   });
 
-  it('provides an eligibility preview and requires matching approval for audited dispatch', async () => {
+  it('allows batch preview but rejects direct Cartesia batch dispatch without provider side effects', async () => {
     const { app, calls, audits } = setup();
     const admin = { 'x-admin-token': 'ok' };
     const payload = { business_id: 'business_test', name: 'Batch', agent_id: 'agent_test', from_number_id: 'number_test', recipients: [{ to_number: '+15555550123' }] };
@@ -53,16 +53,15 @@ describe('Cartesia batch routes', () => {
     assert.equal(preview.status, 200);
     assert.equal(preview.body.preview.requestFingerprint, 'a'.repeat(64));
     const invalid = await request(app).post('/api/cartesia/call-batches').set(admin).send({ ...payload, unknown: true });
-    assert.equal(invalid.status, 400);
+    assert.equal(invalid.status, 409);
+    assert.equal(invalid.body.code, 'cartesia_is_ai_capability');
     const create = await request(app).post('/api/cartesia/call-batches').set(admin).send({
       ...payload, approved: true, confirmed_fingerprint: 'a'.repeat(64), idempotency_key: 'batch-key-test-01',
     });
-    assert.equal(create.status, 202);
-    assert.equal(calls.filter((call) => call[0] === 'create').length, 1);
-    assert.deepEqual(audits.map((event) => [event.action, event.outcome]), [
-      ['outbound_call_dispatch', 'requested'], ['outbound_call_dispatch', 'succeeded'],
-    ]);
-    assert.equal(JSON.stringify(audits).includes('+15555550123'), false);
+    assert.equal(create.status, 409);
+    assert.equal(create.body.code, 'cartesia_is_ai_capability');
+    assert.equal(calls.filter((call) => call[0] === 'create').length, 0);
+    assert.deepEqual(audits, []);
   });
 
   it('supports read-only batch inventory and requires explicit cancellation approval', async () => {

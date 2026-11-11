@@ -191,7 +191,7 @@ describe('Cartesia call routes', () => {
     assert.equal(response.headers['cache-control'], 'no-store');
   });
 
-  it('wires preview, explicitly confirmed dispatch, read and cancellation to the service', async () => {
+  it('keeps preview, history and cancellation while retiring direct Cartesia dispatch', async () => {
     const { app, calls, callAuditEvents } = createApp();
     const headers = { 'x-admin-token': 'test-admin' };
     const payload = {
@@ -211,20 +211,19 @@ describe('Cartesia call routes', () => {
     const cancel = await request(app).post('/api/cartesia/calls/ac_test_01/cancel').set(headers).send({ approved: true });
 
     assert.equal(preview.status, 200);
-    assert.equal(dispatch.status, 202);
+    assert.equal(dispatch.status, 409);
+    assert.equal(dispatch.body.code, 'cartesia_is_ai_capability');
     assert.equal(read.status, 200);
     assert.equal(cancel.status, 200);
-    assert.deepEqual(callAuditEvents.map((event) => event.outcome), ['requested', 'succeeded', 'requested', 'succeeded']);
+    assert.deepEqual(callAuditEvents.map((event) => event.outcome), ['requested', 'succeeded']);
     assert.deepEqual(callAuditEvents.map((event) => event.action), [
-      'outbound_call_dispatch', 'outbound_call_dispatch', 'outbound_call_cancel', 'outbound_call_cancel',
+      'outbound_call_cancel', 'outbound_call_cancel',
     ]);
-    assert.equal(callAuditEvents[1].resource_id, 'ac_test_01');
+    assert.equal(callAuditEvents[0].resource_id, 'ac_test_01');
     assert.equal(JSON.stringify(callAuditEvents).includes('+15555550123'), false);
     assert.equal(JSON.stringify(callAuditEvents).includes('dynamic_variables'), false);
     assert.equal(calls[0][0], 'preview');
-    assert.equal(calls[1][0], 'dispatch');
-    assert.equal(calls[1][1].confirmedFingerprint, 'a'.repeat(64));
-    assert.deepEqual(calls.slice(2), [['read', 'ac_test_01'], ['cancel', 'ac_test_01', true]]);
+    assert.deepEqual(calls.slice(1), [['read', 'ac_test_01'], ['cancel', 'ac_test_01', true]]);
   });
 
   it('rejects unknown execution fields and requires cancellation approval', async () => {
@@ -232,7 +231,8 @@ describe('Cartesia call routes', () => {
     const headers = { 'x-admin-token': 'test-admin' };
     const unknown = await request(app).post('/api/cartesia/calls').set(headers).send({ phone: '+15555550123' });
     const cancel = await request(app).post('/api/cartesia/calls/ac_test_01/cancel').set(headers).send({});
-    assert.equal(unknown.status, 400);
+    assert.equal(unknown.status, 409);
+    assert.equal(unknown.body.code, 'cartesia_is_ai_capability');
     assert.equal(cancel.status, 400);
     assert.equal(calls.length, 0);
   });
@@ -449,14 +449,14 @@ describe('Cartesia call routes', () => {
     assert.deepEqual(calls.filter(([name]) => name === 'cancel'), [['cancel', 'ac_test_01', true]]);
   });
 
-  it('fails closed before outbound dispatch when call audit storage is unavailable', async () => {
+  it('does not attempt direct Cartesia dispatch even when audit storage is unavailable', async () => {
     const { app, calls } = createApp({ callAuditError: new Error('audit unavailable') });
     const response = await request(app).post('/api/cartesia/calls').set('x-admin-token', 'test-admin').send({
       business_id: 'business_test', to_number: '+15555550123', from_number_id: 'phone_test_01', agent_id: 'agent_test_01',
       approved: true, confirmed_fingerprint: 'a'.repeat(64), idempotency_key: 'cartesia-audit-failure',
     });
-    assert.equal(response.status, 503);
-    assert.equal(response.body.code, 'cartesia_admin_action_audit_unavailable');
+    assert.equal(response.status, 409);
+    assert.equal(response.body.code, 'cartesia_is_ai_capability');
     assert.equal(calls.some(([name]) => name === 'dispatch'), false);
   });
 });

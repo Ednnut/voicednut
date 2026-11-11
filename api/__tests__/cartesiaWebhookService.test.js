@@ -4,7 +4,11 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const Database = require('../db/db');
-const { createCartesiaWebhookHandler, normalizeCartesiaWebhookEvent } = require('../services/cartesiaWebhookService');
+const {
+  createCartesiaWebhookHandler,
+  getCommonCallStatusUpdate,
+  normalizeCartesiaWebhookEvent,
+} = require('../services/cartesiaWebhookService');
 
 const WEBHOOK_SECRET = 'test-webhook-secret-with-sufficient-length';
 
@@ -161,6 +165,71 @@ describe('Cartesia call lifecycle webhook', () => {
     assert.equal(saved.business_scope_resolved, false);
   });
 
+  it('maps supported call events into the shared status and deduplicated notification lifecycle', async () => {
+    const receipts = new Set();
+    const notifications = new Set();
+    const statusUpdates = [];
+    let status = 'initiated';
+    const db = {
+      async recordCartesiaWebhookReceipt(receipt) {
+        const key = receipt.webhook_request_id;
+        if (receipts.has(key)) return { inserted: false, duplicate: true, conflict: false };
+        receipts.add(key);
+        return { inserted: true, duplicate: false, conflict: false };
+      },
+      async getCartesiaCallBusinessScope() { return 'business-1'; },
+      async upsertCartesiaCallRecord() {},
+      async getCall() {
+        return { call_id: 'ac_outbound_01', status, user_chat_id: '7001', business_id: 'business-1' };
+      },
+      async getLatestCallState() {
+        return { provider: 'cartesia', business_id: 'business-1' };
+      },
+      async updateCallStatus(_callId, nextStatus, additionalData) {
+        status = nextStatus;
+        statusUpdates.push({ status: nextStatus, additionalData });
+      },
+      async updateCallState() {},
+      async createEnhancedWebhookNotificationOnce(callId, type, chatId) {
+        notifications.add(`${callId}:${type}:${chatId}`);
+      },
+    };
+    const handler = createCartesiaWebhookHandler({ webhookSecret: WEBHOOK_SECRET, db });
+    const send = async (type, requestId, timestamp, callStatus, endTime = null) => {
+      const body = {
+        type,
+        call_id: 'ac_outbound_01',
+        agent_id: 'agent_test_01',
+        webhook_id: 'webhook_test_01',
+        webhook_request_id: requestId,
+        timestamp,
+        call: {
+          id: 'ac_outbound_01',
+          agent_id: 'agent_test_01',
+          status: callStatus,
+          start_time: '2026-11-04T11:59:00.000Z',
+          ...(endTime ? { end_time: endTime } : {}),
+          telephony_params: { from: '+15555550001', to: '+15555550123', direction: 'outbound' },
+        },
+      };
+      const res = responseRecorder();
+      await handler({ headers: { 'x-webhook-secret': WEBHOOK_SECRET }, body }, res);
+      assert.equal(res.statusCode, 204);
+    };
+
+    await send('call_started', 'webhook_req_started', '2026-11-04T11:59:00.000Z', 'started');
+    await send('call_completed', 'webhook_req_completed', '2026-11-04T12:00:00.000Z', 'completed', '2026-11-04T12:00:00.000Z');
+    await send('call_completed', 'webhook_req_completed', '2026-11-04T12:00:00.000Z', 'completed', '2026-11-04T12:00:00.000Z');
+
+    assert.deepEqual(statusUpdates.map(({ status: nextStatus }) => nextStatus), ['in-progress', 'completed', 'completed']);
+    assert.equal(statusUpdates[1].additionalData.duration, 60);
+    assert.deepEqual([...notifications].sort(), [
+      'ac_outbound_01:call_completed:7001',
+      'ac_outbound_01:call_in_progress:7001',
+    ]);
+    assert.deepEqual(getCommonCallStatusUpdate({ status: 'failed' }).additionalData.error_code, 'cartesia_call_failed');
+  });
+
   it('rejects reuse of a webhook request ID with a different event payload', async () => {
     const receipts = new Map();
     const handler = createCartesiaWebhookHandler({
@@ -177,12 +246,19 @@ describe('Cartesia call lifecycle webhook', () => {
     });
     const original = responseRecorder();
     await handler({ headers: { 'x-webhook-secret': WEBHOOK_SECRET }, body: callEvent() }, original);
-    const changedBody = callEvent({ timestamp: '2026-11-04T12:01:00.000Z' });
-    const changed = responseRecorder();
-    await handler({ headers: { 'x-webhook-secret': WEBHOOK_SECRET }, body: changedBody }, changed);
     assert.equal(original.statusCode, 204);
-    assert.equal(changed.statusCode, 409);
-    assert.equal(changed.body.code, 'cartesia_webhook_event_conflict');
+    const changedCalls = [
+      { start_time: '2026-11-04T11:58:00.000Z' },
+      { end_reason: 'agent_hangup' },
+      { telephony_account_type: 'twilio' },
+    ];
+    for (const change of changedCalls) {
+      const body = callEvent({ call: { ...callEvent().call, ...change } });
+      const changed = responseRecorder();
+      await handler({ headers: { 'x-webhook-secret': WEBHOOK_SECRET }, body }, changed);
+      assert.equal(changed.statusCode, 409);
+      assert.equal(changed.body.code, 'cartesia_webhook_event_conflict');
+    }
   });
 
   it('durably deduplicates event IDs and prevents out-of-order call status regression', async () => {
@@ -244,11 +320,16 @@ describe('Cartesia call lifecycle webhook', () => {
         agentId: 'agent_test_01',
         webhookId: 'webhook_test_01',
         timestamp: event.timestamp,
-        status: 'completed',
-        direction: 'inbound',
-        from: '+15555550123',
-        to: '+15555550001',
-        endTime: '2026-11-04T12:00:00.000Z',
+        callRecord: {
+          status: 'completed',
+          direction: 'inbound',
+          phoneNumber: '+15555550123',
+          destinationPhoneNumber: '+15555550001',
+          startTime: '2026-11-04T11:59:00.000Z',
+          endTime: '2026-11-04T12:00:00.000Z',
+          endReason: 'client_hangup',
+          telephonyAccountType: 'cartesia',
+        },
       })).digest('hex'));
     } finally {
       await new Promise((resolve) => db.db.close(resolve));

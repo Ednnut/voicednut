@@ -108,11 +108,16 @@ function normalizeCartesiaWebhookEvent(body) {
     webhookId,
     timestamp,
     ...(callRecord ? {
-      status: callRecord.status,
-      direction: callRecord.direction,
-      from: safeProviderText(body.call?.telephony_params?.from, 64),
-      to: safeProviderText(body.call?.telephony_params?.to, 64),
-      endTime: callRecord.end_time,
+      callRecord: {
+        status: callRecord.status,
+        direction: callRecord.direction,
+        phoneNumber: callRecord.phone_number,
+        destinationPhoneNumber: callRecord.destination_phone_number,
+        startTime: callRecord.start_time,
+        endTime: callRecord.end_time,
+        endReason: callRecord.end_reason,
+        telephonyAccountType: callRecord.telephony_account_type,
+      },
     } : {}),
   };
   const payloadHash = crypto.createHash('sha256').update(JSON.stringify(payloadFingerprint)).digest('hex');
@@ -126,10 +131,87 @@ function normalizeCartesiaWebhookEvent(body) {
   });
 }
 
+function getCommonCallStatusUpdate(callRecord) {
+  if (!callRecord) return null;
+  if (callRecord.status === 'started') {
+    return {
+      status: 'in-progress',
+      notificationType: 'call_in_progress',
+      additionalData: { started_at: callRecord.start_time || undefined },
+    };
+  }
+  if (callRecord.status === 'completed') {
+    const startTime = Date.parse(callRecord.start_time || '');
+    const endTime = Date.parse(callRecord.end_time || '');
+    return {
+      status: 'completed',
+      notificationType: 'call_completed',
+      additionalData: {
+        started_at: callRecord.start_time || undefined,
+        ended_at: callRecord.end_time || undefined,
+        duration: Number.isFinite(startTime) && Number.isFinite(endTime)
+          ? Math.max(0, Math.floor((endTime - startTime) / 1000))
+          : undefined,
+      },
+    };
+  }
+  if (callRecord.status === 'failed') {
+    return {
+      status: 'failed',
+      notificationType: 'call_failed',
+      additionalData: {
+        started_at: callRecord.start_time || undefined,
+        ended_at: callRecord.end_time || undefined,
+        error_code: 'cartesia_call_failed',
+      },
+    };
+  }
+  return null;
+}
+
+async function syncCommonOutboundCall(db, callRecord, businessScope) {
+  const update = getCommonCallStatusUpdate(callRecord);
+  if (!update || callRecord.direction !== 'outbound' ||
+      typeof db?.getCall !== 'function' ||
+      typeof db?.getLatestCallState !== 'function' ||
+      typeof db?.updateCallStatus !== 'function' ||
+      typeof db?.updateCallState !== 'function') {
+    return;
+  }
+  const callId = callRecord.provider_call_id;
+  const call = await db.getCall(callId);
+  if (!call) return;
+  const createdState = await db.getLatestCallState(callId, 'call_created');
+  if (createdState?.provider !== 'cartesia' ||
+      String(createdState.business_id || '') !== String(call.business_id || '') ||
+      (businessScope?.business_id && String(businessScope.business_id) !== String(call.business_id || ''))) {
+    return;
+  }
+
+  await db.updateCallStatus(callId, update.status, update.additionalData);
+  await db.updateCallState(callId, `cartesia_${callRecord.status}`, {
+    provider: 'cartesia',
+    provider_call_id: callId,
+    provider_status: callRecord.status,
+    end_reason: callRecord.end_reason || null,
+    event_timestamp: callRecord.event_timestamp,
+  });
+  const latestCall = await db.getCall(callId);
+  if (String(latestCall?.status || '').toLowerCase().replace(/_/g, '-') !== update.status) return;
+
+  const chatId = String(call.user_chat_id || '').trim();
+  if (!chatId) return;
+  if (typeof db.createEnhancedWebhookNotificationOnce === 'function') {
+    await db.createEnhancedWebhookNotificationOnce(callId, update.notificationType, chatId);
+  } else if (typeof db.createEnhancedWebhookNotification === 'function') {
+    await db.createEnhancedWebhookNotification(callId, update.notificationType, chatId);
+  }
+}
+
 function createCartesiaWebhookHandler(options = {}) {
   return async (req, res) => {
     const expectedSecret = String(options.webhookSecret || '').trim();
-    if (!expectedSecret) {
+    if (options.enabled === false || !expectedSecret) {
       return res.status(503).json({ success: false, code: 'cartesia_webhook_not_configured' });
     }
     if (!safeCompareSecret(req.headers?.['x-webhook-secret'], expectedSecret)) {
@@ -185,6 +267,10 @@ function createCartesiaWebhookHandler(options = {}) {
           from_number_id: scope?.phone_number_id || null,
           business_scope_resolved: businessScopeResolved,
         });
+        await syncCommonOutboundCall(db, {
+          ...event.callRecord,
+          event_timestamp: event.timestamp,
+        }, scope);
       }
       return res.status(204).end();
     } catch {
@@ -196,6 +282,7 @@ function createCartesiaWebhookHandler(options = {}) {
 module.exports = {
   CALL_EVENT_STATUS,
   createCartesiaWebhookHandler,
+  getCommonCallStatusUpdate,
   normalizeCartesiaWebhookEvent,
   safeCompareSecret,
 };

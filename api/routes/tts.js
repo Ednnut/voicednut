@@ -154,6 +154,20 @@ class TextToSpeechService extends EventEmitter {
     }
   }
 
+  configureSpeechProfile(settings) {
+    if (settings === undefined || settings === null) return;
+    if (!settings || typeof settings !== 'object' || Array.isArray(settings) ||
+        String(settings.provider || '').trim().toLowerCase() !== 'cartesia' ||
+        typeof settings.voice_id !== 'string' ||
+        !/^[A-Za-z0-9_-]{1,200}$/.test(settings.voice_id.trim())) {
+      const error = new Error('Cartesia speech profile is invalid');
+      error.code = 'cartesia_speech_profile_invalid';
+      throw error;
+    }
+    this.provider = 'cartesia';
+    this.voiceId = settings.voice_id.trim();
+  }
+
   async fetchSpeechAudio(text, voiceModel, audioSpec = {}, provider = this.provider) {
     if (provider === 'cartesia') {
       return this.fetchCartesiaSpeechAudio(text, voiceModel, audioSpec);

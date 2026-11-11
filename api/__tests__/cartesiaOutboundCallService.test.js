@@ -72,6 +72,56 @@ describe("CartesiaOutboundCallService", () => {
     }), { code: "cartesia_agent_source_not_ready" });
   });
 
+  it("accepts Cartesia's documented paginated agent-list envelope", async () => {
+    const { service } = makeHarness({ client: { listAgents: async () => ({
+      data: [{ id: "agent_1", name: "Support", description: null, version_id: "version_1" }],
+      has_more: false,
+      next_page: null,
+    }) } });
+    assert.deepEqual(await service.listAgentInventory(), [{
+      id: "agent_1",
+      name: "Support",
+      deleted: false,
+      deploymentCount: 0,
+      phoneNumbers: [],
+      ready: false,
+    }]);
+  });
+
+  it("stores validated defaults by business, authorizes reads, and validates source ownership on writes", async () => {
+    const settings = new Map();
+    const authorized = [];
+    const { service } = makeHarness({
+      db: {
+        async getSetting(key) { return settings.get(key) || null; },
+        async setSetting(key, value) { settings.set(key, value); },
+      },
+      outboundSafety: {
+        async authorizeActor(input) { authorized.push(input); },
+      },
+    });
+
+    await service.setCallDefaults({
+      business_id: "biz-1", actor_id: "7001", agent_id: "agent_1", from_number_id: "ap_number_1",
+    });
+    assert.deepEqual(await service.getCallDefaults({ business_id: "biz-1", actor_id: "7001" }), {
+      agentId: "agent_1", fromNumberId: "ap_number_1",
+    });
+    assert.deepEqual(await service.getCallDefaults({ business_id: "biz-2", actor_id: "7001" }), {
+      agentId: null, fromNumberId: null,
+    });
+    assert.equal(settings.size, 1);
+    assert.deepEqual(JSON.parse(settings.get("cartesia_call_defaults:biz-1")), {
+      agent_id: "agent_1", from_number_id: "ap_number_1",
+    });
+    assert.equal(authorized.length, 2);
+
+    await assert.rejects(service.setCallDefaults({
+      business_id: "biz-1", actor_id: "7001", agent_id: "agent_1", from_number_id: "ap_other",
+    }), { code: "cartesia_agent_source_not_ready" });
+    assert.equal(settings.size, 1);
+  });
+
   it("prevents a business from placing outbound calls through another business's scoped number", async () => {
     const { service, state } = makeHarness({
       db: {

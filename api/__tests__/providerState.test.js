@@ -2,13 +2,16 @@ const assert = require("node:assert/strict");
 const {
   getSupportedProviders,
   isCallESelectionReady,
+  normalizeProvider,
 } = require("../adapters/providerState");
 const { listProviderFlows, providerSupportsFlow } = require("../adapters/providerFlowPolicy");
 
 describe("CALL-E provider selection state", () => {
-  it("lists CALL-E as a call provider without adding it to SMS providers", () => {
+  it("lists only telephony providers as call providers without adding them to SMS providers", () => {
     assert.deepEqual(getSupportedProviders("call"), ["twilio", "plivo", "vonage", "call_e"]);
     assert.deepEqual(getSupportedProviders("sms"), ["twilio", "plivo", "vonage"]);
+    assert.equal(getSupportedProviders("call").includes("cartesia"), false);
+    assert.throws(() => normalizeProvider("call", "cartesia"), /Unsupported call provider/);
   });
 
   it("requires all server-side pilot gates before selecting CALL-E", () => {
@@ -37,4 +40,5 @@ describe("CALL-E provider selection state", () => {
     assert.equal(providerSupportsFlow("call", "call_e", "outbound_voice"), false);
     assert.equal(providerSupportsFlow("call", "call_e", "digit_capture"), false);
   });
+
 });

@@ -26,6 +26,42 @@ function sseChunk(audio) {
 }
 
 describe('Cartesia TTS adapter', () => {
+  it('uses a script Cartesia speech profile even when the global TTS default is another engine', async () => {
+    let request;
+    const config = makeConfig();
+    config.tts.provider = 'deepgram';
+    const service = new TextToSpeechService({
+      config,
+      fetchFn: async (url, options) => {
+        request = { url, body: JSON.parse(options.body) };
+        return { ok: true, status: 200, body: Readable.from([sseChunk(Buffer.from([1, 0]))]) };
+      },
+    });
+
+    service.configureSpeechProfile({ provider: 'cartesia', voice_id: 'script_voice_01' });
+    const result = await service.generate(
+      { partialResponseIndex: 9, partialResponse: 'Use the script profile.' },
+      1,
+      { encoding: 'linear16' },
+    );
+
+    assert.equal(result.ok, true);
+    assert.equal(request.url, 'https://api.cartesia.ai/tts/sse');
+    assert.equal(request.body.voice, 'script_voice_01');
+  });
+
+  it('rejects malformed per-call speech profiles before changing the selected TTS provider', () => {
+    const config = makeConfig();
+    config.tts.provider = 'deepgram';
+    const service = new TextToSpeechService({ config });
+
+    assert.throws(
+      () => service.configureSpeechProfile({ provider: 'cartesia', voice_id: 'https://invalid.example' }),
+      { code: 'cartesia_speech_profile_invalid' },
+    );
+    assert.equal(service.provider, 'deepgram');
+  });
+
   it('uses a validated per-call Cartesia voice profile override', async () => {
     let body;
     const service = new TextToSpeechService({

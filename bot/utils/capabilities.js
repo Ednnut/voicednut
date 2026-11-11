@@ -112,6 +112,7 @@ const ACTION_CAPABILITIES = [
   { match: (action) => action === 'PERSONA', cap: 'persona_manage' },
   { match: (action) => action === 'PROVIDER_STATUS', cap: 'provider_manage' },
   { match: (action) => action === 'VAPI_CENTER' || action.startsWith('VAPI_'), cap: 'vapi_manage' },
+  { match: (action) => action === 'CARTESIA_CALL', cap: 'call' },
   { match: (action) => action === 'CARTESIA_CENTER' || action.startsWith('CARTESIA_'), cap: 'cartesia_manage' },
   { match: (action) => action.startsWith('PROVIDER_SET:'), cap: 'provider_manage' },
   { match: (action) => action.startsWith('PROVIDER_CONFIRM:'), cap: 'provider_manage' },

@@ -1011,7 +1011,7 @@ bot.on("callback_query:data", async (ctx) => {
       VAPI_EVALS: "vapi-operation-conversation",
       VAPI_EVAL_CREATE: "vapi-operation-conversation",
       VAPI_SQUADS: "vapi-operation-conversation",
-      CARTESIA_CALL: "cartesia-operation-conversation",
+      CARTESIA_CALL: "call-conversation",
       CARTESIA_RECONCILE: "cartesia-operation-conversation",
       CARTESIA_CALLS: "cartesia-operation-conversation",
       CARTESIA_REVIEW_QUEUE: "cartesia-operation-conversation",

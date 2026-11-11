@@ -738,6 +738,13 @@ async function callFlow(conversation, ctx) {
     }
     flow.touch('authorized');
 
+    const activeProvider = await getActiveCallProvider();
+    ensureActive();
+    if (!activeProvider) {
+      throw new Error('The active call provider could not be determined.');
+    }
+    flow.touch('provider-resolved');
+
     const businessOptions = await getBusinessOptions();
     ensureActive();
     flow.touch('business-options');
@@ -969,14 +976,6 @@ async function callFlow(conversation, ctx) {
       victimName,
       personaLabel
     );
-
-    let activeProvider = null;
-    try {
-      activeProvider = await getActiveCallProvider();
-      ensureActive();
-    } catch (error) {
-      console.warn('Failed to fetch active provider for launch summary:', error?.message || error);
-    }
 
     const toneValue = payload.emotion || 'auto';
     const urgencyValue = payload.urgency || 'auto';
