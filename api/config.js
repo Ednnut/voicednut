@@ -1495,7 +1495,7 @@ module.exports = {
     },
   },
   server: {
-    port: Number(ensure("PORT", "3000")),
+    port: Number(ensure("PORT", "1337")),
     hostname: serverHostname,
     corsOrigins,
     requestTimeoutMs: Number(readEnv("SERVER_REQUEST_TIMEOUT_MS") || "120000"),

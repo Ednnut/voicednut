@@ -49,5 +49,8 @@
     "mocha": "^11.7.4",
     "nodemon": "^3.0.2",
     "supertest": "^6.3.3"
+  },
+  "allowScripts": {
+    "sqlite3": true
   }
 }

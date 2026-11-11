@@ -208,15 +208,35 @@ class CartesiaOutboundCallService {
       throw serviceError("cartesia_not_configured", "Cartesia agent inventory is unavailable", 503);
     }
     const response = await this.client.listAgents();
-    const agents = Array.isArray(response?.summaries) ? response.summaries : response?.data;
+    const agents = Array.isArray(response?.data) ? response.data : response?.summaries;
     if (!Array.isArray(agents)) {
       throw serviceError("cartesia_agent_list_invalid", "Cartesia returned an invalid agent inventory", 502);
+    }
+
+    let numbersByAgent = null;
+    if (typeof this.client.listPhoneNumbers === "function") {
+      const phoneResponse = await this.client.listPhoneNumbers({ limit: 100 });
+      if (!Array.isArray(phoneResponse?.data) || typeof phoneResponse.has_more !== "boolean") {
+        throw serviceError("cartesia_phone_number_list_invalid", "Cartesia returned an invalid phone number inventory", 502);
+      }
+      if (phoneResponse.has_more) {
+        throw serviceError("cartesia_phone_number_inventory_incomplete", "Cartesia phone-number inventory exceeds the supported page size", 503);
+      }
+      numbersByAgent = new Map();
+      for (const phone of phoneResponse.data.slice(0, 100)) {
+        const phoneId = String(phone?.id || "").trim();
+        const agentId = String(phone?.agent?.id || phone?.agent_id || "").trim();
+        if (!ID_PATTERN.test(phoneId) || !ID_PATTERN.test(agentId)) continue;
+        if (!numbersByAgent.has(agentId)) numbersByAgent.set(agentId, []);
+        numbersByAgent.get(agentId).push({ id: phoneId, number: phone?.number });
+      }
     }
     return agents.slice(0, 100).map((agent) => {
       const id = String(agent?.id || "").trim();
       if (!ID_PATTERN.test(id)) return null;
       const deleted = Boolean(agent?.deleted_at);
-      const phoneNumbers = (Array.isArray(agent?.phone_numbers) ? agent.phone_numbers : []).slice(0, 50)
+      const attachedNumbers = numbersByAgent ? numbersByAgent.get(id) || [] : agent?.phone_numbers;
+      const phoneNumbers = (Array.isArray(attachedNumbers) ? attachedNumbers : []).slice(0, 50)
         .map((phone) => {
           const phoneId = String(phone?.id || "").trim();
           if (!ID_PATTERN.test(phoneId)) return null;

@@ -77,14 +77,17 @@ describe("CartesiaOutboundCallService", () => {
       data: [{ id: "agent_1", name: "Support", description: null, version_id: "version_1" }],
       has_more: false,
       next_page: null,
+    }), listPhoneNumbers: async () => ({
+      data: [{ id: "ap_number_1", number: "+14155550111", agent: { id: "agent_1" } }],
+      has_more: false,
     }) } });
     assert.deepEqual(await service.listAgentInventory(), [{
       id: "agent_1",
       name: "Support",
       deleted: false,
       deploymentCount: 0,
-      phoneNumbers: [],
-      ready: false,
+      phoneNumbers: [{ id: "ap_number_1", displayNumber: "••••0111" }],
+      ready: true,
     }]);
   });
 

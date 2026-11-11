@@ -16,8 +16,8 @@ const SECTIONS = [
   {
     comments: ['# API the bot should call (point to /api server)'],
     fields: [
-      { key: 'API_URL', prompt: 'API URL', defaultValue: 'http://localhost:3000' },
-      { key: 'TEMPLATES_API_URL', prompt: 'Templates API URL', defaultValue: 'http://localhost:3000' },
+      { key: 'API_URL', prompt: 'API URL', defaultValue: 'http://127.0.0.1:1337' },
+      { key: 'TEMPLATES_API_URL', prompt: 'Templates API URL', defaultValue: 'http://127.0.0.1:1337' },
     ],
   },
   {

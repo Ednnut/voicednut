@@ -131,7 +131,6 @@ const {
   canFailoverAfterProviderError,
 } = require("./adapters/voiceProviderRegistry");
 const CallEVoiceAdapter = require("./adapters/CallEVoiceAdapter");
-const CartesiaVoiceAdapter = require("./adapters/CartesiaVoiceAdapter");
 const { buildTwilioOutboundCallPayload } = require("./adapters/twilioVoiceCallPayload");
 const { previewCallETemplate } = require("./adapters/callETemplateAdapter");
 const { buildCallEDeploymentStatus, createCallEClientFromEnv, getCallEProviderHealth } = require("./services/callEClient");
@@ -10031,7 +10030,7 @@ app.use((req, res, next) => {
 // Register routes only after app initialization and shared request middleware.
 registerVapiWebCallRoutes();
 
-const PORT = config.server?.port || 3000;
+const PORT = config.server?.port || 1337;
 
 // Enhanced call configurations with function context
 const callConfigurations = new Map();
@@ -14731,10 +14730,6 @@ function getVoiceProviderRegistry() {
     cancelTaskCall: ({ providerCallId }) => createCallEClientFromEnv().cancelCall(providerCallId),
     getCall: ({ providerCallId }) => createCallEClientFromEnv().getCall(providerCallId),
     listCallEvents: ({ providerCallId, ...options }) => createCallEClientFromEnv().listCallEvents(providerCallId, options),
-  }));
-
-  registry.register("cartesia", new CartesiaVoiceAdapter({
-    createOutboundCall: (request) => createCartesiaOutboundCallService().createOutboundCall(request),
   }));
 
   voiceProviderRegistry = registry;
