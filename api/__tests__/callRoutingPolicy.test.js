@@ -30,4 +30,16 @@ describe('explicit call provider routing policy', () => {
     assert.equal(report.uncertain_submission_failover, false);
     assert.equal(report.blocked_providers.some((item) => item.provider === 'vonage' && item.reason === 'not_ready'), true);
   });
+
+  it('disables fallback providers unless explicitly enabled', () => {
+    const report = summarizeCallRoutingPolicy({
+      preferredProvider: 'twilio',
+      configuredOrder: ['twilio', 'plivo'],
+      supportedProviders: ['twilio', 'plivo'],
+      readiness: { twilio: true, plivo: true },
+    });
+
+    assert.deepEqual(report.eligible_order, ['twilio']);
+    assert.equal(report.failover_enabled, false);
+  });
 });

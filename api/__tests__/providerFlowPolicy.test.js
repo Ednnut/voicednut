@@ -27,6 +27,7 @@ describe("provider execution circuit policy", () => {
       providers: ["twilio", "plivo", "vonage"],
       readiness: { twilio: true, plivo: true, vonage: true },
       requestedFlow: "outbound_voice",
+      failoverEnabled: true,
       isProviderDegraded: (provider) => provider === "plivo",
     });
 
@@ -64,6 +65,19 @@ describe("provider execution circuit policy", () => {
     });
 
     assert.deepEqual(plan.healthy_providers, ["twilio", "plivo"]);
+    assert.deepEqual(plan.attempt_order, ["twilio"]);
+    assert.equal(plan.selected_provider, "twilio");
+  });
+
+  it("uses only the preferred provider by default", () => {
+    const plan = resolveProviderExecutionOrder({
+      channel: "call",
+      preferredProvider: "twilio",
+      providers: ["twilio", "plivo"],
+      readiness: { twilio: true, plivo: true },
+      requestedFlow: "outbound_voice",
+    });
+
     assert.deepEqual(plan.attempt_order, ["twilio"]);
     assert.equal(plan.selected_provider, "twilio");
   });

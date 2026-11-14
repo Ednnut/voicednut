@@ -17,6 +17,34 @@ function vapiCallError(code, message) {
   return error;
 }
 
+function normalizeAssistantOverrides(input, template) {
+  const firstMessage = input.firstMessage === undefined || input.firstMessage === null
+    ? ""
+    : String(input.firstMessage);
+  if (firstMessage.length > 4000) {
+    throw vapiCallError("vapi_first_message_invalid", "Vapi first message is too long");
+  }
+  const supplied = input.variableValues && typeof input.variableValues === "object" && !Array.isArray(input.variableValues)
+    ? input.variableValues
+    : {};
+  if (Object.keys(supplied).length > 50) {
+    throw vapiCallError("vapi_variables_invalid", "Vapi call has too many template variables");
+  }
+  const source = `${String(template?.prompt || "")} ${String(template?.first_message || "")}`;
+  const allowed = new Set([...source.matchAll(/\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}/g)].map((match) => match[1]));
+  const variableValues = {};
+  for (const [key, rawValue] of Object.entries(supplied)) {
+    if (!allowed.has(key) || typeof rawValue !== "string" || rawValue.length > 1000) {
+      throw vapiCallError("vapi_variables_invalid", "Vapi variables must match the selected script placeholders");
+    }
+    variableValues[key] = rawValue;
+  }
+  return {
+    ...(firstMessage ? { firstMessage } : {}),
+    ...(Object.keys(variableValues).length ? { variableValues } : {}),
+  };
+}
+
 function resolveExistingRequest(existing, requestHash) {
   if (!existing || existing.provider !== "vapi" || existing.request_hash !== requestHash) {
     throw vapiCallError("vapi_idempotency_conflict", "Idempotency key was already used for a different request");
@@ -78,12 +106,17 @@ class VapiOutboundCallService {
     }
 
     const idempotencyKey = `vapi:${callerKey}`;
+    const rawVariableValues = input.variableValues && typeof input.variableValues === "object" && !Array.isArray(input.variableValues)
+      ? Object.fromEntries(Object.entries(input.variableValues).sort(([left], [right]) => left.localeCompare(right)))
+      : {};
     const requestHash = crypto.createHash("sha256").update(JSON.stringify({
       templateId: Number(input.templateId) || null,
       templateVersion: requestedTemplateVersion,
       mappingId,
       phoneNumberId,
       number,
+      firstMessage: input.firstMessage || null,
+      variableValues: rawVariableValues,
     })).digest("hex");
     const previous = await this.db.getOutboundCallIdempotency(idempotencyKey);
     if (previous) {
@@ -98,6 +131,7 @@ class VapiOutboundCallService {
           business_id: template.business_id || template.businessId,
           actor_id: input.actorId || input.actor_id,
         });
+        await this.recordAcceptanceEvent(previousResult).catch(() => {});
       }
       return resolution;
     }
@@ -124,6 +158,7 @@ class VapiOutboundCallService {
     if (Array.isArray(summary.unsupported) && summary.unsupported.length) {
       throw vapiCallError("vapi_template_unsupported", "Vapi mapping contains behavior that is not supported for calls");
     }
+    const assistantOverrides = normalizeAssistantOverrides(input, template);
 
     if (!this.outboundSafety || typeof this.outboundSafety.reserveDispatch !== "function") {
       throw vapiCallError("outbound_contact_policy_unavailable", "Outbound safety is unavailable; no call was placed");
@@ -150,7 +185,9 @@ class VapiOutboundCallService {
     if (!reservation?.reserved) {
       if (!safetyReservation.idempotentReplay) await this.outboundSafety.completeDispatch(safetyReservation, "released");
       const existing = await this.db.getOutboundCallIdempotency(idempotencyKey);
-      return resolveExistingRequest(existing, requestHash);
+      const replay = resolveExistingRequest(existing, requestHash);
+      if (replay.providerCallId) await this.recordCommonCall(input, template, number, replay).catch(() => {});
+      return replay;
     }
 
     // A create-call timeout can have an unknown remote outcome. Do not retry here.
@@ -161,6 +198,7 @@ class VapiOutboundCallService {
         : {}),
       phoneNumberId,
       customer: { number },
+      ...(Object.keys(assistantOverrides).length ? { assistantOverrides } : {}),
     };
     let call;
     try {
@@ -188,6 +226,7 @@ class VapiOutboundCallService {
       templateId: Number(mapping.template_id),
       templateVersion: Number(mapping.template_version),
       mappingId: Number(mapping.id),
+      localCallId: `vapi_${providerCallId}`,
     };
     await this.db.completeOutboundCallIdempotency({
       idempotency_key: idempotencyKey,
@@ -198,8 +237,51 @@ class VapiOutboundCallService {
       response_payload: result,
     });
     await this.outboundSafety.completeDispatch(safetyReservation, "accepted");
+    await this.recordCommonCall(input, template, number, result).catch(() => {});
+    await this.recordAcceptanceEvent(result).catch(() => {});
     return result;
+  }
+
+  async recordCommonCall(input, template, number, result) {
+    if (typeof this.db?.createCall !== "function") return;
+    const callSid = `vapi_${result.providerCallId}`;
+    const existing = typeof this.db.getCall === "function" ? await this.db.getCall(callSid).catch(() => null) : null;
+    if (existing) return;
+    await this.db.createCall({
+      call_sid: callSid,
+      phone_number: number,
+      user_chat_id: String(input.actorId || input.actor_id || ""),
+      direction: "outbound",
+      business_id: String(template.business_id || template.businessId || "") || null,
+      status: result.status,
+      provider: "vapi",
+      provider_call_id: result.providerCallId,
+      outbound_idempotency_key: input.idempotencyKey || input.idempotency_key || null,
+    });
+    await this.db.updateCallState?.(callSid, "call_created", {
+      provider: "vapi",
+      telephony_provider: "vapi",
+      provider_call_id: result.providerCallId,
+      business_id: String(template.business_id || template.businessId || "") || null,
+      source: "vapi_outbound",
+    });
+  }
+
+  async recordAcceptanceEvent(result = {}) {
+    if (typeof this.db?.recordVapiCallEvent !== "function") return;
+    const callId = String(result.providerCallId || "").trim();
+    if (!callId) return;
+    const eventKey = crypto.createHash("sha256").update(`vapi:accepted:${callId}`).digest("hex");
+    await this.db.recordVapiCallEvent({
+      event_key: eventKey,
+      provider_call_id: callId,
+      event_type: "call_created",
+      provider_status: String(result.status || "queued").toLowerCase(),
+      template_id: Number(result.templateId) || null,
+      template_version: Number(result.templateVersion) || null,
+      event_timestamp: new Date().toISOString(),
+    });
   }
 }
 
-module.exports = { VapiOutboundCallService };
+module.exports = { VapiOutboundCallService, normalizeAssistantOverrides };

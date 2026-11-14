@@ -18,15 +18,48 @@ async function service(ctx, req, res) {
   return { instance };
 }
 
-function handle(ctx, method, { confirm, status = 200, message } = {}) {
+async function speechProfileService(ctx, req, res, write) {
+  const businessId = String(req.query?.business_id || req.body?.business_id || '').trim();
+  if (!businessId) return service(ctx, req, res);
+  if (!/^[A-Za-z0-9._:-]{1,120}$/.test(businessId)) {
+    return { response: sendError(ctx, req, res, 400, 'cartesia_speech_settings_scope_invalid', 'A valid business ID is required') };
+  }
+  if (typeof ctx.db?.hasCallTemplateBusinessId !== 'function') {
+    return { response: sendError(ctx, req, res, 503, 'cartesia_speech_settings_scope_unavailable', 'Business membership is unavailable') };
+  }
+  if (!(await ctx.db.hasCallTemplateBusinessId(businessId))) {
+    return { response: sendError(ctx, req, res, 404, 'cartesia_speech_settings_business_not_found', 'The selected business was not found') };
+  }
+  const actorId = String(req.callEActorId || '');
+  const isAdmin = typeof ctx.isCartesiaAdminActor === 'function' && await ctx.isCartesiaAdminActor(actorId);
+  if (!isAdmin) {
+    if (typeof ctx.db?.getCallEBusinessOperator !== 'function') {
+      return { response: sendError(ctx, req, res, 503, 'cartesia_speech_settings_scope_unavailable', 'Business membership is unavailable') };
+    }
+    const membership = await ctx.db.getCallEBusinessOperator(businessId, actorId);
+    const allowed = write
+      ? membership?.role === 'policy_manager'
+      : ['call_operator', 'policy_manager'].includes(membership?.role);
+    if (!allowed) {
+      return { response: sendError(ctx, req, res, 403, 'cartesia_speech_settings_access_denied', 'Business speech settings access is denied') };
+    }
+  }
+  const instance = typeof ctx.createCartesiaStudioService === 'function' ? ctx.createCartesiaStudioService() : null;
+  if (!instance) return { response: sendError(ctx, req, res, 503, 'cartesia_studio_unavailable', 'Cartesia Studio is unavailable') };
+  return { instance, businessId };
+}
+
+function handle(ctx, method, { confirm, status = 200, message, speechProfile = false, write = false } = {}) {
   return async (req, res) => {
     try {
-      const context = await service(ctx, req, res);
+      const context = speechProfile
+        ? await speechProfileService(ctx, req, res, write)
+        : await service(ctx, req, res);
       if (context.response) return context.response;
       if (confirm && String(confirm(req) || '') !== String(req.body?.confirmation_phrase || '')) {
         throw Object.assign(new Error('An exact confirmation phrase is required'), { code: 'cartesia_confirmation_required', status: 400 });
       }
-      const result = await method(context.instance, req, res);
+      const result = await method(context.instance, req, res, context);
       if (Buffer.isBuffer(result)) return res.type(result.contentType || 'audio/wav').send(result);
       if (result?.stream && typeof result.stream.pipe === 'function') {
         res.status(status);
@@ -61,9 +94,49 @@ function registerCartesiaStudioRoutes(app, ctx = {}, express) {
   const rawAudio = express?.raw ? express.raw({ type: 'application/octet-stream', limit: '16mb' }) : (_req, _res, next) => next();
   const root = '/api/cartesia/studio';
 
-  app.get(`${root}/voices`, limiter, authorize, actor, handle(ctx, (studio, req) => studio.listVoices(req.query || {}), { message: 'Cartesia voices could not be listed' }));
-  app.get(`${root}/models`, limiter, authorize, actor, handle(ctx, (studio, req) => studio.listModels(req.query || {}), { message: 'Cartesia models could not be listed' }));
-  app.get(`${root}/voices/:voiceId`, limiter, authorize, actor, handle(ctx, (studio, req) => studio.getVoice(req.params?.voiceId), { message: 'Cartesia voice details could not be loaded' }));
+  app.get(`${root}/speech-profile`, limiter, authorize, actor, handle(ctx, async (_studio, req, _res, context) => {
+    if (!ctx.cartesiaSpeechSettingsStore) throw Object.assign(new Error('Cartesia speech settings are unavailable'), { code: 'cartesia_speech_settings_unavailable', status: 503 });
+    return {
+      profile: context.businessId
+        ? await ctx.cartesiaSpeechSettingsStore.getBusinessProfile(context.businessId)
+        : await ctx.cartesiaSpeechSettingsStore.getProfile(),
+      ...(context.businessId ? { business_id: context.businessId } : {}),
+    };
+  }, { message: 'Cartesia speech settings could not be loaded', speechProfile: true }));
+  if (typeof app.put === 'function') {
+    app.put(`${root}/speech-profile`, limiter, authorize, actor, handle(ctx, async (studio, req, _res, context) => {
+      if (!ctx.cartesiaSpeechSettingsStore) throw Object.assign(new Error('Cartesia speech settings are unavailable'), { code: 'cartesia_speech_settings_unavailable', status: 503 });
+      const body = req.body && typeof req.body === 'object' && !Array.isArray(req.body) ? req.body : {};
+      if (Object.keys(body).some((key) => !['business_id', 'profile', 'confirmation_phrase'].includes(key))) {
+        throw Object.assign(new Error('Cartesia speech settings contain unsupported fields'), { code: 'cartesia_speech_settings_invalid', status: 400 });
+      }
+      const result = context.businessId
+        ? await ctx.cartesiaSpeechSettingsStore.saveBusinessProfile(context.businessId, body.profile, studio)
+        : await ctx.cartesiaSpeechSettingsStore.save(body.profile, studio);
+      return { ...result, ...(context.businessId ? { business_id: context.businessId } : {}) };
+    }, { confirm: () => 'SAVE CARTESIA TTS PROFILE', message: 'Cartesia speech settings could not be saved', speechProfile: true, write: true }));
+  }
+  app.post(`${root}/speech-profile/reset`, limiter, authorize, actor, handle(ctx, async (_studio, req, _res, context) => {
+    if (!ctx.cartesiaSpeechSettingsStore) throw Object.assign(new Error('Cartesia speech settings are unavailable'), { code: 'cartesia_speech_settings_unavailable', status: 503 });
+    const body = req.body && typeof req.body === 'object' && !Array.isArray(req.body) ? req.body : {};
+    if (Object.keys(body).some((key) => !['business_id', 'confirmation_phrase'].includes(key))) {
+      throw Object.assign(new Error('Cartesia speech settings contain unsupported fields'), { code: 'cartesia_speech_settings_invalid', status: 400 });
+    }
+    const result = context.businessId
+      ? await ctx.cartesiaSpeechSettingsStore.resetBusinessProfile(context.businessId)
+      : await ctx.cartesiaSpeechSettingsStore.reset();
+    return { ...result, ...(context.businessId ? { business_id: context.businessId } : {}) };
+  }, { confirm: () => 'RESET CARTESIA TTS PROFILE', message: 'Cartesia speech settings could not be reset', speechProfile: true, write: true }));
+
+  app.get(`${root}/voices`, limiter, authorize, actor, handle(ctx, (studio, req) => studio.listVoices(req.query || {}), {
+    message: 'Cartesia voices could not be listed', speechProfile: true,
+  }));
+  app.get(`${root}/models`, limiter, authorize, actor, handle(ctx, (studio, req) => studio.listModels(req.query || {}), {
+    message: 'Cartesia models could not be listed', speechProfile: true,
+  }));
+  app.get(`${root}/voices/:voiceId`, limiter, authorize, actor, handle(ctx, (studio, req) => studio.getVoice(req.params?.voiceId), {
+    message: 'Cartesia voice details could not be loaded', speechProfile: true,
+  }));
   app.get(`${root}/accents`, limiter, authorize, actor, handle(ctx, (studio, req) => studio.listAccents(req.query || {}), { message: 'Cartesia accents could not be listed' }));
   app.post(`${root}/voices/localize`, limiter, authorize, actor, handle(ctx, (studio, req) => {
     const voiceId = String(req.body?.voice_id || req.body?.voiceId || '');
@@ -112,8 +185,10 @@ function registerCartesiaStudioRoutes(app, ctx = {}, express) {
     if (String(req.body?.confirmation_phrase || '') !== 'GENERATE CARTESIA TTS PREVIEW') {
       throw Object.assign(new Error('An exact preview confirmation phrase is required'), { code: 'cartesia_confirmation_required', status: 400 });
     }
-    return studio.synthesizePreview(req.body || {});
-  }, { message: 'Cartesia speech preview could not be generated' }));
+    const previewInput = { ...(req.body || {}) };
+    delete previewInput.business_id;
+    return studio.synthesizePreview(previewInput);
+  }, { message: 'Cartesia speech preview could not be generated', speechProfile: true }));
   app.post(`${root}/tts-stream`, limiter, authorize, actor, handle(ctx, (studio, req) => {
     if (String(req.body?.confirmation_phrase || '') !== 'STREAM CARTESIA TTS PREVIEW') throw Object.assign(new Error('An exact streaming TTS confirmation phrase is required'), { code: 'cartesia_confirmation_required', status: 400 });
     return studio.streamSpeech(req.body || {});

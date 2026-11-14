@@ -30,7 +30,7 @@ describe("VapiPhoneNumberService", () => {
       phoneNumbers: [{
         id: "pn_1", name: "Support", number: "+14155550111", provider: "twilio",
         status: "active", assistantId: null, squadId: null, workflowId: null,
-        serverConfigured: true, serverCredentialConfigured: true,
+        outboundCapable: true, serverConfigured: true, serverCredentialConfigured: true,
       }],
       pagination: { currentPage: 2, totalPages: 5, totalItems: 110, hasNextPage: true, nextCursor: "cursor_1" },
     });

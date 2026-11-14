@@ -186,13 +186,14 @@ class CartesiaOutboundCallService {
     this.client = options.client;
     this.db = options.db;
     this.outboundSafety = options.outboundSafety || null;
+    this.enabled = options.enabled !== false;
     this.approvalSecret = String(options.approvalSecret || "");
     this.approvalTtlMs = Math.min(5 * 60 * 1000, Math.max(30 * 1000, Number(options.approvalTtlMs) || 5 * 60 * 1000));
     this.now = options.now || Date.now;
   }
 
   assertDispatchReady() {
-    if (!this.client?.isConfigured?.()) {
+    if (!this.enabled || !this.client?.isConfigured?.()) {
       throw serviceError("cartesia_not_configured", "Cartesia outbound calling is disabled or not configured", 503);
     }
     if (this.approvalSecret.length < 32) {
@@ -293,12 +294,13 @@ class CartesiaOutboundCallService {
       };
     }).filter(Boolean);
     const warnings = [];
+    const liveDeployments = normalizedDeployments.filter((deployment) => deployment.isLive);
     if (deleted) warnings.push("agent_deleted");
     if (attachedNumberCount === 0) warnings.push("no_attached_phone_number");
     if (normalizedDeployments.length === 0) warnings.push("no_deployments");
-    if (!normalizedDeployments.some((deployment) => deployment.isLive)) warnings.push("no_live_deployment");
-    if (normalizedDeployments.some((deployment) => deployment.buildFailed)) warnings.push("deployment_build_failed");
-    if (normalizedDeployments.some((deployment) => deployment.deploymentFailed)) warnings.push("deployment_failed");
+    if (liveDeployments.length === 0) warnings.push("no_live_deployment");
+    if (liveDeployments.some((deployment) => deployment.buildFailed)) warnings.push("deployment_build_failed");
+    if (liveDeployments.some((deployment) => deployment.deploymentFailed)) warnings.push("deployment_failed");
     return {
       agent: {
         id: agentId,
@@ -318,6 +320,14 @@ class CartesiaOutboundCallService {
     const agent = agents.find((entry) => entry.id === input.agentId && entry.ready);
     if (!agent || !agent.phoneNumbers.some((phone) => phone.id === input.fromNumberId)) {
       throw serviceError("cartesia_agent_source_not_ready", "Select an active Cartesia agent and one of its attached phone numbers", 409);
+    }
+    // An attached number is insufficient: outbound calls require a deployed,
+    // live agent version. Verify this immediately before approval/dispatch.
+    if (typeof this.client?.getAgent === "function" && typeof this.client?.listAgentDeployments === "function") {
+      const health = await this.getAgentDeploymentHealth({ agentId: input.agentId });
+      if (!health.ready) {
+        throw serviceError("cartesia_agent_deployment_not_ready", `Cartesia agent is not ready for calls (${health.warnings.join(", ")})`, 409);
+      }
     }
     if (typeof this.db?.getCartesiaPhoneNumberBusinessScope === "function") {
       const scope = await this.db.getCartesiaPhoneNumberBusinessScope(input.fromNumberId);
@@ -643,7 +653,9 @@ class CartesiaOutboundCallService {
         throw serviceError("outbound_business_operator_required", "A verified business call operator is required", 403);
       }
       await this.outboundSafety.authorizeActor({ business_id: normalized.businessId, actor_id: normalized.actorId });
-      return this.resolveExisting(previous, normalized, requestHash);
+      const replay = this.resolveExisting(previous, normalized, requestHash);
+      if (replay.providerCallId) await this.recordAcceptedCall(normalized, replay.providerCallId).catch(() => {});
+      return replay;
     }
     if (typeof this.outboundSafety?.reserveDispatch !== "function") {
       throw serviceError("outbound_contact_policy_unavailable", "Outbound call safety is unavailable; no call was placed", 503);
@@ -714,7 +726,51 @@ class CartesiaOutboundCallService {
       response_payload: response,
     });
     await this.outboundSafety.completeDispatch(safetyReservation, "accepted");
+    await this.recordAcceptedCall(normalized, providerCallId).catch((error) => {
+      console.error("cartesia_call_history_write_failed", { code: String(error?.code || "database_error").slice(0, 80) });
+    });
     return { ...response, idempotentReplay: false };
+  }
+
+  async recordAcceptedCall(normalized, providerCallId) {
+    if (typeof this.db?.upsertCartesiaCallRecord === "function") {
+      await this.db.upsertCartesiaCallRecord({
+        local_call_id: `cartesia_${providerCallId}`,
+        provider_call_id: providerCallId,
+        business_id: normalized.businessId,
+        agent_id: normalized.agentId,
+        from_number_id: normalized.fromNumberId,
+        phone_number: normalized.destination,
+        direction: "outbound",
+        business_scope_resolved: true,
+        status: "created",
+        event_timestamp: new Date().toISOString(),
+      });
+    }
+    if (typeof this.db?.createCall === "function") {
+      const callSid = `cartesia_${providerCallId}`;
+      const existing = typeof this.db.getCall === "function" ? await this.db.getCall(callSid).catch(() => null) : null;
+      if (!existing) {
+        await this.db.createCall({
+          call_sid: callSid,
+          phone_number: normalized.destination,
+          user_chat_id: normalized.actorId,
+          direction: "outbound",
+          business_id: normalized.businessId,
+          status: "initiated",
+          provider: "cartesia",
+          provider_call_id: providerCallId,
+          outbound_idempotency_key: normalized.idempotencyKey,
+        });
+      }
+      await this.db.updateCallState?.(callSid, "call_created", {
+        provider: "cartesia",
+        telephony_provider: "cartesia",
+        provider_call_id: providerCallId,
+        business_id: normalized.businessId,
+        source: "cartesia_outbound",
+      });
+    }
   }
 
   async reconcileOutboundCall(input = {}) {

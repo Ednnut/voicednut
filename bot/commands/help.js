@@ -34,12 +34,14 @@ async function handleHelp(ctx) {
         const formatLines = (items) => items.map((item) => `• ${escapeHtml(item)}`).join('\n');
 
         const callList = [
-            '📞 /call — launch a fresh voice session (requires access)',
+            '📞 /call — launch with configured provider and voice defaults; /call advanced opens optional voice selection; /call new explicitly starts a fresh matching call after a prior accepted call (requires access)',
             ...(isAuthorized ? ['🤖 /calle — guided CALL-E menu for planning, results, campaigns, approvals, recovery, and missions'] : []),
             ...(isOwner ? ['🟣 /vapi — Vapi readiness, phone inventory, call events, campaign drafts, and confirmed live call controls'] : []),
-            ...(isOwner ? ['🔷 /cartesia — Cartesia Managed Agents operations, voice cloning, speech previews, quality metrics, and safe call reconciliation'] : []),
+            ...(isAuthorized ? ['🎙️ /cartesia — manage your business-scoped Cartesia voice, model, and speech settings'] : []),
+            ...(isOwner ? ['🔷 Cartesia Operations — admin-only Managed Agent operations, voice governance, and call reconciliation'] : []),
             '🧭 /callplan — plan a CALL-E template and check consent/compatibility without dialing',
             '📜 /calllog — browse recent calls, search, and events',
+            ...(isOwner ? ['📡 /callmonitor — active/stale calls, provider status, webhook errors, and Telegram delivery health'] : []),
             ...(isOwner ? ['📊 /callresults — recent CALL-E execution and result readiness summaries'] : []),
             ...(isOwner ? ['🧭 /workflowruns [status] — recent post-call workflow run status (read-only, private chat)'] : []),
             ...(isOwner ? ['🔎 /workflowrun <run_id> — sanitized post-call workflow step audit (read-only, private chat)'] : []),

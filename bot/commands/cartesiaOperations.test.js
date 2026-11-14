@@ -14,6 +14,8 @@ const httpClient = require('../utils/httpClient');
 const {
   ACTIONS,
   buildCartesiaKeyboard,
+  buildCartesiaOperationsKeyboard,
+  renderCartesiaCenter,
   cartesiaOperationFlow,
   __testables: {
     buildReconciliationPayload, buildAgentChoices, formatAgentChoices,
@@ -21,6 +23,9 @@ const {
     runCartesiaAgentRuntime, runCartesiaCallOperations, formatCallDetails, formatCallTranscript, formatCampaignOutcomes,
     formatCampaignStatus,
     runCartesiaBusinessScope,
+    runCartesiaManageVoices,
+    runCartesiaModels,
+    runCartesiaUsage,
   },
 } = require('./cartesiaOperations');
 
@@ -40,33 +45,314 @@ test('Cartesia operations keep single calls outside the Cartesia action set', ()
   assert.equal(ACTIONS.has('CARTESIA_REVIEW_RULES'), true);
   assert.equal(ACTIONS.has('CARTESIA_REVIEW_QUEUE'), true);
   assert.equal(ACTIONS.has('CARTESIA_BUSINESS_SCOPE'), true);
+  assert.equal(ACTIONS.has('CARTESIA_DASHBOARD'), true);
+  assert.equal(ACTIONS.has('CARTESIA_PROFILE_SCOPE'), true);
+  assert.equal(ACTIONS.has('CARTESIA_MANAGE_VOICES'), true);
+  assert.equal(ACTIONS.has('CARTESIA_MODELS'), true);
+  assert.equal(ACTIONS.has('CARTESIA_VOICE_SETTINGS'), true);
+  assert.equal(ACTIONS.has('CARTESIA_TEST_VOICE'), true);
+  assert.equal(ACTIONS.has('CARTESIA_USAGE'), true);
+  assert.equal(ACTIONS.has('CARTESIA_CONNECTION_STATUS'), true);
+  assert.equal(ACTIONS.has('CARTESIA_REFRESH'), true);
+  assert.equal(ACTIONS.has('CARTESIA_OPERATIONS'), true);
+});
+
+test('Cartesia dashboard summary and menu actions render through the interactive flow', async () => {
+  const originalGet = httpClient.get;
+  const replies = [];
+  httpClient.get = async (_ctx, url) => {
+    if (url.endsWith('/api/cartesia/status')) return { data: { status: { configured: true, apiVersion: '2026-03-01', enabled: true } } };
+    if (url.endsWith('/api/cartesia/studio/speech-profile')) return { data: { profile: { voice_id: 'voice_1', model_id: 'sonic-3', language: 'en' } } };
+    if (url.endsWith('/api/cartesia/studio/usage/credits')) return { data: { credits: [{ credits: 12, label: 'tts' }] } };
+    return { data: {} };
+  };
+  const ctx = {
+    from: { id: 7001 },
+    chat: { type: 'private' },
+    session: { accessProfile: { isAdmin: true, checkedAt: Date.now() }, cartesiaOperationAction: 'CARTESIA_DASHBOARD' },
+    async reply(message) { replies.push(String(message)); },
+  };
+  try {
+    await cartesiaOperationFlow({ async wait() { return { message: { text: 'ignored' } }; } }, ctx);
+  } finally {
+    httpClient.get = originalGet;
+  }
+  assert.match(replies.join('\n'), /VOICEDNUT — Cartesia/i);
+  assert.match(replies.join('\n'), /voice_1/i);
+  assert.match(replies.join('\n'), /sonic-3/i);
+});
+
+test('Cartesia business profile selection is validated and persisted only in the user session', async () => {
+  const originalGet = httpClient.get;
+  const urls = [];
+  const replies = [];
+  httpClient.get = async (_ctx, url) => {
+    urls.push(url);
+    if (url.includes('/speech-profile?')) {
+      const businessId = new URL(url).searchParams.get('business_id');
+      return { data: { business_id: businessId, profile: { voice_id: 'voice_biz', model_id: 'sonic-3' } } };
+    }
+    if (url.endsWith('/api/cartesia/status')) return { data: { status: { configured: true, enabled: true } } };
+    if (url.endsWith('/usage/credits')) return { data: { credits: [] } };
+    return { data: {} };
+  };
+  const session = {
+    accessProfile: { isAdmin: true, checkedAt: Date.now() },
+    cartesiaOperationAction: 'CARTESIA_PROFILE_SCOPE',
+  };
+  const ctx = {
+    from: { id: 7001 }, chat: { type: 'private' }, session,
+    async reply(message) { replies.push(String(message)); },
+  };
+  try {
+    await cartesiaOperationFlow({ async wait() { return { message: { text: 'biz-1' } }; } }, ctx);
+  } finally {
+    httpClient.get = originalGet;
+  }
+  assert.equal(session.cartesiaSpeechBusinessId, 'biz-1');
+  assert.ok(urls.some((url) => url.endsWith('?business_id=biz-1')));
+  assert.match(replies.join('\n'), /scoped to business/);
+});
+
+test('Cartesia usage view reports documented Managed Agent totals without inventing fields', async () => {
+  const originalGet = httpClient.get;
+  const replies = [];
+  httpClient.get = async (_ctx, url) => url.endsWith('/usage/credits')
+    ? { data: { data: [{ credits: 12, start_ts: '2026-03-01T00:00:00Z', end_ts: '2026-03-02T00:00:00Z' }] } }
+    : { data: { data: [{ calls: 3, minutes: 2.5, cents: 129 }] } };
+  try {
+    await runCartesiaUsage(null, { async reply(message) { replies.push(String(message)); } }, () => {});
+  } finally {
+    httpClient.get = originalGet;
+  }
+  assert.match(replies.join('\n'), /3 calls · 2\.50 minutes · \$1\.29 provider-reported cost/);
+  assert.match(replies.join('\n'), /12/);
 });
 
 test('Cartesia single-call action is not handled by the Cartesia operations flow', () => {
   const keyboard = buildCartesiaKeyboard({ session: {} });
-  const callback = keyboard.inline_keyboard.flat().find((button) => button.text.includes('Place a single call'));
+  const dashboardButtons = keyboard.inline_keyboard.flat();
+  for (const action of ['CARTESIA_MANAGE_VOICES', 'CARTESIA_MODELS', 'CARTESIA_VOICE_SETTINGS',
+    'CARTESIA_TEST_VOICE', 'CARTESIA_USAGE', 'CARTESIA_CONNECTION_STATUS', 'CARTESIA_REFRESH', 'CARTESIA_OPERATIONS']) {
+    assert.ok(dashboardButtons.some((button) => button.callback_data.includes(action)));
+  }
+  assert.equal(dashboardButtons.some((button) => button.text.includes('Recent calls')), false);
+  const operations = buildCartesiaOperationsKeyboard({ session: {} }).inline_keyboard.flat();
+  const callback = operations.find((button) => button.text.includes('Place a single call'));
   assert.ok(callback);
   assert.match(callback.callback_data, /CALL/);
-  const reconcile = keyboard.inline_keyboard.flat().find((button) => button.text.includes('Reconcile a call'));
+  const reconcile = operations.find((button) => button.text.includes('Reconcile a call'));
   assert.ok(reconcile);
   assert.match(reconcile.callback_data, /CARTESIA_RECONCILE/);
-  const calls = keyboard.inline_keyboard.flat().find((button) => button.text.includes('Recent calls'));
+  const calls = operations.find((button) => button.text.includes('Recent calls'));
   assert.ok(calls);
   assert.match(calls.callback_data, /CARTESIA_CALLS/);
-  assert.equal(keyboard.inline_keyboard.flat().some((button) => button.text.includes('Plan a batch campaign')), false);
-  assert.ok(keyboard.inline_keyboard.flat().some((button) => /CARTESIA_BATCH_RECONCILE/.test(button.callback_data)));
-  assert.ok(keyboard.inline_keyboard.flat().some((button) => /CARTESIA_BATCH_CANCEL/.test(button.callback_data)));
-  assert.equal(keyboard.inline_keyboard.flat().some((button) => /CARTESIA_BATCH_RETRY/.test(button.callback_data)), false);
-  const campaignReconcile = keyboard.inline_keyboard.flat().find((button) => button.callback_data.includes('CARTESIA_CAMPAIGN_RECONCILE'));
+  assert.equal(operations.some((button) => button.text.includes('Plan a batch campaign')), false);
+  assert.ok(operations.some((button) => /CARTESIA_BATCH_RECONCILE/.test(button.callback_data)));
+  assert.ok(operations.some((button) => /CARTESIA_BATCH_CANCEL/.test(button.callback_data)));
+  assert.equal(operations.some((button) => /CARTESIA_BATCH_RETRY/.test(button.callback_data)), false);
+  const campaignReconcile = operations.find((button) => button.callback_data.includes('CARTESIA_CAMPAIGN_RECONCILE'));
   assert.ok(campaignReconcile);
   assert.match(campaignReconcile.text, /provider progress/i);
-  assert.ok(keyboard.inline_keyboard.flat().some((button) => /CARTESIA_STUDIO_CENTER/.test(button.callback_data)));
-  const health = keyboard.inline_keyboard.flat().find((button) => button.callback_data.includes('CARTESIA_AGENT_HEALTH'));
+  assert.ok(operations.some((button) => /CARTESIA_STUDIO_CENTER/.test(button.callback_data)));
+  const health = operations.find((button) => button.callback_data.includes('CARTESIA_AGENT_HEALTH'));
   assert.ok(health);
   assert.match(health.text, /health/i);
-  assert.ok(keyboard.inline_keyboard.flat().some((button) => /CARTESIA_AGENT_RUNTIME/.test(button.callback_data)));
-  assert.ok(keyboard.inline_keyboard.flat().some((button) => /CARTESIA_REVIEW_RULES/.test(button.callback_data)));
-  assert.ok(keyboard.inline_keyboard.flat().some((button) => /CARTESIA_BUSINESS_SCOPE/.test(button.callback_data)));
+  assert.ok(operations.some((button) => /CARTESIA_AGENT_RUNTIME/.test(button.callback_data)));
+  assert.ok(operations.some((button) => /CARTESIA_REVIEW_RULES/.test(button.callback_data)));
+  assert.ok(operations.some((button) => /CARTESIA_BUSINESS_SCOPE/.test(button.callback_data)));
+});
+
+test('voice selection uses inline controls and saves Cartesia without changing telephony', async () => {
+  const originalGet = httpClient.get;
+  const originalPut = httpClient.put;
+  const requests = [];
+  const replies = [];
+  httpClient.get = async (_ctx, url) => {
+    if (url.includes('/speech-profile?')) return { data: { business_id: 'biz-1', profile: {
+      provider: 'deepgram', voice_id: 'old_voice', model_id: 'sonic-3.6', language: 'en',
+      speed: 1, volume: 1, output_format: 'wav',
+    } } };
+    if (url.includes('/studio/voices?')) return { data: { voices: [{ id: 'voice_new', name: 'New voice', language: 'en' }], hasMore: false } };
+    if (url.includes('/studio/voices/voice_new?')) return { data: { voice: { id: 'voice_new', name: 'New voice', language: 'en', access: 'public' } } };
+    throw new Error(`Unexpected request: ${url}`);
+  };
+  httpClient.put = async (_ctx, url, body, options) => {
+    requests.push({ url, body, options });
+    return { data: { success: true, business_id: body.business_id } };
+  };
+  const session = { accessProfile: { isAdmin: true, checkedAt: Date.now() }, cartesiaOperationAction: 'CARTESIA_MANAGE_VOICES', cartesiaSpeechBusinessId: 'biz-1' };
+  const ctx = {
+    from: { id: 7001 }, chat: { type: 'private' }, session,
+    async reply(message) { replies.push(String(message)); },
+  };
+  const actions = ['cartesia-pick:voice:0', 'cartesia-pick:voice-save'];
+  const conversation = {
+    async waitFor() {
+      const callbackQuery = { data: actions.shift() };
+      return { session, callbackQuery, async answerCallbackQuery() {} };
+    },
+  };
+  try {
+    await cartesiaOperationFlow(conversation, ctx);
+  } finally {
+    httpClient.get = originalGet;
+    httpClient.put = originalPut;
+  }
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].body.profile.voice_id, 'voice_new');
+  assert.equal(requests[0].body.profile.provider, 'cartesia');
+  assert.equal(requests[0].body.business_id, 'biz-1');
+  assert.equal(requests[0].body.confirmation_phrase, 'SAVE CARTESIA TTS PROFILE');
+  assert.equal(requests[0].options.retry.retries, 0);
+  assert.match(replies.join('\n'), /Saved Cartesia voice/);
+});
+
+test('Cartesia model selection validates supported language before saving and disables request retries', async () => {
+  const originalGet = httpClient.get;
+  const originalPut = httpClient.put;
+  const requests = [];
+  httpClient.get = async (_ctx, url) => {
+    if (url.includes('/speech-profile?')) return { data: { business_id: 'biz-1', profile: {
+      provider: 'deepgram', voice_id: 'voice_1', model_id: 'sonic-3', language: 'en',
+      speed: 1, volume: 1, output_format: 'wav',
+    } } };
+    if (url.includes('/models?')) return { data: { models: [
+      { id: 'sonic-3.6', capability: 'tts', supportedLanguages: ['en', 'es'] },
+    ] } };
+    throw new Error(`Unexpected request: ${url}`);
+  };
+  httpClient.put = async (_ctx, _url, body, options) => {
+    requests.push({ body, options });
+    return { data: { success: true, business_id: body.business_id } };
+  };
+  const session = { accessProfile: { isAdmin: true, checkedAt: Date.now() }, cartesiaOperationAction: 'CARTESIA_MODELS', cartesiaSpeechBusinessId: 'biz-1' };
+  const ctx = { from: { id: 7001 }, chat: { type: 'private' }, session, async reply() {} };
+  const actions = ['cartesia-pick:model:0', 'cartesia-pick:model-save'];
+  const conversation = { async waitFor() {
+    return { session, callbackQuery: { data: actions.shift() }, async answerCallbackQuery() {} };
+  } };
+  try {
+    await cartesiaOperationFlow(conversation, ctx);
+  } finally {
+    httpClient.get = originalGet;
+    httpClient.put = originalPut;
+  }
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].body.profile.model_id, 'sonic-3.6');
+  assert.equal(requests[0].body.profile.provider, 'cartesia');
+  assert.equal(requests[0].body.business_id, 'biz-1');
+  assert.equal(requests[0].body.confirmation_phrase, 'SAVE CARTESIA TTS PROFILE');
+  assert.equal(requests[0].options.retry.retries, 0);
+});
+
+test('voice settings save validated controls while preserving the telephony provider', async () => {
+  const originalGet = httpClient.get;
+  const originalPut = httpClient.put;
+  const requests = [];
+  httpClient.get = async (_ctx, url) => {
+    if (url.includes('/speech-profile?')) return { data: { business_id: 'biz-1', profile: {
+      provider: 'deepgram', voice_id: 'voice_1', model_id: 'sonic-3.6', language: 'en',
+      speed: 1, volume: 1, output_format: 'wav',
+    } } };
+    if (url.includes('/models?')) return { data: { models: [
+      { id: 'sonic-3.6', capability: 'tts', supportedLanguages: ['en', 'es'] },
+    ] } };
+    throw new Error(`Unexpected request: ${url}`);
+  };
+  httpClient.put = async (_ctx, _url, body, options) => {
+    requests.push({ body, options });
+    return { data: { success: true, business_id: body.business_id } };
+  };
+  const session = { accessProfile: { isAdmin: true, checkedAt: Date.now() }, cartesiaOperationAction: 'CARTESIA_VOICE_SETTINGS', cartesiaSpeechBusinessId: 'biz-1' };
+  const ctx = { from: { id: 7001 }, chat: { type: 'private' }, session, async reply() {} };
+  const actions = ['cartesia-pick:speed-up', 'cartesia-pick:save', 'cartesia-pick:settings-save'];
+  const conversation = { async waitFor() {
+    return { session, callbackQuery: { data: actions.shift() }, async answerCallbackQuery() {} };
+  } };
+  try {
+    await cartesiaOperationFlow(conversation, ctx);
+  } finally {
+    httpClient.get = originalGet;
+    httpClient.put = originalPut;
+  }
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].body.profile.speed, 1.1);
+  assert.equal(requests[0].body.business_id, 'biz-1');
+  assert.equal(requests[0].body.profile.provider, 'deepgram');
+  assert.equal(requests[0].options.retry.retries, 0);
+});
+
+test('Cartesia voice testing sends only a bounded TTS preview and returns audio with repeat navigation', async () => {
+  const originalGet = httpClient.get;
+  const originalPost = httpClient.post;
+  const requests = [];
+  let audioFile;
+  httpClient.get = async (_ctx, url) => {
+    assert.match(url, /speech-profile\?business_id=biz-1$/);
+    return { data: { business_id: 'biz-1', profile: {
+      provider: 'cartesia', voice_id: 'voice_1', model_id: 'sonic-3.6', language: 'en',
+      speed: 1.1, volume: 0.9, output_format: 'mp3',
+    } } };
+  };
+  httpClient.post = async (_ctx, url, body, options) => {
+    requests.push({ url, body, options });
+    return { data: { audioBase64: 'V0FWRQ==' } };
+  };
+  const session = { accessProfile: { isAdmin: true, checkedAt: Date.now() }, cartesiaOperationAction: 'CARTESIA_TEST_VOICE', cartesiaSpeechBusinessId: 'biz-1' };
+  const ctx = {
+    from: { id: 7001 }, chat: { type: 'private' }, session,
+    async reply() {},
+    async replyWithAudio(file) { audioFile = file; },
+  };
+  const conversation = {
+    async wait() { return { message: { text: 'Hello, this is a preview.' } }; },
+    async waitFor() {
+      return { session, callbackQuery: { data: 'cartesia-pick:dashboard' }, async answerCallbackQuery() {} };
+    },
+  };
+  try {
+    await cartesiaOperationFlow(conversation, ctx);
+  } finally {
+    httpClient.get = originalGet;
+    httpClient.post = originalPost;
+  }
+  assert.equal(requests.length, 1);
+  assert.match(requests[0].url, /\/studio\/tts-preview$/);
+  assert.equal(requests[0].body.voice_id, 'voice_1');
+  assert.equal(requests[0].body.business_id, 'biz-1');
+  assert.deepEqual(requests[0].body.output_format, { container: 'mp3', sample_rate: 24000, bit_rate: 128000 });
+  assert.equal(requests[0].options.retry.retries, 0);
+  assert.ok(audioFile);
+  assert.doesNotMatch(requests[0].url, /\/calls(?:\/|$)/);
+});
+
+test('authorized business members see only scoped speech controls in the Cartesia dashboard', async () => {
+  const originalGet = httpClient.get;
+  const replies = [];
+  httpClient.get = async (_ctx, url) => {
+    assert.match(url, /speech-profile$/);
+    return { data: { profile: { provider: 'cartesia', voice_id: 'voice_1', model_id: 'sonic-3.6' } } };
+  };
+  const ctx = {
+    from: { id: 8001 }, chat: { type: 'private' },
+    session: { accessProfile: { role: 'user', isAuthorized: true, isAdmin: false, checkedAt: Date.now() } },
+    async reply(message, options) { replies.push({ message, options }); },
+  };
+  try {
+    await renderCartesiaCenter(ctx);
+  } finally {
+    httpClient.get = originalGet;
+  }
+  const buttons = replies[0].options.reply_markup.inline_keyboard.flat();
+  assert.ok(buttons.some((button) => button.callback_data.includes('CARTESIA_MANAGE_VOICES')));
+  assert.equal(buttons.some((button) => button.callback_data.includes('CARTESIA_OPERATIONS')), false);
+  assert.equal(buttons.some((button) => button.callback_data.includes('CARTESIA_USAGE')), false);
+
+  const deniedReplies = [];
+  ctx.session.cartesiaOperationAction = 'CARTESIA_OPERATIONS';
+  await cartesiaOperationFlow(null, { ...ctx, async reply(message) { deniedReplies.push(String(message)); } });
+  assert.match(deniedReplies.join('\n'), /restricted to administrators/i);
 });
 
 test('Cartesia business-scope workflow previews and explicitly approves a private tenant mapping', async () => {
@@ -581,7 +867,7 @@ test('admins can configure the three persistent Cartesia post-call review rules 
   finally { httpClient.get = originalGet; httpClient.post = originalPost; }
   assert.equal(requests[0].method, 'GET');
   assert.match(requests[0].url, /business_id=biz-1/);
-  assert.deepEqual(requests[1], { method: 'POST', url: 'http://127.0.0.1:3000/api/cartesia/review-rules', body: { business_id: 'biz-1', rules: { review_failed_calls: false, review_tool_calls: true, review_missing_summary: true } } });
+  assert.deepEqual(requests[1], { method: 'POST', url: new URL('/api/cartesia/review-rules', process.env.API_URL).toString(), body: { business_id: 'biz-1', rules: { review_failed_calls: false, review_tool_calls: true, review_missing_summary: true } } });
   assert.match(replies.join('\n'), /review rules saved/);
 });
 

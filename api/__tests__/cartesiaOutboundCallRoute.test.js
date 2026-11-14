@@ -28,23 +28,39 @@ function makeHandler(overrides = {}) {
 }
 
 describe("Cartesia outbound call API contract", () => {
-  it("rejects Cartesia as a call provider without dispatching to any carrier", async () => {
-    let dispatched = false;
+  it("dispatches Cartesia Managed Agent calls through the approved Cartesia service", async () => {
+    let received;
     const handler = makeHandler({
-      placeOutboundCall: async () => { dispatched = true; },
-      placeCartesiaOutboundCall: async () => { dispatched = true; },
+      placeCartesiaOutboundCall: async (input) => {
+        received = input;
+        return { providerCallId: "call_123", status: "created", idempotentReplay: false };
+      },
     });
-    for (const body of [
-      { provider: "cartesia" },
-      { preferred_provider: "cartesia" },
-      { call_provider: "cartesia" },
-    ]) {
-      const res = makeResponse();
-      await handler({ body, headers: {}, requestId: "req-1" }, res);
-      assert.equal(dispatched, false);
-      assert.equal(res.statusCode, 400);
-      assert.equal(res.body.code, "cartesia_is_ai_capability");
-    }
+    const res = makeResponse();
+    await handler({
+      body: {
+        provider: "cartesia", business_id: "biz-1", number: "+15555550123",
+        agent_id: "agent_1", from_number_id: "ap_number_1", idempotency_key: "idem-key-123",
+        approval_token: "signed-approval-token",
+      },
+      headers: {}, callEActorId: "7001", requestId: "req-1",
+    }, res);
+    assert.equal(res.statusCode, 200);
+    assert.equal(res.body.success, true);
+    assert.equal(res.body.call_sid, "call_123");
+    assert.equal(res.body.provider, "cartesia");
+    assert.equal(received.actor_id, "7001");
+    assert.equal(received.approval_token, "signed-approval-token");
+  });
+
+  it("rejects Cartesia dispatch when required approval input is missing", async () => {
+    let dispatched = false;
+    const handler = makeHandler({ placeCartesiaOutboundCall: async () => { dispatched = true; } });
+    const res = makeResponse();
+    await handler({ body: { provider: "cartesia" }, headers: {}, requestId: "req-1" }, res);
+    assert.equal(dispatched, false);
+    assert.equal(res.statusCode, 400);
+    assert.equal(res.body.code, "cartesia_call_input_invalid");
   });
 
   it("registers the approval endpoint behind rate limiting, API authorization, and signed actor assertion", () => {

@@ -10,7 +10,7 @@ const CARTESIA_API_VERSION = '2026-08-14';
 class CartesiaInkRealtimeTranscriptionService extends EventEmitter {
   constructor(options = {}) {
     super();
-    const apiKey = String(options.apiKey || config.tts?.cartesia?.apiKey || '').trim();
+    const apiKey = String(options.apiKey ?? config.tts?.cartesia?.apiKey ?? '').trim();
     if (!apiKey) throw new Error('Cartesia Ink is selected but CARTESIA_API_KEY is not configured');
     const sampleRate = Number(options.sampleRate || 8000);
     if (!Number.isInteger(sampleRate) || sampleRate < 8000 || sampleRate > 48000) {

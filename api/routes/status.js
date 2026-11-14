@@ -36,6 +36,19 @@ function maskPhoneLast4(value) {
   return `••••${digits.slice(-4)}`;
 }
 
+function normalizeCallProviderLabel(value) {
+  const provider = String(value || '').trim().toLowerCase();
+  const labels = {
+    twilio: 'Twilio',
+    plivo: 'Plivo',
+    vonage: 'Vonage',
+    vapi: 'Vapi',
+    cartesia: 'Cartesia',
+    deepgram: 'Deepgram',
+  };
+  return labels[provider] || null;
+}
+
 function stripStatusEmoji(value) {
   return String(value || '').replace(/^[^A-Za-z0-9]+/, '').trim();
 }
@@ -653,26 +666,20 @@ class EnhancedWebhookService {
     }
 
     const { lastStatus } = currentStatusInfo;
-    
+
     // Don't send duplicate status
     if (lastStatus === newStatus) {
       console.log(`⏭️ Skipping duplicate status ${newStatus} for call ${call_sid}`);
       return false;
     }
 
-    if (lastStatus === 'completed' && newStatus !== 'voicemail') {
-      console.log(`⏭️ Skipping ${newStatus} because call ${call_sid} already completed`);
-      return false;
-    }
-
-    if (lastStatus === 'voicemail') {
-      console.log(`⏭️ Skipping ${newStatus} because call ${call_sid} already ended as voicemail`);
-      return false;
-    }
-
-    if (['busy', 'no-answer', 'failed', 'canceled', 'voicemail'].includes(lastStatus) && newStatus === 'completed') {
-      console.log(`⏭️ Skipping completed because call ${call_sid} already ended as ${lastStatus}`);
-      return false;
+    if (this.isTerminalStatus(lastStatus)) {
+      const allowsVoicemailCorrection =
+        newStatus === 'voicemail' && ['completed', 'no-answer'].includes(lastStatus);
+      if (!allowsVoicemailCorrection) {
+        console.log(`⏭️ Skipping ${newStatus} because call ${call_sid} already ended as ${lastStatus}`);
+        return false;
+      }
     }
 
     // Check if this is a valid status progression
@@ -813,6 +820,8 @@ class EnhancedWebhookService {
 
   // Enhanced call status update with proper no-answer detection
   async sendCallStatusUpdate(call_sid, status, telegram_chat_id, additionalData = {}) {
+    let statusTransition = null;
+    let notificationDelivered = false;
     try {
       const normalizedStatus = this.normalizeStatus(status);
       if (!this.callTimestamps.has(call_sid)) {
@@ -872,10 +881,30 @@ class EnhancedWebhookService {
         return true;
       }
 
+      const previousStatusInfo = this.activeCallStatus.get(call_sid);
+      const previousStatusSnapshot = previousStatusInfo
+        ? {
+            ...previousStatusInfo,
+            statusHistory: Array.isArray(previousStatusInfo.statusHistory)
+              ? [...previousStatusInfo.statusHistory]
+              : [],
+          }
+        : null;
+
       // Check if we should send this status
       if (!this.shouldSendStatus(call_sid, adjustedStatus)) {
-        return true; // Return success to mark notification as processed
+        await consolePromise;
+        await this.updateLiveConsoleStatus(call_sid, adjustedStatus, telegram_chat_id, statusSource);
+        return true;
       }
+      const transitionedStatus = this.activeCallStatus.get(call_sid);
+      statusTransition = transitionedStatus
+        ? {
+            status: adjustedStatus,
+            timestamp: transitionedStatus.timestamp,
+            previous: previousStatusSnapshot,
+          }
+        : null;
 
       const victimName = callMeta.victimName || 'the victim';
       let message = '';
@@ -1052,6 +1081,7 @@ class EnhancedWebhookService {
       if (shouldSendBubble.includes(adjustedStatus)) {
         const replyMarkup = shouldOfferRetry ? this.buildRetryActions(call_sid) : null;
         await this.sendTelegramMessage(telegram_chat_id, fullMessage, false, { replyMarkup, parseMode });
+        notificationDelivered = true;
         console.log(`✅ Sent enhanced status update: ${adjustedStatus} for call ${call_sid}`);
         if (this.isTerminalStatus(adjustedStatus)) {
           this.terminalStatusSent.set(call_sid, true);
@@ -1061,6 +1091,7 @@ class EnhancedWebhookService {
       }
       await consolePromise;
       await this.updateLiveConsoleStatus(call_sid, adjustedStatus, telegram_chat_id, statusSource);
+      notificationDelivered = true;
 
       if (this.isTerminalStatus(adjustedStatus)) {
         await this.flushPendingTranscript(call_sid);
@@ -1073,14 +1104,26 @@ class EnhancedWebhookService {
 
       // Schedule cleanup for terminal states
       if (['completed', 'failed', 'no-answer', 'busy', 'canceled', 'voicemail'].includes(adjustedStatus)) {
-        setTimeout(() => {
+        const cleanupTimer = setTimeout(() => {
           this.cleanupCallData(call_sid);
         }, 5 * 60 * 1000); // Cleanup after 5 minutes
+        cleanupTimer.unref?.();
       }
 
       return true;
     } catch (error) {
       console.error('❌ Failed to send enhanced call status update:', error);
+      if (!notificationDelivered && statusTransition) {
+        const currentTransition = this.activeCallStatus.get(call_sid);
+        if (currentTransition?.lastStatus === statusTransition.status &&
+            currentTransition.timestamp === statusTransition.timestamp) {
+          if (statusTransition.previous) {
+            this.activeCallStatus.set(call_sid, statusTransition.previous);
+          } else {
+            this.activeCallStatus.delete(call_sid);
+          }
+        }
+      }
       
       // Log failed notification metric
       if (this.db && this.db.logNotificationMetric) {
@@ -1654,12 +1697,20 @@ class EnhancedWebhookService {
     const routeLabel = inbound
       ? (state?.route_label || resolveInboundRouteLabel(toNumber, config.inbound?.routes || {}))
       : null;
+    const provider = normalizeCallProviderLabel(state?.provider || details?.provider);
+    const configuredSpeechProvider =
+      state?.script_policy?.agent_config?.speech_settings?.provider ||
+      state?.speech_settings?.provider ||
+      (['Twilio', 'Plivo', 'Vonage'].includes(provider) ? config.tts?.provider : null);
 
     return {
       victimName: label,
       phoneNumber: phoneNumber || 'Unknown',
       toNumber: toNumber || 'Unknown',
       script: state?.script || details?.script || '—',
+      callReference: String(callSid || '').slice(-8) || null,
+      provider,
+      aiVoiceEngine: normalizeCallProviderLabel(configuredSpeechProvider),
       routeLabel: routeLabel || null,
       inbound,
       callerFlag: callerFlag?.status || null,
@@ -1669,7 +1720,12 @@ class EnhancedWebhookService {
 
   async ensureLiveConsole(callSid, chatId, callMeta = null) {
     const existing = this.liveConsoleByCallSid.get(callSid);
-    if (existing) return existing;
+    if (existing) {
+      if (existing.persistencePending === true) {
+        await this.persistLiveConsoleState(existing);
+      }
+      return existing;
+    }
     if (!chatId) return null;
 
     const meta = callMeta || await this.getCallMeta(callSid);
@@ -1696,6 +1752,9 @@ class EnhancedWebhookService {
       inbound: meta.inbound === true,
       phoneNumber: meta.phoneNumber || 'Unknown',
       toNumber: meta.toNumber || 'Unknown',
+      callReference: meta.callReference || String(callSid || '').slice(-8) || null,
+      provider: meta.provider || null,
+      aiVoiceEngine: meta.aiVoiceEngine || null,
       script: meta.script || '—',
       routeLabel: meta.routeLabel || null,
       callerFlag: meta.callerFlag || null,
@@ -1719,6 +1778,31 @@ class EnhancedWebhookService {
       this.setInboundGate(callSid, 'pending', { chatId });
     }
 
+    let persistedConsole = null;
+    try {
+      persistedConsole = await this.db?.getLatestCallState?.(callSid, 'live_console');
+    } catch (error) {
+      console.warn('live_console_restore_state_read_failed', {
+        call_reference: String(callSid || '').slice(-8) || null,
+        code: String(error?.code || 'call_state_read_failed').slice(0, 80),
+      });
+    }
+    const persistedChatId = String(persistedConsole?.telegram_chat_id || '');
+    const persistedMessageId = Number(persistedConsole?.telegram_message_id);
+    if (persistedChatId === String(chatId) &&
+        Number.isSafeInteger(persistedMessageId) && persistedMessageId > 0) {
+      const restoredCreatedAt = new Date(persistedConsole.created_at);
+      if (Number.isFinite(restoredCreatedAt.getTime())) {
+        entry.createdAt = restoredCreatedAt;
+      }
+      entry.messageId = persistedMessageId;
+      entry.lastEditAt = null;
+      entry.lastMessageText = null;
+      entry.lastMarkup = null;
+      this.liveConsoleByCallSid.set(callSid, entry);
+      return entry;
+    }
+
     const text = this.buildLiveConsoleMessage(entry);
     const escapedText = this.escapeMarkdownV2PreservingSpoilers(text);
     const initialMarkup = this.consoleButtons(callSid, entry);
@@ -1731,7 +1815,26 @@ class EnhancedWebhookService {
     entry.lastMessageText = text;
     entry.lastMarkup = JSON.stringify(initialMarkup || {});
     this.liveConsoleByCallSid.set(callSid, entry);
+    if (Number.isSafeInteger(entry.messageId) && entry.messageId > 0 &&
+        typeof this.db?.updateCallState === 'function') {
+      entry.persistencePending = true;
+      await this.persistLiveConsoleState(entry);
+    }
     return entry;
+  }
+
+  async persistLiveConsoleState(entry) {
+    if (!entry || !Number.isSafeInteger(entry.messageId) || entry.messageId <= 0 ||
+        typeof this.db?.updateCallState !== 'function') {
+      return false;
+    }
+    await this.db.updateCallState(entry.callSid, 'live_console', {
+      telegram_chat_id: String(entry.chatId),
+      telegram_message_id: entry.messageId,
+      created_at: entry.createdAt.toISOString(),
+    });
+    entry.persistencePending = false;
+    return true;
   }
 
   getConsoleStatusLabel(status, inbound = false) {
@@ -2245,8 +2348,11 @@ class EnhancedWebhookService {
       status_label: entry.status || null,
       phase: entry.phaseKey || null,
       phase_label: entry.phase || null,
-      from: entry.phoneNumber || null,
-      to: entry.toNumber || null,
+      call_reference: entry.callReference || null,
+      telephony_provider: entry.provider || null,
+      ai_voice_engine: entry.aiVoiceEngine || null,
+      from: entry.phoneNumber && entry.phoneNumber !== 'Unknown' ? maskPhoneLast4(entry.phoneNumber) : null,
+      to: entry.toNumber && entry.toNumber !== 'Unknown' ? maskPhoneLast4(entry.toNumber) : null,
       name: entry.victimName || null,
       script: entry.script || null,
       route_label: entry.routeLabel || null,
@@ -2399,11 +2505,19 @@ class EnhancedWebhookService {
     const previewUser = this.applyPreviewRedaction(entry, entry.previewTurns.user || '—');
     const previewAgent = this.applyPreviewRedaction(entry, entry.previewTurns.agent || '—');
     const maskedFrom = maskPhoneLast4(entry.phoneNumber);
+    const maskedTo = entry.toNumber && entry.toNumber !== 'Unknown' ? maskPhoneLast4(entry.toNumber) : null;
     const fromLine = entry.inbound
       ? (entry.victimName && entry.victimName !== 'Unknown'
         ? `📲 From: ${entry.victimName} • ${maskedFrom}`
         : `📲 From: ${maskedFrom}`)
-      : `👤 ${entry.victimName} | 📞 ${entry.phoneNumber}`;
+      : `👤 ${entry.victimName} | 📞 ${maskedFrom}`;
+    const callContextLines = entry.inbound
+      ? []
+      : [
+          entry.provider ? `☎️ Telephony: ${entry.provider}` : null,
+          entry.aiVoiceEngine ? `🎙️ AI Voice: ${entry.aiVoiceEngine}` : null,
+          entry.callReference ? `🆔 Call: …${entry.callReference}` : null,
+        ];
 
     if (entry.compact) {
       if (entry.inbound) {
@@ -2432,6 +2546,8 @@ class EnhancedWebhookService {
         headerLine,
         updatedLine,
         fromLine,
+        ...callContextLines,
+        maskedTo ? `📍 To: ${maskedTo}` : null,
         entry.script && entry.script !== '—' ? `🧩 ${entry.script}` : null,
         `⏱ ${elapsed} | Phase: ${phaseDisplay}`,
         `${latencyLine} | ${healthLine}`,
@@ -2450,13 +2566,14 @@ class EnhancedWebhookService {
       const scriptLine = entry.routeLabel && entry.script && entry.script !== '—' && entry.script !== entry.routeLabel
         ? `🧩 Script: ${entry.script}`
         : null;
-      const toLine = entry.toNumber && entry.toNumber !== 'Unknown' ? `📍 To: ${entry.toNumber}` : null;
+      const toLine = entry.toNumber && entry.toNumber !== 'Unknown' ? `📍 To: ${maskPhoneLast4(entry.toNumber)}` : null;
       const timingLine = this.formatInboundTimingLine(entry, phaseDisplay);
       return [
         headerLine,
         gateLine,
         updatedLine,
         fromLine,
+        ...callContextLines,
         toLine,
         routeLine,
         scriptLine,
@@ -2480,6 +2597,8 @@ class EnhancedWebhookService {
       headerLine,
       updatedLine,
       fromLine,
+      ...callContextLines,
+      maskedTo ? `📍 To: ${maskedTo}` : null,
       entry.script && entry.script !== '—' ? `🧩 ${entry.script}` : null,
       `⏱ ${elapsed} | Phase: ${phaseDisplay}`,
       latencyLine,

@@ -1,4 +1,6 @@
 const config = require('../config');
+const { createHash, randomUUID } = require('node:crypto');
+const botDb = require('../db/db');
 const httpClient = require('../utils/httpClient');
 const { getAccessProfile } = require('../utils/capabilities');
 const {
@@ -58,6 +60,270 @@ async function notifyCallError(ctx, lines = []) {
     })
   });
 }
+
+function formatCallAcceptedMessage(data = {}) {
+  const destination = String(data.to || '').trim();
+  const maskedDestination = /^\+[1-9]\d{1,14}$/.test(destination)
+    ? `••••${destination.slice(-4)}`
+    : '••••';
+  const statuses = {
+    queued: '🟡 Queued',
+    initiated: '🔵 Initiated',
+    ringing: '🟡 Ringing',
+    answered: '🟢 Answered',
+    'in-progress': '🔵 In progress',
+    in_progress: '🔵 In progress',
+    completed: '✅ Completed',
+    busy: '📵 Busy',
+    'no-answer': '⚪ No answer',
+    no_answer: '⚪ No answer',
+    failed: '🔴 Failed',
+    canceled: '⚪ Canceled',
+    cancelled: '⚪ Canceled'
+  };
+  const providers = {
+    twilio: 'Twilio',
+    plivo: 'Plivo',
+    vonage: 'Vonage',
+    vapi: 'Vapi',
+    cartesia: 'Cartesia Managed Agent'
+  };
+  const aiEngines = {
+    cartesia: 'Cartesia',
+    deepgram: 'Deepgram',
+    vapi: 'Vapi'
+  };
+  const callId = String(data.call_sid || '').replace(/[^A-Za-z0-9]/g, '');
+  const callReference = callId ? `VN-${callId.slice(-8)}` : 'unavailable';
+  const provider = providers[String(data.provider || '').trim().toLowerCase()];
+  const aiVoiceEngine = aiEngines[String(data.ai_voice_engine || '').trim().toLowerCase()];
+  const lines = [
+    '📞 VOICEDNUT — Outgoing Call',
+    `Status: ${statuses[String(data.status || '').trim().toLowerCase()] || '🟡 Submitted'}`,
+    `Destination: ${maskedDestination}`,
+    provider ? `Telephony: ${provider}` : null,
+    aiVoiceEngine ? `AI Voice: ${aiVoiceEngine}` : null,
+    `Call ID: ${callReference}`,
+    'Live status updates will continue in the call monitor.'
+  ].filter(Boolean);
+  return lines.join('\n');
+}
+
+function getReconciliationInstruction(provider) {
+  const normalized = String(provider || '').toLowerCase();
+  if (normalized === 'vapi') return 'Open /vapi, choose the call activity, and reconcile the call before retrying.';
+  if (normalized === 'cartesia') return 'Open /cartesia, choose Managed Agent call reconciliation, and verify the original request before retrying.';
+  return 'Open /callmonitor and verify the call with the selected provider before retrying.';
+}
+
+function resolveCallProviderDefaults(status = {}) {
+  const callState = status.providers?.call || {};
+  const telephonyProvider = String(status.provider || callState.provider || '').trim().toLowerCase();
+  const supportedProviders = Array.isArray(status.supported_providers)
+    ? status.supported_providers
+    : callState.supported_providers;
+  const supported = Array.isArray(supportedProviders)
+    ? supportedProviders.map((provider) => String(provider || '').trim().toLowerCase())
+    : [];
+  if (!telephonyProvider || !supported.includes(telephonyProvider)) {
+    throw Object.assign(new Error('The configured telephony provider is unavailable or unsupported. Review /provider settings.'), {
+      code: 'call_provider_config_invalid'
+    });
+  }
+
+  const descriptor = Array.isArray(status.voice_provider_capabilities)
+    ? status.voice_provider_capabilities.find((item) => String(item?.provider || '').toLowerCase() === telephonyProvider)
+    : null;
+  if (!descriptor || descriptor.operations?.['outbound_call.create'] !== true) {
+    throw Object.assign(new Error('The configured provider does not support direct /call requests. Select a direct-call provider in /provider.'), {
+      code: 'call_provider_operation_unsupported'
+    });
+  }
+  const providerReady = typeof callState.readiness?.[telephonyProvider] === 'boolean'
+    ? callState.readiness[telephonyProvider]
+    : typeof status[`${telephonyProvider}_ready`] === 'boolean'
+      ? status[`${telephonyProvider}_ready`]
+      : null;
+  if (providerReady === false) {
+    throw Object.assign(new Error(`The configured ${toTitleCase(telephonyProvider)} provider is not ready. Review /provider settings before starting a call.`), {
+      code: 'call_provider_not_ready'
+    });
+  }
+
+  const aiVoiceEngine = String(status.tts_provider || '').trim().toLowerCase();
+  if (!['cartesia', 'deepgram'].includes(aiVoiceEngine)) {
+    throw Object.assign(new Error('The configured AI voice engine is unavailable or unsupported. Review /provider settings.'), {
+      code: 'call_voice_engine_config_invalid'
+    });
+  }
+
+  const cartesiaProfile = status.cartesia_tts_profile && typeof status.cartesia_tts_profile === 'object'
+    ? status.cartesia_tts_profile
+    : null;
+  if (aiVoiceEngine === 'cartesia' &&
+      (cartesiaProfile?.provider !== 'cartesia' ||
+       !String(cartesiaProfile.voice_id || '').trim() ||
+       !String(cartesiaProfile.model_id || '').trim())) {
+    throw Object.assign(new Error('The Cartesia speech profile is incomplete. Review Voice Settings in /cartesia before calling.'), {
+      code: 'call_cartesia_profile_incomplete'
+    });
+  }
+
+  const providerHealth = status.provider_health?.[telephonyProvider] || null;
+  return {
+    telephonyProvider,
+    aiVoiceEngine,
+    cartesiaProfile,
+    supportedProviders: supported,
+    readiness: callState.readiness || {},
+    providerReady,
+    providerHealth,
+  };
+}
+
+function resolveCallVoiceModel({ aiVoiceEngine, scriptVoiceModel, configuredVoice } = {}) {
+  if (String(aiVoiceEngine || '').trim().toLowerCase() === 'cartesia') return null;
+  return String(scriptVoiceModel || configuredVoice || '').trim() || null;
+}
+
+function prepareCallSubmission(session, payload, createKey = randomUUID) {
+  const requestFingerprint = createHash('sha256').update(JSON.stringify(payload || {})).digest('hex');
+  const existing = session?.outboundCallSubmission;
+  if (existing?.outcomeUncertain === true && existing.requestFingerprint !== requestFingerprint) {
+    return { blocked: true, reason: 'previous_submission_uncertain' };
+  }
+  if (existing?.requestFingerprint === requestFingerprint && /^[A-Za-z0-9._:-]{8,128}$/.test(String(existing.idempotencyKey || ''))) {
+    return { blocked: false, reused: true, idempotencyKey: existing.idempotencyKey };
+  }
+  const idempotencyKey = String(createKey() || '').trim();
+  if (!/^[A-Za-z0-9._:-]{8,128}$/.test(idempotencyKey)) {
+    throw new Error('Could not create a safe call submission key');
+  }
+  if (session && typeof session === 'object') {
+    session.outboundCallSubmission = {
+      requestFingerprint,
+      idempotencyKey,
+      outcomeUncertain: true,
+      createdAt: Date.now(),
+    };
+  }
+  return { blocked: false, reused: false, idempotencyKey };
+}
+
+function resolveCallSubmissionOutcome(session, idempotencyKey, outcomeUncertain, acceptedResult = null) {
+  const pending = session?.outboundCallSubmission;
+  if (!pending || pending.idempotencyKey !== idempotencyKey) return false;
+  if (outcomeUncertain) {
+    pending.outcomeUncertain = true;
+    delete pending.acceptedResult;
+  } else if (acceptedResult && typeof acceptedResult === 'object') {
+    pending.outcomeUncertain = false;
+    pending.acceptedResult = {
+      call_sid: String(acceptedResult.call_sid || '').slice(0, 160),
+      status: String(acceptedResult.status || '').slice(0, 40),
+      provider: String(acceptedResult.provider || '').slice(0, 40),
+    };
+    pending.updatedAt = Date.now();
+  } else {
+    delete session.outboundCallSubmission;
+  }
+  return true;
+}
+
+async function persistCallSubmission(ctx, idempotencyKey) {
+  const userId = ctx?.from?.id;
+  const pending = ctx?.session?.outboundCallSubmission;
+  if (pending?.idempotencyKey === idempotencyKey) {
+    await botDb.saveOutboundCallSubmission(userId, pending);
+    return;
+  }
+  await botDb.clearOutboundCallSubmission(userId, idempotencyKey);
+}
+
+function isUncertainCallSubmissionError(error) {
+  const status = Number(error?.response?.status);
+  if (!Number.isFinite(status)) return true;
+  const code = String(error?.response?.data?.code || '').toLowerCase();
+  if (['idempotency_conflict', 'idempotency_in_progress', 'provider_submission_ambiguous', 'outbound_persistence_failed'].includes(code)) {
+    return true;
+  }
+  return status >= 500 || status === 408 || status === 429;
+}
+
+async function selectCallProvider(conversation, ctx, ensureActive, callDefaults) {
+  const options = [];
+  const directProviders = ['twilio', 'plivo', 'vonage'];
+  for (const provider of directProviders) {
+    const supported = provider === callDefaults.telephonyProvider ||
+      (Array.isArray(callDefaults.supportedProviders) && callDefaults.supportedProviders.includes(provider));
+    const ready = callDefaults.readiness?.[provider];
+    if (!supported || ready === false) continue;
+    options.push({ id: provider, label: `${provider === callDefaults.telephonyProvider ? '⭐ ' : ''}${toTitleCase(provider)}${ready === true ? ' · ready' : ''}` });
+  }
+
+  const apiBase = config.apiUrl.replace(/\/+$/, '');
+  const authHeaders = config.admin.apiToken ? { 'x-admin-token': config.admin.apiToken } : {};
+  try {
+    const response = await httpClient.get(ctx, `${apiBase}/api/vapi/status`, { timeout: 8000, headers: authHeaders, retry: { retries: 0 } });
+    const status = response?.data?.status || {};
+    if (status.enabled === true && status.configured === true) options.push({ id: 'vapi', label: 'Vapi · ready' });
+  } catch (_) { /* A provider that cannot pass its status check is not selectable. */ }
+  try {
+    const response = await httpClient.get(ctx, `${apiBase}/api/cartesia/call-readiness`, { timeout: 8000, retry: { retries: 0 } });
+    if (response?.data?.enabled === true) options.push({ id: 'cartesia', label: 'Cartesia Managed Agent · ready' });
+  } catch (_) { /* A provider that cannot pass its status check is not selectable. */ }
+  options.push({ id: 'cancel', label: '❌ Cancel' });
+
+  const selection = await askOptionWithButtons(conversation, ctx,
+    '📡 *Call provider*\nChoose the provider for this call. Provider setup is checked before launch.',
+    options, { prefix: 'call-provider', columns: 1 });
+  ensureActive();
+  return selection?.id || null;
+}
+
+async function selectVapiCallSetup(conversation, ctx, ensureActive, script) {
+  const apiBase = config.apiUrl.replace(/\/+$/, '');
+  const headers = config.admin.apiToken ? { 'x-admin-token': config.admin.apiToken } : {};
+  const [mappingResponse, phoneResponse] = await Promise.all([
+    httpClient.get(ctx, `${apiBase}/api/call-scripts/${encodeURIComponent(script.id)}/vapi-mappings`, { timeout: 12000, headers }),
+    httpClient.get(ctx, `${apiBase}/api/vapi/phone-numbers`, { params: { page: 1, limit: 100 }, timeout: 12000, headers }),
+  ]);
+  ensureActive();
+  const mappings = (Array.isArray(mappingResponse?.data?.mappings) ? mappingResponse.data.mappings : [])
+    .filter((item) => Number(item.template_version) === Number(mappingResponse?.data?.current_template_version) &&
+      item.compatibility_status === 'compatible' && item.mapping_status === 'provisioned' && item.sync_status === 'synced');
+  if (!mappings.length) throw Object.assign(new Error('This script has no current, synced Vapi mapping. Ask an administrator to sync a compatible mapping in /vapi.'), { code: 'call_vapi_mapping_unavailable' });
+  const mappingChoice = await askOptionWithButtons(conversation, ctx,
+    '🔗 *Vapi assistant mapping*\nChoose the synced assistant version for this script.',
+    [...mappings.map((mapping) => ({ id: String(mapping.id), label: `${mapping.vapi_assistant_name || 'Assistant'} · v${mapping.template_version}` })), { id: 'cancel', label: '❌ Cancel' }],
+    { prefix: 'call-vapi-mapping', columns: 1 });
+  ensureActive();
+  if (!mappingChoice?.id || mappingChoice.id === 'cancel') return null;
+  const numbers = (Array.isArray(phoneResponse?.data?.phoneNumbers) ? phoneResponse.data.phoneNumbers : [])
+    .filter((item) => item?.id && item?.number && item.status !== 'inactive' && item.outboundCapable !== false);
+  if (!numbers.length) throw Object.assign(new Error('Vapi has no active caller numbers. Add or activate a phone number in /vapi first.'), { code: 'call_vapi_number_unavailable' });
+  const phoneChoice = await askOptionWithButtons(conversation, ctx,
+    '☎️ *Vapi caller number*\nChoose the number Vapi will present to the recipient.',
+    [...numbers.map((item) => ({ id: String(item.id), label: `${item.name || item.number} · ${String(item.number).slice(-4)}` })), { id: 'cancel', label: '❌ Cancel' }],
+    { prefix: 'call-vapi-number', columns: 1 });
+  ensureActive();
+  if (!phoneChoice?.id || phoneChoice.id === 'cancel') return null;
+  return { mapping_id: Number(mappingChoice.id), phone_number_id: phoneChoice.id, script_version: Number(script.version) || Number(mappingResponse?.data?.current_template_version) || 1 };
+}
+
+function buildCartesiaConfirmationPhrase(payload) {
+  const phrase = `PLACE CARTESIA CALL TO ${payload.number} FROM ${payload.from_number_id} WITH AGENT ${payload.agent_id}`;
+  const variables = payload.dynamic_variables && typeof payload.dynamic_variables === 'object' ? payload.dynamic_variables : {};
+  if (!Object.keys(variables).length) return phrase;
+  const stable = (value) => {
+    if (Array.isArray(value)) return `[${value.map(stable).join(',')}]`;
+    if (value && typeof value === 'object') return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stable(value[key])}`).join(',')}}`;
+    return JSON.stringify(value);
+  };
+  const fingerprint = createHash('sha256').update(stable(variables)).digest('hex').slice(0, 12);
+  return `${phrase} WITH VARIABLES ${fingerprint}`;
+}
+
 const { buildCallbackData } = require('../utils/actions');
 
 const scriptsApiBase = config.scriptsApiUrl.replace(/\/+$/, '');
@@ -249,7 +515,7 @@ async function getCallScripts() {
   return response.data;
 }
 
-async function getActiveCallProvider() {
+async function getCallProviderStatus() {
   const response = await httpClient.get(null, `${scriptsApiBase}/admin/provider`, {
     timeout: 10000,
     headers: {
@@ -259,7 +525,25 @@ async function getActiveCallProvider() {
       channel: 'call'
     }
   });
-  return String(response?.data?.provider || '').trim().toLowerCase() || null;
+  return response?.data || {};
+}
+
+function getCallProviderSelectionState(status = {}) {
+  const call = status.providers?.call || {};
+  const supportedProviders = Array.isArray(call.supported_providers)
+    ? call.supported_providers.map((item) => String(item || '').toLowerCase())
+    : Array.isArray(status.supported_providers)
+      ? status.supported_providers.map((item) => String(item || '').toLowerCase())
+      : [];
+  return {
+    telephonyProvider: String(status.provider || call.provider || '').toLowerCase(),
+    aiVoiceEngine: String(status.tts_provider || '').toLowerCase(),
+    cartesiaProfile: status.cartesia_tts_profile && typeof status.cartesia_tts_profile === 'object' ? status.cartesia_tts_profile : null,
+    supportedProviders,
+    readiness: call.readiness || {},
+    providerReady: call.readiness?.[String(status.provider || call.provider || '').toLowerCase()] ?? null,
+    providerHealth: status.provider_health?.[String(status.provider || call.provider || '').toLowerCase()] || null,
+  };
 }
 
 async function collectPlaceholderValues(conversation, ctx, placeholders, ensureActive) {
@@ -290,7 +574,7 @@ async function fetchCallScriptById(id) {
   return data.script;
 }
 
-async function selectCallScript(conversation, ctx, ensureActive) {
+async function selectCallScript(conversation, ctx, ensureActive, activeProvider) {
   let scripts;
   try {
     scripts = await fetchCallScripts();
@@ -361,14 +645,6 @@ async function selectCallScript(conversation, ctx, ensureActive) {
   const scriptProfileRouting = resolveScriptProfileRouting(script);
   const scriptObjectiveTags = scriptProfileRouting.objectiveTags;
   if (scriptFlowTypes.includes('payment_collection')) {
-    let activeProvider = null;
-    try {
-      activeProvider = await getActiveCallProvider();
-      ensureActive();
-    } catch (error) {
-      console.warn('Failed to fetch active provider for payment flow guard:', error?.message || error);
-    }
-
     if (activeProvider && activeProvider !== 'twilio') {
       const providerGuard = await askOptionWithButtons(
         conversation,
@@ -487,6 +763,8 @@ async function selectCallScript(conversation, ctx, ensureActive) {
     summary,
     meta: {
       scriptName: script.name,
+      scriptId: script.id,
+      scriptVersion: Number(script.version) || 1,
       scriptDescription: script.description || 'No description provided',
       personaLabel: businessOption?.label || script.business_id || 'Custom',
       scriptVoiceModel: script.voice_model || null,
@@ -715,7 +993,13 @@ async function buildCustomCallConfig(conversation, ctx, ensureActive, businessOp
 
 async function callFlow(conversation, ctx) {
   const opId = startOperation(ctx, 'call');
+  let callSubmissionKey = null;
+  let callRequestStarted = false;
+  const forceFreshCallSubmission = ctx.session?.callForceNewSubmission === true;
+  if (ctx.session) delete ctx.session.callForceNewSubmission;
   const flow = ensureFlow(ctx, 'call', { step: 'start' });
+  const advancedVoiceOptions = ctx.session?.callAdvancedVoiceOptions === true;
+  if (ctx.session) delete ctx.session.callAdvancedVoiceOptions;
   const ensureActive = () => ensureOperationActive(ctx, opId);
 
   const waitForMessage = async () => {
@@ -738,11 +1022,28 @@ async function callFlow(conversation, ctx) {
     }
     flow.touch('authorized');
 
-    const activeProvider = await getActiveCallProvider();
+    const providerStatus = await getCallProviderStatus();
     ensureActive();
-    if (!activeProvider) {
-      throw new Error('The active call provider could not be determined.');
+    const selectionState = getCallProviderSelectionState(providerStatus);
+    const selectedProvider = await selectCallProvider(conversation, ctx, ensureActive, selectionState);
+    if (!selectedProvider || selectedProvider === 'cancel') {
+      await ctx.reply(cancelledMessage('Call setup', 'Use /call to start again.'), { parse_mode: 'Markdown' });
+      return;
     }
+    const activeProvider = selectedProvider;
+    const managedAgentMode = activeProvider === 'cartesia';
+    const vapiMode = activeProvider === 'vapi';
+    const directProviderMode = !managedAgentMode && !vapiMode;
+    const callDefaults = directProviderMode
+      ? resolveCallProviderDefaults({
+        ...providerStatus,
+        provider: activeProvider,
+        providers: {
+          ...(providerStatus.providers || {}),
+          call: { ...(providerStatus.providers?.call || {}), provider: activeProvider },
+        },
+      })
+      : selectionState;
     flow.touch('provider-resolved');
 
     const businessOptions = await getBusinessOptions();
@@ -797,32 +1098,46 @@ async function callFlow(conversation, ctx) {
       }
     }
 
-    const configurationMode = await askOptionWithButtons(
-      conversation,
-      ctx,
-      '⚙️ How would you like to configure this call?',
-      [
-        { id: 'script', label: '📁 Use call script' },
-        { id: 'custom', label: '🛠️ Build custom persona' },
-        { id: 'cancel', label: '❌ Cancel' }
-      ],
-      { prefix: 'call-config', columns: 1 }
-    );
-    ensureActive();
-    if (!configurationMode || configurationMode.id === 'cancel') {
-      await ctx.reply(cancelledMessage('Call setup', 'Use /call to start again.'), {
-        parse_mode: 'Markdown',
-        reply_markup: buildBackToMenuReplyMarkup(ctx, {
-          backAction: 'CALL',
-          backLabel: '⬅️ Back to Call'
-        })
-      });
-      return;
-    }
-
     let configuration = null;
-    if (configurationMode.id === 'script') {
-      const selection = await selectCallScript(conversation, ctx, ensureActive);
+    let cartesiaProfile = null;
+    let vapiCallSetup = null;
+    if (managedAgentMode) {
+      const businessId = String(config.defaultBusinessId || '').trim();
+      if (!businessId) throw Object.assign(new Error('Set DEFAULT_BUSINESS_ID and authorize this Telegram account as a business call operator before using Cartesia Managed Agents.'), { code: 'call_cartesia_business_missing' });
+      const profileResponse = await httpClient.get(ctx, `${config.apiUrl.replace(/\/+$/, '')}/api/cartesia/provider-defaults`, {
+        params: { business_id: businessId }, timeout: 10000, retry: { retries: 0 }
+      });
+      ensureActive();
+      cartesiaProfile = profileResponse?.data?.profile || {};
+      if (!cartesiaProfile.agent_id || !cartesiaProfile.from_number_id) throw Object.assign(new Error('Cartesia Managed Agent defaults are incomplete. Ask a Cartesia administrator to set the business agent and source number in /cartesia.'), { code: 'call_cartesia_defaults_missing' });
+      configuration = {
+        payloadUpdates: { business_id: businessId, provider: 'cartesia', agent_id: cartesiaProfile.agent_id, from_number_id: cartesiaProfile.from_number_id },
+        summary: [`Cartesia agent: ${cartesiaProfile.agent_id}`, `Source number ID: ${cartesiaProfile.from_number_id}`],
+        meta: { scriptName: 'Cartesia Managed Agent', personaLabel: 'Cartesia Managed Agent' },
+      };
+    } else {
+      const configurationMode = await askOptionWithButtons(
+        conversation,
+        ctx,
+        vapiMode ? '⚙️ Vapi uses a synced call script. Select a script to continue.' : '⚙️ How would you like to configure this call?',
+        [
+          { id: 'script', label: '📁 Use call script' },
+          ...(!vapiMode ? [{ id: 'custom', label: '🛠️ Build custom persona' }] : []),
+          { id: 'cancel', label: '❌ Cancel' }
+        ],
+        { prefix: 'call-config', columns: 1 }
+      );
+      ensureActive();
+      if (!configurationMode || configurationMode.id === 'cancel') {
+        await ctx.reply(cancelledMessage('Call setup', 'Use /call to start again.'), {
+          parse_mode: 'Markdown',
+          reply_markup: buildBackToMenuReplyMarkup(ctx, { backAction: 'CALL', backLabel: '⬅️ Back to Call' })
+        });
+        return;
+      }
+
+      if (configurationMode.id === 'script') {
+      const selection = await selectCallScript(conversation, ctx, ensureActive, activeProvider);
       if (selection?.status === 'ok') {
         configuration = selection;
       } else if (selection?.status === 'cancel') {
@@ -834,7 +1149,7 @@ async function callFlow(conversation, ctx) {
           })
         });
         return;
-      } else if (selection?.status === 'empty' || selection?.status === 'back') {
+      } else if (!vapiMode && (selection?.status === 'empty' || selection?.status === 'back')) {
         const fallbackChoice = await promptScriptFallback(
           conversation,
           ctx,
@@ -851,17 +1166,19 @@ async function callFlow(conversation, ctx) {
           });
           return;
         }
-      } else if (selection?.status === 'error') {
+      } else if (selection?.status === 'error' || (vapiMode && (selection?.status === 'empty' || selection?.status === 'back'))) {
         await safeReset(ctx, 'call_script_error', {
-          message: '⚠️ Unable to load call scripts.',
-          menuHint: '📋 Check API credentials or use /call to try again.'
+          message: vapiMode ? '⚠️ Vapi requires an existing call script.' : '⚠️ Unable to load call scripts.',
+          menuHint: vapiMode ? '📋 Create a call script, sync its Vapi mapping, then use /call again.' : '📋 Check API credentials or use /call to try again.'
         });
         return;
+      }
       }
     }
     flow.touch('mode-selected');
 
     if (!configuration) {
+      if (vapiMode) throw Object.assign(new Error('Vapi calls require a call script with a current, compatible mapping.'), { code: 'call_vapi_mapping_unavailable' });
       configuration = await buildCustomCallConfig(conversation, ctx, ensureActive, businessOptions);
     }
 
@@ -881,8 +1198,33 @@ async function callFlow(conversation, ctx) {
       number,
       user_chat_id: ctx.from.id.toString(),
       customer_name: victimName || null,
-      ...configuration.payloadUpdates
+      ...configuration.payloadUpdates,
+      preferred_provider: activeProvider
     };
+
+    const scriptVariables = configuration.meta?.placeholderValues && typeof configuration.meta.placeholderValues === 'object'
+      ? configuration.meta.placeholderValues
+      : {};
+    if (activeProvider === 'cartesia' && Object.keys(scriptVariables).length) {
+      payload.dynamic_variables = scriptVariables;
+    }
+
+    if (vapiMode) {
+      const scriptId = Number(configuration.meta?.scriptId || configuration.payloadUpdates?.script_id);
+      const scriptVersion = Number(configuration.meta?.scriptVersion || 1);
+      const vapiSetup = await selectVapiCallSetup(conversation, ctx, ensureActive, { id: scriptId, version: scriptVersion });
+      if (!vapiSetup) {
+        await ctx.reply(cancelledMessage('Vapi call setup', 'Use /call to start again.'), { parse_mode: 'Markdown' });
+        return;
+      }
+      vapiCallSetup = vapiSetup;
+      Object.assign(payload, vapiSetup, {
+        provider: 'vapi',
+        script_version: vapiSetup.script_version,
+        first_message_override: configuration.payloadUpdates?.first_message || undefined,
+        variable_values: scriptVariables,
+      });
+    }
 
     payload.business_id = payload.business_id || config.defaultBusinessId;
     payload.purpose = payload.purpose || config.defaultPurpose;
@@ -905,67 +1247,88 @@ async function callFlow(conversation, ctx) {
       : [];
 
     const defaultVoice = config.defaultVoiceModel;
-    const voiceCatalog = await fetchVoiceModelCatalog(ctx);
-    const availableVoiceModels = Array.isArray(voiceCatalog.models) ? voiceCatalog.models : [];
-    if (availableVoiceModels.length > 8) {
-      await ctx.reply('🔎 Tip: use Search in the voice picker to filter by model id quickly.');
-    }
-
-    const voiceSelection = await askVoiceModelWithPagination(
-      conversation,
-      ctx,
-      {
-        prompt: '🎙️ *Voice selection*\nChoose which voice to use for this call.',
-        models: availableVoiceModels,
-        topOptions: [
-          { id: 'auto', label: '⚙️ Auto (best for flow)' },
-          ...(scriptVoiceModel
-            ? [{ id: 'script', label: `🎤 Script voice (${scriptVoiceModel})` }]
-            : []),
-          ...(defaultVoice && defaultVoice !== scriptVoiceModel
-            ? [{ id: 'default', label: `🎧 Default voice (${defaultVoice})` }]
-            : []),
-        ],
-        bottomOptions: [
-          { id: 'custom', label: '✍️ Custom voice id' },
-          { id: 'cancel', label: '❌ Cancel' },
-        ],
-        prefix: 'call-voice',
-        pageSize: 8,
-        ensureActive,
-      }
-    );
-    ensureActive();
-    if (!voiceSelection || voiceSelection.id === 'cancel') {
-      await ctx.reply(cancelledMessage('Call setup', 'Use /call to start again.'), {
-        parse_mode: 'Markdown',
-        reply_markup: buildBackToMenuReplyMarkup(ctx, {
-          backAction: 'CALL',
-          backLabel: '⬅️ Back to Call'
-        })
-      });
-      return;
-    }
-
-    if (voiceSelection?.id === 'auto') {
+    if (managedAgentMode || vapiMode) {
       payload.voice_model = null;
-    } else if (voiceSelection?.id === 'script' && scriptVoiceModel) {
-      payload.voice_model = scriptVoiceModel;
-    } else if (voiceSelection?.id === 'default') {
-      payload.voice_model = defaultVoice;
-    } else if (voiceSelection?.id?.startsWith('model:')) {
-      payload.voice_model = voiceSelection.id.slice('model:'.length).trim() || null;
-    } else if (voiceSelection?.id === 'custom') {
-      await ctx.reply(setupStepMessage('Voice override', [
-        'Enter the voice model id to use.',
-        'Type `skip` for Auto voice selection.'
-      ]), { parse_mode: 'Markdown' });
-      const voiceMsg = await waitForMessage();
-      let customVoice = voiceMsg?.message?.text?.trim();
-      if (customVoice && customVoice.toLowerCase() === 'skip') {
-        customVoice = null;
+    } else if (callDefaults.aiVoiceEngine === 'cartesia') {
+      payload.voice_model = resolveCallVoiceModel({
+        aiVoiceEngine: callDefaults.aiVoiceEngine,
+        scriptVoiceModel,
+      });
+    } else {
+      const voiceCatalog = await fetchVoiceModelCatalog(ctx);
+      const availableVoiceModels = Array.isArray(voiceCatalog.models) ? voiceCatalog.models : [];
+      const configuredVoice = voiceCatalog.source === 'bot_fallback'
+        ? null
+        : voiceCatalog.defaults?.runtime_voice_model || null;
+      if (!advancedVoiceOptions) {
+        payload.voice_model = resolveCallVoiceModel({
+          aiVoiceEngine: callDefaults.aiVoiceEngine,
+          scriptVoiceModel,
+          configuredVoice,
+        });
+      } else {
+        if (availableVoiceModels.length > 8) {
+          await ctx.reply('🔎 Tip: use Search in the voice picker to filter by model id quickly.');
+        }
+        const advancedDefaultVoice = configuredVoice || defaultVoice;
+
+        const voiceSelection = await askVoiceModelWithPagination(
+          conversation,
+          ctx,
+          {
+            prompt: '🎙️ *Voice selection*\nChoose which voice to use for this call.',
+            models: availableVoiceModels,
+            topOptions: [
+              { id: 'auto', label: '⚙️ Auto (best for flow)' },
+              ...(scriptVoiceModel
+                ? [{ id: 'script', label: `🎤 Script voice (${scriptVoiceModel})` }]
+                : []),
+              ...(advancedDefaultVoice && advancedDefaultVoice !== scriptVoiceModel
+                ? [{ id: 'default', label: `🎧 Default voice (${advancedDefaultVoice})` }]
+                : []),
+            ],
+            bottomOptions: [
+              { id: 'custom', label: '✍️ Custom voice id' },
+              { id: 'cancel', label: '❌ Cancel' },
+            ],
+            prefix: 'call-voice',
+            pageSize: 8,
+            ensureActive,
+          }
+        );
+        ensureActive();
+        if (!voiceSelection || voiceSelection.id === 'cancel') {
+          await ctx.reply(cancelledMessage('Call setup', 'Use /call to start again.'), {
+            parse_mode: 'Markdown',
+            reply_markup: buildBackToMenuReplyMarkup(ctx, {
+              backAction: 'CALL',
+              backLabel: '⬅️ Back to Call'
+            })
+          });
+          return;
+        }
+
+        if (voiceSelection?.id === 'auto') {
+          payload.voice_model = null;
+        } else if (voiceSelection?.id === 'script' && scriptVoiceModel) {
+          payload.voice_model = scriptVoiceModel;
+        } else if (voiceSelection?.id === 'default') {
+          payload.voice_model = advancedDefaultVoice;
+        } else if (voiceSelection?.id?.startsWith('model:')) {
+          payload.voice_model = voiceSelection.id.slice('model:'.length).trim() || null;
+        } else if (voiceSelection?.id === 'custom') {
+          await ctx.reply(setupStepMessage('Voice override', [
+            'Enter the voice model id to use.',
+            'Type `skip` for Auto voice selection.'
+          ]), { parse_mode: 'Markdown' });
+          const voiceMsg = await waitForMessage();
+          let customVoice = voiceMsg?.message?.text?.trim();
+          if (customVoice && customVoice.toLowerCase() === 'skip') {
+            customVoice = null;
+          }
+          payload.voice_model = customVoice || null;
+        }
       }
-      payload.voice_model = customVoice || null;
     }
 
     if (!payload.first_message) {
@@ -985,6 +1348,9 @@ async function callFlow(conversation, ctx) {
     const placeholderSummary = formatPlaceholderSummary(configuration?.meta?.placeholderValues);
     const providerLabel = activeProvider ? toTitleCase(activeProvider) : 'Unknown';
     const expectedFollowUpMode = getExpectedFollowUpMode(attachedProfile || payload.purpose);
+    const selectedProviderReady = managedAgentMode || vapiMode
+      ? true
+      : callDefaults.readiness?.[activeProvider] ?? callDefaults.providerReady;
 
     const detailLines = [
       buildLine('📋', 'To', number),
@@ -995,9 +1361,41 @@ async function callFlow(conversation, ctx) {
       scriptObjectiveTags.length
         ? buildLine('🏷️', 'Objective tags', escapeMarkdown(scriptObjectiveTags.join(', ')))
         : null,
-      buildLine('🎤', 'Voice', escapeMarkdown(payload.voice_model || 'Auto (best for flow)')),
+      buildLine(
+        '🎤',
+        managedAgentMode ? 'Managed agent' : vapiMode ? 'Vapi assistant' : callDefaults.aiVoiceEngine === 'cartesia' ? 'Cartesia voice' : 'Voice',
+        escapeMarkdown(managedAgentMode
+          ? cartesiaProfile.agent_id
+          : vapiMode
+            ? `Mapping ${vapiCallSetup.mapping_id}`
+            : callDefaults.aiVoiceEngine === 'cartesia'
+          ? callDefaults.cartesiaProfile.voice_id
+          : payload.voice_model || (advancedVoiceOptions ? 'Auto (best for flow)' : 'Configured default'))
+      ),
+      !managedAgentMode && !vapiMode && callDefaults.aiVoiceEngine === 'cartesia'
+        ? buildLine('🧠', 'TTS model', escapeMarkdown(callDefaults.cartesiaProfile.model_id))
+        : null,
+      buildLine('🧠', 'AI voice engine', managedAgentMode ? 'Cartesia Managed Agent' : vapiMode ? 'Vapi' : toTitleCase(callDefaults.aiVoiceEngine)),
       payload.purpose ? buildLine('🎯', 'Purpose', escapeMarkdown(payload.purpose)) : null,
       buildLine('📡', 'Provider', escapeMarkdown(providerLabel)),
+      buildLine(
+        '✅',
+        'Telephony configuration',
+        selectedProviderReady === true
+          ? 'Ready'
+          : selectedProviderReady === false
+            ? 'Not ready'
+            : 'Not verified'
+      ),
+      buildLine(
+        '🛡️',
+        'Consent and contact policy',
+        'Checked by the API before dispatch; no call is placed if blocked'
+      ),
+      !managedAgentMode && !vapiMode && (callDefaults.providerHealth?.degraded === true ||
+      callDefaults.providerHealth?.circuit_state === 'open')
+        ? buildLine('⚠️', 'Provider health', 'Recent API errors detected; provider routing may fail over')
+        : null,
       buildLine('🔒', 'Profile lock', escapeMarkdown(formatCallProfileLockState(payload.conversation_profile_lock))),
       buildLine('🧩', 'Placeholder values', escapeMarkdown(placeholderSummary)),
       buildLine('🪜', 'Follow-up mode', escapeMarkdown(expectedFollowUpMode))
@@ -1078,6 +1476,37 @@ async function callFlow(conversation, ctx) {
     }
     await sendEphemeral(ctx, '⏳ Making the call…');
 
+    const persistedSubmission = await botDb.getOutboundCallSubmission(ctx.from?.id);
+    if (persistedSubmission) ctx.session.outboundCallSubmission = persistedSubmission;
+    if (forceFreshCallSubmission) {
+      if (ctx.session.outboundCallSubmission?.outcomeUncertain === true) {
+        await notifyCallError(ctx, 'A previous call may still have been accepted. Check /calllog or /callmonitor before starting a fresh call.');
+        await safeReset(ctx, 'call_fresh_retry_blocked', {
+          message: '⚠️ No new call was started.',
+          menuHint: '📋 Review call history before another attempt.'
+        });
+        return;
+      }
+      const priorKey = ctx.session.outboundCallSubmission?.idempotencyKey;
+      if (priorKey) await botDb.clearOutboundCallSubmission(ctx.from?.id, priorKey);
+      delete ctx.session.outboundCallSubmission;
+    }
+    const submission = prepareCallSubmission(ctx.session, payload);
+    if (submission.blocked) {
+      await notifyCallError(ctx, [
+        'A previous call with different details may still have been accepted.',
+        'Check /calllog or /callmonitor before starting another call. To safely replay the same request, use the same call details so VOICEDNUT can reuse its submission key.'
+      ]);
+      await safeReset(ctx, 'call_submission_uncertain', {
+        message: '⚠️ No new call was started.',
+        menuHint: '📋 Review call history, then retry with the same details if appropriate.'
+      });
+      return;
+    }
+    callSubmissionKey = submission.idempotencyKey;
+    payload.idempotency_key = callSubmissionKey;
+    await persistCallSubmission(ctx, callSubmissionKey);
+
     const payloadForLog = { ...payload };
     if (payloadForLog.prompt) {
       payloadForLog.prompt = `${payloadForLog.prompt.substring(0, 50)}${payloadForLog.prompt.length > 50 ? '...' : ''}`;
@@ -1085,10 +1514,30 @@ async function callFlow(conversation, ctx) {
 
     console.log('Sending call request to API');
 
+    if (managedAgentMode) {
+      const approvalPayload = {
+        business_id: payload.business_id,
+        destination: payload.number,
+        agent_id: payload.agent_id,
+        from_number_id: payload.from_number_id,
+        idempotency_key: payload.idempotency_key,
+        dynamic_variables: payload.dynamic_variables || {},
+        confirmation_phrase: buildCartesiaConfirmationPhrase(payload),
+      };
+      const approvalResponse = await httpClient.post(ctx, `${config.apiUrl.replace(/\/+$/, '')}/api/cartesia/call-approval`, approvalPayload, {
+        timeout: 12000,
+        retry: { retries: 0 },
+      });
+      const approvalToken = String(approvalResponse?.data?.approval_token || '').trim();
+      if (!approvalToken) throw Object.assign(new Error('Cartesia did not return call approval. No call was submitted.'), { code: 'cartesia_approval_unavailable' });
+      payload.approval_token = approvalToken;
+    }
+
     const controller = new AbortController();
     const release = registerAbortController(ctx, controller);
     let data;
     try {
+      callRequestStarted = true;
       const response = await httpClient.post(ctx, `${config.apiUrl}/outbound-call`, payload, {
         headers: {
           'Content-Type': 'application/json'
@@ -1102,9 +1551,34 @@ async function callFlow(conversation, ctx) {
       release();
     }
     if (data?.success && data.call_sid) {
+      resolveCallSubmissionOutcome(ctx.session, callSubmissionKey, false, {
+        call_sid: data.call_sid,
+        status: data.status,
+        provider: data.provider,
+      });
+      await persistCallSubmission(ctx, callSubmissionKey).catch((error) => {
+        console.error('call_submission_confirmation_state_persist_failed', {
+          code: String(error?.code || 'storage_error').slice(0, 80),
+        });
+      });
+      try {
+        await ctx.reply(formatCallAcceptedMessage(data), {
+          reply_markup: buildBackToMenuReplyMarkup(ctx, {
+            backAction: 'CALL',
+            backLabel: '⬅️ Back to Call'
+          })
+        });
+      } catch (error) {
+        console.error('call_acceptance_confirmation_delivery_failed', {
+          call_reference: String(data.call_sid).replace(/[^A-Za-z0-9]/g, '').slice(-8) || null,
+          code: String(error?.code || 'telegram_delivery_failed').slice(0, 80)
+        });
+      }
       flow.touch('completed');
     } else {
-      await ctx.reply('⚠️ Call was sent but response format unexpected. Check logs.', {
+      resolveCallSubmissionOutcome(ctx.session, callSubmissionKey, true);
+      await persistCallSubmission(ctx, callSubmissionKey).catch(() => {});
+      await ctx.reply(`⚠️ The call response was incomplete, so VOICEDNUT could not confirm whether a call was created. Do not retry yet. ${getReconciliationInstruction(activeProvider)}`, {
         reply_markup: buildBackToMenuReplyMarkup(ctx, {
           backAction: 'CALL',
           backLabel: '⬅️ Back to Call'
@@ -1112,8 +1586,35 @@ async function callFlow(conversation, ctx) {
       });
     }
   } catch (error) {
+    if (callSubmissionKey) {
+      resolveCallSubmissionOutcome(ctx.session, callSubmissionKey,
+        callRequestStarted && isUncertainCallSubmissionError(error));
+      await persistCallSubmission(ctx, callSubmissionKey).catch((persistError) => {
+        console.error('call_submission_recovery_state_persist_failed', {
+          code: String(persistError?.code || 'storage_error').slice(0, 80),
+        });
+      });
+    }
     if (error instanceof OperationCancelledError || error?.name === 'AbortError' || error?.name === 'CanceledError') {
       console.log('Call flow cancelled');
+      return;
+    }
+
+    if ([
+      'call_provider_config_invalid',
+      'call_provider_operation_unsupported',
+      'call_provider_not_ready',
+      'call_voice_engine_config_invalid',
+      'call_cartesia_profile_incomplete',
+      'call_cartesia_business_missing',
+      'call_cartesia_defaults_missing',
+      'call_vapi_mapping_unavailable', 'call_vapi_number_unavailable'
+    ].includes(error?.code)) {
+      await notifyCallError(ctx, error.message);
+      await safeReset(ctx, 'call_provider_config_error', {
+        message: '⚠️ Provider setup needs attention.',
+        menuHint: '📋 Review /provider or /cartesia settings, then use /call again.'
+      });
       return;
     }
 
@@ -1127,16 +1628,30 @@ async function callFlow(conversation, ctx) {
     if (error.response) {
       const status = error.response.status;
       const apiError = (error.response.data?.error || '').toString();
+      const apiCode = String(error.response.data?.code || '').toLowerCase();
       const unknownBusinessMatch = apiError.match(/Unknown business_id "([^"]+)"/i);
-      if (unknownBusinessMatch) {
+      if (apiCode === 'outbound_persistence_failed') {
+        await notifyCallError(ctx, `The provider may have accepted this call, but VOICEDNUT could not confirm it was saved. Do not retry yet. ${getReconciliationInstruction(activeProvider)}`);
+        handled = true;
+      } else if (apiCode.startsWith('outbound_') &&
+          /(consent|opted_out|cooldown|quiet_hours|emergency_stop|contact_policy)/.test(apiCode)) {
+        await notifyCallError(ctx, 'The business contact or safety policy blocked this call before provider dispatch. No call was placed; ask a policy manager to review consent and settings.');
+        handled = true;
+      } else if (unknownBusinessMatch) {
         const invalidId = unknownBusinessMatch[1];
         await notifyCallError(ctx, `${tipLine('🧩', `Unrecognized service “${escapeMarkdown(invalidId)}”. Choose a valid profile.`)}`);
         handled = true;
+      } else if (apiCode === 'provider_operation_unsupported') {
+        await notifyCallError(ctx, apiError || 'The selected telephony provider cannot place this call. Review /provider and choose a direct-call provider.');
+        handled = true;
       } else if (status === 400) {
-        await notifyCallError(ctx, 'Invalid request. Check the provided details and try again.');
+        const detail = apiError.trim().slice(0, 300);
+        await notifyCallError(ctx, detail
+          ? `Call setup needs attention: ${escapeMarkdown(detail)}`
+          : 'Invalid call setup. Review the selected script and required details, then try again.');
         handled = true;
       } else if (status === 401 || status === 403) {
-        await notifyCallError(ctx, 'Not authorized. Check the ADMIN token / API secret.');
+        await notifyCallError(ctx, 'Your account or selected business is not authorized to place this call. Ask an administrator to review your access.');
         handled = true;
       } else if (status === 503) {
         await notifyCallError(ctx, 'Service unavailable. Please try again shortly.');
@@ -1149,7 +1664,7 @@ async function callFlow(conversation, ctx) {
         handled = true;
       }
     } else if (error.request) {
-      await notifyCallError(ctx, httpClient.getUserMessage(error, 'API unreachable. Please try again.'));
+      await notifyCallError(ctx, `VOICEDNUT did not receive confirmation from the API. Do not retry yet. ${getReconciliationInstruction(activeProvider)}`);
       handled = true;
     } else {
       await notifyCallError(ctx, httpClient.getUserMessage(error, `Unexpected error: ${escapeMarkdown(error.message)}`));
@@ -1167,10 +1682,16 @@ function registerCallCommand(bot) {
   bot.command('call', async (ctx) => {
     try {
       console.log(`Call command started by user ${ctx.from?.id || 'unknown'}`);
+      const requestedMode = String(ctx.message?.text || '').trim().split(/\s+/).slice(1)[0]?.toLowerCase() || '';
+      if (requestedMode && !['advanced', 'new'].includes(requestedMode)) {
+        return ctx.reply('Usage: /call, /call advanced, or /call new');
+      }
       const access = await getAccessProfile(ctx);
       if (!access.isAuthorized) {
         return ctx.reply('❌ Access denied. Your account is not authorized for this action.');
       }
+      ctx.session.callAdvancedVoiceOptions = requestedMode === 'advanced';
+      ctx.session.callForceNewSubmission = requestedMode === 'new';
       await ctx.conversation.enter('call-conversation');
     } catch (error) {
       console.error('Error starting call conversation:', error);
@@ -1181,5 +1702,15 @@ function registerCallCommand(bot) {
 
 module.exports = {
   callFlow,
+  formatCallAcceptedMessage,
+  getReconciliationInstruction,
+  buildCartesiaConfirmationPhrase,
+  resolveCallProviderDefaults,
+  getCallProviderSelectionState,
+  resolveCallVoiceModel,
+  prepareCallSubmission,
+  resolveCallSubmissionOutcome,
+  persistCallSubmission,
+  isUncertainCallSubmissionError,
   registerCallCommand
 };

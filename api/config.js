@@ -681,7 +681,7 @@ const inboundCallbackDelayMinutes = Number(
 );
 
 const providerFailoverEnabled =
-  String(readEnv("PROVIDER_FAILOVER_ENABLED") || "true").toLowerCase() ===
+  String(readEnv("PROVIDER_FAILOVER_ENABLED") || "false").toLowerCase() ===
   "true";
 const providerFailoverThreshold = Number(
   readEnv("PROVIDER_ERROR_THRESHOLD") || "3",

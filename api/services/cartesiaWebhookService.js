@@ -43,12 +43,22 @@ function safeProviderText(value, maxLength = 100) {
 
 function normalizeCartesiaWebhookEvent(body) {
   const type = String(body?.type || '').trim();
+  if (!type) {
+    throw webhookError('cartesia_webhook_invalid', 'Cartesia webhook event type is missing', 400);
+  }
+  if (!EVENT_TYPES.has(type)) {
+    return Object.freeze({
+      ignored: true,
+      type,
+      timestamp: normalizeTimestamp(body?.timestamp) || new Date().toISOString(),
+    });
+  }
   const eventId = String(body?.webhook_request_id || '').trim();
   const providerCallId = String(body?.call_id || '').trim();
   const agentId = String(body?.agent_id || '').trim();
   const webhookId = String(body?.webhook_id || '').trim();
   const timestamp = normalizeTimestamp(body?.timestamp);
-  if (!EVENT_TYPES.has(type) || !/^[A-Za-z0-9_-]{1,200}$/.test(eventId) ||
+  if (!/^[A-Za-z0-9_-]{1,200}$/.test(eventId) ||
       !/^[A-Za-z0-9_-]{1,200}$/.test(providerCallId) ||
       !/^[A-Za-z0-9_-]{1,200}$/.test(agentId) ||
       !/^[A-Za-z0-9_-]{1,200}$/.test(webhookId) || !timestamp) {
@@ -188,23 +198,35 @@ async function syncCommonOutboundCall(db, callRecord, businessScope) {
     return;
   }
 
-  await db.updateCallStatus(callId, update.status, update.additionalData);
-  await db.updateCallState(callId, `cartesia_${callRecord.status}`, {
+  const persistedCartesiaCall = typeof db.getCartesiaCallRecord === 'function'
+    ? await db.getCartesiaCallRecord(callId)
+    : null;
+  const effectiveProviderStatus = persistedCartesiaCall?.status || callRecord.status;
+  const effectiveUpdate = getCommonCallStatusUpdate({ ...callRecord, status: effectiveProviderStatus });
+  if (!effectiveUpdate) return;
+
+  const currentCallStatus = String(call.status || '').toLowerCase().replace(/_/g, '-');
+  const terminalStatuses = new Set(['completed', 'busy', 'no-answer', 'failed', 'canceled', 'voicemail']);
+  if (terminalStatuses.has(currentCallStatus) && !terminalStatuses.has(effectiveUpdate.status)) return;
+  if (currentCallStatus === effectiveUpdate.status) return;
+
+  await db.updateCallStatus(callId, effectiveUpdate.status, effectiveUpdate.additionalData);
+  await db.updateCallState(callId, `cartesia_${effectiveProviderStatus}`, {
     provider: 'cartesia',
     provider_call_id: callId,
-    provider_status: callRecord.status,
+    provider_status: effectiveProviderStatus,
     end_reason: callRecord.end_reason || null,
     event_timestamp: callRecord.event_timestamp,
   });
   const latestCall = await db.getCall(callId);
-  if (String(latestCall?.status || '').toLowerCase().replace(/_/g, '-') !== update.status) return;
+  if (String(latestCall?.status || '').toLowerCase().replace(/_/g, '-') !== effectiveUpdate.status) return;
 
   const chatId = String(call.user_chat_id || '').trim();
   if (!chatId) return;
   if (typeof db.createEnhancedWebhookNotificationOnce === 'function') {
-    await db.createEnhancedWebhookNotificationOnce(callId, update.notificationType, chatId);
+    await db.createEnhancedWebhookNotificationOnce(callId, effectiveUpdate.notificationType, chatId);
   } else if (typeof db.createEnhancedWebhookNotification === 'function') {
-    await db.createEnhancedWebhookNotification(callId, update.notificationType, chatId);
+    await db.createEnhancedWebhookNotification(callId, effectiveUpdate.notificationType, chatId);
   }
 }
 
@@ -223,6 +245,9 @@ function createCartesiaWebhookHandler(options = {}) {
       event = normalizeCartesiaWebhookEvent(req.body);
     } catch (error) {
       return res.status(error.status || 400).json({ success: false, code: 'cartesia_webhook_invalid' });
+    }
+    if (event?.ignored) {
+      return res.status(204).end();
     }
     const db = options.db;
     if (typeof db?.recordCartesiaWebhookReceipt !== 'function' ||

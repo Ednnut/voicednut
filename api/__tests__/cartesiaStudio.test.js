@@ -9,6 +9,7 @@ const {
   normalizeSttTurnSettings,
   validateWebhookTool,
   validateClientTool,
+  validateTtsPreview,
   phraseCacheKey,
 } = require("../services/cartesiaStudioService");
 
@@ -357,7 +358,7 @@ describe("CartesiaStudioService", () => {
       async listVoices() { return { data: [{ id: "voice_1", name: "Speaker", language: "en", is_pro: true, accents: [{ locale: "en-US", accent: "general-american", is_native: true }], prompt: "sensitive", secret: "hidden" }] }; },
       async cloneVoice(input) { received = input; return { id: "voice_2", name: input.name, language: input.language, access: input.access }; },
     }, voiceGovernanceStore });
-    assert.deepEqual(await service.listVoices(), { voices: [{ id: "voice_1", name: "Speaker", language: "en", access: null, isOwner: false, isPro: true, createdAt: null, accents: [{ locale: "en-US", accent: "general-american", isNative: true }] }] });
+    assert.deepEqual(await service.listVoices(), { voices: [{ id: "voice_1", name: "Speaker", description: null, language: "en", gender: null, access: null, isOwner: false, isPro: true, createdAt: null, accents: [{ locale: "en-US", accent: "general-american", isNative: true }] }], hasMore: false, nextPage: null });
     const clone = await service.createInstantVoiceClone({ clip: Buffer.from("synthetic"), name: "Team Voice", language: "en", access: "public", consentActorId: '7001', consentPhrase: 'I CONFIRM SPEAKER CONSENT AND CREATE CARTESIA CLONE TEAM VOICE' });
     assert.equal(received.access, "private");
     assert.equal(clone.voice.id, "voice_2");
@@ -765,6 +766,23 @@ describe("CartesiaStudioService", () => {
     assert.throws(() => validateSttKeyterms(["duplicate", "DUPLICATE"]), { code: "cartesia_stt_keyterms_duplicate" });
     assert.deepEqual(normalizeSttTurnSettings({}), { start_threshold: 0.8, eager_end_threshold: 0.6, end_threshold: 0.3, end_timeout_ms: 5600 });
     assert.throws(() => normalizeSttTurnSettings({ start_threshold: 0.5 }), { code: "cartesia_stt_turn_settings_invalid" });
+  });
+
+  it("normalizes documented WAV and MP3 output formats for Cartesia previews", () => {
+    const wav = validateTtsPreview({
+      voice_id: "voice_1", model_id: "sonic-3.6", transcript: "Hello",
+      output_format: { container: "wav", encoding: "pcm_s16le", sample_rate: 24000 },
+    });
+    assert.deepEqual(wav.output_format, { container: "wav", encoding: "pcm_s16le", sample_rate: 24000 });
+    const mp3 = validateTtsPreview({
+      voice_id: "voice_1", model_id: "sonic-3.6", transcript: "Hello",
+      output_format: { container: "mp3", sample_rate: 24000, bit_rate: 128000 },
+    });
+    assert.deepEqual(mp3.output_format, { container: "mp3", sample_rate: 24000, bit_rate: 128000 });
+    assert.throws(() => validateTtsPreview({
+      voice_id: "voice_1", model_id: "sonic-3.6", transcript: "Hello",
+      output_format: { container: "mp3", encoding: "pcm_s16le", sample_rate: 24000 },
+    }), { code: "cartesia_tts_preview_format_invalid" });
   });
 
   it("limits pronunciation dictionary items and blocks private or mutating webhook targets", () => {

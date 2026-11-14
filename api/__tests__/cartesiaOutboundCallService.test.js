@@ -36,6 +36,7 @@ function makeHarness(overrides = {}) {
       ...overrides.outboundSafety,
     },
     approvalSecret: "test-approval-secret-which-is-long-enough-123",
+    enabled: overrides.enabled,
     now: () => 1000,
   });
   return { service, state };
@@ -47,6 +48,27 @@ const input = {
 };
 
 describe("CartesiaOutboundCallService", () => {
+  it("writes accepted Cartesia calls to common activity history with actor and business scope", async () => {
+    const writes = [];
+    const { service } = makeHarness({ db: {
+      async upsertCartesiaCallRecord(row) { writes.push(["cartesia", row]); },
+      async getCall() { return null; },
+      async createCall(row) { writes.push(["common", row]); },
+      async updateCallState(...args) { writes.push(["state", ...args]); },
+    } });
+    await service.recordAcceptedCall({ actorId: "7001", businessId: "biz-1", destination: "+14155550123", agentId: "agent_1", fromNumberId: "ap_number_1" }, "agent_call_1");
+    assert.equal(writes[0][1].local_call_id, "cartesia_agent_call_1");
+    assert.equal(writes[1][1].call_sid, "cartesia_agent_call_1");
+    assert.equal(writes[1][1].user_chat_id, "7001");
+    assert.equal(writes[1][1].business_id, "biz-1");
+    assert.equal(writes[2][3].provider_call_id, "agent_call_1");
+  });
+
+  it("keeps Managed Agent dispatch closed when its feature gate is off", async () => {
+    const { service } = makeHarness({ enabled: false });
+    await assert.rejects(service.createApproval({ ...input, confirmation_phrase: buildCartesiaConfirmationPhrase(input) }), { code: "cartesia_not_configured" });
+  });
+
   it("requires exact typed confirmation and issues an actor- and request-bound approval", async () => {
     const { service, state } = makeHarness();
     await assert.rejects(service.createApproval({ ...input, confirmation_phrase: "yes" }), { code: "cartesia_confirmation_required" });
@@ -89,6 +111,29 @@ describe("CartesiaOutboundCallService", () => {
       phoneNumbers: [{ id: "ap_number_1", displayNumber: "••••0111" }],
       ready: true,
     }]);
+  });
+
+  it("blocks approval when an attached Cartesia agent has no live deployment", async () => {
+    const { service, state } = makeHarness({ client: {
+      async getAgent(agentId) { return { id: agentId, name: 'Support', phone_numbers: [{ id: 'ap_number_1' }] }; },
+      async listAgentDeployments() { return [{ id: 'deploy_1', agent_id: 'agent_1', status: 'ready', is_live: false }]; },
+    } });
+    await assert.rejects(service.createApproval({
+      ...input,
+      confirmation_phrase: buildCartesiaConfirmationPhrase(input),
+    }), (error) => error.code === 'cartesia_agent_deployment_not_ready');
+    assert.equal(state.calls, 0);
+  });
+
+  it("writes accepted Cartesia call metadata immediately for shared provider history", async () => {
+    const records = [];
+    const { service } = makeHarness({ db: { async upsertCartesiaCallRecord(record) { records.push(record); } } });
+    const approval = await service.createApproval({ ...input, confirmation_phrase: buildCartesiaConfirmationPhrase(input) });
+    await service.createOutboundCall({ ...input, approval_token: approval.approvalToken });
+    assert.equal(records.length, 1);
+    assert.equal(records[0].provider_call_id, "agent_call_1");
+    assert.equal(records[0].business_scope_resolved, true);
+    assert.equal(records[0].direction, "outbound");
   });
 
   it("stores validated defaults by business, authorizes reads, and validates source ownership on writes", async () => {
@@ -305,12 +350,25 @@ describe("CartesiaOutboundCallService", () => {
     const health = await service.getAgentDeploymentHealth({ agent_id: "agent_1" });
     assert.equal(health.agent.name, "Support");
     assert.equal(health.ready, false);
-    assert.deepEqual(health.warnings, ["deployment_build_failed", "deployment_failed"]);
+    assert.deepEqual(health.warnings, ["deployment_build_failed"]);
     assert.deepEqual(health.deployments[0], {
       id: "deploy_live", versionId: "version_1", status: "running", isLive: true, isPinned: true,
       createdAt: null, updatedAt: null, buildCompletedAt: null, buildFailed: true, deploymentFailed: false,
     });
     assert.doesNotMatch(JSON.stringify(health), /private prompt|private logs|secret build path|private deployment details|\+14155550111/);
+  });
+
+  it("ignores failed historical Cartesia deployments when the current live deployment is healthy", async () => {
+    const { service } = makeHarness({ client: {
+      async getAgent() { return { id: "agent_1", name: "Support", phone_numbers: [{ id: "ap_number_1" }] }; },
+      async listAgentDeployments() { return [
+        { id: "deploy_live", agent_id: "agent_1", status: "running", is_live: true },
+        { id: "deploy_old", agent_id: "agent_1", status: "failed", deployment_error: "old failure" },
+      ]; },
+    } });
+    const health = await service.getAgentDeploymentHealth({ agent_id: "agent_1" });
+    assert.equal(health.ready, true);
+    assert.deepEqual(health.warnings, []);
   });
 
   it("rechecks status immediately before canceling and refuses inactive calls", async () => {

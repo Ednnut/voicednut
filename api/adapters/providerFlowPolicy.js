@@ -242,7 +242,7 @@ function resolveProviderExecutionOrder(options = {}) {
     readiness = {},
     requestedFlow = null,
     context = {},
-    failoverEnabled = true,
+    failoverEnabled = false,
     isProviderDegraded = () => false,
     getProviderHealthScore = null,
   } = options;

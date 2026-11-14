@@ -165,7 +165,7 @@ async function request(method, ctx, url, data, options = {}) {
   const normalized = normalizeOptions(options, url);
   let callEActorHeaders = {};
   const pathname = new URL(url, config.apiUrl).pathname;
-  if (pathname.startsWith('/api/call-e/') || pathname.startsWith('/api/cartesia/') || pathname === '/outbound-call' || /\/api\/call-scripts\/\d+\/vapi-call$/.test(pathname)) {
+  if (pathname.startsWith('/api/call-e/') || pathname.startsWith('/api/cartesia/') || pathname.startsWith('/api/calls/activity') || pathname === '/outbound-call' || /\/api\/call-scripts\/\d+\/vapi-call$/.test(pathname)) {
     callEActorHeaders = createCallEActorAssertionHeaders({
       actorId: ctx?.from?.id || data?.user_chat_id || data?.actor_id,
       method,

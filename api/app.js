@@ -40,6 +40,10 @@ const { CartesiaStudioService } = require("./services/cartesiaStudioService");
 const { CartesiaPhraseCacheStore } = require("./services/cartesiaPhraseCacheStore");
 const { CartesiaSttProfileStore } = require("./services/cartesiaSttProfileStore");
 const { CartesiaAgentProfileStore } = require("./services/cartesiaAgentProfileStore");
+const {
+  CartesiaSpeechSettingsStore,
+  applyBusinessSpeechProfile,
+} = require("./services/cartesiaSpeechSettingsStore");
 const { registerCartesiaStudioRoutes } = require("./services/cartesiaStudioRoutes");
 const { registerCartesiaWebhookRoutes } = require("./services/cartesiaWebhookRoutes");
 const { CartesiaKnowledgeBaseClient } = require("./services/cartesiaKnowledgeBaseClient");
@@ -53,6 +57,7 @@ const { registerWebhookRoutes } = require("./services/webhookRoutes");
 const Database = require("./db/db");
 const { webhookService } = require("./routes/status");
 const twilioSignature = require("./middleware/twilioSignature");
+const { validatePlivoSignatureV3 } = require("./middleware/plivoSignatureV3");
 const DynamicFunctionEngine = require("./functions/DynamicFunctionEngine");
 const { createDigitCollectionService } = require("./functions/Digit");
 const { formatDigitCaptureLabel } = require("./functions/Labels");
@@ -393,6 +398,7 @@ const sttLastFrameAt = new Map(); // callSid -> timestamp
 const streamWatchdogState = new Map(); // callSid -> { noMediaNotifiedAt, noMediaEscalatedAt, sttNotifiedAt }
 const greetingRecoveryWatchdogs = new Map(); // callSid -> { timer, retries, ... }
 const providerEventDedupe = new Map(); // source:hash -> ts
+const plivoSignatureV3Nonces = new Map();
 const providerHealth = new Map();
 const keypadProviderGuardWarnings = new Set(); // provider -> warning emitted
 const keypadProviderOverrides = new Map(); // scopeKey -> { provider, expiresAt, ... }
@@ -3500,11 +3506,8 @@ async function shouldProcessProviderEventAsync(
   dedupePayload = {},
   options = {},
 ) {
-  if (!shouldProcessProviderEvent(source, dedupePayload, options)) {
-    return false;
-  }
   if (!db?.reserveProviderEventIdempotency) {
-    return true;
+    return shouldProcessProviderEvent(source, dedupePayload, options);
   }
   const ttlMs =
     Number.isFinite(Number(options.ttlMs)) && Number(options.ttlMs) > 0
@@ -3518,13 +3521,29 @@ async function shouldProcessProviderEventAsync(
       event_key: fingerprint.key,
       ttl_ms: ttlMs,
     });
-    return reserved?.reserved !== false;
+    if (reserved?.reserved === false) {
+      return false;
+    }
+    providerEventDedupe.set(fingerprint.key, Date.now());
+    pruneDedupeMap(providerEventDedupe, PROVIDER_EVENT_DEDUPE_MAX);
+    return true;
   } catch (error) {
     console.error("Provider event idempotency persistence failed:", error);
     const dedupeError = new Error("provider_event_idempotency_unavailable");
     dedupeError.code = "provider_event_idempotency_unavailable";
     dedupeError.cause = error;
     throw dedupeError;
+  }
+}
+
+async function releaseProviderEventAsync(source, dedupePayload = {}) {
+  const fingerprint = buildProviderEventFingerprint(source, dedupePayload);
+  providerEventDedupe.delete(fingerprint.key);
+  if (typeof db?.deleteProviderEventIdempotency === "function") {
+    await db.deleteProviderEventIdempotency({
+      source: fingerprint.source,
+      event_key: fingerprint.key,
+    });
   }
 }
 
@@ -4409,6 +4428,7 @@ async function hydrateCallConfigFromDb(callSid) {
     user_chat_id: call.user_chat_id || null,
     customer_name: state?.customer_name || state?.victim_name || null,
     provider: state?.provider || currentProvider,
+    provider_call_id: state?.provider_call_id || null,
     provider_metadata: state?.provider_metadata || null,
     business_context:
       state?.business_context || parsedContext || functionSystem.context,
@@ -7002,7 +7022,6 @@ function buildVonageAnswerWebhookUrl(req, callSid, extraParams = {}) {
   const baseUrl = config.vonage?.voice?.answerUrl || defaultBase;
   return appendQueryParamsToUrl(baseUrl, {
     callSid: callSid || undefined,
-    secret: config.plivo?.webhookSecret || undefined,
     ...extraParams,
   });
 }
@@ -7290,8 +7309,40 @@ function requireValidTelegramWebhook(req, res, label = "") {
   return true;
 }
 
+function consumePlivoSignatureV3Nonce(req) {
+  const nonce = String(
+    req?.headers?.["x-plivo-signature-v3-nonce"] || "",
+  ).trim();
+  const signature = [
+    req?.headers?.["x-plivo-signature-v3"],
+    req?.headers?.["x-plivo-signature-ma-v3"],
+  ].filter(Boolean).join(",");
+  if (!nonce || !signature) return false;
+
+  const now = Date.now();
+  const maxAgeMs = 5 * 60 * 1000;
+  for (const [key, expiresAt] of plivoSignatureV3Nonces.entries()) {
+    if (expiresAt <= now) plivoSignatureV3Nonces.delete(key);
+  }
+  const key = crypto
+    .createHash("sha256")
+    .update(`${nonce}:${signature}`)
+    .digest("hex");
+  if (plivoSignatureV3Nonces.has(key)) return false;
+  plivoSignatureV3Nonces.set(key, now + maxAgeMs);
+  while (plivoSignatureV3Nonces.size > 10000) {
+    plivoSignatureV3Nonces.delete(plivoSignatureV3Nonces.keys().next().value);
+  }
+  return true;
+}
+
 function verifyPlivoWebhookAuth(req, options = {}) {
   const { allowQuerySecret = false } = options;
+  if (validatePlivoSignatureV3(req, config.plivo?.authToken)) {
+    return consumePlivoSignatureV3Nonce(req)
+      ? { ok: true, method: "plivo_signature_v3" }
+      : { ok: false, reason: "plivo_signature_v3_replay" };
+  }
   const expectedSecret = config.plivo?.webhookSecret;
   const providedHeaderSecret = req?.headers?.["x-plivo-webhook-secret"];
   const providedQuerySecret = allowQuerySecret
@@ -14110,7 +14161,11 @@ function getProviderReadiness() {
   ).toLowerCase();
   const plivoWebhookReady =
     plivoWebhookMode !== "strict" ||
-    Boolean(config.plivo?.webhookSecret || config.apiAuth?.hmacSecret);
+    Boolean(
+      config.plivo?.authToken ||
+      config.plivo?.webhookSecret ||
+      config.apiAuth?.hmacSecret,
+    );
   const vonageHasCredentials = !!(
     config.vonage.apiKey &&
     config.vonage.apiSecret &&
@@ -14541,7 +14596,7 @@ function getVoiceProviderRegistry() {
   const registry = new VoiceProviderRegistry();
   registry.register("twilio", {
     capabilities: listProviderFlows(PROVIDER_CHANNELS.CALL, "twilio"),
-    createOutboundCall: async ({ host, number }) => {
+    createOutboundCall: async ({ host, number, callSid }) => {
       warnIfMachineDetectionDisabled("outbound-call");
       const accountSid = config.twilio.accountSid;
       const authToken = config.twilio.authToken;
@@ -14567,6 +14622,7 @@ function getVoiceProviderRegistry() {
           from: fromNumber,
           machineDetection: config.twilio?.machineDetection,
           machineDetectionTimeout: config.twilio?.machineDetectionTimeout,
+          callSid,
         });
       } catch (error) {
         error.providerSubmissionState = "not_submitted";
@@ -14594,27 +14650,33 @@ function getVoiceProviderRegistry() {
         throw error;
       }
       return {
-        callId: call.sid,
+        callId: String(callSid || call.sid),
         providerCallId: call.sid,
         status: call.status || "queued",
+        metadata: { twilio_call_sid: call.sid },
       };
     },
-    endCall: async ({ callId }) => {
+    getCall: async ({ providerCallId }) => {
+      const id = String(providerCallId || "").trim();
+      if (!id || !config.twilio.accountSid || !config.twilio.authToken) throw new Error("Twilio call lookup is not configured");
+      return twilio(config.twilio.accountSid, config.twilio.authToken).calls(id).fetch();
+    },
+    endCall: async ({ callId, providerCallId }) => {
       const accountSid = config.twilio.accountSid;
       const authToken = config.twilio.authToken;
       if (!accountSid || !authToken) {
         throw new Error("Twilio credentials not configured");
       }
       const client = twilio(accountSid, authToken);
-      await client.calls(callId).update({ status: "completed" });
+      await client.calls(providerCallId || callId).update({ status: "completed" });
     },
   });
 
   registry.register("plivo", {
     capabilities: listProviderFlows(PROVIDER_CHANNELS.CALL, "plivo"),
-    createOutboundCall: async ({ host, number, idempotencyKey }) => {
+    createOutboundCall: async ({ host, number, idempotencyKey, callSid: requestedCallSid }) => {
       const plivoAdapter = getPlivoVoiceAdapter();
-      const callId = uuidv4();
+      const callId = String(requestedCallSid || uuidv4());
       const webhookReq = reqForHost(host);
       const answerUrl = buildPlivoAnswerWebhookUrl(webhookReq, callId);
       const eventUrl = buildPlivoEventWebhookUrl(webhookReq, callId);
@@ -14654,15 +14716,16 @@ function getVoiceProviderRegistry() {
       }
       await getPlivoVoiceAdapter().hangupCall(callUuid);
     },
+    getCall: async ({ providerCallId }) => getPlivoVoiceAdapter().getCall(providerCallId),
   });
 
   registry.register("vonage", {
     capabilities: listProviderFlows(PROVIDER_CHANNELS.CALL, "vonage", {
       vonageDtmfWebhookEnabled: config.vonage?.dtmfWebhookEnabled === true,
     }),
-    createOutboundCall: async ({ host, number, idempotencyKey }) => {
+    createOutboundCall: async ({ host, number, idempotencyKey, callSid: requestedCallSid }) => {
       const vonageAdapter = getVonageVoiceAdapter();
-      const callId = uuidv4();
+      const callId = String(requestedCallSid || uuidv4());
       const webhookReq = reqForHost(host);
       const answerUrl = buildVonageAnswerWebhookUrl(webhookReq, callId);
       const eventUrl = buildVonageEventWebhookUrl(webhookReq, callId);
@@ -14719,6 +14782,7 @@ function getVoiceProviderRegistry() {
       }
       await getVonageVoiceAdapter().hangupCall(callUuid);
     },
+    getCall: async ({ providerCallId }) => getVonageVoiceAdapter().getCall(providerCallId),
   });
 
   registry.register("call_e", new CallEVoiceAdapter({
@@ -14744,6 +14808,8 @@ async function endCallForProvider(callSid) {
     providerCallId = resolveVonageHangupUuid(callSid, callConfig);
   } else if (provider === "plivo") {
     providerCallId = resolvePlivoHangupUuid(callSid, callConfig);
+  } else if (provider === "twilio") {
+    providerCallId = String(callConfig?.provider_metadata?.twilio_call_sid || callSid);
   }
   await getVoiceProviderRegistry().endCall(provider, {
     callId: callSid,
@@ -15376,6 +15442,7 @@ async function startServer(options = {}) {
     console.log("Initializing enhanced database...");
     db = new Database();
     await db.initialize();
+    await cartesiaSpeechSettingsStore.load();
     const schemaGuard = await db.ensureSchemaGuardrails({
       expectedVersion: Number(config.database?.schemaVersion) || 2,
       strict: config.database?.schemaStrict !== false,
@@ -15967,7 +16034,9 @@ app.ws("/connection", (ws, req) => {
 
         if (event === "start") {
           streamSid = msg.start.streamSid;
-          callSid = msg.start.callSid;
+          const providerCallSid = msg.start.callSid;
+          const customParams = msg.start?.customParameters || {};
+          callSid = customParams.callSid || providerCallSid;
           callStartTime = new Date();
           streamStartTimes.set(callSid, Date.now());
           if (!callSid) {
@@ -15975,7 +16044,13 @@ app.ws("/connection", (ws, req) => {
             ws.close();
             return;
           }
-          const customParams = msg.start?.customParameters || {};
+          if (providerCallSid && providerCallSid !== callSid) {
+            db.updateCallState(callSid, "provider_metadata_updated", {
+              provider: "twilio",
+              twilio_call_sid: providerCallSid,
+              at: new Date().toISOString(),
+            }).catch(() => {});
+          }
           const authResult = verifyStreamAuth(callSid, req, customParams);
           if (!authResult.ok) {
             console.warn("Stream auth failed", {
@@ -19463,12 +19538,20 @@ async function handleTwilioIncoming(req, res) {
     console.log(
       `Incoming call webhook (${req.method}) from ${maskedFrom} to ${maskedTo} host=${host}`,
     );
-    const callSid = req.body?.CallSid;
+    const providerCallSid = req.body?.CallSid;
+    const callSid = String(req.query?.callSid || providerCallSid || "").trim();
     const directionRaw = req.body?.Direction || req.body?.direction;
     const isOutbound = isOutboundTwilioDirection(directionRaw);
     const directionLabel = isOutbound ? "outbound" : "inbound";
     if (callSid) {
       callDirections.set(callSid, directionLabel);
+      if (providerCallSid && providerCallSid !== callSid) {
+        await db.updateCallState(callSid, "provider_metadata_updated", {
+          provider: "twilio",
+          twilio_call_sid: providerCallSid,
+          at: new Date().toISOString(),
+        }).catch(() => {});
+      }
       if (!isOutbound) {
         await refreshInboundDefaultScript();
         const callRecord = await ensureCallRecord(
@@ -19744,6 +19827,7 @@ async function handleTwilioIncoming(req, res) {
     if (req.body?.From) streamParameters.from = String(req.body.From);
     if (req.body?.To) streamParameters.to = String(req.body.To);
     streamParameters.direction = directionLabel;
+    if (req.query?.callSid) streamParameters.callSid = callSid;
     if (callSid && config.streamAuth?.secret) {
       const timestamp = String(Date.now());
       const token = buildStreamAuthToken(callSid, timestamp);
@@ -19756,7 +19840,7 @@ async function handleTwilioIncoming(req, res) {
     const streamNode = connect.stream({
       url: `wss://${host}/connection`,
       track: TWILIO_STREAM_TRACK,
-      statusCallback: `https://${host}/webhook/twilio-stream`,
+      statusCallback: `https://${host}/webhook/twilio-stream?callSid=${encodeURIComponent(callSid)}`,
       statusCallbackMethod: "POST",
       statusCallbackEvent: ["start", "end"],
     });
@@ -23718,6 +23802,22 @@ app.get("/admin/provider", requireAdminToken, async (req, res) => {
       : channel === PROVIDER_CHANNELS.SMS
         ? smsState
         : emailState;
+  const providerHealth = Object.fromEntries(
+    callState.supported_providers.map((provider) => {
+      const health = getProviderHealthEntry(provider);
+      return [
+        provider,
+        {
+          circuit_state: health.circuitState,
+          degraded: isProviderDegraded(provider),
+          consecutive_errors: health.consecutiveErrors,
+          last_error_at: health.lastErrorAt,
+          last_success_at: health.lastSuccessAt,
+          observation_scope: "api_process_memory",
+        },
+      ];
+    }),
+  );
 
   res.json({
     channel,
@@ -23743,10 +23843,13 @@ app.get("/admin/provider", requireAdminToken, async (req, res) => {
       sms: smsState,
       email: emailState,
     },
+    provider_health: providerHealth,
     call_agent_capability_schema: buildCallAgentProviderCapabilitySchema({
       vonageDtmfWebhookEnabled: config.vonage?.dtmfWebhookEnabled === true,
     }),
     voice_provider_capabilities: getVoiceProviderRegistry().listDescriptors(),
+    tts_provider: config.tts?.provider || "deepgram",
+    cartesia_tts_profile: await cartesiaSpeechSettingsStore.getProfile(),
     call_routing_policy: buildCallRoutingPolicyReport(callState.provider),
     call_e_provider: {
       configured: createCallEClientFromEnv().isConfigured(),
@@ -25065,6 +25168,7 @@ function createCartesiaOutboundCallService() {
     db,
     outboundSafety: createOutboundCallSafetyService(),
     approvalSecret: config.cartesia?.approvalSecret,
+    enabled: config.cartesia?.enabled === true && config.cartesia?.managedAgentsEnabled === true,
   });
 }
 
@@ -25084,6 +25188,13 @@ function createCartesiaCampaignService() {
 const cartesiaPhraseCacheStore = new CartesiaPhraseCacheStore();
 const cartesiaSttProfileStore = new CartesiaSttProfileStore();
 const cartesiaAgentProfileStore = new CartesiaAgentProfileStore();
+const cartesiaSpeechSettingsStore = new CartesiaSpeechSettingsStore({
+  db: {
+    getSetting: (...args) => db.getSetting(...args),
+    setSetting: (...args) => db.setSetting(...args),
+  },
+  config,
+});
 
 function createCartesiaStudioService() {
   return new CartesiaStudioService({
@@ -26127,6 +26238,8 @@ app.post(
         mappingId: body.mapping_id,
         phoneNumberId: body.phone_number_id,
         number: body.number,
+        firstMessage: body.first_message_override,
+        variableValues: body.variable_values,
         idempotencyKey: body.idempotency_key,
         actorId: req.callEActorId,
       });
@@ -26141,6 +26254,8 @@ app.post(
           "vapi_mapping_required",
           "vapi_phone_number_id_required",
           "vapi_destination_invalid",
+          "vapi_first_message_invalid",
+          "vapi_variables_invalid",
           "vapi_mapping_template_mismatch",
           "vapi_idempotency_key_required",
         ].includes(code)
@@ -28513,6 +28628,14 @@ async function placeOutboundCall(payload, hostOverride = null) {
     error.status = 403;
     throw error;
   }
+  if (outboundBusinessId) {
+    const businessSpeechProfile = await cartesiaSpeechSettingsStore.getBusinessProfile(outboundBusinessId);
+    scriptPolicy = applyBusinessSpeechProfile(scriptPolicy, businessSpeechProfile);
+  }
+  const aiVoiceEngine =
+    scriptPolicy?.agent_config?.speech_settings?.provider ||
+    config.tts?.provider ||
+    null;
   const trustedRoutingBusinessId = trustedTemplateBusinessId;
   let businessProviderOrder = [];
   if (/^[A-Za-z0-9._:-]{1,120}$/.test(trustedRoutingBusinessId) && typeof db?.getCallEBusinessProviderRouting === 'function') {
@@ -28591,199 +28714,6 @@ async function placeOutboundCall(payload, hostOverride = null) {
   if (!attemptProviders.length) {
     throw new Error("No eligible outbound call providers are currently available");
   }
-  const outboundIdempotencyContext = await reserveOutboundCallIdempotency(
-    {
-      ...payloadObject,
-      idempotency_key: normalizedOutboundIdempotencyKey,
-    },
-    providerPlan.selected_provider || preferredProvider || currentProvider,
-  );
-  if (outboundIdempotencyContext?.replay) {
-    await createOutboundCallSafetyService().authorizeActor({
-      business_id: outboundBusinessId,
-      actor_id: user_chat_id,
-    });
-    callId = outboundIdempotencyContext.replay.callId;
-    callStatus = outboundIdempotencyContext.replay.callStatus || "queued";
-    providerMetadata =
-      outboundIdempotencyContext.replay.providerMetadata || {};
-    if (!providerMetadata.idempotency_key && normalizedOutboundIdempotencyKey) {
-      providerMetadata = {
-        ...providerMetadata,
-        idempotency_key: normalizedOutboundIdempotencyKey,
-      };
-    }
-    idempotentReplay = true;
-    if (providerMetadata?.vonage_uuid) {
-      rememberVonageCallMapping(
-        callId,
-        providerMetadata.vonage_uuid,
-        "idempotent_replay",
-      );
-    }
-    const replayProvider =
-      normalizeProviderName(outboundIdempotencyContext.replay.provider) ||
-      providerPlan.selected_provider ||
-      preferredProvider ||
-      currentProvider;
-    recordProviderFlowMetric("outbound_call_idempotent_replay", {
-      channel: "call",
-      flow: keypadRequired ? "digit_capture" : "outbound_voice",
-      provider: replayProvider || null,
-      attempt: 0,
-      call_sid: callId,
-    });
-    return {
-      callId,
-      callStatus,
-      functionSystem,
-      provider: replayProvider || currentProvider,
-      idempotentReplay,
-      warnings: callWarnings,
-    };
-  }
-  let outboundSafetyReservation;
-  const outboundSafety = createOutboundCallSafetyService();
-  try {
-    outboundSafetyReservation = await outboundSafety.reserveDispatch({
-      business_id: outboundBusinessId,
-      actor_id: user_chat_id,
-      destination: number,
-      provider: providerPlan.selected_provider || preferredProvider || currentProvider,
-      idempotency_key: normalizedOutboundIdempotencyKey || `generated:${crypto.randomUUID()}`,
-    });
-  } catch (error) {
-    await completeOutboundCallIdempotency(outboundIdempotencyContext, 'failed', {
-      provider: providerPlan.selected_provider || preferredProvider || currentProvider,
-      errorMessage: String(error?.code || 'outbound_contact_policy_blocked'),
-    }).catch(() => {});
-    throw error;
-  }
-  let lastError = null;
-
-  for (let providerIndex = 0; providerIndex < attemptProviders.length; providerIndex += 1) {
-    const provider = attemptProviders[providerIndex];
-    try {
-      recordProviderFlowMetric("outbound_call_attempt", {
-        channel: "call",
-        flow: keypadRequired ? "digit_capture" : "outbound_voice",
-        provider,
-        attempt: providerIndex + 1,
-      });
-      const providerCall = await getVoiceProviderRegistry().createOutboundCall(
-        provider,
-        {
-          host,
-          number,
-          idempotencyKey: normalizedOutboundIdempotencyKey || null,
-          flow: keypadRequired ? "digit_capture" : "outbound_voice",
-        },
-      );
-      callId = providerCall.callId;
-      callStatus = providerCall.status;
-      providerMetadata = providerCall.metadata;
-      await completeOutboundCallIdempotency(
-        outboundIdempotencyContext,
-        "completed",
-        {
-          provider,
-          callSid: callId,
-          responsePayload: {
-            call_status: callStatus,
-            provider,
-            provider_metadata: providerMetadata,
-          },
-        },
-      );
-      await outboundSafety.completeDispatch(outboundSafetyReservation, 'accepted');
-      recordProviderSuccess(provider);
-      recordProviderFlowMetric("outbound_call_success", {
-        channel: "call",
-        flow: keypadRequired ? "digit_capture" : "outbound_voice",
-        provider,
-        attempt: providerIndex + 1,
-      });
-      selectedProvider = provider;
-      break;
-    } catch (error) {
-      if (
-        error?.code === "idempotency_conflict" ||
-        error?.code === "idempotency_in_progress"
-      ) {
-        await outboundSafety.completeDispatch(outboundSafetyReservation, 'released');
-        throw error;
-      }
-      const safeError = normalizeProviderOperationError(
-        provider,
-        "outbound_call.create",
-        error,
-      );
-      lastError = Object.assign(new Error(safeError.message), safeError);
-      recordProviderError(provider, lastError);
-      recordProviderFlowMetric("outbound_call_error", {
-        channel: "call",
-        flow: keypadRequired ? "digit_capture" : "outbound_voice",
-        provider,
-        attempt: providerIndex + 1,
-        reason: safeError.code,
-      });
-      console.error("outbound_call_provider_error", {
-        provider,
-        operation: safeError.operation,
-        code: safeError.code,
-        status_code: safeError.statusCode,
-        submission_state: safeError.submissionState,
-      });
-      if (!canFailoverAfterProviderError(error)) {
-        const ambiguousError = new Error(
-          "Provider submission status is unknown. Do not retry until an operator verifies the provider call state.",
-        );
-        ambiguousError.code = "provider_submission_ambiguous";
-        ambiguousError.status = 503;
-        ambiguousError.provider = provider;
-        ambiguousError.operation = safeError.operation;
-        ambiguousError.providerSubmissionState = "unknown";
-        throw ambiguousError;
-      }
-    }
-  }
-
-  if (!selectedProvider) {
-    await outboundSafety.completeDispatch(outboundSafetyReservation, 'released');
-    await completeOutboundCallIdempotency(
-      outboundIdempotencyContext,
-      "failed",
-      {
-        provider:
-          providerPlan.selected_provider || preferredProvider || currentProvider,
-        errorMessage:
-          lastError?.message || "outbound_call_provider_attempts_exhausted",
-      },
-    ).catch(() => {});
-    throw lastError || new Error("Failed to place outbound call");
-  }
-  if (keypadOverride) {
-    providerMetadata = {
-      ...providerMetadata,
-      provider_guard_override: {
-        scope_key: keypadOverride.scopeKey,
-        provider: keypadOverride.provider,
-        expires_at: keypadOverride.expiresAt
-          ? new Date(keypadOverride.expiresAt).toISOString()
-          : null,
-        reason: keypadOverride.reason || "vonage_dtmf_timeout",
-      },
-    };
-  }
-
-  const createdAt = new Date().toISOString();
-  const templateExecution = buildCallTemplateExecutionContext({
-    template: resolvedScriptTemplate,
-    templateId: normalizedScriptId,
-    templateVersion: resolvedScriptVersion,
-    provider: selectedProvider || currentProvider,
-    flow: keypadRequired ? "digit_capture" : "outbound_voice",
-  });
   const mergedPaymentInput = {
     payment_enabled: hasPayloadField("payment_enabled")
       ? payment_enabled
@@ -28845,6 +28775,352 @@ async function placeOutboundCall(payload, hostOverride = null) {
     error.status = 400;
     throw error;
   }
+  const normalizedPaymentSettingsByProvider = new Map();
+  for (const provider of attemptProviders) {
+    const normalizedPayment = normalizePaymentSettings(mergedPaymentInput, {
+      provider,
+      requireConnectorWhenEnabled: false,
+      hasScript: Boolean(normalizedScriptId),
+      enforceFeatureGate: true,
+    });
+    if (normalizedPayment.errors.length) {
+      const error = new Error(normalizedPayment.errors.join(" "));
+      error.code = "payment_validation_error";
+      error.status = 400;
+      throw error;
+    }
+    normalizedPaymentSettingsByProvider.set(provider, normalizedPayment);
+  }
+  const outboundIdempotencyContext = await reserveOutboundCallIdempotency(
+    {
+      ...payloadObject,
+      idempotency_key: normalizedOutboundIdempotencyKey,
+    },
+    providerPlan.selected_provider || preferredProvider || currentProvider,
+  );
+  if (outboundIdempotencyContext?.replay) {
+    await createOutboundCallSafetyService().authorizeActor({
+      business_id: outboundBusinessId,
+      actor_id: user_chat_id,
+    });
+    callId = outboundIdempotencyContext.replay.callId;
+    callStatus = outboundIdempotencyContext.replay.callStatus || "queued";
+    providerMetadata =
+      outboundIdempotencyContext.replay.providerMetadata || {};
+    if (!providerMetadata.idempotency_key && normalizedOutboundIdempotencyKey) {
+      providerMetadata = {
+        ...providerMetadata,
+        idempotency_key: normalizedOutboundIdempotencyKey,
+      };
+    }
+    idempotentReplay = true;
+    if (providerMetadata?.vonage_uuid) {
+      rememberVonageCallMapping(
+        callId,
+        providerMetadata.vonage_uuid,
+        "idempotent_replay",
+      );
+    }
+    const replayProvider =
+      normalizeProviderName(outboundIdempotencyContext.replay.provider) ||
+      providerPlan.selected_provider ||
+      preferredProvider ||
+      currentProvider;
+    recordProviderFlowMetric("outbound_call_idempotent_replay", {
+      channel: "call",
+      flow: keypadRequired ? "digit_capture" : "outbound_voice",
+      provider: replayProvider || null,
+      attempt: 0,
+      call_sid: callId,
+    });
+    return {
+      callId,
+      callStatus,
+      functionSystem,
+      provider: replayProvider || currentProvider,
+      aiVoiceEngine,
+      idempotentReplay,
+      warnings: callWarnings,
+    };
+  }
+  let outboundSafetyReservation;
+  const outboundSafety = createOutboundCallSafetyService();
+  try {
+    outboundSafetyReservation = await outboundSafety.reserveDispatch({
+      business_id: outboundBusinessId,
+      actor_id: user_chat_id,
+      destination: number,
+      provider: providerPlan.selected_provider || preferredProvider || currentProvider,
+      idempotency_key: normalizedOutboundIdempotencyKey || `generated:${crypto.randomUUID()}`,
+    });
+  } catch (error) {
+    await completeOutboundCallIdempotency(outboundIdempotencyContext, 'failed', {
+      provider: providerPlan.selected_provider || preferredProvider || currentProvider,
+      errorMessage: String(error?.code || 'outbound_contact_policy_blocked'),
+    }).catch(() => {});
+    throw error;
+  }
+  callId = uuidv4();
+  try {
+    await db.createCall({
+      call_sid: callId,
+      phone_number: number,
+      prompt: effectivePrompt,
+      first_message: effectiveFirstMessage,
+      user_chat_id: user_chat_id,
+      business_context: JSON.stringify(functionSystem.context),
+      generated_functions: JSON.stringify(
+        functionSystem.functions.map((f) => f.function.name),
+      ),
+      direction: "outbound",
+      business_id: outboundBusinessId || null,
+      status: "submission_pending",
+      outbound_idempotency_key: normalizedOutboundIdempotencyKey || null,
+      ai_voice_engine: aiVoiceEngine,
+    });
+    await db.updateCallState(callId, "outbound_submission_pending", {
+      provider: providerPlan.selected_provider || preferredProvider || currentProvider,
+      ai_voice_engine: aiVoiceEngine,
+      at: new Date().toISOString(),
+    });
+  } catch (error) {
+    await outboundSafety.completeDispatch(outboundSafetyReservation, "released");
+    await completeOutboundCallIdempotency(outboundIdempotencyContext, "failed", {
+      provider: providerPlan.selected_provider || preferredProvider || currentProvider,
+      errorMessage: "outbound_call_record_creation_failed",
+    }).catch(() => {});
+    throw error;
+  }
+  let lastError = null;
+  let providerCallId = null;
+  let normalizedPayment = null;
+
+  for (let providerIndex = 0; providerIndex < attemptProviders.length; providerIndex += 1) {
+    const provider = attemptProviders[providerIndex];
+    normalizedPayment = normalizedPaymentSettingsByProvider.get(provider);
+    let providerCall;
+    try {
+      recordProviderFlowMetric("outbound_call_attempt", {
+        channel: "call",
+        flow: keypadRequired ? "digit_capture" : "outbound_voice",
+        provider,
+        attempt: providerIndex + 1,
+      });
+      providerCall = await getVoiceProviderRegistry().createOutboundCall(
+        provider,
+        {
+          host,
+          number,
+          callSid: callId,
+          idempotencyKey: normalizedOutboundIdempotencyKey || null,
+          flow: keypadRequired ? "digit_capture" : "outbound_voice",
+        },
+      );
+    } catch (error) {
+      if (
+        error?.code === "idempotency_conflict" ||
+        error?.code === "idempotency_in_progress"
+      ) {
+        await outboundSafety.completeDispatch(outboundSafetyReservation, 'released');
+        await db.updateCallStatus(callId, "failed", {
+          error_code: String(error.code),
+          error_message: "Call submission was rejected before a provider call was created.",
+        }).catch(() => {});
+        throw error;
+      }
+      const safeError = normalizeProviderOperationError(
+        provider,
+        "outbound_call.create",
+        error,
+      );
+      lastError = Object.assign(new Error(safeError.message), safeError);
+      recordProviderError(provider, lastError);
+      recordProviderFlowMetric("outbound_call_error", {
+        channel: "call",
+        flow: keypadRequired ? "digit_capture" : "outbound_voice",
+        provider,
+        attempt: providerIndex + 1,
+        reason: safeError.code,
+      });
+      console.error("outbound_call_provider_error", {
+        provider,
+        operation: safeError.operation,
+        code: safeError.code,
+        status_code: safeError.statusCode,
+        submission_state: safeError.submissionState,
+      });
+      if (!canFailoverAfterProviderError(error)) {
+        await db.updateCallStatus(callId, "unknown", {
+          error_code: safeError.code,
+          error_message: "Provider submission outcome is uncertain; verify provider state before retrying.",
+        }).catch(() => {});
+        await db.updateCallState(callId, "outbound_submission_uncertain", {
+          provider,
+          error_code: safeError.code,
+          at: new Date().toISOString(),
+        }).catch(() => {});
+        await completeOutboundCallIdempotency(outboundIdempotencyContext, "pending", {
+          provider,
+          callSid: callId,
+          errorMessage: "provider_submission_uncertain",
+        }).catch(() => {});
+        const ambiguousError = new Error(
+          "Provider submission status is unknown. Do not retry until an operator verifies the provider call state.",
+        );
+        ambiguousError.code = "provider_submission_ambiguous";
+        ambiguousError.status = 503;
+        ambiguousError.provider = provider;
+        ambiguousError.operation = safeError.operation;
+        ambiguousError.providerSubmissionState = "unknown";
+        throw ambiguousError;
+      }
+      continue;
+    }
+
+    if (providerCall.callId !== callId) {
+      await db.updateCallStatus(callId, "unknown", {
+        error_code: "provider_call_correlation_mismatch",
+        error_message: "Provider accepted a call but returned an unexpected local call identifier.",
+      }).catch(() => {});
+      await db.updateCallState(callId, "outbound_submission_uncertain", {
+        provider,
+        provider_call_id: providerCall.providerCallId || null,
+        outbound_idempotency_key: normalizedOutboundIdempotencyKey || null,
+        ai_voice_engine: aiVoiceEngine,
+        at: new Date().toISOString(),
+      }).catch(() => {});
+      await completeOutboundCallIdempotency(outboundIdempotencyContext, "pending", {
+        provider,
+        callSid: callId,
+        errorMessage: "provider_call_correlation_mismatch",
+      }).catch(() => {});
+      await outboundSafety.completeDispatch(outboundSafetyReservation, "accepted");
+      const error = new Error("Provider accepted a call with an unexpected correlation identifier.");
+      error.code = "provider_call_correlation_mismatch";
+      error.status = 503;
+      error.providerSubmissionState = "unknown";
+      throw error;
+    }
+
+    callStatus = providerCall.status;
+    providerCallId = providerCall.providerCallId;
+    providerMetadata = providerCall.metadata;
+    selectedProvider = provider;
+    try {
+      await db.updateCallStatus(callId, callStatus);
+      await db.updateCallState(callId, "provider_submission_accepted", {
+        provider,
+        provider_call_id: providerCallId,
+        outbound_idempotency_key: normalizedOutboundIdempotencyKey || null,
+        ai_voice_engine: aiVoiceEngine,
+        provider_metadata: providerMetadata,
+        status: callStatus,
+        at: new Date().toISOString(),
+      });
+      await completeOutboundCallIdempotency(
+        outboundIdempotencyContext,
+        "completed",
+        {
+          provider,
+          callSid: callId,
+          responsePayload: {
+            call_status: callStatus,
+            provider,
+            provider_metadata: providerMetadata,
+          },
+        },
+      );
+      await outboundSafety.completeDispatch(outboundSafetyReservation, "accepted");
+    } catch (error) {
+      await outboundSafety.completeDispatch(outboundSafetyReservation, "accepted");
+      await db.updateCallStatus(callId, "unknown", {
+        error_code: "outbound_persistence_failed",
+        error_message: "Provider accepted the call, but local confirmation could not be persisted.",
+      }).catch(() => {});
+      await db.updateCallState(callId, "outbound_submission_uncertain", {
+        provider,
+        provider_call_id: providerCallId,
+        provider_metadata: providerMetadata,
+        status: callStatus,
+        error_code: "outbound_persistence_failed",
+        at: new Date().toISOString(),
+      }).catch(() => {});
+      await completeOutboundCallIdempotency(
+        outboundIdempotencyContext,
+        "pending",
+        {
+          provider,
+          callSid: callId,
+          errorMessage: "provider_accepted_persistence_failed",
+        },
+      ).catch(() => {});
+      const persistenceError = new Error(
+        "Provider accepted the call, but VOICEDNUT could not persist confirmation. Do not retry the call; reconcile its saved record.",
+      );
+      persistenceError.code = "outbound_persistence_failed";
+      persistenceError.status = 503;
+      persistenceError.retryable = false;
+      persistenceError.providerSubmissionState = "accepted";
+      persistenceError.provider = provider;
+      persistenceError.callId = callId;
+      persistenceError.cause = error;
+      throw persistenceError;
+    }
+    recordProviderSuccess(provider);
+    recordProviderFlowMetric("outbound_call_success", {
+      channel: "call",
+      flow: keypadRequired ? "digit_capture" : "outbound_voice",
+      provider,
+      attempt: providerIndex + 1,
+    });
+    break;
+  }
+
+  if (!selectedProvider) {
+    await outboundSafety.completeDispatch(outboundSafetyReservation, 'released');
+    await db.updateCallStatus(callId, "failed", {
+      error_code: lastError?.code || "outbound_call_provider_attempts_exhausted",
+      error_message: "All provider attempts were rejected before a call was created.",
+    }).catch(() => {});
+    await db.updateCallState(callId, "outbound_submission_rejected", {
+      provider: providerPlan.selected_provider || preferredProvider || currentProvider,
+      error_code: lastError?.code || "outbound_call_provider_attempts_exhausted",
+      at: new Date().toISOString(),
+    }).catch(() => {});
+    await completeOutboundCallIdempotency(
+      outboundIdempotencyContext,
+      "failed",
+      {
+        provider:
+          providerPlan.selected_provider || preferredProvider || currentProvider,
+        errorMessage:
+          lastError?.message || "outbound_call_provider_attempts_exhausted",
+      },
+    ).catch(() => {});
+    throw lastError || new Error("Failed to place outbound call");
+  }
+  if (keypadOverride) {
+    providerMetadata = {
+      ...providerMetadata,
+      provider_guard_override: {
+        scope_key: keypadOverride.scopeKey,
+        provider: keypadOverride.provider,
+        expires_at: keypadOverride.expiresAt
+          ? new Date(keypadOverride.expiresAt).toISOString()
+          : null,
+        reason: keypadOverride.reason || "vonage_dtmf_timeout",
+      },
+    };
+  }
+
+  const createdAt = new Date().toISOString();
+  const templateExecution = buildCallTemplateExecutionContext({
+    template: resolvedScriptTemplate,
+    templateId: normalizedScriptId,
+    templateVersion: resolvedScriptVersion,
+    provider: selectedProvider || currentProvider,
+    flow: keypadRequired ? "digit_capture" : "outbound_voice",
+  });
   if (normalizedPaymentPolicyResult.warnings.length) {
     callWarnings.push(...normalizedPaymentPolicyResult.warnings);
   }
@@ -28852,18 +29128,6 @@ async function placeOutboundCall(payload, hostOverride = null) {
     Object.keys(normalizedPaymentPolicyResult.normalized).length > 0
       ? normalizedPaymentPolicyResult.normalized
       : null;
-  const normalizedPayment = normalizePaymentSettings(mergedPaymentInput, {
-    provider: selectedProvider || currentProvider,
-    requireConnectorWhenEnabled: false,
-    hasScript: Boolean(normalizedScriptId),
-    enforceFeatureGate: true,
-  });
-  if (normalizedPayment.errors.length) {
-    const error = new Error(normalizedPayment.errors.join(" "));
-    error.code = "payment_validation_error";
-    error.status = 400;
-    throw error;
-  }
   if (normalizedPayment.warnings.length) {
     callWarnings.push(...normalizedPayment.warnings);
   }
@@ -28879,6 +29143,7 @@ async function placeOutboundCall(payload, hostOverride = null) {
     user_chat_id: user_chat_id,
     customer_name: customer_name || null,
     provider: selectedProvider || currentProvider,
+    provider_call_id: providerCallId,
     provider_metadata: providerMetadata,
     template_execution: templateExecution,
     outbound_idempotency_key: normalizedOutboundIdempotencyKey || null,
@@ -28994,19 +29259,6 @@ async function placeOutboundCall(payload, hostOverride = null) {
   });
 
   try {
-    await db.createCall({
-      call_sid: callId,
-      phone_number: number,
-      prompt: effectivePrompt,
-      first_message: effectiveFirstMessage,
-      user_chat_id: user_chat_id,
-      business_context: JSON.stringify(functionSystem.context),
-      generated_functions: JSON.stringify(
-        functionSystem.functions.map((f) => f.function.name),
-      ),
-      direction: "outbound",
-      business_id: business_id || null,
-    });
     const callCreatedState = buildCallCreatedState({
       customer_name: customer_name || null,
       business_id: business_id || null,
@@ -29043,6 +29295,8 @@ async function placeOutboundCall(payload, hostOverride = null) {
       technical_level: technical_level || null,
       voice_model: voice_model || null,
       provider: selectedProvider || currentProvider,
+      provider_call_id: providerCallId,
+      ai_voice_engine: aiVoiceEngine,
       provider_metadata: providerMetadata,
       outbound_idempotency_key: normalizedOutboundIdempotencyKey || null,
       from:
@@ -29120,6 +29374,7 @@ async function placeOutboundCall(payload, hostOverride = null) {
     callStatus,
     functionSystem,
     provider: selectedProvider || currentProvider,
+    aiVoiceEngine,
     idempotentReplay,
     warnings: callWarnings,
   };
@@ -29136,10 +29391,16 @@ async function processCallStatusWebhookPayload(payload = {}, options = {}) {
     ErrorMessage,
     DialCallDuration,
   } = payload || {};
+  const providerCallSid = String(
+    payload?.CallSid || payload?.callSid || payload?.call_sid || "",
+  ).trim();
+  const internalCallSid = String(
+    options.internalCallSid || options.callSid || "",
+  ).trim();
   const canonicalEvent = buildCanonicalCallStatusEvent("twilio", payload || {}, {
-    callSid: CallSid || payload?.callSid || payload?.call_sid || null,
+    callSid: internalCallSid || CallSid || payload?.callSid || payload?.call_sid || null,
   });
-  CallSid = canonicalEvent.call_sid || CallSid;
+  CallSid = internalCallSid || canonicalEvent.call_sid || CallSid;
   CallStatus = canonicalEvent.raw_status || CallStatus;
   ErrorCode = canonicalEvent.error_code || ErrorCode;
   ErrorMessage = canonicalEvent.error_message || ErrorMessage;
@@ -29151,6 +29412,13 @@ async function processCallStatusWebhookPayload(payload = {}, options = {}) {
     const err = new Error("Missing CallSid");
     err.code = "missing_call_sid";
     throw err;
+  }
+  if (internalCallSid && providerCallSid && internalCallSid !== providerCallSid) {
+    await db.updateCallState(internalCallSid, "provider_metadata_updated", {
+      provider: "twilio",
+      twilio_call_sid: providerCallSid,
+      at: new Date().toISOString(),
+    }).catch(() => {});
   }
 
   const source = options.source || "provider";
@@ -29165,40 +29433,43 @@ async function processCallStatusWebhookPayload(payload = {}, options = {}) {
     ErrorCode,
     ErrorMessage,
   };
-  if (!(await shouldProcessCallStatusPayloadAsync(dedupePayload, options))) {
-    console.log(`⏭️ Duplicate status webhook ignored for ${CallSid}`);
-    return { ok: true, callSid: CallSid, deduped: true };
-  }
-
-  console.log(`Fixed Webhook: Call ${CallSid} status: ${CallStatus}`.blue);
-  console.log(`Debug Info:`);
-  console.log(`Duration: ${Duration || "N/A"}`);
-  console.log(`CallDuration: ${CallDuration || "N/A"}`);
-  console.log(`DialCallDuration: ${DialCallDuration || "N/A"}`);
-  console.log(`AnsweredBy: ${AnsweredBy || "N/A"}`);
-
-  const durationCandidates = [Duration, CallDuration, DialCallDuration]
-    .map((value) => parseInt(value, 10))
-    .filter((value) => Number.isFinite(value));
-  const durationValue = Number.isFinite(Number(canonicalEvent.duration))
-    ? Math.max(0, Math.floor(Number(canonicalEvent.duration)))
-    : durationCandidates.length
-    ? Math.max(...durationCandidates)
-    : 0;
-
-  let call = await db.getCall(CallSid);
-  if (!call) {
-    console.warn(`Webhook received for unknown call: ${CallSid}`);
-    call = await ensureCallRecord(CallSid, payload, "status_webhook", {
-      provider: "twilio",
-      inbound: !isOutboundTwilioDirection(
-        payload?.Direction || payload?.direction,
-      ),
-    });
-    if (!call) {
-      return { ok: false, error: "call_not_found", callSid: CallSid };
+  let dedupeReserved = false;
+  try {
+    if (!(await shouldProcessCallStatusPayloadAsync(dedupePayload, options))) {
+      console.log(`⏭️ Duplicate status webhook ignored for ${CallSid}`);
+      return { ok: true, callSid: CallSid, deduped: true };
     }
-  }
+    dedupeReserved = true;
+
+    console.log(`Fixed Webhook: Call ${CallSid} status: ${CallStatus}`.blue);
+    console.log(`Debug Info:`);
+    console.log(`Duration: ${Duration || "N/A"}`);
+    console.log(`CallDuration: ${CallDuration || "N/A"}`);
+    console.log(`DialCallDuration: ${DialCallDuration || "N/A"}`);
+    console.log(`AnsweredBy: ${AnsweredBy || "N/A"}`);
+
+    const durationCandidates = [Duration, CallDuration, DialCallDuration]
+      .map((value) => parseInt(value, 10))
+      .filter((value) => Number.isFinite(value));
+    const durationValue = Number.isFinite(Number(canonicalEvent.duration))
+      ? Math.max(0, Math.floor(Number(canonicalEvent.duration)))
+      : durationCandidates.length
+        ? Math.max(...durationCandidates)
+        : 0;
+
+    let call = await db.getCall(CallSid);
+    if (!call) {
+      console.warn(`Webhook received for unknown call: ${CallSid}`);
+      call = await ensureCallRecord(CallSid, payload, "status_webhook", {
+        provider: "twilio",
+        inbound: !isOutboundTwilioDirection(
+          payload?.Direction || payload?.direction,
+        ),
+      });
+      if (!call) {
+        return { ok: false, error: "call_not_found", callSid: CallSid };
+      }
+    }
 
   const streamMediaState = await db
     .getLatestCallState(CallSid, "stream_media")
@@ -29469,6 +29740,16 @@ async function processCallStatusWebhookPayload(payload = {}, options = {}) {
     duration: updateData.duration,
     voicemailDetected,
   };
+  } catch (error) {
+    if (dedupeReserved) {
+      try {
+        await releaseProviderEventAsync("twilio_call_status", dedupePayload);
+      } catch (releaseError) {
+        console.error("Failed to release Twilio call-status dedupe reservation:", releaseError);
+      }
+    }
+    throw error;
+  }
 }
 
 function normalizeDateFilter(value, isEnd = false) {
@@ -29546,6 +29827,25 @@ function formatCallDispositionLabel(value) {
 function normalizeCallRecordForApi(call) {
   if (!call || typeof call !== "object") return call;
   const normalized = { ...call };
+  const createdState = safeJsonParse(normalized.call_created_state, null);
+  if (createdState && typeof createdState === "object") {
+    normalized.provider =
+      normalized.provider ||
+      normalized.runtime_provider ||
+      normalized.provider_used ||
+      createdState.provider ||
+      null;
+    normalized.ai_voice_engine =
+      normalized.ai_voice_engine || createdState.ai_voice_engine || null;
+  } else {
+    normalized.provider =
+      normalized.provider || normalized.runtime_provider || normalized.provider_used || null;
+  }
+  normalized.telephony_provider =
+    normalized.telephony_provider || normalized.provider || null;
+  delete normalized.call_created_state;
+  delete normalized.runtime_provider;
+  delete normalized.provider_used;
   const rawStatus = normalized.status || normalized.twilio_status || "";
   normalized.status_normalized = normalizeCallStatus(rawStatus);
   normalized.duration = Number.isFinite(Number(normalized.duration))
@@ -33557,6 +33857,7 @@ app.get("/api/sms/status/:messageSid", requireOutboundAuthorization, async (req,
 
 registerCallRoutes(app, {
   requireOutboundAuthorization,
+  requireAdminToken,
   requireCallEActorAssertion,
   sendApiError,
   resolveHost,
@@ -33574,6 +33875,14 @@ registerCallRoutes(app, {
   reconcileCartesiaOutboundCall: (input) => createCartesiaOutboundCallService().reconcileOutboundCall(input),
   listCartesiaAgents: () => createCartesiaOutboundCallService().listAgentInventory(),
   getCartesiaCallDefaults: (input) => createCartesiaOutboundCallService().getCallDefaults(input),
+  getCartesiaCallReadiness: () => {
+    try {
+      createCartesiaOutboundCallService().assertDispatchReady();
+      return { enabled: true };
+    } catch (error) {
+      return { enabled: false, code: String(error?.code || "cartesia_not_configured") };
+    }
+  },
   setCartesiaCallDefaults: (input) => createCartesiaOutboundCallService().setCallDefaults(input),
   getCartesiaAgentDeploymentHealth: (input) => createCartesiaOutboundCallService().getAgentDeploymentHealth(input),
   listCartesiaCalls: (input) => createCartesiaOutboundCallService().listCallsForOperations(input),
@@ -33595,6 +33904,56 @@ registerCallRoutes(app, {
   buildErrorDetails,
   getCurrentProvider: () => currentProvider,
   getDb: () => db,
+  getCallActivityStatus: async ({ call, actorId }) => {
+    const provider = String(call?.provider || "").toLowerCase();
+    const providerCallId = String(call?.provider_call_id || "").trim();
+    if (!providerCallId) {
+      const error = new Error("Provider call identifier is not available");
+      error.code = "provider_call_id_missing";
+      throw error;
+    }
+    if (provider === "vapi") {
+      const safety = createOutboundCallSafetyService();
+      if (call.business_id) await safety.authorizeActor({ business_id: call.business_id, actor_id: actorId });
+      const remote = await createVapiClientFromEnv().getCall(providerCallId);
+      return { status: remote?.status, endedReason: remote?.endedReason || remote?.ended_reason };
+    }
+    if (provider === "cartesia") {
+      const remote = await createCartesiaOutboundCallService().getCallForOperations(providerCallId, {
+        businessId: call.business_id,
+        actorId,
+      });
+      return { status: remote?.status };
+    }
+    if (["twilio", "plivo", "vonage"].includes(provider)) {
+      const remote = await getVoiceProviderRegistry().getCall(provider, { providerCallId });
+      const status = remote?.status || remote?.call_status || remote?.state;
+      return { status };
+    }
+    const error = new Error("Provider status lookup is unavailable for this provider");
+    error.code = "provider_status_unsupported";
+    error.status = 503;
+    throw error;
+  },
+  reconcileVapiCallActivity: async ({ call, actorId }) => {
+    const providerCallId = String(call?.provider_call_id || "").trim();
+    if (!providerCallId) {
+      const error = new Error("Provider call identifier is not available");
+      error.code = "provider_call_id_missing";
+      throw error;
+    }
+    if (call.business_id) {
+      await createOutboundCallSafetyService().authorizeActor({
+        business_id: call.business_id,
+        actor_id: actorId,
+      });
+    }
+    return new VapiCallReconciliationService({
+      client: createVapiClientFromEnv(),
+      getLocalCall: (id) => db.getVapiOutboundCallByProviderId(id),
+      recordEvent: (event) => db.recordVapiCallEvent(event),
+    }).reconcile(providerCallId);
+  },
   isSafeId,
   normalizeCallRecordForApi,
   buildCallbackPayload,
@@ -33624,8 +33983,10 @@ registerCartesiaStudioRoutes(app, {
   requireCallEActorAssertion,
   sendApiError,
   isCartesiaAdminActor: (actorId) => isTelegramAdminUser(actorId),
+  db,
   cartesiaApprovalLimiter: callEPolicyWriteLimiter,
   createCartesiaStudioService,
+  cartesiaSpeechSettingsStore,
 }, express);
 
 registerCartesiaWebhookRoutes(app, { handler: cartesiaWebhookHandler, limiter: callEWebhookLimiter });
@@ -33925,6 +34286,7 @@ registerWebhookRoutes(app, {
   activeStreamConnections,
   shouldProcessProviderEvent,
   shouldProcessProviderEventAsync,
+  releaseProviderEventAsync,
   recordCallStatus,
   getPlivoCallUuid,
   resolvePlivoCallSid,
@@ -34303,11 +34665,51 @@ module.exports = {
   startServer,
   __testables: {
     setDbForTests,
+    getDb: () => db,
+    setCallTestConfigForTests: (patch = {}) => {
+      const previous = {
+        twilio: structuredClone(config.twilio),
+        plivo: structuredClone(config.plivo),
+        vonage: structuredClone(config.vonage),
+        server: structuredClone(config.server),
+        providerFailover: structuredClone(config.providerFailover),
+      };
+      if (patch.twilio) Object.assign(config.twilio, patch.twilio);
+      if (patch.plivo) Object.assign(config.plivo, patch.plivo);
+      if (patch.vonage) Object.assign(config.vonage, patch.vonage);
+      if (patch.server) Object.assign(config.server, patch.server);
+      if (patch.providerFailover) Object.assign(config.providerFailover, patch.providerFailover);
+      return previous;
+    },
+    placeOutboundCall,
+    processCallStatusWebhookPayload,
+    shouldProcessProviderEventAsync,
+    getCallConfigurations: () => callConfigurations,
+    cleanupCallStateForTests: (callSid) => {
+      for (const timers of [callRuntimePersistTimers, callLifecycleCleanupTimers]) {
+        const timer = timers.get(callSid);
+        if (timer) clearTimeout(timer);
+        timers.delete(callSid);
+      }
+      callRuntimePendingWrites.delete(callSid);
+      callConfigurations.delete(callSid);
+      callFunctionSystems.delete(callSid);
+      callDirections.delete(callSid);
+      callLifecycle.delete(callSid);
+      callPhaseLifecycle.delete(callSid);
+      purgeCallStatusDedupe(callSid);
+    },
+    setVoiceProviderRegistryForTests: (registry) => {
+      const previous = voiceProviderRegistry;
+      voiceProviderRegistry = registry;
+      return previous;
+    },
     verifyHmacSignature,
     resolveApiHmacReplayValidationMode,
     resetHmacReplayCacheForTests,
     verifyTelegramWebhookAuth,
     requireValidTwilioSignature,
+    requireValidPlivoWebhook,
     requireValidVonageWebhook,
     evaluateProviderPreflightReport,
     enforceProviderPreflight,

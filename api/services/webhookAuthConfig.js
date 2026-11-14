@@ -43,11 +43,12 @@ function assertPlivoWebhookAuthConfiguration(config = {}) {
   const activeCallProvider = String(config.platform?.provider || "").toLowerCase();
   const activeSmsProvider = String(config.sms?.provider || "").toLowerCase();
   if (activeCallProvider !== "plivo" && activeSmsProvider !== "plivo") return;
+  const hasPlivoAuthToken = hasSecret(config.plivo?.authToken);
   const hasPlivoSecret = hasSecret(config.plivo?.webhookSecret);
   const hasHmacSecret = hasSecret(config.apiAuth?.hmacSecret);
-  if (hasPlivoSecret || hasHmacSecret) return;
+  if (hasPlivoAuthToken || hasPlivoSecret || hasHmacSecret) return;
   throw new Error(
-    "PLIVO_WEBHOOK_VALIDATION is strict but no Plivo webhook auth secret is configured. Set PLIVO_WEBHOOK_SECRET or API_SECRET/API_HMAC_SECRET.",
+    "PLIVO_WEBHOOK_VALIDATION is strict but no Plivo webhook auth credential is configured. Set PLIVO_AUTH_TOKEN, PLIVO_WEBHOOK_SECRET, or API_SECRET/API_HMAC_SECRET.",
   );
 }
 

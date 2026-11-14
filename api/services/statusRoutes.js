@@ -24,7 +24,25 @@ function createGetCallStatusHandler(ctx = {}) {
       if (!call) {
         return res.status(404).json({ error: "Call not found" });
       }
-      const normalizedCall = normalizeCallRecordForApi(call);
+      const requesterChatId = String(
+        req.headers?.["x-telegram-chat-id"] ||
+          req.query?.telegram_chat_id ||
+          req.query?.chat_id ||
+          "",
+      ).trim();
+      if (
+        requesterChatId &&
+        String(call.user_chat_id || "") !== requesterChatId
+      ) {
+        return res.status(403).json({ error: "Not authorized for this call" });
+      }
+      const createdState = await db
+        .getLatestCallState(callSid, "call_created")
+        .catch(() => null);
+      const normalizedCall = normalizeCallRecordForApi({
+        ...call,
+        call_created_state: createdState || null,
+      });
       if (!normalizedCall.digit_summary) {
         const digitEvents = await db.getCallDigits(callSid).catch(() => []);
         const digitSummary = buildDigitSummary(digitEvents);
@@ -515,5 +533,6 @@ module.exports = {
   registerStatusRoutes,
   __testables: {
     createHealthHandler,
+    createGetCallStatusHandler,
   },
 };

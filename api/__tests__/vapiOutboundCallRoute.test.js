@@ -53,6 +53,7 @@ describe("customer outbound Vapi call route", () => {
       status: "queued",
       deduped: true,
       provider: "vapi",
+      ai_voice_engine: "vapi",
       template_id: 17,
       template_version: 4,
       mapping_id: 91,

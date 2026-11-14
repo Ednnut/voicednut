@@ -208,6 +208,11 @@ class CartesiaStudioClient {
     if (query.isOwner === true) params.set("is_owner", "true");
     if (query.limit) params.set("limit", String(Math.max(1, Math.min(100, Number(query.limit) || 50))));
     if (query.startingAfter && ID_PATTERN.test(String(query.startingAfter))) params.set("starting_after", String(query.startingAfter));
+    if (query.endingBefore && ID_PATTERN.test(String(query.endingBefore))) params.set("ending_before", String(query.endingBefore));
+    for (const [source, target, maxLength] of [["q", "q", 100], ["language", "language", 24], ["gender", "gender", 32]]) {
+      const value = String(query[source] || "").trim();
+      if (value && value.length <= maxLength) params.set(target, value);
+    }
     return this.read(`/voices${params.size ? `?${params}` : ""}`, "voice_list");
   }
   listModels(query = {}) {

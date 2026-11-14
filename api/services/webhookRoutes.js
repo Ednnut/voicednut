@@ -237,6 +237,39 @@ function logProviderDedupeSkip(eventName, req, decision = {}) {
   });
 }
 
+async function releaseProviderEventReservation(ctx, req, source, dedupePayload) {
+  if (!dedupePayload || typeof ctx.releaseProviderEventAsync !== "function") {
+    return;
+  }
+  try {
+    await ctx.releaseProviderEventAsync(source, dedupePayload);
+  } catch (error) {
+    console.error("provider_event_idempotency_release_failed", {
+      source,
+      request_id: req?.requestId || null,
+      code: error?.code || "provider_event_idempotency_release_failed",
+    });
+  }
+}
+
+async function respondWithProviderWebhookFailure(
+  ctx,
+  req,
+  res,
+  source,
+  dedupePayload,
+  error,
+) {
+  await releaseProviderEventReservation(ctx, req, source, dedupePayload);
+  console.error("provider_webhook_processing_failed", {
+    source,
+    request_id: req?.requestId || null,
+    code: error?.code || "provider_webhook_processing_failed",
+    name: error?.name || "Error",
+  });
+  return res.status(503).send("Service unavailable");
+}
+
 function logProviderDedupeFailure(eventName, req, decision = {}) {
   if (!shouldFailProviderDedupeDecision(decision)) return;
   console.warn(eventName, {
@@ -1148,7 +1181,10 @@ function createCallStatusWebhookHandler(ctx = {}) {
       if (!requireValidTwilioSignature(req, res, "/webhook/call-status")) {
         return;
       }
-      await processCallStatusWebhookPayload(req.body, { source: "provider" });
+      await processCallStatusWebhookPayload(req.body, {
+        source: "provider",
+        internalCallSid: req.query?.callSid,
+      });
     } catch (error) {
       console.error("Error processing fixed call status webhook:", error);
       const db = getDb(ctx);
@@ -1176,7 +1212,8 @@ function createTwilioStreamWebhookHandler(ctx = {}) {
       }
       const db = getDb(ctx);
       const payload = req.body || {};
-      const callSid = payload.CallSid || payload.callSid || "unknown";
+      const providerCallSid = payload.CallSid || payload.callSid || "unknown";
+      const callSid = req.query?.callSid || providerCallSid;
       const streamSid = payload.StreamSid || payload.streamSid || "unknown";
       const eventType =
         payload.EventType || payload.eventType || payload.event || "unknown";
@@ -1206,6 +1243,9 @@ function createTwilioStreamWebhookHandler(ctx = {}) {
           db
             ?.updateCallState(callSid, "stream_status_start", {
               stream_sid: streamSid,
+              ...(providerCallSid !== "unknown" && providerCallSid !== callSid
+                ? { twilio_call_sid: providerCallSid }
+                : {}),
               at: new Date().toISOString(),
             })
             .catch(() => {});
@@ -1215,6 +1255,9 @@ function createTwilioStreamWebhookHandler(ctx = {}) {
           db
             ?.updateCallState(callSid, "stream_status_end", {
               stream_sid: streamSid,
+              ...(providerCallSid !== "unknown" && providerCallSid !== callSid
+                ? { twilio_call_sid: providerCallSid }
+                : {}),
               at: new Date().toISOString(),
             })
             .catch(() => {});
@@ -1994,6 +2037,7 @@ function createVonageEventWebhookHandler(ctx = {}) {
     if (!requireValidVonageWebhook(req, res, req.path || "/ve")) {
       return;
     }
+    let dedupePayload = null;
     try {
       const payload = req.body || {};
       const normalizedPayload = getVonageCallPayload(req, payload);
@@ -2015,7 +2059,7 @@ function createVonageEventWebhookHandler(ctx = {}) {
         });
         return res.status(200).send("OK");
       }
-      const dedupePayload = {
+      dedupePayload = {
         uuid: uuid || normalizedPayload?.uuid || null,
         status: String(status || "").toLowerCase() || null,
         timestamp:
@@ -2033,6 +2077,14 @@ function createVonageEventWebhookHandler(ctx = {}) {
         "vonage_event",
         dedupePayload,
       );
+      if (dedupeDecision?.retryable) {
+        await releaseProviderEventReservation(
+          ctx,
+          req,
+          "vonage_event",
+          dedupePayload,
+        );
+      }
       if (shouldShortCircuitProviderDedupe(res, dedupeDecision)) {
         logProviderDedupeFailure("vonage_event_dedupe_unavailable", req, dedupeDecision);
         logProviderDedupeSkip("vonage_event_duplicate_ignored", req, dedupeDecision);
@@ -2147,8 +2199,14 @@ function createVonageEventWebhookHandler(ctx = {}) {
 
       return res.status(200).send("OK");
     } catch (error) {
-      console.error("Vonage webhook error:", error);
-      return res.status(200).send("OK");
+      return respondWithProviderWebhookFailure(
+        ctx,
+        req,
+        res,
+        "vonage_event",
+        dedupePayload,
+        error,
+      );
     }
   };
 }
@@ -2401,6 +2459,7 @@ function createPlivoEventWebhookHandler(ctx = {}) {
     if (!requireValidPlivoWebhook(req, res, req.path || "/plivo/events")) {
       return;
     }
+    let dedupePayload = null;
     try {
       const payload = req.body || {};
       const plivoUuid = getPlivoCallUuid(payload);
@@ -2408,7 +2467,7 @@ function createPlivoEventWebhookHandler(ctx = {}) {
       if (callSid && plivoUuid) {
         rememberPlivoCallMapping(callSid, plivoUuid, "event");
       }
-      const dedupePayload = {
+      dedupePayload = {
         uuid: plivoUuid || null,
         callSid: callSid || null,
         status: String(payload.CallStatus || payload.callStatus || payload.status || "").toLowerCase() || null,
@@ -2425,6 +2484,14 @@ function createPlivoEventWebhookHandler(ctx = {}) {
         "plivo_event",
         dedupePayload,
       );
+      if (dedupeDecision?.retryable) {
+        await releaseProviderEventReservation(
+          ctx,
+          req,
+          "plivo_event",
+          dedupePayload,
+        );
+      }
       if (shouldShortCircuitProviderDedupe(res, dedupeDecision)) {
         logProviderDedupeFailure("plivo_event_dedupe_unavailable", req, dedupeDecision);
         logProviderDedupeSkip("plivo_event_duplicate_ignored", req, dedupeDecision);
@@ -2474,8 +2541,14 @@ function createPlivoEventWebhookHandler(ctx = {}) {
       }
       return res.status(200).send("OK");
     } catch (error) {
-      console.error("Plivo webhook error:", error);
-      return res.status(200).send("OK");
+      return respondWithProviderWebhookFailure(
+        ctx,
+        req,
+        res,
+        "plivo_event",
+        dedupePayload,
+        error,
+      );
     }
   };
 }

@@ -16,13 +16,58 @@ function createOutboundCallHandler(ctx = {}) {
         req.body?.provider || req.body?.preferred_provider || req.body?.call_provider || "",
       ).trim().toLowerCase();
       if (requestedProvider === "cartesia") {
-        return sendApiError(
-          res,
-          400,
-          "cartesia_is_ai_capability",
-          "Cartesia is an AI voice capability, not a telephony provider. Select a supported telephony provider and configure its compatible voice profile.",
-          req.requestId || null,
-        );
+        const number = String(req.body?.number || "").trim();
+        const businessId = String(req.body?.business_id || "").trim();
+        const agentId = String(req.body?.agent_id || "").trim();
+        const fromNumberId = String(req.body?.from_number_id || "").trim();
+        const idempotencyKey = String(req.body?.idempotency_key || req.headers?.["idempotency-key"] || "").trim();
+        if (!/^\+[1-9]\d{7,14}$/.test(number) || !businessId || !agentId || !fromNumberId ||
+            !/^[A-Za-z0-9._:-]{8,180}$/.test(idempotencyKey)) {
+          return sendApiError(res, 400, "cartesia_call_input_invalid", "Business, E.164 destination, agent, source number, and idempotency key are required", req.requestId || null);
+        }
+        try {
+          if (typeof ctx.placeCartesiaOutboundCall !== "function") {
+            const error = new Error("Cartesia Managed Agent calls are unavailable");
+            error.code = "cartesia_not_configured";
+            throw error;
+          }
+          const result = await ctx.placeCartesiaOutboundCall({
+            business_id: businessId,
+            actor_id: req.callEActorId,
+            destination: number,
+            agent_id: agentId,
+            from_number_id: fromNumberId,
+            idempotency_key: idempotencyKey,
+            approval_token: req.body?.approval_token,
+            dynamic_variables: req.body?.dynamic_variables,
+          });
+          const providerCallId = String(result?.providerCallId || "").trim();
+          if (!providerCallId) {
+            const error = new Error("Cartesia did not return a call ID");
+            error.code = "cartesia_call_outcome_unknown";
+            throw error;
+          }
+          return res.json({
+            success: true,
+            call_sid: providerCallId,
+            provider_call_id: providerCallId,
+            to: number,
+            status: result.status || "created",
+            deduped: result.idempotentReplay === true,
+            provider: "cartesia",
+            ai_voice_engine: "cartesia",
+            business_id: businessId,
+            agent_id: agentId,
+          });
+        } catch (error) {
+          const code = String(error?.code || "cartesia_call_failed");
+          const status = Number(error?.status) || (code.includes("not_configured") || code.includes("approval_unavailable") || code.includes("dependencies_missing") ? 503
+            : code.includes("operator") || code.includes("scope") ? 403
+              : code.includes("invalid") || code.includes("required") ? 400
+                : code.includes("conflict") || code.includes("unresolved") || code.includes("not_ready") || code.includes("approval") ? 409 : 502);
+          console.error("cartesia_managed_agent_call_error", { code, status });
+          return sendApiError(res, status, code, status >= 500 ? "Cartesia Managed Agent call failed or needs reconciliation" : error.message, req.requestId || null);
+        }
       }
       if (requestedProvider === "vapi") {
         const number = String(req.body?.number || "").trim();
@@ -57,6 +102,8 @@ function createOutboundCallHandler(ctx = {}) {
             templateId,
             ...(req.body?.script_version !== undefined ? { templateVersion: req.body.script_version } : {}),
             mappingId, phoneNumberId, number, idempotencyKey,
+            ...(req.body?.first_message_override !== undefined ? { firstMessage: req.body.first_message_override } : {}),
+            ...(req.body?.variable_values !== undefined ? { variableValues: req.body.variable_values } : {}),
             actorId: req.callEActorId,
           });
           const providerCallId = String(result?.providerCallId || "").trim();
@@ -73,6 +120,7 @@ function createOutboundCallHandler(ctx = {}) {
             status: result.status || "queued",
             deduped: result.idempotentReplay === true,
             provider: "vapi",
+            ai_voice_engine: "vapi",
             template_id: Number(result.templateId) || templateId,
             template_version: Number(result.templateVersion) || null,
             mapping_id: Number(result.mappingId) || mappingId,
@@ -85,7 +133,7 @@ function createOutboundCallHandler(ctx = {}) {
           const code = String(error?.code || "vapi_call_failed");
           const status = code.startsWith("outbound_") ? Number(error?.status) || 409
             : code === "vapi_not_configured" || code === "vapi_call_dependencies_missing" ? 503
-            : ["vapi_mapping_required", "vapi_phone_number_id_required", "vapi_destination_invalid", "vapi_idempotency_key_required"].includes(code) ? 400
+            : ["vapi_mapping_required", "vapi_phone_number_id_required", "vapi_destination_invalid", "vapi_idempotency_key_required", "vapi_first_message_invalid", "vapi_variables_invalid"].includes(code) ? 400
               : ["vapi_mapping_not_found", "vapi_mapping_not_ready", "vapi_mapping_stale", "vapi_template_unsupported", "vapi_mapping_template_mismatch", "vapi_idempotency_conflict", "vapi_previous_call_failed", "vapi_call_outcome_unresolved"].includes(code) ? 409
                 : 502;
           console.error("vapi_outbound_call_route_error", {
@@ -170,7 +218,7 @@ function createOutboundCallHandler(ctx = {}) {
           req.body?.profile_confidence_gate,
         purpose: req.body?.purpose || req.body?.call_profile || req.body?.profile,
         preferred_provider:
-          req.body?.preferred_provider || req.body?.call_provider || null,
+          req.body?.preferred_provider || req.body?.call_provider || req.body?.provider || null,
         emotion: req.body?.emotion,
         urgency: req.body?.urgency,
         technical_level: req.body?.technical_level,
@@ -208,6 +256,7 @@ function createOutboundCallHandler(ctx = {}) {
           (typeof getCurrentProvider === "function"
             ? getCurrentProvider()
             : "twilio"),
+        ai_voice_engine: result.aiVoiceEngine || null,
         business_context: result.functionSystem.context,
         generated_functions: result.functionSystem.functions.length,
         function_types: result.functionSystem.functions.map(
@@ -281,7 +330,7 @@ function createOutboundCallHandler(ctx = {}) {
             : paymentPolicyInvalid || paymentValidationError
               ? message || "Invalid payment configuration."
           : outboundPersistenceFailed
-            ? "Call provider accepted the request but persistence failed; retry with the same idempotency key."
+            ? "Call provider accepted the request but VOICEDNUT could not persist confirmation. Do not retry the call; reconcile its saved record."
           : providerOperationUnsupported
             ? message || "The selected provider does not support this call operation."
           : outboundSafetyBlock
@@ -304,8 +353,8 @@ function getRequesterChatId(req) {
 }
 
 function isOwnedByDifferentChat(call, requesterChatId) {
-  if (!call?.user_chat_id || !requesterChatId) return false;
-  return String(call.user_chat_id) !== String(requesterChatId);
+  if (!requesterChatId) return false;
+  return String(call?.user_chat_id || "") !== String(requesterChatId);
 }
 
 function pickTranscriptAudioUrl(call, states = []) {
@@ -483,7 +532,10 @@ function createGetCallDetailsHandler(ctx = {}) {
                 callState?.customer_name || callState?.victim_name,
             }
           : call;
-      const normalizedCall = normalizeCallRecordForApi(enrichedCall);
+      const normalizedCall = normalizeCallRecordForApi({
+        ...enrichedCall,
+        call_created_state: callState || null,
+      });
       if (!normalizedCall.digit_summary) {
         const digitEvents = await db.getCallDigits(callSid).catch(() => []);
         const digitSummary = buildDigitSummary(digitEvents);
@@ -868,11 +920,16 @@ function createListCallsHandler(ctx = {}) {
         defaultLimit: 10,
         maxLimit: 50,
       });
+      const requesterChatId = getRequesterChatId(req);
 
       console.log(`Fetching calls list: limit=${limit}, offset=${offset}`);
 
-      const calls = await db.getRecentCalls(limit, offset);
-      const totalCount = await db.getCallsCount();
+      const calls = await db.getRecentCalls({
+        limit,
+        offset,
+        userChatId: requesterChatId || null,
+      });
+      const totalCount = await db.getCallsCount(requesterChatId || null);
 
       const formattedCalls = calls.map((call) => {
         const normalized = normalizeCallRecordForApi(call);
@@ -906,6 +963,188 @@ function createListCallsHandler(ctx = {}) {
       });
     }
   };
+}
+
+function createCallActivityHandlers(ctx = {}) {
+  const getDb = () => typeof ctx.getDb === "function" ? ctx.getDb() : ctx.db;
+  const owner = (req) => String(req.callEActorId || "").trim();
+  const readCall = async (req) => {
+    const actorId = owner(req);
+    const callSid = String(req.params?.callSid || "").trim();
+    if (!actorId || !callSid || callSid.length > 200) return { error: "invalid" };
+    const db = getDb();
+    const call = await db?.getCall?.(callSid);
+    if (!call) return { error: "not_found" };
+    if (String(call.user_chat_id || "") !== actorId) return { error: "forbidden" };
+    let created = typeof db.getLatestCallState === "function" ? await db.getLatestCallState(callSid, "call_created").catch(() => null) : null;
+    if (typeof created === "string") { try { created = JSON.parse(created); } catch { created = {}; } }
+    return { db, call, created: created || {}, actorId };
+  };
+  const maskPhone = (value) => {
+    const digits = String(value || "").replace(/\D/g, "");
+    return digits ? `••••${digits.slice(-4)}` : null;
+  };
+  const project = (call, created = {}) => ({
+    call_sid: call.call_sid,
+    provider: String(created.telephony_provider || created.provider || call.telephony_provider || call.provider || "unknown").toLowerCase(),
+    provider_call_id: (() => {
+      const provider = String(created.telephony_provider || created.provider || call.telephony_provider || call.provider || "unknown").toLowerCase();
+      const recorded = call.provider_call_id || created.provider_call_id || created.provider_metadata?.twilio_call_sid || created.provider_metadata?.plivo_uuid || created.provider_metadata?.vonage_uuid;
+      if (recorded) return recorded;
+      if (provider === "vapi" && String(call.call_sid || "").startsWith("vapi_")) return String(call.call_sid).slice(5);
+      if (provider === "cartesia" && String(call.call_sid || "").startsWith("cartesia_")) return String(call.call_sid).slice(9);
+      return null;
+    })(),
+    ai_voice_engine: call.ai_voice_engine || created.ai_voice_engine || null,
+    phone_number: maskPhone(call.phone_number),
+    status: call.status || "unknown",
+    direction: call.direction || null,
+    created_at: call.created_at || null,
+    started_at: call.started_at || null,
+    ended_at: call.ended_at || null,
+    duration: Number(call.duration) || 0,
+    business_id: call.business_id || created.business_id || null,
+    refresh_available: Boolean(created.provider_call_id || created.provider_metadata?.twilio_call_sid || created.provider_metadata?.plivo_uuid || created.provider_metadata?.vonage_uuid ||
+      ((String(created.telephony_provider || created.provider || call.provider || "").toLowerCase() === "vapi" && String(call.call_sid || "").startsWith("vapi_")) ||
+       (String(created.telephony_provider || created.provider || call.provider || "").toLowerCase() === "cartesia" && String(call.call_sid || "").startsWith("cartesia_")))),
+  });
+  const normalizeProviderStatus = (provider, remote) => {
+    const raw = String(remote?.status || remote?.call_status || remote?.state || "").trim().toLowerCase().replace(/_/g, "-");
+    if (!raw) return "";
+    if (raw === "created" || raw === "queued") return "queued";
+    if (raw === "started" || raw === "answered" || raw === "in-progress") return "in-progress";
+    if (raw === "ended") {
+      const reason = String(remote?.endedReason || remote?.end_reason || "").toLowerCase();
+      if (/no-answer|did-not-answer|timeout/.test(reason)) return "no-answer";
+      if (/busy/.test(reason)) return "busy";
+      if (/failed|error|rejected/.test(reason)) return "failed";
+      return "completed";
+    }
+    if (["unanswered", "no-answer"].includes(raw)) return "no-answer";
+    if (["rejected", "declined"].includes(raw)) return "failed";
+    if (["hangup", "disconnected"].includes(raw)) return "completed";
+    if (["ringing", "completed", "failed", "busy", "no-answer", "canceled", "cancelled", "voicemail"].includes(raw)) return raw === "cancelled" ? "canceled" : raw;
+    if (provider === "cartesia" && raw === "starting") return "initiated";
+    return raw.slice(0, 40);
+  };
+  const list = async (req, res) => {
+    try {
+      const actorId = owner(req);
+      if (!actorId) return res.status(401).json({ success: false, error: "verified_actor_required" });
+      const db = getDb();
+      const limit = Math.max(1, Math.min(30, Number.parseInt(req.query?.limit, 10) || 10));
+      const offset = Math.max(0, Math.min(1000, Number.parseInt(req.query?.offset, 10) || 0));
+      const search = String(req.query?.q || "").trim().slice(0, 100);
+      const status = String(req.query?.status || "").trim().toLowerCase().slice(0, 40);
+      const date = /^\d{4}-\d{2}-\d{2}$/.test(String(req.query?.date || "")) ? String(req.query.date) : null;
+      const dateStart = date ? new Date(`${date}T00:00:00.000Z`) : null;
+      const dateEnd = date ? new Date(dateStart.getTime() + 24 * 60 * 60 * 1000) : null;
+      if (date && (!Number.isFinite(dateStart.getTime()) || dateStart.toISOString().slice(0, 10) !== date)) return res.status(400).json({ success: false, error: "invalid_activity_date" });
+      const calls = await db.getRecentCalls({ limit, offset, userChatId: actorId, query: search || null, status: status || null, start: dateStart?.toISOString() || null, end: dateEnd?.toISOString() || null });
+      const rows = await Promise.all(calls.map(async (call) => {
+        const state = typeof db.getLatestCallState === "function" ? await db.getLatestCallState(call.call_sid, "call_created").catch(() => null) : null;
+        return project(call, typeof state === "string" ? (() => { try { return JSON.parse(state); } catch { return {}; } })() : state || {});
+      }));
+      return res.json({ success: true, calls: rows, pagination: { limit, offset, has_more: rows.length === limit } });
+    } catch (error) {
+      console.error("call_activity_list_failed", { code: String(error?.code || "database_error").slice(0, 80) });
+      return res.status(500).json({ success: false, error: "call_activity_unavailable" });
+    }
+  };
+  const detail = async (req, res) => {
+    try {
+      const result = await readCall(req);
+      if (result.error === "invalid") return res.status(400).json({ success: false, error: "invalid_call_id" });
+      if (result.error === "not_found") return res.status(404).json({ success: false, error: "call_not_found" });
+      if (result.error) return res.status(403).json({ success: false, error: "not_authorized_for_call" });
+      const states = await result.db.getCallStates(result.call.call_sid, { limit: 20 });
+      const lifecycle_events = typeof result.db.listCallLifecycleEvents === "function"
+        ? await result.db.listCallLifecycleEvents(result.call.call_sid, result.actorId, { limit: 20 })
+        : [];
+      const call = project(result.call, result.created);
+      const recent_states = states.slice().reverse().map((state) => ({
+        state: String(state.state || "event").slice(0, 80),
+        timestamp: state.timestamp || null,
+        sequence_number: Number(state.sequence_number) || null,
+        data: state.data && typeof state.data === "object" ? {
+          status: typeof state.data.status === "string" ? state.data.status.slice(0, 40) : undefined,
+          provider_status: typeof state.data.provider_status === "string" ? state.data.provider_status.slice(0, 40) : undefined,
+          source: typeof state.data.source === "string" ? state.data.source.slice(0, 40) : undefined,
+        } : null,
+      }));
+      if (call.provider === "vapi" && typeof result.db.listVapiCallEvents === "function") {
+        const events = await result.db.listVapiCallEvents({ provider_call_id: call.provider_call_id, limit: 20 });
+        for (const event of events) recent_states.push({
+          state: String(event.event_type || "provider_event").slice(0, 80),
+          timestamp: event.event_timestamp || event.received_at || null,
+          sequence_number: null,
+          data: { provider_status: typeof event.provider_status === "string" ? event.provider_status.slice(0, 40) : undefined },
+        });
+        recent_states.sort((left, right) => Date.parse(left.timestamp || "") - Date.parse(right.timestamp || ""));
+        if (recent_states.length > 20) recent_states.splice(0, recent_states.length - 20);
+      }
+      return res.json({ success: true, call, lifecycle_events: lifecycle_events.map((event) => ({
+        event_id: Number(event.event_id) || null,
+        provider: event.provider || null,
+        event_type: String(event.event_type || "event").slice(0, 80),
+        status: event.status || null,
+        provider_status: event.provider_status || null,
+        source: String(event.source || "call_state").slice(0, 40),
+        occurred_at: event.occurred_at || null,
+      })), recent_states, retry_safe: false, retry_guidance: call.refresh_available
+        ? "Status refresh only confirms provider state. Do not retry while a call may be active or accepted."
+        : "No provider call ID is recorded. Reconcile with the provider first; absence of an ID is not proof that no call was placed." });
+    } catch (error) {
+      console.error("call_activity_detail_failed", { code: String(error?.code || "database_error").slice(0, 80) });
+      return res.status(500).json({ success: false, error: "call_activity_unavailable" });
+    }
+  };
+  const refresh = async (req, res, { reconcile = false } = {}) => {
+    try {
+      const result = await readCall(req);
+      if (result.error === "invalid") return res.status(400).json({ success: false, error: "invalid_call_id" });
+      if (result.error === "not_found") return res.status(404).json({ success: false, error: "call_not_found" });
+      if (result.error) return res.status(403).json({ success: false, error: "not_authorized_for_call" });
+      if (typeof ctx.getCallActivityStatus !== "function") return res.status(503).json({ success: false, error: "provider_status_refresh_unavailable" });
+      const call = project(result.call, result.created);
+      if (!call.refresh_available) return res.status(409).json({
+        success: false,
+        error: "provider_call_id_unavailable",
+        reconciliation: reconcile ? { outcome: "unresolved", reason: "provider_call_id_unavailable" } : undefined,
+        retry_safe: false,
+        retry_guidance: "No provider call ID is recorded. A search by time or destination could match another call; verify with the provider and do not retry based only on this record.",
+      });
+      const remote = reconcile && call.provider === "vapi" && typeof ctx.reconcileVapiCallActivity === "function"
+        ? await ctx.reconcileVapiCallActivity({ call, actorId: result.actorId })
+        : await ctx.getCallActivityStatus({ call, actorId: result.actorId });
+      const status = normalizeProviderStatus(call.provider, remote);
+      if (!status || status.length > 40) return res.status(502).json({ success: false, error: "provider_status_invalid" });
+      await result.db.updateCallStatus(call.call_sid, status, { allow_terminal_upgrade: true });
+      await result.db.updateCallState(call.call_sid, reconcile ? "provider_call_reconciled" : "provider_status_refreshed", {
+        provider: call.provider,
+        status,
+        source: reconcile ? "provider_reconciliation" : "provider_lookup",
+        refreshed_at: new Date().toISOString(),
+      });
+      return res.json({
+        success: true,
+        call: { ...call, status },
+        status_source: reconcile ? "provider_reconciliation" : "provider_lookup",
+        ...(reconcile ? { reconciliation: { outcome: "reconciled", provider: call.provider } } : {}),
+        retry_safe: false,
+        retry_guidance: reconcile
+          ? "Reconciliation only read provider state. A retry is not authorized by this result."
+          : "Status refresh does not authorize a retry. Confirm no active or accepted call before placing another call.",
+      });
+    } catch (error) {
+      const status = Number(error?.status || error?.statusCode);
+      if (status === 404) return res.status(404).json({ success: false, error: "provider_call_not_found", retry_safe: false, retry_guidance: "A provider lookup miss is not proof that submission failed; wait and refresh again before considering another call." });
+      console.error("call_activity_refresh_failed", { code: String(error?.code || "provider_lookup_failed").slice(0, 80) });
+      return res.status(status >= 400 && status < 500 ? status : 502).json({ success: false, error: "provider_status_refresh_failed", retry_safe: false, retry_guidance: "Provider status could not be confirmed; do not retry until the outcome is verified." });
+    }
+  };
+  const reconcile = (req, res) => refresh(req, res, { reconcile: true });
+  return { list, detail, refresh, reconcile };
 }
 
 function getStatusIcon(status) {
@@ -949,6 +1188,7 @@ function createListCallsFilteredHandler(ctx = {}) {
       const phone = req.query.phone;
       const dateFrom = normalizeDateFilter(req.query.date_from);
       const dateTo = normalizeDateFilter(req.query.date_to, true);
+      const requesterChatId = getRequesterChatId(req);
 
       let whereClause = "";
       let queryParams = [];
@@ -973,6 +1213,10 @@ function createListCallsFilteredHandler(ctx = {}) {
         conditions.push("c.created_at <= ?");
         queryParams.push(dateTo);
       }
+      if (requesterChatId) {
+        conditions.push("c.user_chat_id = ?");
+        queryParams.push(requesterChatId);
+      }
 
       if (conditions.length > 0) {
         whereClause = "WHERE " + conditions.join(" AND ");
@@ -984,9 +1228,16 @@ function createListCallsFilteredHandler(ctx = {}) {
           COUNT(t.id) as transcript_count,
           GROUP_CONCAT(DISTINCT t.speaker) as speakers,
           MIN(t.timestamp) as conversation_start,
-          MAX(t.timestamp) as conversation_end
+          MAX(t.timestamp) as conversation_end,
+          (SELECT s.data FROM call_states s
+           WHERE s.call_sid = c.call_sid AND s.state = 'call_created'
+           ORDER BY s.timestamp DESC, s.id DESC LIMIT 1) as call_created_state,
+          cr.provider as runtime_provider,
+          co.provider_used as provider_used
         FROM calls c
         LEFT JOIN transcripts t ON c.call_sid = t.call_sid
+        LEFT JOIN call_runtime_state cr ON cr.call_sid = c.call_sid
+        LEFT JOIN call_outcomes co ON co.call_sid = c.call_sid
         ${whereClause}
         GROUP BY c.call_sid
         ORDER BY c.created_at DESC
@@ -1104,6 +1355,7 @@ function createSearchCallsHandler(ctx = {}) {
         min: 1,
         max: 50,
       });
+      const requesterChatId = getRequesterChatId(req);
 
       if (!query || query.length < 2) {
         return res.status(400).json({
@@ -1123,15 +1375,23 @@ function createSearchCallsHandler(ctx = {}) {
           SELECT DISTINCT
             c.*,
             COUNT(t.id) as transcript_count,
-            GROUP_CONCAT(t.message, ' ') as conversation_text
+            GROUP_CONCAT(t.message, ' ') as conversation_text,
+            (SELECT s.data FROM call_states s
+             WHERE s.call_sid = c.call_sid AND s.state = 'call_created'
+             ORDER BY s.timestamp DESC, s.id DESC LIMIT 1) as call_created_state,
+            cr.provider as runtime_provider,
+            co.provider_used as provider_used
           FROM calls c
           LEFT JOIN transcripts t ON c.call_sid = t.call_sid
-          WHERE 
+          LEFT JOIN call_runtime_state cr ON cr.call_sid = c.call_sid
+          LEFT JOIN call_outcomes co ON co.call_sid = c.call_sid
+          WHERE (
             c.phone_number LIKE ? OR
             c.call_summary LIKE ? OR
             c.prompt LIKE ? OR
             c.first_message LIKE ? OR
             t.message LIKE ?
+          )${requesterChatId ? " AND c.user_chat_id = ?" : ""}
           GROUP BY c.call_sid
           ORDER BY c.created_at DESC
           LIMIT ?
@@ -1144,8 +1404,9 @@ function createSearchCallsHandler(ctx = {}) {
           searchTerm,
           searchTerm,
           searchTerm,
-          limit,
         ];
+        if (requesterChatId) params.push(requesterChatId);
+        params.push(limit);
 
         db.db.all(searchQuery, params, (err, rows) => {
           if (err) {
@@ -1311,6 +1572,271 @@ function resolveScheduledRunAt(rawRunAt, rawDelayMinutes, defaultDelayMinutes = 
   return new Date(
     Date.now() + Math.max(0, Number(defaultDelayMinutes) || 15) * 60 * 1000,
   ).toISOString();
+}
+
+function maskCallDestination(value) {
+  const digits = String(value || "").replace(/\D/g, "");
+  return digits ? `•••${digits.slice(-4)}` : "unavailable";
+}
+
+function createCallOperationsHandler(ctx = {}) {
+  return async function handleCallOperations(_req, res) {
+    try {
+      const db = typeof ctx.getDb === "function" ? ctx.getDb() : ctx.db;
+      if (!db?.db) {
+        return res.status(500).json({ success: false, error: "Database unavailable" });
+      }
+
+      const limit = 10;
+      const staleCutoff = new Date(Date.now() - 5 * 60 * 1000).toISOString();
+      const dayCutoff = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+      const activeStatusCondition =
+        "LOWER(COALESCE(c.status, '')) NOT IN ('completed','voicemail','busy','failed','no-answer','no_answer','canceled','cancelled')";
+      const activeStatusPredicate = `c.direction = 'outbound' AND ${activeStatusCondition}`;
+      const failedStatusCondition =
+        "LOWER(COALESCE(c.status, '')) IN ('failed','busy','no-answer','no_answer','canceled','cancelled')";
+      const failedStatusPredicate = `c.direction = 'outbound' AND ${failedStatusCondition}`;
+      const staleActivityPredicate =
+        "julianday(COALESCE((SELECT MAX(s.timestamp) FROM call_states s WHERE s.call_sid = c.call_sid), c.started_at, c.created_at)) <= julianday(?)";
+      const staleSubmissionPredicate =
+        `LOWER(COALESCE(c.status, '')) = 'unknown' OR (LOWER(COALESCE(c.status, '')) = 'submission_pending' AND ${staleActivityPredicate})`;
+      const loadCalls = (where, params = []) =>
+        new Promise((resolve, reject) => {
+          db.db.all(
+            `SELECT c.call_sid, c.phone_number, c.status, c.created_at, c.started_at,
+                    c.ended_at, c.duration, c.error_code,
+                    cr.provider AS runtime_provider,
+                    co.provider_used AS provider_used,
+                    (SELECT s.data FROM call_states s
+                     WHERE s.call_sid = c.call_sid AND s.state = 'call_created'
+                     ORDER BY s.timestamp DESC, s.id DESC LIMIT 1) AS call_created_state,
+                    (SELECT s.data FROM call_states s
+                     WHERE s.call_sid = c.call_sid
+                       AND s.state IN ('outbound_submission_uncertain', 'provider_submission_accepted', 'provider_metadata_updated', 'call_created')
+                     ORDER BY s.sequence_number DESC LIMIT 1) AS provider_state_data,
+                    (SELECT MAX(s.timestamp) FROM call_states s
+                     WHERE s.call_sid = c.call_sid) AS last_event_at
+             FROM calls c
+             LEFT JOIN call_runtime_state cr ON cr.call_sid = c.call_sid
+             LEFT JOIN call_outcomes co ON co.call_sid = c.call_sid
+             WHERE c.direction = 'outbound' AND ${where}
+             ORDER BY c.created_at DESC
+             LIMIT ?`,
+            [...params, limit],
+            (error, rows) => (error ? reject(error) : resolve(rows || [])),
+          );
+        });
+      const [active, stale, failures, unknownSubmissions, notifications, webhookErrors] = await Promise.all([
+        loadCalls(activeStatusCondition),
+        loadCalls(
+          `${activeStatusCondition} AND ${staleActivityPredicate}`,
+          [staleCutoff],
+        ),
+        loadCalls(
+          `${failedStatusCondition} AND julianday(c.created_at) >= julianday(?)`,
+          [dayCutoff],
+        ),
+        loadCalls(`(${staleSubmissionPredicate})`, [staleCutoff]),
+        new Promise((resolve, reject) => {
+          db.db.all(
+            `SELECT status, COUNT(*) AS count
+             FROM webhook_notifications
+             WHERE status IN ('pending', 'retrying', 'failed')
+             GROUP BY status`,
+            (error, rows) => (error ? reject(error) : resolve(rows || [])),
+          );
+        }),
+        new Promise((resolve, reject) => {
+          db.db.get(
+            `SELECT COUNT(*) AS count, MAX(timestamp) AS latest_at
+             FROM service_health_logs
+             WHERE service_name = 'webhook_system' AND status = 'error'
+               AND julianday(timestamp) >= julianday(?)`,
+            [dayCutoff],
+            (error, row) => (error ? reject(error) : resolve(row || { count: 0 })),
+          );
+        }),
+      ]);
+
+      const [activeCount, staleCount, failureCount, unknownSubmissionCount, activeProviders] = await Promise.all([
+        new Promise((resolve, reject) => {
+          db.db.get(
+            `SELECT COUNT(*) AS count FROM calls c WHERE ${activeStatusPredicate}`,
+            (error, row) => (error ? reject(error) : resolve(Number(row?.count) || 0)),
+          );
+        }),
+        new Promise((resolve, reject) => {
+          db.db.get(
+            `SELECT COUNT(*) AS count FROM calls c
+             WHERE ${activeStatusPredicate} AND ${staleActivityPredicate}`,
+            [staleCutoff],
+            (error, row) => (error ? reject(error) : resolve(Number(row?.count) || 0)),
+          );
+        }),
+        new Promise((resolve, reject) => {
+          db.db.get(
+            `SELECT COUNT(*) AS count FROM calls c
+             WHERE ${failedStatusPredicate} AND julianday(c.created_at) >= julianday(?)`,
+            [dayCutoff],
+            (error, row) => (error ? reject(error) : resolve(Number(row?.count) || 0)),
+          );
+        }),
+        new Promise((resolve, reject) => {
+          db.db.get(
+            `SELECT COUNT(*) AS count FROM calls c
+             WHERE c.direction = 'outbound' AND (${staleSubmissionPredicate})`,
+            [staleCutoff],
+            (error, row) => (error ? reject(error) : resolve(Number(row?.count) || 0)),
+          );
+        }),
+        new Promise((resolve, reject) => {
+          db.db.all(
+            `SELECT COALESCE(cr.provider, co.provider_used, 'unknown') AS provider,
+                    COUNT(*) AS count
+             FROM calls c
+             LEFT JOIN call_runtime_state cr ON cr.call_sid = c.call_sid
+             LEFT JOIN call_outcomes co ON co.call_sid = c.call_sid
+             WHERE ${activeStatusPredicate}
+             GROUP BY provider ORDER BY count DESC`,
+            (error, rows) => (error ? reject(error) : resolve(rows || [])),
+          );
+        }),
+      ]);
+
+      const normalizeRow = (row) => {
+        let createdState = {};
+        let providerState = {};
+        try {
+          createdState =
+            typeof row.call_created_state === "string"
+              ? JSON.parse(row.call_created_state)
+              : row.call_created_state || {};
+        } catch (_) {
+          createdState = {};
+        }
+        try {
+          providerState =
+            typeof row.provider_state_data === "string"
+              ? JSON.parse(row.provider_state_data)
+              : row.provider_state_data || {};
+        } catch (_) {
+          providerState = {};
+        }
+        const providerMetadata =
+          providerState.provider_metadata && typeof providerState.provider_metadata === "object"
+            ? providerState.provider_metadata
+            : {};
+        return {
+          call_sid: row.call_sid,
+          destination: maskCallDestination(row.phone_number),
+          status: row.status || "unknown",
+          telephony_provider:
+            row.runtime_provider ||
+            row.provider_used ||
+            providerState.provider ||
+            createdState.provider ||
+            null,
+          provider_call_id:
+            providerState.provider_call_id ||
+            providerMetadata.provider_call_id ||
+            providerMetadata.twilio_call_sid ||
+            providerMetadata.plivo_call_id ||
+            providerMetadata.vonage_uuid ||
+            null,
+          ai_voice_engine: createdState.ai_voice_engine || null,
+          created_at: row.created_at || null,
+          last_event_at: row.last_event_at || row.created_at || null,
+          started_at: row.started_at || null,
+          ended_at: row.ended_at || null,
+          duration: Number.isFinite(Number(row.duration)) ? Number(row.duration) : null,
+          error_code: row.error_code || null,
+        };
+      };
+      const notificationCounts = Object.fromEntries(
+        notifications.map((row) => [row.status, Number(row.count) || 0]),
+      );
+      const activeCalls = active.map(normalizeRow);
+      const providerActive = Object.fromEntries(
+        activeProviders.map((row) => [row.provider, Number(row.count) || 0]),
+      );
+
+      // One administrator-only, provider-neutral activity feed. Keep source
+      // records separate and expose only masked destinations and status data.
+      const providerCallGroups = await Promise.all([
+        new Promise((resolve, reject) => db.db.all(
+          `SELECT c.call_sid, c.phone_number, c.status, c.created_at,
+                  COALESCE(cr.provider, co.provider_used, 'unknown') AS provider
+           FROM calls c
+           LEFT JOIN call_runtime_state cr ON cr.call_sid = c.call_sid
+           LEFT JOIN call_outcomes co ON co.call_sid = c.call_sid
+           WHERE c.direction = 'outbound' ORDER BY c.created_at DESC LIMIT 20`,
+          (error, rows) => error ? reject(error) : resolve((rows || []).map((row) => ({
+            call_sid: row.call_sid, provider_call_id: null, destination: maskCallDestination(row.phone_number),
+            status: row.status || 'unknown', telephony_provider: row.provider,
+            created_at: row.created_at || null,
+          }))),
+        )),
+        new Promise((resolve, reject) => db.db.all(
+          `SELECT e.provider_call_id, e.provider_status, e.event_type, e.event_timestamp, e.received_at
+           FROM vapi_call_events e
+           WHERE e.id = (SELECT MAX(latest.id) FROM vapi_call_events latest WHERE latest.provider_call_id = e.provider_call_id)
+           ORDER BY COALESCE(e.event_timestamp, e.received_at) DESC LIMIT 20`,
+          (error, rows) => error ? reject(error) : resolve((rows || []).map((row) => ({
+            call_sid: row.provider_call_id, provider_call_id: row.provider_call_id, destination: null,
+            status: row.provider_status || row.event_type || 'unknown', telephony_provider: 'vapi',
+            created_at: row.event_timestamp || row.received_at || null,
+          }))),
+        )),
+        new Promise((resolve, reject) => db.db.all(
+          `SELECT provider_call_id, phone_number, status, COALESCE(start_time, created_at) AS created_at
+           FROM cartesia_calls WHERE direction = 'outbound' ORDER BY created_at DESC LIMIT 20`,
+          (error, rows) => error ? reject(error) : resolve((rows || []).map((row) => ({
+            call_sid: row.provider_call_id, provider_call_id: row.provider_call_id,
+            destination: maskCallDestination(row.phone_number), status: row.status || 'unknown',
+            telephony_provider: 'cartesia', created_at: row.created_at || null,
+          }))),
+        )),
+      ]);
+      const directCallIds = new Set(providerCallGroups[0].map((call) => String(call.call_sid || '')));
+      const recentProviderCalls = [
+        ...providerCallGroups[0],
+        ...providerCallGroups[1],
+        ...providerCallGroups[2].filter((call) => !directCallIds.has(`cartesia_${call.provider_call_id}`)),
+      ].sort((left, right) => Date.parse(right.created_at || 0) - Date.parse(left.created_at || 0)).slice(0, 20);
+
+      return res.json({
+        success: true,
+        generated_at: new Date().toISOString(),
+        counts: {
+          active: activeCount,
+          stale: staleCount,
+          recent_failures: failureCount,
+          unknown_submissions: unknownSubmissionCount,
+        },
+        active_calls: activeCalls,
+        recent_provider_calls: recentProviderCalls,
+        stale_calls: stale.map(normalizeRow),
+        recent_failures: failures.map(normalizeRow),
+        unknown_submissions: unknownSubmissions.map(normalizeRow),
+        active_by_provider: providerActive,
+        notification_delivery: {
+          pending: notificationCounts.pending || 0,
+          retrying: notificationCounts.retrying || 0,
+          failed: notificationCounts.failed || 0,
+        },
+        webhook_processing_errors_24h: {
+          count: Number(webhookErrors.count) || 0,
+          latest_at: webhookErrors.latest_at || null,
+        },
+      });
+    } catch (error) {
+      console.error("Error fetching call operations summary:", error);
+      return res.status(500).json({
+        success: false,
+        error: "Failed to fetch call operations summary",
+      });
+    }
+  };
 }
 
 function createListCallbackTasksHandler(ctx = {}) {
@@ -1876,6 +2402,10 @@ function registerCallRoutes(app, ctx = {}) {
     typeof ctx.requireOutboundAuthorization === "function"
       ? ctx.requireOutboundAuthorization
       : (_req, _res, next) => next();
+  const requireAdminToken =
+    typeof ctx.requireAdminToken === "function"
+      ? ctx.requireAdminToken
+      : requireOutboundAuthorization;
   const requireCallEActorAssertion = typeof ctx.requireCallEActorAssertion === "function"
     ? ctx.requireCallEActorAssertion
     : (_req, _res, next) => next();
@@ -1884,10 +2414,12 @@ function registerCallRoutes(app, ctx = {}) {
     : (_req, _res, next) => next();
   const handleOutboundCall = createOutboundCallHandler(ctx);
   const handleGetCallDetails = createGetCallDetailsHandler(ctx);
+  const callActivity = createCallActivityHandlers(ctx);
   const handleGetTranscriptAudio = createGetTranscriptAudioHandler(ctx);
   const handleListCalls = createListCallsHandler(ctx);
   const handleListCallsFiltered = createListCallsFilteredHandler(ctx);
   const handleSearchCalls = createSearchCallsHandler(ctx);
+  const handleCallOperations = createCallOperationsHandler(ctx);
   const handleListCallbackTasks = createListCallbackTasksHandler(ctx);
   const handleCreateCallbackTask = createCreateCallbackTaskHandler(ctx);
   const handleUpdateCallbackTaskStatus =
@@ -1906,6 +2438,20 @@ function registerCallRoutes(app, ctx = {}) {
     requireCallEActorAssertion,
     handleOutboundCall,
   );
+  app.get(
+    "/api/calls/operations",
+    requireAdminToken,
+    handleCallOperations,
+  );
+  app.get("/api/cartesia/call-readiness", cartesiaApprovalLimiter, requireOutboundAuthorization, requireCallEActorAssertion, async (req, res) => {
+    try {
+      if (typeof ctx.getCartesiaCallReadiness !== "function") return res.json({ success: true, enabled: false, reason: "cartesia_not_configured" });
+      const result = await ctx.getCartesiaCallReadiness();
+      return res.json({ success: true, enabled: result?.enabled === true, reason: result?.enabled === true ? null : result?.code || "cartesia_not_configured" });
+    } catch {
+      return res.json({ success: true, enabled: false, reason: "cartesia_not_configured" });
+    }
+  });
   app.get("/api/cartesia/provider-defaults", cartesiaApprovalLimiter, requireOutboundAuthorization, requireCallEActorAssertion, async (req, res) => {
     try {
       if (typeof ctx.getCartesiaCallDefaults !== "function") {
@@ -1970,8 +2516,22 @@ function registerCallRoutes(app, ctx = {}) {
     }
   });
   app.post("/api/cartesia/call-approval", cartesiaApprovalLimiter, requireOutboundAuthorization, requireCallEActorAssertion, async (req, res) => {
-    return sendRouteError(ctx, req, res, 409, "cartesia_is_ai_capability",
-      "Direct Cartesia dialing is retired. Start calls through /call using the selected telephony provider.");
+    try {
+      const body = req.body && typeof req.body === "object" && !Array.isArray(req.body) ? req.body : {};
+      const allowedFields = new Set(["business_id", "destination", "agent_id", "from_number_id", "idempotency_key", "dynamic_variables", "confirmation_phrase"]);
+      if (Object.keys(body).some((key) => !allowedFields.has(key))) return sendRouteError(ctx, req, res, 400, "cartesia_call_approval_invalid", "Cartesia call approval contains unsupported fields");
+      if (typeof ctx.createCartesiaCallApproval !== "function") return sendRouteError(ctx, req, res, 503, "cartesia_not_configured", "Cartesia Managed Agent calling is unavailable");
+      const approval = await ctx.createCartesiaCallApproval({ ...body, actor_id: req.callEActorId });
+      return res.json({ success: true, approval_token: approval.approvalToken, request_fingerprint: approval.requestFingerprint, expires_at: approval.expiresAt });
+    } catch (error) {
+      const code = String(error?.code || "cartesia_call_approval_failed");
+      const status = Number(error?.status) || (code.includes("not_configured") || code.includes("unavailable") ? 503
+        : code.includes("operator") ? 403
+          : code.includes("invalid") || code.includes("required") ? 400
+            : code.includes("conflict") || code.includes("not_ready") ? 409 : 502);
+      console.error("cartesia_call_approval_error", { code, status });
+      return sendRouteError(ctx, req, res, status, code, status >= 500 ? "Cartesia Managed Agent call approval failed" : error.message);
+    }
   });
   app.get("/api/cartesia/agents", cartesiaApprovalLimiter, requireOutboundAuthorization, requireCallEActorAssertion, async (req, res) => {
     try {
@@ -2248,15 +2808,19 @@ function registerCallRoutes(app, ctx = {}) {
       return sendRouteError(ctx, req, res, status, code, status === 502 ? "Cartesia call lookup failed" : error?.message || "Cartesia call lookup failed");
     }
   });
-  app.get("/api/calls/:callSid", requireOutboundAuthorization, handleGetCallDetails);
+  app.get("/api/calls", requireOutboundAuthorization, handleListCalls);
+  app.get("/api/calls/list", requireOutboundAuthorization, handleListCallsFiltered);
+  app.get("/api/calls/search", requireOutboundAuthorization, handleSearchCalls);
+  app.get("/api/calls/activity", requireOutboundAuthorization, requireCallEActorAssertion, callActivity.list);
+  app.get("/api/calls/activity/:callSid", requireOutboundAuthorization, requireCallEActorAssertion, callActivity.detail);
+  app.post("/api/calls/activity/:callSid/refresh", requireOutboundAuthorization, requireCallEActorAssertion, callActivity.refresh);
+  app.post("/api/calls/activity/:callSid/reconcile", requireOutboundAuthorization, requireCallEActorAssertion, callActivity.reconcile);
   app.get(
     "/api/calls/:callSid/transcript/audio",
     requireOutboundAuthorization,
     handleGetTranscriptAudio,
   );
-  app.get("/api/calls", requireOutboundAuthorization, handleListCalls);
-  app.get("/api/calls/list", requireOutboundAuthorization, handleListCallsFiltered);
-  app.get("/api/calls/search", requireOutboundAuthorization, handleSearchCalls);
+  app.get("/api/calls/:callSid", requireOutboundAuthorization, handleGetCallDetails);
   app.get(
     "/api/callback-tasks",
     requireOutboundAuthorization,
@@ -2300,5 +2864,10 @@ module.exports = {
   registerCallRoutes,
   __testables: {
     createOutboundCallHandler,
+    createListCallsHandler,
+    createListCallsFilteredHandler,
+    createSearchCallsHandler,
+    createCallOperationsHandler,
+    createCallActivityHandlers,
   },
 };

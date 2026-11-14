@@ -1,556 +1,557 @@
-VOICEDNUT — Cartesia Advanced Integration Foundation & Unified Voice Orchestration Engine
+VOICEDNUT — Phase 1: Unified Communications Foundation & Live Operations
 
 ROLE
 
-Act as a principal software architect, senior TypeScript/backend engineer, senior frontend engineer, AI voice infrastructure engineer, and enterprise platform engineer.
+Act as a principal software architect, senior Node.js backend engineer, telephony infrastructure engineer, AI voice integration engineer, and senior Telegram bot developer.
 
-Your mission is to evolve the existing VOICEDNUT codebase into a production-grade AI Voice Operations Platform by integrating Cartesia’s advanced voice and telephony capabilities into the existing architecture.
+Your mission is to evolve the existing VOICEDNUT project into a unified, intelligent, enterprise-ready AI communications platform.
 
-Think and work like a senior engineer responsible for a mission-critical, multi-provider AI calling platform.
+Think and work proactively. Inspect the actual repository, understand its existing architecture, reuse proven implementations, and deliver production-quality improvements with the smallest effective changes.
 
 1. PRIMARY OBJECTIVE
 
-Design and implement a first-class Cartesia integration and unified voice orchestration foundation.
+Build a unified communications foundation that makes all supported providers and AI voice capabilities work together through VOICEDNUT’s existing API and Telegram BOT.
 
-Integrate the relevant Cartesia capabilities:
+The desired experience:
 
-* Cartesia Managed Phone Agents.
-* Inbound and outbound phone calling.
-* Cartesia Sonic text-to-speech.
-* Cartesia Ink speech-to-text.
-* Cartesia Line SDK and agent runtime.
-* SIP trunking and carrier interoperability.
-* Phone-number management and agent assignment.
-* Real-time audio streaming and interruption handling.
-* Agent tools and multi-agent handoffs.
-* Batch calling and campaign capabilities.
-* Webhooks, call events and observability.
-* Voice testing and agent evaluation.
+* /call is the single unified outgoing-call command.
+* /provider manages telephony and AI capability defaults through interactive menus.
+* /cartesia provides separate interactive Cartesia management.
+* All compatible calls use the same VOICEDNUT call records and lifecycle.
+* All providers feed into shared internal webhook processing.
+* Telegram users receive immediate and continuous call-status feedback.
+* Authorized administrators can monitor calls and investigate failures.
+* Call results are consistently recorded and accessible.
 
-Build these capabilities as an additional provider and infrastructure layer within VOICEDNUT.
+Do not create a separate calling system for Cartesia or any other provider.
 
-Do not treat Cartesia as a replacement for existing providers.
+2. STRICT PROJECT SCOPE
 
-2. NON-NEGOTIABLE PRESERVATION REQUIREMENTS
+Prioritize:
 
-Preserve all existing:
+* api/
+* bot/
 
-* Project structure and architectural conventions.
-* Frameworks, languages and package-management conventions.
-* Backend and frontend functionality.
-* API endpoints and existing integrations.
-* Database architecture and existing migrations.
-* Authentication and authorization systems.
-* User interfaces and navigation.
-* Environment configuration conventions.
-* Existing development workflows and scripts.
+Keep miniapp/ completely untouched.
 
-Existing integrations that must remain operational:
+Do not redesign or implement Mini App features until the API and BOT implementation is complete, tested, and stable.
 
-1. Twilio.
-2. Plivo.
-3. Vonage.
-4. CALL-E.
+Preserve:
 
-Do not rewrite, remove, rename, replace, or unnecessarily refactor existing integrations.
+* Existing project structure.
+* Existing database and migrations.
+* Existing authentication and authorization.
+* Existing payment integrations.
+* Existing provider integrations.
+* Existing Telegram commands and interactive menus.
+* Existing business logic and successful workflows.
 
-Do not introduce a competing architecture when the repository already contains an appropriate abstraction.
+Do not replace functioning code simply because a different implementation is preferred.
 
-Inspect before deciding where code belongs.
+3. STAGE ONE — REPOSITORY AND ARCHITECTURE AUDIT
 
-3. FIRST TASK — READ-ONLY REPOSITORY AUDIT
+Before changing code, inspect:
 
-Before changing anything, inspect the entire repository.
+* Project structure and dependencies.
+* Provider adapters and registration.
+* Existing call services and controllers.
+* Provider-selection logic.
+* /provider command and interactive settings.
+* /call command and call-creation workflow.
+* Cartesia integration and existing Cartesia commands.
+* Webhook routes and signature verification.
+* Call-status normalization.
+* Call persistence and identifier correlation.
+* Telegram notification and message-editing mechanisms.
+* Administrator commands and permissions.
+* Retry, queue, and error-handling mechanisms.
+* Existing tests and validation scripts.
 
 Identify:
 
-* Frameworks and programming languages.
-* Frontend and backend architecture.
-* Existing provider adapters and interfaces.
-* Current telephony and voice-agent workflows.
-* Existing AI model and speech integrations.
-* Database schema and persistence conventions.
-* Authentication, authorization and secret management.
-* Existing webhook architecture.
-* Call lifecycle and event handling.
-* Background jobs and queues.
-* Existing dashboards and components.
-* Existing tests and CI/CD workflows.
-* Dependencies and package versions.
-* Existing documentation and developer tooling.
-
-Inspect the current implementations of Twilio, Plivo, Vonage and CALL-E.
-
-Determine how Cartesia should integrate without introducing duplicate abstractions or breaking existing functionality.
-
-Audit deliverables
-
-Produce:
-
-1. Repository architecture report.
-2. Existing provider integration comparison.
-3. Cartesia capability-to-codebase mapping.
-4. Recommended integration architecture.
-5. Required files and modules.
-6. Database changes, if any.
-7. Dependency and compatibility assessment.
-8. Security and operational risk assessment.
-9. Testing strategy.
-10. Phased implementation roadmap.
-
-STOP after the audit. Do not modify files or install packages until I approve the proposed implementation.
-
-4. OFFICIAL CARTESIA DOCUMENTATION
-
-Use current official Cartesia documentation and verify every API contract before implementation.
-
-Reference:
-
-* Documentation: https://docs.cartesia.ai/
-* API overview: https://docs.cartesia.ai/get-started/overview
-* AI Phone Agent: https://www.cartesia.ai/product/ai-phone-agent
-* Line SDK: https://github.com/cartesia-ai/line
-* SIP trunking: https://www.cartesia.ai/learn/sip-trunking
-* Cartesia MCP: https://github.com/cartesia-ai/cartesia-mcp
-
-Verify:
-
-* Current API version.
-* Authentication requirements.
-* Official SDK availability and compatibility.
-* Actual endpoint paths and HTTP methods.
-* Request and response schemas.
-* Webhook event formats.
-* Streaming protocols.
-* Supported audio codecs and sample rates.
-* Phone-number and SIP requirements.
-* Rate limits and concurrency restrictions.
-* Regional and country availability.
-* Pricing and usage implications.
-
-Never invent endpoints, SDK methods, configuration properties, or unsupported capabilities.
-
-Use official documentation as the source of truth.
-
-5. TARGET ARCHITECTURE
-
-Build around a unified orchestration architecture:
-
-VOICEDNUT Platform
-    |
-    v
-Unified Voice Orchestration Engine
-    |
-    +-- Telephony Provider Layer
-    |     +-- Cartesia
-    |     +-- Twilio
-    |     +-- Plivo
-    |     +-- Vonage
-    |     +-- CALL-E
-    |
-    +-- Speech Provider Layer
-    |     +-- Cartesia Sonic
-    |     +-- Cartesia Ink
-    |     +-- Existing compatible providers
-    |
-    +-- Agent Runtime Layer
-    |     +-- VOICEDNUT Runtime
-    |     +-- Cartesia Managed Agents
-    |     +-- Cartesia Line
-    |     +-- Existing compatible runtimes
-    |
-    +-- Shared Platform Services
-          +-- Agent Management
-          +-- Call Management
-          +-- Tool Execution
-          +-- Webhooks
-          +-- Workflows
-          +-- Analytics
-          +-- Security
-          +-- Billing and Usage
+1. What already works correctly.
+2. What can be reused.
+3. What is incomplete or duplicated.
+4. Which integrations lack complete webhook/status support.
+5. Which changes are necessary to achieve the objective.
 
-Use capability-aware adapters rather than assuming every provider supports every operation.
+Do not assume a provider is integrated merely because its name appears in the project.
 
-Keep telephony, speech, LLM, agent runtime and orchestration responsibilities separate.
+Produce a concise implementation plan and then proceed with safe implementation.
 
-6. CARTESIA PROVIDER ADAPTER
+4. STAGE TWO — UNIFIED PROVIDER AND CAPABILITY ARCHITECTURE
 
-Implement a dedicated Cartesia provider adapter following existing VOICEDNUT conventions.
+Extend the existing architecture rather than introducing a competing framework.
 
-Required capabilities:
+Separate provider responsibilities into compatible capabilities:
 
-* Provider registration.
-* Server-side API authentication.
-* Configuration validation.
-* Health and connectivity checks.
-* Inbound call support.
-* Outbound call support.
-* Call lifecycle management.
-* Phone-number operations where supported.
-* Agent assignment.
-* Webhook processing.
-* Error normalization.
-* Usage reporting where available.
-* Provider-specific logging and observability.
+Telephony
 
-Expose consistent internal interfaces while preserving provider-specific capabilities.
+* Places and receives telephone calls.
+* Supplies authoritative telephone call lifecycle events.
+* Exposes call identifiers and provider-specific results.
 
-Use explicit capability declarations, such as:
+AI voice and speech
 
-* inbound_calling
-* outbound_calling
-* speech_to_text
-* text_to_speech
-* streaming_audio
-* managed_agents
-* agent_runtime
-* sip_trunking
-* batch_calling
-* call_transfer
-* voicemail_detection
-* number_management
+* TTS.
+* STT.
+* Voice generation.
+* Voice profiles.
+* Compatible AI model and speech capabilities.
 
-Do not advertise capabilities until verified and implemented.
+VOICEDNUT orchestration
 
-7. INBOUND AND OUTBOUND CALLING
+* Resolves provider configuration.
+* Validates compatibility.
+* Executes calls.
+* Correlates provider identifiers.
+* Maintains internal call records.
+* Coordinates webhook processing and notifications.
 
-Implement Cartesia inbound and outbound calling as independent, testable capabilities.
+Cartesia must remain an independently manageable AI voice capability layer.
 
-Inbound
+Preserve Twilio, Plivo, Vonage, and all other verified existing integrations.
 
-* Receive and validate incoming call events.
-* Associate numbers with the correct agent.
-* Load agent configuration and instructions.
-* Initialize the appropriate runtime.
-* Track call state and lifecycle.
-* Handle disconnects, errors and timeouts.
-* Persist relevant call metadata.
+Make future integrations possible through the existing adapter architecture without duplicating business logic.
 
-Outbound
+5. STAGE THREE — INTERACTIVE /provider CONFIGURATION
 
-* Initiate approved calls.
-* Validate destination numbers.
-* Associate calls with agents and workflows.
-* Support caller ID configuration where permitted.
-* Track initiation and completion.
-* Handle busy, failed, unanswered and completed calls.
-* Support cancellation where the API permits it.
-* Persist call outcomes.
+Improve the existing /provider command using the established interactive Telegram menu architecture.
 
-Support both Cartesia Managed Agents and compatible external telephony integrations.
+Allow authorized users to configure independently:
 
-Never assume that an arbitrary existing carrier stream can be connected directly to Cartesia without validating the media and signaling contract.
-
-8. CARTESIA SONIC AND INK
-
-Create a dedicated speech integration layer.
-
-Sonic TTS
-
-Implement:
-
-* Text-to-speech generation.
-* Streaming speech output where supported.
-* Voice selection.
-* Language and model configuration.
-* Pronunciation handling.
-* Audio format configuration.
-* Streaming lifecycle management.
-* Error handling and usage tracking.
-
-Ink STT
-
-Implement:
-
-* Speech transcription.
-* Streaming transcription where supported.
-* Language configuration.
-* Audio input validation.
-* Transcript normalization.
-* Confidence metadata where available.
-* Error handling and usage tracking.
-
-Support a provider-independent speech interface so compatible existing speech providers can coexist.
-
-9. CARTESIA LINE AND AGENT RUNTIME
-
-Evaluate Cartesia Line as an additional agent runtime.
-
-Implement only capabilities verified against the current SDK.
-
-Evaluate:
-
-* Real-time conversations.
-* Interruption handling.
-* Turn-taking.
-* Tool calling.
-* Multi-agent handoffs.
-* DTMF.
-* Call transfers.
-* Voicemail handling.
-* Knowledge-base tools.
-* External HTTP tools.
-* LLM provider interoperability.
-
-Allow users to select the runtime appropriate for their agent.
-
-Do not force existing VOICEDNUT agents to migrate to Cartesia Line.
-
-10. SIP AND TELEPHONY INTEROPERABILITY
-
-Implement a configurable SIP integration layer where appropriate.
-
-Evaluate:
-
-* SIP trunk registration.
-* Bring-your-own-carrier configuration.
-* Inbound SIP routing.
-* Outbound SIP routing.
-* Secure authentication.
-* IP allowlisting.
-* TLS and SRTP.
-* Media encryption policies.
-* Number association.
-* SIP REFER and call transfer behavior.
-
-Validate carrier-specific limitations.
-
-Never expose SIP passwords or credentials to the frontend.
-
-11. UNIFIED AGENT MANAGEMENT
-
-Enhance the existing agent management experience with Cartesia-compatible settings.
-
-Include:
-
-* Agent name and description.
-* System instructions.
-* Runtime selection.
-* Telephony provider.
-* Speech provider.
-* Voice and model selection.
-* Language settings.
-* Conversation objectives.
-* Tool configuration.
-* Knowledge-base configuration.
-* Transfer and escalation rules.
-* Testing and deployment status.
-
-Make incompatible configurations impossible to activate.
-
-12. UNIFIED CALL OPERATIONS
-
-Integrate Cartesia into the existing call management experience.
-
-Provide:
-
-* Live call status.
-* Call history.
-* Provider identification.
-* Agent identification.
-* Call duration.
-* Call outcomes.
-* Error details.
-* Transcripts where supported.
-* Recordings where supported and authorized.
-* Call metadata.
-* Usage information.
-* Search and filtering.
-
-Do not create duplicate dashboards if suitable existing screens can be extended.
-
-13. WEBHOOK AND EVENT ARCHITECTURE
-
-Implement reliable event processing.
+* Default telephony provider.
+* AI voice engine.
+* TTS provider.
+* STT provider.
+* AI model.
+* Voice profile.
+* Compatible fallback preferences.
 
 Requirements:
 
+* Display current selections.
+* Show only supported options.
+* Allow interactive selection and confirmation.
+* Validate configuration before saving.
+* Preserve previous valid settings if a new selection fails.
+* Support Back, Cancel, Refresh, and Reset where appropriate.
+* Keep provider-specific advanced options out of the normal user journey.
+* Enforce tenant and user permissions.
+
+Changing the telephony provider must not silently change the AI voice engine, and vice versa.
+
+6. STAGE FOUR — UNIFIED /call EXECUTION
+
+Make /call the only normal outgoing-call initiation workflow.
+
+When invoked:
+
+1. Load the user’s authorized configuration.
+2. Resolve the default telephony provider.
+3. Resolve compatible AI voice and speech capabilities.
+4. Identify required fields.
+5. Ask only for missing information.
+6. Display a simple interactive call setup.
+7. Validate the destination and provider configuration.
+8. Validate agent and AI capability compatibility.
+9. Create or prepare the internal call record safely.
+10. Execute through the selected telephony provider.
+11. Store the actual provider call ID.
+12. Correlate applicable AI voice/session identifiers.
+13. Start the shared status-monitoring workflow.
+14. Immediately notify the user of the submission result.
+
+Do not show an active call when the provider has rejected the request.
+
+Do not silently switch providers.
+
+Do not initiate duplicate calls because of retries or uncertain network responses.
+
+Where call execution times out after a potentially successful provider request, use safe reconciliation or an explicit uncertain state rather than blindly resubmitting.
+
+7. STAGE FIVE — UNIFIED WEBHOOK AND LIVE CALL ENGINE
+
+This is a critical deliverable.
+
+Extend the existing webhook infrastructure so every compatible provider participates in one internal VOICEDNUT call lifecycle.
+
+Preserve provider-specific external webhook endpoints and payload formats where required.
+
+Each provider adapter should:
+
+* Verify its webhook signature.
+* Validate incoming events.
+* Identify the correct internal call.
+* Normalize provider-specific event information.
+* Forward events to shared processing.
+* Handle provider-specific exceptions.
+
+The shared processing service should:
+
+* Process events idempotently.
+* Prevent duplicate state transitions.
+* Handle late and out-of-order events safely.
+* Persist event history.
+* Update the internal call record.
+* Trigger the existing Telegram notification mechanism.
+* Record processing failures.
+* Support safe retry and recovery.
+
+Use the existing status model where possible.
+
+Support the following states where the provider exposes sufficient evidence:
+
+* Queued.
+* Initiated.
+* Ringing.
+* Answered.
+* In progress.
+* Completed.
+* Busy.
+* No answer.
+* Failed.
+* Canceled.
+* Unknown or uncertain, where appropriate.
+
+Do not fabricate events or statuses.
+
+Cartesia correlation
+
+Keep telephone lifecycle events authoritative to the telephony provider.
+
+Cartesia session events may supplement the internal call record where officially supported.
+
+Maintain the appropriate internal call ID, telephony call ID, and Cartesia session ID separately.
+
+Never treat a Cartesia session event as proof that a telephone call connected or ended.
+
+8. STAGE SIX — PROFESSIONAL TELEGRAM LIVE-CALL EXPERIENCE
+
+Reuse the existing call-status notification implementation that already works well for other providers.
+
+The objective is consistency, not a new notification framework.
+
+After a successful call submission, provide immediate feedback.
+
+Example:
+
+📞 VOICEDNUT — Outgoing Call
+
+Status: Queued
+
+Destination: +234 XXX XXX XXXX
+
+Telephony: Selected provider
+
+AI Voice: Cartesia
+
+Reference: VN-XXXX
+
+As actual provider events arrive, update the same Telegram message where supported.
+
+Example status updates:
+
+🟡 Ringing
+
+🟢 Connected
+
+🔵 In progress
+
+✅ Completed
+
+🔴 Failed
+
+⚪ No answer
+
+At the end of the call, display:
+
+* Final status.
+* Call duration where available.
+* Completion time.
+* Provider information.
+* Call result.
+* Recording/transcript availability where supported and authorized.
+* Failure explanation and useful recovery guidance.
+
+Use existing Telegram message-editing and callback conventions.
+
+Prevent duplicate notifications.
+
+If message editing fails, use a safe fallback notification without disrupting call execution.
+
+9. STAGE SEVEN — INTERACTIVE CARTESIA MANAGEMENT
+
+Keep /cartesia as one interactive dashboard entry point.
+
+Reuse the existing Telegram interactive menu architecture.
+
+Provide appropriate menus for:
+
+* Connection status.
+* Voice management.
+* Voice selection.
+* Model management.
+* Voice settings.
+* Voice testing.
+* Usage and activity.
+* Refresh and navigation.
+
+Use pagination, validation, confirmations, Back, and Cancel actions.
+
+Retrieve supported capabilities from verified official Cartesia API contracts.
+
+Voice testing must not initiate a telephone call.
+
+Saved Cartesia configuration must be available to the unified /call engine whenever selected and compatible.
+
+Keep Cartesia independently manageable without disconnecting it from the shared call infrastructure.
+
+10. STAGE EIGHT — UNIFIED CALL HISTORY AND ADMINISTRATOR VISIBILITY
+
+Reuse existing database tables and call-management services.
+
+Every call should retain the relevant information available from its providers:
+
+* Internal VOICEDNUT call ID.
+* User and tenant ownership.
+* Telephony provider.
+* Provider call ID.
+* AI voice engine.
+* Cartesia session identifier where applicable.
+* Destination reference.
+* Agent reference.
+* Call status.
+* Event timestamps.
+* Duration.
+* Final outcome.
+* Error information.
+* Recording/transcript references where supported.
+* Telegram notification reference where needed.
+
+Improve existing operations so authorized users can view recent calls, active calls, individual call details, and results.
+
+Authorized administrators should be able to inspect:
+
+* Active calls.
+* Failed calls.
+* Stale calls.
+* Missing or delayed webhooks.
+* Webhook processing failures.
+* Provider health.
+* Notification failures.
+
+Enforce existing role-based and tenant-level access controls.
+
+11. STAGE NINE — PROVIDER RELIABILITY AND RECOVERY
+
+Strengthen existing integrations with:
+
+* Connection and configuration validation.
+* Provider-specific rate-limit handling.
+* Appropriate timeout handling.
+* Safe retry policies.
 * Webhook signature verification.
-* Event validation.
-* Idempotency.
-* Duplicate event protection.
-* Retry handling.
-* Failure logging.
-* Event persistence.
-* Delivery monitoring.
-* Event-to-call association.
-* Safe asynchronous processing.
+* Idempotency protection.
+* Duplicate-event prevention.
+* Stale-call detection.
+* Safe status reconciliation where supported.
+* Structured logging.
+* Correlation IDs.
+* Actionable error messages.
 
-Support only documented Cartesia event types.
+Never automatically retry an uncertain call submission in a way that might place a second real call.
 
-Prevent webhook replay and unauthorized event injection.
+Fallback routing must only happen when the original provider’s execution state is sufficiently known and retrying is safe.
 
-14. CAMPAIGNS AND BATCH CALLING
+12. STAGE TEN — TESTING AND REGRESSION
 
-After core calling is stable, extend the existing campaign system or create one following existing architecture.
+Use existing test frameworks and conventions.
 
-Potential features:
+Add focused tests for:
 
-* Single-call execution.
-* Batch campaigns.
-* CSV imports.
-* Contact validation.
-* Scheduling.
-* Retry rules.
-* Concurrency limits.
-* Time-zone restrictions.
-* Quiet hours.
-* Campaign pause and cancellation.
-* Results and analytics.
+* Provider selection.
+* Capability compatibility.
+* Unified call creation.
+* Cartesia integration.
+* Provider-specific webhook signatures.
+* Event normalization.
+* Duplicate events.
+* Out-of-order events.
+* Late events.
+* Missing call identifiers.
+* Failed call submissions.
+* Uncertain call submissions.
+* Telegram live-status updates.
+* Telegram notification recovery.
+* Administrator permissions.
+* Tenant isolation.
+* Bot restarts.
+* Existing provider regression.
 
-Validate Cartesia’s actual batch calling limits and current availability.
+Use mocked provider responses for automated testing.
 
-Implement consent, applicable calling regulations, do-not-call checks, suppression lists and human approval requirements.
+Do not make real calls during automated tests.
 
-Do not initiate live campaigns during development or testing.
+Do not claim that live provider integration has been verified when only mocked tests have been run.
 
-15. SECURITY AND ENTERPRISE CONTROLS
+13. ENGINEERING AND SECURITY REQUIREMENTS
 
-Implement:
+* Keep API keys server-side.
+* Never expose credentials in Telegram messages or logs.
+* Validate all external inputs.
+* Verify webhook signatures.
+* Protect against cross-tenant access.
+* Apply least-privilege authorization.
+* Prevent unauthorized recording/transcript access.
+* Use safe database transactions where appropriate.
+* Preserve existing migrations and compatibility.
+* Avoid unnecessary packages.
+* Avoid duplicate services.
+* Follow existing code style and conventions.
+* Document new environment variables and configuration requirements.
+* Do not invent API endpoints, SDK methods, events, or provider capabilities.
 
-* Server-side secret storage.
-* Strict API-key access controls.
-* Encrypted sensitive configuration.
-* Role-based permissions.
-* Audit logging.
-* Rate limiting.
-* Request validation.
-* Webhook authentication.
-* Data retention controls.
-* Consent management.
-* Call authorization.
-* Spend and usage limits.
-* Kill switch for calling operations.
+Use official provider documentation and existing repository contracts as the source of truth.
 
-Never log API keys, passwords, access tokens or sensitive call credentials.
+14. EXECUTION STRATEGY
 
-Never expose provider secrets through frontend responses or browser bundles.
+Work incrementally.
 
-16. TESTING AND QUALITY ASSURANCE
+For each implementation stage:
 
-Create a comprehensive automated testing strategy.
+1. Inspect the relevant existing code.
+2. Identify the smallest safe change.
+3. Implement the change.
+4. Run focused tests.
+5. Fix regressions.
+6. Verify compatibility with existing services.
+7. Document important decisions.
 
-Include:
+Do not rewrite the whole project.
 
-* Unit tests.
-* Provider adapter tests.
-* API contract tests.
-* Integration tests using mocked Cartesia responses.
-* Webhook verification tests.
-* Call lifecycle tests.
-* Speech integration tests.
-* Runtime compatibility tests.
-* Authorization tests.
-* Failure and retry tests.
-* Regression tests for Twilio, Plivo, Vonage and CALL-E.
+Do not introduce unnecessary architectural complexity.
 
-Use mock mode by default.
+Do not stop after writing an implementation plan when the required work can safely be performed in the repository.
 
-No test should initiate an actual phone call, purchase a number, consume paid resources or modify production data.
+If a critical implementation is blocked by missing credentials, unsupported provider functionality, or unavailable external services, complete the safe work that can be done and clearly identify the blocker.
 
-Verify existing functionality before and after each approved implementation phase.
+15. STRICT APPROVAL GATES
 
-17. DOCUMENTATION
+Do not perform any of the following without explicit approval:
 
-Document:
+* Real outgoing or incoming calls.
+* Real SMS or messaging campaigns.
+* Phone-number purchases or releases.
+* Billable provider operations.
+* Production deployments.
+* Production database migrations.
+* Destructive data changes.
+* Production credential changes.
+* Paid infrastructure creation.
 
-* Architecture and provider boundaries.
-* Cartesia configuration.
-* Environment variables.
-* API operations.
-* Supported capabilities.
-* Agent configuration.
-* Inbound and outbound workflows.
-* Speech integration.
-* SIP setup.
-* Webhook events.
-* Testing procedures.
-* Troubleshooting.
-* Security requirements.
-* Deployment requirements.
+Read-only inspection, local development, mocked tests, and non-destructive code changes are permitted.
 
-Update existing documentation locations instead of creating unnecessary new documentation structures.
+16. FINAL ACCEPTANCE CRITERIA
 
-18. IMPLEMENTATION PHASES
+The implementation is successful only when:
 
-Follow this order:
+1. Existing supported providers continue working.
+2. /provider controls compatible defaults through interactive menus.
+3. /call provides one consistent call initiation experience.
+4. Cartesia remains independently manageable through interactive menus.
+5. Cartesia-powered calls use the selected telephony provider.
+6. Compatible calls use the shared VOICEDNUT webhook lifecycle.
+7. Users receive immediate call submission feedback.
+8. Live call statuses update in Telegram when provider events are available.
+9. Final call results are recorded and visible.
+10. Authorized administrators can investigate active and failed calls.
+11. Webhook retries do not create duplicate calls.
+12. Existing call workflows and BOT commands remain functional.
+13. Relevant automated tests pass.
+14. miniapp/ remains untouched.
 
-Phase	Scope
-0	Repository audit and official documentation verification
-1	Cartesia provider adapter and unified capability interfaces
-2	Inbound and outbound calling
-3	Sonic TTS and Ink STT
-4	Cartesia Line runtime integration
-5	SIP and carrier interoperability
-6	Agent management and configuration UI
-7	Webhooks and event processing
-8	Unified call operations dashboard
-9	Batch calling and campaign integration
-10	Tool execution and multi-agent orchestration
-11	Security, analytics, usage and enterprise controls
-12	Complete regression testing and documentation
+17. FINAL IMPLEMENTATION REPORT
 
-Each phase requires:
+At completion, report:
 
-1. Scope confirmation.
-2. Repository impact analysis.
-3. Implementation plan.
-4. Explicit approval.
-5. Implementation.
-6. Tests.
-7. Regression verification.
-8. Change summary.
-9. Next-phase proposal.
+* Architecture discovered.
+* Existing functionality reused.
+* Features implemented.
+* Files changed.
+* Provider integrations affected.
+* Webhook and lifecycle changes.
+* Telegram BOT improvements.
+* Database changes, if any.
+* Tests actually executed and their results.
+* Remaining provider limitations.
+* Outstanding blockers.
+* Recommended next implementation phase.
 
-Do not silently advance to another phase.
+Be precise and truthful about what was implemented and verified.
 
-19. STRICT EXECUTION RULES
+FINAL PRODUCT VISION
 
-* Do not make changes during the initial audit.
-* Do not install dependencies without approval.
-* Do not modify package manifests without approval.
-* Do not create database migrations without approval.
-* Do not change production configuration.
-* Do not deploy.
-* Do not provision or release phone numbers.
-* Do not initiate actual phone calls.
-* Do not create paid resources.
-* Do not delete existing code or files.
-* Do not replace existing providers.
-* Do not introduce unnecessary root folders.
-* Do not fabricate test results.
-* Do not claim an integration works without verification.
+VOICEDNUT should feel like one intelligent enterprise communications platform, not a collection of disconnected provider commands.
 
-When implementation is approved, make minimal, focused and reversible changes.
+Users should simply configure their defaults, manage their AI capabilities, initiate calls, and see their results.
 
-If an existing architectural constraint prevents a feature, explain the issue and propose alternatives before proceeding.
+VOICEDNUT should handle the underlying provider complexity reliably, securely, and consistently.
 
-20. DEFINITION OF DONE
+Prioritize simplicity for users and engineering excellence behind the scenes.
 
-The Cartesia foundation is complete when:
+18. NEXT PRIORITY ROADMAP
 
-* Cartesia is registered as an independent provider.
-* Existing providers remain intact.
-* Supported inbound and outbound workflows work in mocked integration tests.
-* Sonic and Ink integrations follow verified API contracts.
-* Cartesia Line is integrated only where compatible.
-* SIP integration follows verified security requirements.
-* Unified agent and call interfaces work.
-* Webhooks are authenticated and idempotent.
-* Capability-aware provider selection works.
-* Secrets remain server-side.
-* Automated tests pass.
-* Documentation is updated.
-* Existing application functionality passes regression tests.
+Implement these enhancements in order. They build on the provider-neutral Call Activity Center and are intended to connect existing call, provider, webhook, reconciliation, and post-call automation features without replacing the working provider flows.
 
-IMMEDIATE EXECUTION INSTRUCTION
+1. Build one durable provider-neutral call lifecycle record.
 
-START WITH PHASE 0 ONLY.
+   Current calls are represented across the shared `calls` and `call_states` tables, Vapi event and idempotency records, and Cartesia call and webhook records. Establish one canonical local call identity with verified actor/business ownership, provider call IDs, idempotency references, and a normalized append-only event timeline. Project provider events into that lifecycle while retaining provider-specific metadata behind allowlisted adapters. Backfill historical calls only when their owner and business scope can be established from trusted records; leave ambiguous records unassigned rather than guessing.
 
-Perform a comprehensive read-only audit of the actual VOICEDNUT repository.
+   Acceptance criteria:
+   * New Twilio, Plivo, Vonage, Vapi, and Cartesia calls appear in one scoped call history.
+   * The same local call identity is used by call details, callbacks, status refresh, and post-call workflows.
+   * Duplicate and out-of-order provider events do not regress terminal state or create duplicate lifecycle events.
+   * Historical records without verified ownership remain unavailable to user-scoped views and are reported as an explicit migration limitation.
 
-If repository access is unavailable, ask me to provide the repository or connect the appropriate GitHub access. Do not pretend to have inspected files you cannot access.
+2. Integrate safe reconciliation into the Call Activity Center.
 
-Return the complete audit report, recommended architecture, exact proposed file locations, risks, dependencies and phased implementation plan.
+   Add a per-call reconciliation action for uncertain submissions, using the provider call ID or the original idempotency/request correlation data when the ID is missing. Connect the existing Vapi and Cartesia reconciliation services to this shared flow, and provide equivalent provider lookup paths for direct carriers where identifiers are available. Add a bounded background reconciler for eligible unresolved records, with backoff, leases, deduplication, and a durable audit trail. A provider search miss must remain unresolved until its safe visibility window has elapsed; it must not trigger a new call.
 
-STOP AND WAIT FOR MY EXPLICIT APPROVAL BEFORE MAKING ANY CODE CHANGES.
+   Acceptance criteria:
+   * Users can reconcile an eligible call from its Activity Center detail view without switching provider commands.
+   * Reconciliation only reads provider state and updates local records; it never submits or ends a call.
+   * A retry is allowed only after a definitive provider rejection or other authoritative proof that no call was accepted.
+   * Missing identifiers, incomplete searches, ambiguous matches, provider timeouts, and eventual-consistency windows remain visibly unresolved with a clear next step.
+
+3. Route every terminal call event through durable post-call automation.
+
+   Send normalized completion events from each provider through one durable, idempotent queue before running summaries, QA, notifications, and approved post-call workflows. Replace fire-and-forget completion triggers with persisted enqueueing, leased workers, bounded retries, dead-letter visibility, and per-step run status. Preserve consent, business scope, and approval rules for every downstream action.
+
+   Acceptance criteria:
+   * A completed call from every supported provider can trigger the same configured post-call capabilities.
+   * Duplicate callbacks, refreshes, and worker restarts do not duplicate notifications or business actions.
+   * Failed, delayed, and completed automation runs are visible to authorized operators with safe error codes and recovery actions.
+   * Post-call processing failure never changes the recorded provider call outcome or causes another call to be placed.
+
+4. Simplify call setup into one guided launch flow.
+
+   Keep telephony selection and AI voice selection distinct, while presenting them in one call setup experience. Based on the selected call mode, gather only required inputs such as business, agent, source number, script, and voice profile. Run the existing provider readiness, business authorization, consent, contact policy, and idempotency checks before showing a concise preflight summary and one final confirmation.
+
+   Acceptance criteria:
+   * The user sees the selected telephony provider, AI voice mode, destination, business, and required script/agent before dispatch.
+   * Missing configuration and unsupported capabilities are shown with a direct setup path before a provider request is made.
+   * A single confirmation submits the exact previewed request with one reusable idempotency key.
+   * Canceling or changing inputs before confirmation makes no provider call and leaves no ambiguous submission.
+
+5. Add a shared offline lifecycle rehearsal and production readiness gate.
+
+   Expand the current provider acceptance tests into a common offline scenario for each provider covering dispatch, accepted response, timeout/unknown outcome, webhook delivery, status refresh, reconciliation, duplicate events, and post-call automation. Run this matrix alongside existing API, BOT, profile, and provider parity checks in CI. Extend the operator readiness view with recent provider lookup success/failure, webhook delivery lag, unresolved call age, and failed automation counts. Clearly distinguish local configuration checks from live provider connectivity.
+
+   Acceptance criteria:
+   * Every provider passes the same lifecycle contract against stubbed provider clients without placing live calls.
+   * CI fails on provider contract drift, unsafe retry behavior, missing actor/business scope, or duplicate side effects.
+   * Operators can identify stale unresolved calls and failed webhooks/automation from one sanitized dashboard.
+   * Production rollout remains gated on the documented checks, with a tested rollback path and no claim of live connectivity unless an actual probe ran.
+
+Recommended implementation sequence: complete item 1 first, then items 2 and 3 on the shared lifecycle. Implement item 4 as the user-facing flow over those stable contracts, and keep item 5 as the release gate for each phase.

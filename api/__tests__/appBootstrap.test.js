@@ -25,6 +25,38 @@ describe("API app bootstrap", function () {
     assert.equal(route.route.stack[0].name, "requireAdminToken");
   });
 
+  it("keeps provider diagnostics behind admin-token authorization and labels process-local observations", async function () {
+    const route = app._router.stack.find((layer) => layer.route?.path === "/admin/provider");
+    assert.ok(route, "provider status route should be registered");
+    assert.equal(route.route.methods.get, true);
+    assert.equal(route.route.stack[0].name, "requireAdminToken");
+
+    const previousDb = __testables.getDb();
+    let responseBody;
+    __testables.setDbForTests({ getSetting: async () => null });
+    try {
+      await route.route.stack[1].handle(
+        { query: {} },
+        {
+          json(value) {
+            responseBody = value;
+            return this;
+          },
+        },
+      );
+    } finally {
+      __testables.setDbForTests(previousDb);
+    }
+
+    const health = responseBody.provider_health?.[responseBody.provider];
+    assert.equal(health.observation_scope, "api_process_memory");
+    assert.equal(typeof health.circuit_state, "string");
+    assert.equal(typeof health.degraded, "boolean");
+    assert.equal(typeof health.consecutive_errors, "number");
+    assert.equal(Object.hasOwn(health, "api_key"), false);
+    assert.equal(Object.hasOwn(health, "last_error"), false);
+  });
+
   it("registers Vapi tool policy reads and mutations behind admin-token authorization", function () {
     for (const [path, method] of [
       ["/api/call-scripts/:id/vapi-tools", "get"],

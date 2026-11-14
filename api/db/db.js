@@ -24,6 +24,19 @@ const CALL_STATUS_ORDER = Object.freeze([
     'failed',
     'canceled',
 ]);
+const CALL_LIFECYCLE_PROVIDERS = new Set([
+    'twilio',
+    'plivo',
+    'vonage',
+    'vapi',
+    'call_e',
+    'cartesia',
+]);
+const CALL_LIFECYCLE_STATUSES = new Set([
+    ...CALL_STATUS_ORDER,
+    'unknown',
+    'submission-pending',
+]);
 const CALL_ACTIVE_STATUSES = Object.freeze([
     'queued',
     'initiated',
@@ -153,6 +166,85 @@ function getCallStatusRank(status) {
     return CALL_STATUS_ORDER.indexOf(normalizeCallStatusForDb(status));
 }
 
+function normalizeLifecycleProvider(value) {
+    const provider = String(value || '').trim().toLowerCase();
+    return CALL_LIFECYCLE_PROVIDERS.has(provider) ? provider : null;
+}
+
+function normalizeLifecycleStatus(value) {
+    const status = normalizeCallStatusForDb(value);
+    if (status === 'cancelled') return 'canceled';
+    return CALL_LIFECYCLE_STATUSES.has(status) ? status : null;
+}
+
+function normalizeLifecycleReference(value) {
+    const reference = String(value || '').trim();
+    return /^[A-Za-z0-9._:-]{1,400}$/.test(reference) ? reference : null;
+}
+
+function normalizeLifecycleEventType(value) {
+    const eventType = String(value || '').trim().toLowerCase();
+    return /^[a-z0-9][a-z0-9_.-]{0,79}$/.test(eventType) ? eventType : null;
+}
+
+function callLifecycleEventFromState(callSid, state, data = {}, stableEventKey = null) {
+    const normalizedState = String(state || '').trim().toLowerCase();
+    const fixedTypes = {
+        call_created: 'call_created',
+        outbound_submission_pending: 'submission_pending',
+        provider_submission_accepted: 'submission_accepted',
+        outbound_submission_uncertain: 'submission_uncertain',
+        outbound_submission_rejected: 'submission_rejected',
+        provider_status_refreshed: 'status_refreshed',
+        provider_call_reconciled: 'reconciled',
+    };
+    let eventType = fixedTypes[normalizedState] || null;
+    let status = normalizeLifecycleStatus(data.status || data.provider_status);
+    if (normalizedState === 'ringing') {
+        eventType = 'provider_status';
+        status = 'ringing';
+    } else if (normalizedState.startsWith('status_')) {
+        eventType = 'provider_status';
+        status = status || normalizeLifecycleStatus(normalizedState.slice('status_'.length));
+    } else if (normalizedState.startsWith('cartesia_')) {
+        eventType = 'provider_status';
+        status = status || normalizeLifecycleStatus(normalizedState.slice('cartesia_'.length));
+    }
+    if (!eventType) return null;
+
+    const provider = normalizeLifecycleProvider(data.telephony_provider || data.provider);
+    const providerStatusValue = String(data.provider_status || '').trim();
+    const providerStatus = /^[A-Za-z0-9._:-]{1,80}$/.test(providerStatusValue)
+        ? providerStatusValue
+        : null;
+    const rawTimestamp = data.event_timestamp || data.at || data.refreshed_at;
+    const parsedTimestamp = rawTimestamp && Number.isFinite(Date.parse(rawTimestamp))
+        ? new Date(rawTimestamp).toISOString()
+        : null;
+    const sourceValue = String(data.source || '').trim().toLowerCase();
+    const source = /^[a-z0-9_.-]{1,40}$/.test(sourceValue) ? sourceValue : 'call_state';
+
+    return {
+        event_key: stableEventKey || (eventType === 'call_created'
+            ? `call-created:${callSid}`
+            : ['provider_status', 'status_changed'].includes(eventType) && status
+                ? `call-status:${callSid}:${status}`
+                : eventType === 'reconciled' && status
+                    ? `call-reconciled:${callSid}:${status}`
+                : `call-milestone:${callSid}:${eventType}`),
+        call_sid: callSid,
+        provider,
+        event_type: eventType,
+        status,
+        provider_status: providerStatus,
+        provider_call_id: normalizeLifecycleReference(data.provider_call_id),
+        outbound_idempotency_key: normalizeLifecycleReference(data.outbound_idempotency_key),
+        ai_voice_engine: data.ai_voice_engine,
+        occurred_at: parsedTimestamp,
+        source,
+    };
+}
+
 class EnhancedDatabase {
     constructor() {
         this.db = null;
@@ -241,7 +333,13 @@ class EnhancedDatabase {
                 error_message TEXT,
                 ring_duration INTEGER,
                 answer_delay INTEGER,
-                business_id TEXT
+                business_id TEXT,
+                provider TEXT,
+                telephony_provider TEXT,
+                provider_call_id TEXT,
+                outbound_idempotency_key TEXT,
+                ai_voice_engine TEXT,
+                cartesia_session_id TEXT
             )`,
 
             // Enhanced call transcripts table with personality tracking
@@ -280,6 +378,22 @@ class EnhancedDatabase {
                 data TEXT,
                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
                 sequence_number INTEGER,
+                FOREIGN KEY(call_sid) REFERENCES calls(call_sid)
+            )`,
+
+            `CREATE TABLE IF NOT EXISTS call_lifecycle_events (
+                event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_key TEXT NOT NULL UNIQUE,
+                call_sid TEXT NOT NULL,
+                actor_id TEXT NOT NULL,
+                business_id TEXT,
+                provider TEXT,
+                event_type TEXT NOT NULL,
+                status TEXT,
+                provider_status TEXT,
+                source TEXT NOT NULL,
+                occurred_at TEXT NOT NULL,
+                recorded_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY(call_sid) REFERENCES calls(call_sid)
             )`,
 
@@ -1733,7 +1847,20 @@ class EnhancedDatabase {
             );
         });
 
-        await this.ensureCallColumns(['digit_summary', 'digit_count', 'last_otp', 'last_otp_masked', 'direction', 'business_id']);
+        await this.ensureCallColumns([
+            'digit_summary',
+            'digit_count',
+            'last_otp',
+            'last_otp_masked',
+            'direction',
+            'business_id',
+            'provider',
+            'telephony_provider',
+            'provider_call_id',
+            'outbound_idempotency_key',
+            'ai_voice_engine',
+            'cartesia_session_id',
+        ]);
         await this.ensureCartesiaBatchReconciliationColumns();
         await this.ensureCallEContactPolicyColumns();
         await this.ensureCallEReconciliationBusinessColumn();
@@ -1805,6 +1932,52 @@ class EnhancedDatabase {
             'CREATE INDEX IF NOT EXISTS idx_states_call_sid ON call_states(call_sid)',
             'CREATE INDEX IF NOT EXISTS idx_states_timestamp ON call_states(timestamp)',
             'CREATE INDEX IF NOT EXISTS idx_states_state ON call_states(state)',
+            'CREATE INDEX IF NOT EXISTS idx_call_lifecycle_events_call ON call_lifecycle_events(call_sid, event_id)',
+            'CREATE INDEX IF NOT EXISTS idx_call_lifecycle_events_actor ON call_lifecycle_events(actor_id, event_id)',
+            'CREATE INDEX IF NOT EXISTS idx_call_lifecycle_events_business ON call_lifecycle_events(business_id, event_id)',
+            `CREATE TRIGGER IF NOT EXISTS calls_lifecycle_event_insert
+             AFTER INSERT ON calls
+             WHEN TRIM(COALESCE(NEW.user_chat_id, '')) != ''
+             BEGIN
+                 INSERT OR IGNORE INTO call_lifecycle_events (
+                     event_key, call_sid, actor_id, business_id, provider, event_type, status, source, occurred_at
+                 ) VALUES (
+                     'call-created:' || NEW.call_sid,
+                     NEW.call_sid,
+                     TRIM(NEW.user_chat_id),
+                     NEW.business_id,
+                     NEW.provider,
+                     'call_created',
+                     LOWER(REPLACE(COALESCE(NEW.status, 'initiated'), '_', '-')),
+                     'call_record_insert',
+                     COALESCE(NEW.created_at, CURRENT_TIMESTAMP)
+                 );
+             END`,
+            `CREATE TRIGGER IF NOT EXISTS calls_lifecycle_event_status_update
+             AFTER UPDATE OF status ON calls
+             WHEN TRIM(COALESCE(NEW.user_chat_id, '')) != ''
+               AND COALESCE(LOWER(REPLACE(OLD.status, '_', '-')), '') != COALESCE(LOWER(REPLACE(NEW.status, '_', '-')), '')
+             BEGIN
+                 INSERT OR IGNORE INTO call_lifecycle_events (
+                     event_key, call_sid, actor_id, business_id, provider, event_type, status, source, occurred_at
+                 ) VALUES (
+                     'call-status:' || NEW.call_sid || ':' || LOWER(REPLACE(NEW.status, '_', '-')),
+                     NEW.call_sid,
+                     TRIM(NEW.user_chat_id),
+                     NEW.business_id,
+                     NEW.provider,
+                     'status_changed',
+                     LOWER(REPLACE(NEW.status, '_', '-')),
+                     'call_record_status',
+                     COALESCE(NEW.ended_at, NEW.started_at, CURRENT_TIMESTAMP)
+                 );
+             END`,
+            `CREATE TRIGGER IF NOT EXISTS call_lifecycle_events_no_update
+             BEFORE UPDATE ON call_lifecycle_events
+             BEGIN SELECT RAISE(ABORT, 'Call lifecycle events are append-only'); END`,
+            `CREATE TRIGGER IF NOT EXISTS call_lifecycle_events_no_delete
+             BEFORE DELETE ON call_lifecycle_events
+             BEGIN SELECT RAISE(ABORT, 'Call lifecycle events are append-only'); END`,
             'CREATE INDEX IF NOT EXISTS idx_call_outcomes_primary_flow ON call_outcomes(primary_flow)',
             'CREATE INDEX IF NOT EXISTS idx_call_outcomes_disposition ON call_outcomes(disposition)',
             'CREATE INDEX IF NOT EXISTS idx_call_outcomes_updated_at ON call_outcomes(updated_at)',
@@ -1910,7 +2083,234 @@ class EnhancedDatabase {
             });
         }
 
+        const lifecycleBackfill = await this.backfillCallLifecycleEvents(500);
+        if (lifecycleBackfill.has_unassigned_records) {
+            console.warn('call_lifecycle_backfill_owner_unresolved', {
+                limitation: 'Legacy calls without a verified owner remain excluded from user-scoped lifecycle history.',
+            });
+        }
+
         console.log('✅ Enhanced database tables and indexes created successfully');
+    }
+
+    async insertCallLifecycleEvent(event) {
+        const callSid = String(event?.call_sid || '').trim();
+        const actorId = String(event?.actor_id || '').trim();
+        const eventKey = normalizeLifecycleReference(event?.event_key);
+        const eventType = normalizeLifecycleEventType(event?.event_type);
+        const status = event?.status ? normalizeLifecycleStatus(event.status) : null;
+        const occurredAt = event?.occurred_at && Number.isFinite(Date.parse(event.occurred_at))
+            ? new Date(event.occurred_at).toISOString()
+            : new Date().toISOString();
+        const sourceValue = String(event?.source || '').trim().toLowerCase();
+        const source = /^[a-z0-9_.-]{1,40}$/.test(sourceValue) ? sourceValue : 'call_state';
+        if (!callSid || callSid.length > 200 || !actorId || actorId.length > 80 || !eventKey || !eventType ||
+            (event?.status && !status)) return false;
+        const providerStatusValue = String(event?.provider_status || '').trim();
+        const providerStatus = /^[A-Za-z0-9._:-]{1,80}$/.test(providerStatusValue) ? providerStatusValue : null;
+        const provider = normalizeLifecycleProvider(event?.provider);
+        const businessId = String(event?.business_id || '').trim();
+        return new Promise((resolve, reject) => this.db.run(
+            `INSERT OR IGNORE INTO call_lifecycle_events (
+                event_key, call_sid, actor_id, business_id, provider, event_type, status, provider_status, source, occurred_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [eventKey, callSid, actorId, businessId || null, provider, eventType, status, providerStatus, source, occurredAt],
+            function (error) {
+                if (error) return reject(error);
+                resolve(this.changes > 0);
+            },
+        ));
+    }
+
+    async backfillCallLifecycleEvents(batchSize = 500) {
+        const safeBatchSize = Math.max(1, Math.min(500, Math.floor(Number(batchSize) || 500)));
+        const calls = await new Promise((resolve, reject) => this.db.all(
+            `SELECT c.call_sid, c.user_chat_id AS actor_id, c.business_id,
+                    COALESCE(c.telephony_provider, c.provider) AS provider,
+                    c.status, c.created_at, c.started_at, c.ended_at
+             FROM calls c
+             WHERE TRIM(COALESCE(c.user_chat_id, '')) != ''
+               AND (
+                 NOT EXISTS (SELECT 1 FROM call_lifecycle_events e WHERE e.event_key = 'call-created:' || c.call_sid)
+                 OR (
+                   LOWER(REPLACE(COALESCE(c.status, ''), '_', '-')) NOT IN ('', 'initiated')
+                   AND NOT EXISTS (
+                     SELECT 1 FROM call_lifecycle_events e
+                     WHERE e.event_key = 'call-status:' || c.call_sid || ':' || LOWER(REPLACE(COALESCE(c.status, ''), '_', '-'))
+                   )
+                 )
+               )
+             ORDER BY c.id
+             LIMIT ?`,
+            [safeBatchSize],
+            (error, rows) => error ? reject(error) : resolve(rows || []),
+        ));
+        for (const call of calls) {
+            const createdAt = call.created_at && Number.isFinite(Date.parse(call.created_at))
+                ? new Date(call.created_at).toISOString()
+                : new Date().toISOString();
+            await this.insertCallLifecycleEvent({
+                event_key: `call-created:${call.call_sid}`,
+                call_sid: call.call_sid,
+                actor_id: call.actor_id,
+                business_id: call.business_id,
+                provider: call.provider,
+                event_type: 'call_created',
+                status: 'initiated',
+                source: 'historical_call_record',
+                occurred_at: createdAt,
+            });
+            const status = normalizeLifecycleStatus(call.status);
+            if (status && status !== 'initiated') {
+                const statusAt = call.ended_at || call.started_at || call.created_at || createdAt;
+                await this.insertCallLifecycleEvent({
+                    event_key: `call-status:${call.call_sid}:${status}`,
+                    call_sid: call.call_sid,
+                    actor_id: call.actor_id,
+                    business_id: call.business_id,
+                    provider: call.provider,
+                    event_type: 'status_changed',
+                    status,
+                    source: 'historical_call_record',
+                    occurred_at: statusAt,
+                });
+            }
+
+        }
+
+        const states = await new Promise((resolve, reject) => this.db.all(
+            `SELECT s.id, s.call_sid, s.state, s.data, s.timestamp, s.sequence_number,
+                    c.user_chat_id AS actor_id, c.business_id, c.provider, c.telephony_provider
+             FROM call_states s
+             JOIN calls c ON c.call_sid = s.call_sid
+             WHERE TRIM(COALESCE(c.user_chat_id, '')) != ''
+               AND (
+                 s.state IN (
+                   'call_created', 'outbound_submission_pending', 'provider_submission_accepted',
+                   'outbound_submission_uncertain', 'outbound_submission_rejected',
+                   'provider_status_refreshed', 'provider_call_reconciled', 'ringing'
+                 )
+                 OR substr(s.state, 1, 7) = 'status_'
+                 OR substr(s.state, 1, 9) = 'cartesia_'
+               )
+               AND NOT EXISTS (
+                 SELECT 1 FROM call_lifecycle_events e
+                 WHERE e.event_key = CASE
+                   WHEN lower(s.state) = 'call_created' THEN 'call-created:' || s.call_sid
+                   WHEN lower(s.state) = 'provider_status_refreshed' THEN 'call-state:' || s.call_sid || ':' || s.id
+                   WHEN lower(s.state) = 'provider_call_reconciled' THEN 'call-reconciled:' || s.call_sid || ':' ||
+                     lower(replace(COALESCE(json_extract(
+                       CASE WHEN json_valid(s.data) THEN s.data ELSE '{}' END, '$.status'
+                     ), ''), '_', '-'))
+                   WHEN lower(s.state) IN (
+                     'outbound_submission_pending', 'provider_submission_accepted',
+                     'outbound_submission_uncertain', 'outbound_submission_rejected'
+                   ) THEN 'call-milestone:' || s.call_sid || ':' || CASE lower(s.state)
+                     WHEN 'outbound_submission_pending' THEN 'submission_pending'
+                     WHEN 'provider_submission_accepted' THEN 'submission_accepted'
+                     WHEN 'outbound_submission_uncertain' THEN 'submission_uncertain'
+                     ELSE 'submission_rejected'
+                   END
+                   WHEN lower(s.state) = 'ringing' THEN 'call-status:' || s.call_sid || ':ringing'
+                   WHEN substr(lower(s.state), 1, 7) = 'status_' THEN 'call-status:' || s.call_sid || ':' ||
+                     replace(replace(substr(lower(s.state), 8), '_', '-'), 'cancelled', 'canceled')
+                   WHEN substr(lower(s.state), 1, 9) = 'cartesia_' THEN 'call-status:' || s.call_sid || ':' ||
+                     replace(replace(substr(lower(s.state), 10), '_', '-'), 'cancelled', 'canceled')
+                   ELSE 'call-milestone:' || s.call_sid || ':provider_status'
+                 END
+               )
+             ORDER BY s.id
+             LIMIT ?`,
+            [safeBatchSize],
+            (error, rows) => error ? reject(error) : resolve(rows || []),
+        ));
+        for (const state of states) {
+            let data = {};
+            try {
+                const parsed = JSON.parse(state.data || '{}');
+                if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) data = parsed;
+            } catch {
+                data = {};
+            }
+            const event = callLifecycleEventFromState(state.call_sid, state.state, data);
+            if (!event) continue;
+            const eventKey = event.event_type === 'status_refreshed'
+                ? `call-state:${state.call_sid}:${state.id}`
+                : event.event_key;
+            await this.appendCallLifecycleEventForCall(state.call_sid, {
+                ...event,
+                event_key: eventKey,
+                provider: event.provider || state.telephony_provider || state.provider,
+                occurred_at: state.timestamp,
+            });
+        }
+        const hasUnassignedRecords = await new Promise((resolve, reject) => this.db.get(
+            `SELECT 1 AS found FROM calls
+             WHERE user_chat_id IS NULL OR TRIM(user_chat_id) = ''
+             LIMIT 1`,
+            (error, row) => error ? reject(error) : resolve(Boolean(row)),
+        ));
+        return { calls_backfilled: calls.length, states_backfilled: states.length, has_unassigned_records: hasUnassignedRecords };
+    }
+
+    async appendCallLifecycleEventForCall(callSid, event) {
+        const row = await new Promise((resolve, reject) => this.db.get(
+            `SELECT user_chat_id AS actor_id, business_id, provider, telephony_provider,
+                    provider_call_id, outbound_idempotency_key, ai_voice_engine
+             FROM calls WHERE call_sid = ?`,
+            [callSid],
+            (error, result) => error ? reject(error) : resolve(result || null),
+        ));
+        if (!row?.actor_id) return false;
+        const inputProvider = normalizeLifecycleProvider(event.provider);
+        const provider = normalizeLifecycleProvider(row.telephony_provider || row.provider) || inputProvider;
+        const providerCallId = normalizeLifecycleReference(event.provider_call_id);
+        const idempotencyKey = normalizeLifecycleReference(event.outbound_idempotency_key);
+        const aiVoiceEngineValue = String(event.ai_voice_engine || '').trim().toLowerCase();
+        const aiVoiceEngine = /^[a-z0-9_.-]{1,40}$/.test(aiVoiceEngineValue) ? aiVoiceEngineValue : null;
+        const providerIsConfirmed = Boolean(providerCallId) ||
+            ['submission_accepted', 'submission_uncertain', 'provider_status'].includes(event.event_type);
+        if ((provider && providerIsConfirmed) || providerCallId || idempotencyKey || aiVoiceEngine) {
+            await new Promise((resolve, reject) => this.db.run(
+                `UPDATE calls SET
+                    provider = COALESCE(provider, ?),
+                    telephony_provider = COALESCE(telephony_provider, ?),
+                    provider_call_id = COALESCE(provider_call_id, ?),
+                    outbound_idempotency_key = COALESCE(outbound_idempotency_key, ?),
+                    ai_voice_engine = COALESCE(ai_voice_engine, ?)
+                 WHERE call_sid = ?`,
+                [providerIsConfirmed ? provider : null, providerIsConfirmed ? provider : null, providerCallId, idempotencyKey, aiVoiceEngine, callSid],
+                (error) => error ? reject(error) : resolve(),
+            ));
+        }
+        return this.insertCallLifecycleEvent({
+            ...event,
+            call_sid: callSid,
+            actor_id: row.actor_id,
+            business_id: row.business_id,
+            provider,
+        });
+    }
+
+    async listCallLifecycleEvents(callSid, actorId, options = {}) {
+        const normalizedCallSid = String(callSid || '').trim();
+        const normalizedActorId = String(actorId || '').trim();
+        const limit = Math.max(1, Math.min(100, Math.floor(Number(options.limit) || 20)));
+        if (!normalizedCallSid || normalizedCallSid.length > 200 || !normalizedActorId || normalizedActorId.length > 80) {
+            return [];
+        }
+        const rows = await new Promise((resolve, reject) => this.db.all(
+            `SELECT e.event_id, e.call_sid, e.actor_id, e.business_id, e.provider,
+                    e.event_type, e.status, e.provider_status, e.source,
+                    e.occurred_at, e.recorded_at
+             FROM call_lifecycle_events e
+             JOIN calls c ON c.call_sid = e.call_sid
+             WHERE e.call_sid = ? AND e.actor_id = ? AND c.user_chat_id = ?
+             ORDER BY e.event_id DESC LIMIT ?`,
+            [normalizedCallSid, normalizedActorId, normalizedActorId, limit],
+            (error, result) => error ? reject(error) : resolve(result || []),
+        ));
+        return rows.reverse();
     }
 
     async ensureOutboundContactDispatchCartesiaProvider() {
@@ -2254,8 +2654,8 @@ class EnhancedDatabase {
                 await addColumn('last_otp_masked', 'TEXT');
             } else if (column === 'direction') {
                 await addColumn('direction', 'TEXT');
-            } else if (column === 'business_id') {
-                await addColumn('business_id', 'TEXT');
+            } else if (['business_id', 'provider', 'telephony_provider', 'provider_call_id', 'outbound_idempotency_key', 'ai_voice_engine', 'cartesia_session_id'].includes(column)) {
+                await addColumn(column, 'TEXT');
             }
         }
     }
@@ -2368,16 +2768,33 @@ class EnhancedDatabase {
             business_context = null,
             generated_functions = null,
             direction = null,
-            business_id = null
+            business_id = null,
+            status = 'initiated',
+            provider = null,
+            telephony_provider = null,
+            provider_call_id = null,
+            outbound_idempotency_key = null,
+            ai_voice_engine = null,
+            cartesia_session_id = null,
         } = callData;
+        const initialStatus = status === 'submission_pending' ? status : 'initiated';
+        const normalizedProvider = normalizeLifecycleProvider(telephony_provider || provider);
+        const normalizedProviderCallId = normalizeLifecycleReference(provider_call_id);
+        const normalizedIdempotencyKey = normalizeLifecycleReference(outbound_idempotency_key);
+        const normalizedAiVoiceEngine = /^[a-z0-9_.-]{1,40}$/.test(String(ai_voice_engine || '').trim().toLowerCase())
+            ? String(ai_voice_engine).trim().toLowerCase()
+            : null;
+        const normalizedCartesiaSessionId = normalizeLifecycleReference(cartesia_session_id);
         
         return new Promise((resolve, reject) => {
             const stmt = this.db.prepare(`
                 INSERT INTO calls (
                     call_sid, phone_number, prompt, first_message, 
-                    user_chat_id, status, business_context, generated_functions, direction, business_id
+                    user_chat_id, status, business_context, generated_functions, direction, business_id,
+                    provider, telephony_provider, provider_call_id, outbound_idempotency_key,
+                    ai_voice_engine, cartesia_session_id
                 )
-                VALUES (?, ?, ?, ?, ?, 'initiated', ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             `);
             
             stmt.run([
@@ -2386,10 +2803,17 @@ class EnhancedDatabase {
                 prompt, 
                 first_message, 
                 user_chat_id, 
+                initialStatus,
                 business_context,
                 generated_functions,
                 direction,
-                business_id
+                business_id,
+                normalizedProvider,
+                normalizedProvider,
+                normalizedProviderCallId,
+                normalizedIdempotencyKey,
+                normalizedAiVoiceEngine,
+                normalizedCartesiaSessionId,
             ], function(err) {
                 if (err) {
                     reject(err);
@@ -2544,6 +2968,23 @@ class EnhancedDatabase {
                     values.push(additionalData[key]);
                 }
             });
+            const provider = normalizeLifecycleProvider(additionalData.telephony_provider || additionalData.provider);
+            const providerCallId = normalizeLifecycleReference(additionalData.provider_call_id);
+            const idempotencyKey = normalizeLifecycleReference(additionalData.outbound_idempotency_key);
+            const aiVoiceEngineValue = String(additionalData.ai_voice_engine || '').trim().toLowerCase();
+            const aiVoiceEngine = /^[a-z0-9_.-]{1,40}$/.test(aiVoiceEngineValue) ? aiVoiceEngineValue : null;
+            const identityFields = {
+                provider,
+                telephony_provider: provider,
+                provider_call_id: providerCallId,
+                outbound_idempotency_key: idempotencyKey,
+                ai_voice_engine: aiVoiceEngine,
+            };
+            for (const [field, value] of Object.entries(identityFields)) {
+                if (value === null || additionalData[field] === undefined) continue;
+                updateFields.push(`${field} = COALESCE(${field}, ?)`);
+                values.push(value);
+            }
 
             values.push(call_sid);
 
@@ -2561,25 +3002,30 @@ class EnhancedDatabase {
 
     // Enhanced call state tracking
     async updateCallState(call_sid, state, data = null) {
-        return new Promise((resolve, reject) => {
-            const stmt = this.db.prepare(`
-                INSERT INTO call_states (call_sid, state, data, sequence_number)
-                VALUES (?, ?, ?, (
-                    SELECT COALESCE(MAX(sequence_number), 0) + 1 
-                    FROM call_states 
-                    WHERE call_sid = ?
-                ))
-            `);
-            
-            stmt.run([call_sid, state, data ? JSON.stringify(data) : null, call_sid], function(err) {
-                if (err) {
-                    reject(err);
-                } else {
-                    resolve(this.lastID);
-                }
-            });
-            stmt.finalize();
-        });
+        const callSid = String(call_sid || '').trim();
+        if (!callSid || callSid.length > 200) throw new Error('call_sid is invalid');
+        const stateData = data && typeof data === 'object' && !Array.isArray(data) ? data : {};
+        const serializedData = data && typeof data === 'object' ? JSON.stringify(data) : null;
+        const stateId = await new Promise((resolve, reject) => this.db.run(
+            `INSERT INTO call_states (call_sid, state, data, sequence_number)
+             VALUES (?, ?, ?, (
+                 SELECT COALESCE(MAX(sequence_number), 0) + 1
+                 FROM call_states WHERE call_sid = ?
+             ))`,
+            [callSid, String(state || '').slice(0, 80) || 'event', serializedData, callSid],
+            function (error) {
+                if (error) return reject(error);
+                resolve(this.lastID);
+            },
+        ));
+        const event = callLifecycleEventFromState(callSid, state, stateData);
+        if (event) {
+            const eventKey = event.event_type === 'status_refreshed'
+                ? `call-state:${callSid}:${stateId}`
+                : event.event_key;
+            await this.appendCallLifecycleEventForCall(callSid, { ...event, event_key: eventKey });
+        }
+        return stateId;
     }
 
     async getLatestCallState(call_sid, state) {
@@ -5543,6 +5989,24 @@ class EnhancedDatabase {
                     }
                 );
             });
+        });
+    }
+
+    async deleteProviderEventIdempotency(payload = {}) {
+        const source = String(payload.source || '').trim();
+        const eventKey = String(payload.event_key || '').trim();
+        if (!source || !eventKey) {
+            return { deleted: false };
+        }
+        return new Promise((resolve, reject) => {
+            this.db.run(
+                `DELETE FROM provider_event_idempotency WHERE source = ? AND event_key = ?`,
+                [source, eventKey],
+                function(error) {
+                    if (error) reject(error);
+                    else resolve({ deleted: (this.changes || 0) > 0 });
+                },
+            );
         });
     }
 
@@ -9677,6 +10141,22 @@ class EnhancedDatabase {
         });
     }
 
+    async getCartesiaCallRecord(providerCallId) {
+        const id = String(providerCallId || '').trim();
+        if (!/^[A-Za-z0-9_-]{1,200}$/.test(id)) return null;
+        return new Promise((resolve, reject) => {
+            this.db.get(
+                `SELECT local_call_id, provider_call_id, business_id, agent_id,
+                        from_number_id, phone_number, direction, business_scope_resolved,
+                        status, start_time, end_time, end_reason, telephony_account_type,
+                        last_event_timestamp
+                 FROM cartesia_calls WHERE provider_call_id = ? LIMIT 1`,
+                [id],
+                (error, row) => error ? reject(error) : resolve(row || null),
+            );
+        });
+    }
+
     async upsertCartesiaCallBatchSnapshot(payload = {}) {
         const batchId = String(payload.provider_batch_id || '').trim();
         const businessId = String(payload.business_id || '').trim();
@@ -11064,6 +11544,7 @@ class EnhancedDatabase {
         let search = null;
         let start = null;
         let end = null;
+        let userChatId = null;
 
         if (typeof limitOrOptions === 'object' && limitOrOptions !== null) {
             limit = Number(limitOrOptions.limit ?? 10);
@@ -11073,6 +11554,7 @@ class EnhancedDatabase {
             search = limitOrOptions.query ?? null;
             start = limitOrOptions.start ?? null;
             end = limitOrOptions.end ?? null;
+            userChatId = limitOrOptions.userChatId ?? limitOrOptions.user_chat_id ?? null;
         } else {
             limit = Number(limitOrOptions ?? 10);
             actualOffset = Number(offset ?? 0);
@@ -11125,15 +11607,27 @@ class EnhancedDatabase {
             params.push(end);
         }
 
+        if (userChatId) {
+            where.push('c.user_chat_id = ?');
+            params.push(String(userChatId));
+        }
+
         const whereClause = where.length ? `WHERE ${where.join(' AND ')}` : '';
 
         return new Promise((resolve, reject) => {
             const query = `
                 SELECT 
                     c.*,
-                    COUNT(t.id) as transcript_count
+                    COUNT(t.id) as transcript_count,
+                    (SELECT s.data FROM call_states s
+                     WHERE s.call_sid = c.call_sid AND s.state = 'call_created'
+                     ORDER BY s.timestamp DESC, s.id DESC LIMIT 1) as call_created_state,
+                    cr.provider as runtime_provider,
+                    co.provider_used as provider_used
                 FROM calls c
                 LEFT JOIN transcripts t ON c.call_sid = t.call_sid
+                LEFT JOIN call_runtime_state cr ON cr.call_sid = c.call_sid
+                LEFT JOIN call_outcomes co ON co.call_sid = c.call_sid
                 ${whereClause}
                 GROUP BY c.call_sid
                 ORDER BY c.created_at DESC
@@ -11155,9 +11649,13 @@ class EnhancedDatabase {
     }
 
     // NEW: Get total calls count (REQUIRED FOR API ENDPOINTS)
-    async getCallsCount() {
+    async getCallsCount(userChatId = null) {
         return new Promise((resolve, reject) => {
-            this.db.get('SELECT COUNT(*) as count FROM calls', (err, row) => {
+            const query = userChatId
+                ? 'SELECT COUNT(*) as count FROM calls WHERE user_chat_id = ?'
+                : 'SELECT COUNT(*) as count FROM calls';
+            const params = userChatId ? [String(userChatId)] : [];
+            this.db.get(query, params, (err, row) => {
                 if (err) {
                     console.error('Database error in getCallsCount:', err);
                     reject(err);

@@ -24,13 +24,13 @@ function summarizeCallRoutingPolicy(options = {}) {
     readiness: options.readiness || {},
     requestedFlow: options.requestedFlow || 'outbound_voice',
     context: options.context || {},
-    failoverEnabled: options.failoverEnabled !== false,
+    failoverEnabled: options.failoverEnabled === true,
     isProviderDegraded: options.isProviderDegraded,
   });
   const openCircuits = order.filter((provider) => options.circuitState?.[provider] === 'open');
   return Object.freeze({
     configured_order: Object.freeze(order),
-    failover_enabled: options.failoverEnabled !== false,
+    failover_enabled: options.failoverEnabled === true,
     selected_provider: plan.selected_provider,
     eligible_order: Object.freeze(plan.attempt_order),
     blocked_providers: Object.freeze(plan.blocked_providers),
