@@ -656,6 +656,7 @@ class CartesiaOutboundCallService {
       from_number_id: normalized.fromNumberId,
       phone_number: normalized.destination,
       direction: "outbound",
+      business_scope_resolved: true,
       status: result.status === "queued" && existing?.status === "started"
         ? "started"
         : ["started", "completed", "failed"].includes(result.status) ? result.status : "created",
