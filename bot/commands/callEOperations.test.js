@@ -388,7 +388,7 @@ test('review assignment flow asks for an explicit policy manager and acknowledge
 test('mission usage report states imported provider figures are not independently verified', async () => {
   const priorGet = httpClient.get;
   const requests = [];
-  httpClient.get = async (_ctx, url, options) => { requests.push({ url, options }); return { data: { report: { reserved_minor: 1000, budget_currency: 'USD', actual_by_currency: { USD: 1250 }, budget_exceeded: true } } }; };
+  httpClient.get = async (_ctx, url, options) => { requests.push({ url, options }); return { data: { report: { reserved_minor: 1000, budget_currency: 'USD', actual_by_currency: { USD: 1250 }, estimated_by_currency: { USD: 300 }, budget_exceeded: true } } }; };
   const replies = [];
   const answers = ['biz-usage', `mission_${'a'.repeat(64)}`, 'report'];
   const conversation = { async wait() { return { message: { text: answers.shift() } }; } };
@@ -396,7 +396,9 @@ test('mission usage report states imported provider figures are not independentl
   try { await runMissionUsage(conversation, ctx, () => {}); } finally { httpClient.get = priorGet; }
   assert.equal(requests.length, 1);
   assert.ok(requests[0].url.endsWith('/usage'));
-  assert.match(replies.join('\n'), /operator-entered records/);
+  assert.match(replies.join('\n'), /Reported actual usage: 1250 USD minor units/);
+  assert.match(replies.join('\n'), /Estimated usage: 300 USD minor units/);
+  assert.match(replies.join('\n'), /not independently verified/);
   assert.match(replies.join('\n'), /exceeded/);
 });
 

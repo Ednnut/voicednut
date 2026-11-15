@@ -8,14 +8,15 @@ describe("Twilio Voice provider contract", () => {
       host: "api.example.com",
       to: "+15555550123",
       from: "+15555550100",
+      callSid: "internal-call-123",
       machineDetection: "Enable",
       machineDetectionTimeout: 20,
     });
 
-    assert.equal(payload.url, "https://api.example.com/incoming");
+    assert.equal(payload.url, "https://api.example.com/incoming?callSid=internal-call-123");
     assert.equal(payload.to, "+15555550123");
     assert.equal(payload.from, "+15555550100");
-    assert.equal(payload.statusCallback, "https://api.example.com/webhook/call-status");
+    assert.equal(payload.statusCallback, "https://api.example.com/webhook/call-status?callSid=internal-call-123");
     assert.deepEqual(payload.statusCallbackEvent, [
       "initiated", "ringing", "answered", "completed", "busy", "no-answer", "canceled", "failed",
     ]);

@@ -56,6 +56,7 @@ describe('CALL-E campaign mission approval', () => {
       budget_limit_minor: 1000, per_call_cost_ceiling_minor: 200, budget_currency: 'USD', budget_reserved_minor: 100,
       recipients: [{ position: 0, encrypted_destination: encrypted }] };
     let dispatched = false;
+    let usage = { actual_by_currency: { USD: 100 }, estimated_by_currency: { USD: 300 } };
     const service = new CallECampaignMissionService({
       idempotencySecret, encryptionKeys: { 1: encryptionSecret },
       env: { CALLE_MISSION_DISPATCH_ENABLED: 'true', CALLE_DISPATCH_ENABLED: 'true', CALLE_PILOT_READINESS_REVIEWED: 'true',
@@ -66,13 +67,22 @@ describe('CALL-E campaign mission approval', () => {
       providerRoutingPreview: async () => ({ selected_provider: 'twilio', eligible_order: ['twilio'], blocked_providers: [] }),
       dispatchRecipient: async () => { dispatched = true; },
       db: { async getCallECampaignMission() { return mission; }, async validateCallECampaignMissionApproval() { return { valid: true }; },
-        async getCallEMissionUsageReport() { return { actual_by_currency: { USD: 100 } }; } },
+        async getCallEMissionUsageReport() { return usage; } },
     });
     const report = await service.readinessReport({ mission_id: missionId, business_id: 'business_1', actor_id: '12345' });
     assert.equal(report.ready, true);
     assert.equal(report.dispatch_performed, false);
     assert.equal(report.checks.find((item) => item.key === 'consent_and_template').ready, true);
     assert.equal(report.budget.actual_minor, 100);
+    assert.equal(report.budget.estimated_minor, 300);
+    assert.equal(report.budget.committed_minor, 400);
+    assert.equal(dispatched, false);
+
+    usage = { actual_by_currency: { USD: 100 }, estimated_by_currency: { USD: 700 } };
+    const estimateBlocksDispatch = await service.readinessReport({ mission_id: missionId, business_id: 'business_1', actor_id: '12345' });
+    assert.equal(estimateBlocksDispatch.ready, false);
+    assert.equal(estimateBlocksDispatch.checks.find((item) => item.key === 'budget').ready, false);
+    assert.equal(estimateBlocksDispatch.budget.committed_minor, 800);
     assert.equal(dispatched, false);
   });
 

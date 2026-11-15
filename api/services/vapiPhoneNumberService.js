@@ -45,6 +45,11 @@ class VapiPhoneNumberService {
       }
       const result = {};
       for (const field of PHONE_FIELDS) result[field] = safeText(phone[field]);
+      // Vapi-hosted free numbers are inbound-first and outbound eligibility
+      // depends on Vapi account limits. Require an explicit capability flag
+      // before presenting one as ready for an outbound workflow.
+      const provider = String(result.provider || "").toLowerCase();
+      result.outboundCapable = provider !== "vapi" || phone.outboundEnabled === true;
       result.serverConfigured = Boolean(safeText(phone.server?.url));
       result.serverCredentialConfigured = Boolean(safeText(phone.server?.credentialId));
       return result;

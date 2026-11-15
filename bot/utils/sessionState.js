@@ -1,4 +1,7 @@
 const { randomUUID } = require('crypto');
+const { CONVERSATION_VERSION } = require('./persistentSessions');
+
+const SESSION_SCHEMA_VERSION = CONVERSATION_VERSION;
 
 class OperationCancelledError extends Error {
   constructor(reason = 'Operation cancelled') {
@@ -54,9 +57,15 @@ const initialSessionState = () => ({
 function ensureSession(ctx) {
   if (!ctx.session || typeof ctx.session !== 'object') {
     ctx.session = initialSessionState();
+  } else if (ctx.session.__sessionRecoveryNotice === true ||
+      (ctx.session.sessionSchemaVersion !== undefined && ctx.session.sessionSchemaVersion !== SESSION_SCHEMA_VERSION)) {
+    ctx.session = { ...initialSessionState(), recoveryNotice: true, sessionSchemaVersion: SESSION_SCHEMA_VERSION };
   } else {
+    ctx.session.sessionSchemaVersion = SESSION_SCHEMA_VERSION;
     ctx.session.currentOp = ctx.session.currentOp || null;
-    ctx.session.pendingControllers = ctx.session.pendingControllers || [];
+    ctx.session.pendingControllers = Array.isArray(ctx.session.pendingControllers)
+      ? ctx.session.pendingControllers.filter((controller) => typeof controller?.abort === 'function')
+      : [];
     ctx.session.meta = ctx.session.meta || {};
     ctx.session.flow = ctx.session.flow || null;
     ctx.session.errors = Array.isArray(ctx.session.errors) ? ctx.session.errors : [];
@@ -69,6 +78,7 @@ function ensureSession(ctx) {
       ctx.session.currentOp.token = ctx.session.currentOp.id.replace(/-/g, '').slice(0, 8);
     }
   }
+  if (!ctx.session.sessionSchemaVersion) ctx.session.sessionSchemaVersion = SESSION_SCHEMA_VERSION;
 }
 
 function generateOpId() {
@@ -115,7 +125,7 @@ async function cancelActiveFlow(ctx, reason = 'reset') {
   if (ctx.session.pendingControllers.length > 0) {
     ctx.session.pendingControllers.forEach((controller) => {
       try {
-        controller.abort(reason);
+        if (typeof controller?.abort === 'function') controller.abort(reason);
       } catch (error) {
         console.warn('Abort controller error:', error.message);
       }
@@ -247,5 +257,6 @@ module.exports = {
   guardAgainstCommandInterrupt,
   isSlashCommandInput,
   FlowContext,
-  OperationCancelledError
+  OperationCancelledError,
+  SESSION_SCHEMA_VERSION,
 };

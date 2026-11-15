@@ -11,6 +11,50 @@ const {
 } = require('../services/callAgentDefinition');
 
 describe('call agent definition validation', () => {
+  it('rejects explicitly malformed extraction required fields in runtime configuration', () => {
+    for (const required of [false, 0, '', null, 'requested', {}]) {
+      const result = validateCallAgentRuntimeConfig({
+        schema_version: 2,
+        approved_tools: [],
+        business_context: {
+          post_call_extraction: {
+            schema_version: 'appointment_v1',
+            schema: {
+              type: 'object', additionalProperties: false, required,
+              properties: { requested: { type: 'boolean' } },
+            },
+          },
+        },
+      });
+      assert.equal(result.valid, false);
+    }
+  });
+
+  it('accepts bounded structured extraction requirements in authorized agent business context and keeps them out of live prompt context', () => {
+    const extraction = {
+      schema_version: 'appointment_v1',
+      schema: {
+        type: 'object', additionalProperties: false, required: ['requested'],
+        properties: { requested: { type: 'boolean' } },
+      },
+    };
+    const result = validateCallAgentRuntimeConfig({
+      schema_version: 2,
+      approved_tools: [],
+      business_context: { business_name: 'Example Clinic', post_call_extraction: extraction },
+    });
+    assert.equal(result.valid, true);
+    assert.deepEqual(result.normalized.business_context.post_call_extraction, extraction);
+    assert.doesNotMatch(renderCallAgentBusinessContext(result.normalized.business_context), /post_call_extraction/);
+
+    const invalid = validateCallAgentRuntimeConfig({
+      schema_version: 2,
+      approved_tools: [],
+      business_context: { business_name: 'Example Clinic', post_call_extraction: { ...extraction, schema: { type: 'object', properties: {} } } },
+    });
+    assert.equal(invalid.valid, false);
+  });
+
   it('accepts a versioned Cartesia speech profile independently from conversational runtime settings', () => {
     const result = validateCallAgentRuntimeConfig({
       schema_version: 7,

@@ -8,6 +8,7 @@ const { formatVoiceCapabilityMatrix } = require('../utils/providerCapabilities')
 
 const ADMIN_HEADER_NAME = 'x-admin-token';
 const SUPPORTED_PROVIDERS = ['twilio', 'plivo', 'vonage'];
+const SUPPORTED_AI_VOICE_ENGINES = ['cartesia', 'deepgram'];
 const STATUS_CACHE_TTL_MS = 8000;
 const statusCache = {
     value: null,
@@ -18,8 +19,13 @@ function normalizeProviders(status = {}) {
     const supportedValues = Array.isArray(status.supported_providers) && status.supported_providers.length > 0
         ? status.supported_providers
         : SUPPORTED_PROVIDERS;
+    const directCallProviders = Array.isArray(status.voice_provider_capabilities)
+        ? new Set(status.voice_provider_capabilities
+            .filter((item) => item?.operations?.['outbound_call.create'] === true)
+            .map((item) => String(item?.provider || '').trim().toLowerCase()))
+        : new Set(SUPPORTED_PROVIDERS);
     const supported = Array.from(new Set(supportedValues.map((item) => String(item).toLowerCase())))
-        .filter((provider) => Boolean(provider) && provider !== 'cartesia');
+        .filter((provider) => Boolean(provider) && provider !== 'cartesia' && directCallProviders.has(provider));
     const active = typeof status.provider === 'string' ? status.provider.toLowerCase() : '';
     return { supported, active };
 }
@@ -59,8 +65,12 @@ function formatReadinessMatrix(status = {}) {
     const callState = status.providers?.call || {};
     const smsState = status.providers?.sms || {};
     const emailState = status.providers?.email || {};
+    const callProviders = normalizeProviders({
+        ...status,
+        supported_providers: callState.supported_providers || status.supported_providers,
+    }).supported;
     const providers = Array.from(new Set([
-        ...(callState.supported_providers || SUPPORTED_PROVIDERS),
+        ...callProviders,
         ...(smsState.supported_providers || []),
         ...(emailState.supported_providers || [])
     ])).map((item) => String(item || '').toLowerCase())
@@ -89,19 +99,69 @@ function formatProviderStatus(status) {
     const supportedValues = Array.isArray(status.supported_providers) && status.supported_providers.length > 0
         ? status.supported_providers
         : SUPPORTED_PROVIDERS;
-    const filteredSupportedValues = supportedValues.filter((provider) => String(provider).toLowerCase() !== 'cartesia');
+    const filteredSupportedValues = normalizeProviders({ ...status, supported_providers: supportedValues }).supported;
     const smsProvider = String(status.sms_provider || status.providers?.sms?.provider || 'unknown').toUpperCase();
     const emailProvider = String(status.email_provider || status.providers?.email?.provider || 'unknown').toUpperCase();
+    const activeProviderKey = current.toLowerCase();
+    const configured =
+        typeof status.providers?.call?.readiness?.[activeProviderKey] === 'boolean'
+            ? status.providers.call.readiness[activeProviderKey]
+            : typeof status[`${activeProviderKey}_ready`] === 'boolean'
+                ? status[`${activeProviderKey}_ready`]
+                : null;
+    const observedHealth = status.provider_health?.[activeProviderKey];
+    const observationLines = [];
+    if (configured !== null) {
+        observationLines.push(buildLine('•', 'Configuration', configured ? 'Ready' : 'Incomplete'));
+    }
+    if (observedHealth && typeof observedHealth === 'object') {
+        observationLines.push(buildLine(
+            '•',
+            'Last API-observed success',
+            observedHealth.last_success_at
+                ? escapeMarkdown(observedHealth.last_success_at)
+                : 'No success recorded',
+        ));
+        observationLines.push(buildLine(
+            '•',
+            'Last API-observed error',
+            observedHealth.last_error_at
+                ? escapeMarkdown(observedHealth.last_error_at)
+                : 'No error recorded',
+        ));
+        observationLines.push(buildLine(
+            '•',
+            'Provider circuit',
+            escapeMarkdown(observedHealth.circuit_state || 'unknown'),
+        ));
+    }
+    const healthAlert = observedHealth?.degraded === true ||
+        String(observedHealth?.circuit_state || '').toLowerCase() === 'open'
+        ? '⚠️ Provider is degraded or circuit-open. Verify status before dispatch; this view does not run a connectivity check.'
+        : null;
 
     const details = [
-        buildLine('•', `Current Provider`, `*${current.toUpperCase()}*`),
+        buildLine('•', `Current Telephony Provider`, `*${current.toUpperCase()}*`),
         buildLine('•', `Stored Default`, stored.toUpperCase()),
         buildLine('•', `SMS Provider`, smsProvider),
         buildLine('•', `Email Provider`, emailProvider),
-        buildLine('•', `Supported Backbones`, filteredSupportedValues.join(', ').toUpperCase())
+        buildLine('•', `Global AI Voice Default`, String(status.tts_provider || 'unknown').toUpperCase()),
+        buildLine('•', `Cartesia Managed Agent Calls`, 'Available as a separate per-call mode in /call when dispatch and approval are enabled'),
+        ...(status.cartesia_tts_profile && typeof status.cartesia_tts_profile === 'object'
+            ? [
+                buildLine('•', `Cartesia Voice`, escapeMarkdown(status.cartesia_tts_profile.voice_id || 'not selected')),
+                buildLine('•', `Cartesia Model`, escapeMarkdown(status.cartesia_tts_profile.model_id || 'not selected')),
+            ]
+            : []),
+        buildLine('•', `Selectable Telephony Providers`, filteredSupportedValues.join(', ').toUpperCase()),
+        ...observationLines
     ];
     return [
         section('⚙️ Call Provider Settings', details),
+       ...(healthAlert ? [healthAlert] : []),
+       ...(observedHealth
+           ? ['ℹ️ Provider health reflects recent API-process activity; it is not a live connectivity probe.']
+           : []),
         formatReadinessMatrix(status),
         formatVoiceCapabilityMatrix(status)
     ].join('\n\n');
@@ -110,7 +170,7 @@ function formatProviderStatus(status) {
 function buildProviderKeyboard(ctx, activeProvider = '', supportedProviders = []) {
     const keyboard = new InlineKeyboard();
     const providers = (supportedProviders.length ? supportedProviders : SUPPORTED_PROVIDERS)
-        .filter((provider) => String(provider).toLowerCase() !== 'cartesia');
+        .filter((provider) => SUPPORTED_PROVIDERS.includes(String(provider).toLowerCase()));
     providers.forEach((provider, index) => {
         const normalized = provider.toLowerCase();
         const isActive = normalized === activeProvider;
@@ -123,6 +183,9 @@ function buildProviderKeyboard(ctx, activeProvider = '', supportedProviders = []
         }
     });
     keyboard.row().text('🔄 Refresh', buildCallbackData(ctx, 'PROVIDER_STATUS'));
+    keyboard.row().text('🎙️ AI Voice: Cartesia / Deepgram', buildCallbackData(ctx, 'CARTESIA_VOICE_SETTINGS'));
+    keyboard.row().text('🎙️ Manage Cartesia TTS', buildCallbackData(ctx, 'CARTESIA_CENTER'));
+    keyboard.row().text('📞 Cartesia Managed Agent call', buildCallbackData(ctx, 'CARTESIA_CALL'));
     keyboard.row().text('⬅️ Main Menu', buildCallbackData(ctx, 'MENU'));
     return keyboard;
 }
@@ -152,6 +215,63 @@ async function fetchProviderStatus({ force = false } = {}) {
     statusCache.value = response.data;
     statusCache.fetchedAt = Date.now();
     return response.data;
+}
+
+function buildProviderRecommendationUrl({ operation = 'outbound_call.create', requiredCapabilities = [], preferredProvider = null } = {}) {
+    const baseUrl = String(config.apiUrl || '').replace(/\/+$/, '');
+    const query = new URLSearchParams({ operation });
+    if (Array.isArray(requiredCapabilities) && requiredCapabilities.length) {
+        query.set('required_capabilities', requiredCapabilities.join(','));
+    }
+    if (preferredProvider) query.set('preferred_provider', String(preferredProvider));
+    return `${baseUrl}/admin/provider/recommendation?${query.toString()}`;
+}
+
+async function fetchProviderRecommendation(options = {}) {
+    const response = await httpClient.get(
+        null,
+        buildProviderRecommendationUrl(options),
+        {
+            timeout: 10000,
+            headers: {
+                [ADMIN_HEADER_NAME]: config.admin.apiToken,
+                'Content-Type': 'application/json',
+            },
+        },
+    );
+    return response.data;
+}
+
+function formatProviderRecommendation(data = {}) {
+    const recommendation = data.recommendation || {};
+    const lines = [];
+    if (recommendation.provider) {
+        lines.push(buildLine('•', 'Recommended provider', String(recommendation.provider).toUpperCase()));
+        lines.push(buildLine('•', 'Reason', escapeMarkdown(recommendation.reason || 'capability and configuration match')));
+    } else {
+        lines.push(buildLine('•', 'Recommendation', `None (${escapeMarkdown(recommendation.reason || 'no eligible provider')})`));
+    }
+    const selected = Array.isArray(data.providers)
+        ? data.providers.find((item) => item.provider === recommendation.provider)
+        : null;
+    if (selected?.operational_state === 'unverified') {
+        lines.push('• Provider reachability is not verified by this recommendation.');
+    }
+    if (Array.isArray(data.alternatives) && data.alternatives.length) {
+        lines.push('', 'Alternatives:');
+        for (const alternative of data.alternatives.slice(0, 8)) {
+            lines.push(`• ${escapeMarkdown(String(alternative.provider || 'unknown').toUpperCase())} — ${escapeMarkdown(alternative.reasons?.join(', ') || 'eligible')}`);
+        }
+    }
+    const blocked = Array.isArray(data.providers) ? data.providers.filter((item) => !item.eligible) : [];
+    if (blocked.length) {
+        lines.push('', 'Not eligible:');
+        for (const provider of blocked.slice(0, 8)) {
+            lines.push(`• ${escapeMarkdown(String(provider.provider || 'unknown').toUpperCase())} — ${escapeMarkdown(provider.blockers?.join(', ') || 'not eligible')}`);
+        }
+    }
+    lines.push('', 'This is a read-only recommendation; dispatch still validates provider readiness.');
+    return section('🔎 Provider Recommendation', lines);
 }
 
 function formatProviderError(error, actionLabel) {
@@ -208,7 +328,7 @@ async function renderProviderMenu(ctx, { status, notice, forceRefresh = false } 
         if (notices.length) {
             message = `${notices.join('\n')}\n\n${message}`;
         }
-        message += '\n\nTap a provider below to review readiness before switching.';
+        message += '\n\nThe provider buttons select the phone carrier. Choose *AI Voice: Cartesia / Deepgram* to set speech separately for a business; this keeps your phone carrier unchanged.';
         await renderMenu(ctx, message, keyboard, { parseMode: 'Markdown' });
     } catch (error) {
         console.error('Provider status command error:', error);
@@ -315,6 +435,17 @@ function registerProviderCommand(bot) {
                 return;
             }
 
+            if (requestedAction === 'recommend') {
+                const requiredCapabilities = args.slice(1).map((value) => value.toLowerCase());
+                if (requiredCapabilities.length > 8 || requiredCapabilities.some((value) => !/^[a-z][a-z0-9_]{0,79}$/.test(value))) {
+                    await ctx.reply('Usage: /provider recommend [capability ...] (up to 8 registered capabilities)');
+                    return;
+                }
+                const recommendation = await fetchProviderRecommendation({ requiredCapabilities });
+                await ctx.reply(formatProviderRecommendation(recommendation), { parse_mode: 'Markdown' });
+                return;
+            }
+
             await handleProviderSwitch(ctx, requestedAction);
         } catch (error) {
             console.error('Failed to manage provider via Telegram command:', error);
@@ -330,6 +461,9 @@ function initializeProviderCommand(bot) {
 module.exports = initializeProviderCommand;
 module.exports.registerProviderCommand = registerProviderCommand;
 module.exports.fetchProviderStatus = fetchProviderStatus;
+module.exports.fetchProviderRecommendation = fetchProviderRecommendation;
+module.exports.buildProviderRecommendationUrl = buildProviderRecommendationUrl;
+module.exports.formatProviderRecommendation = formatProviderRecommendation;
 module.exports.updateProvider = updateProvider;
 module.exports.formatProviderStatus = formatProviderStatus;
 module.exports.handleProviderSwitch = handleProviderSwitch;
@@ -337,4 +471,6 @@ module.exports.renderProviderMenu = renderProviderMenu;
 module.exports.renderProviderConfirm = renderProviderConfirm;
 module.exports.buildProviderKeyboard = buildProviderKeyboard;
 module.exports.SUPPORTED_PROVIDERS = SUPPORTED_PROVIDERS;
+module.exports.SUPPORTED_AI_VOICE_ENGINES = SUPPORTED_AI_VOICE_ENGINES;
+module.exports.normalizeProviders = normalizeProviders;
 module.exports.ADMIN_HEADER_NAME = ADMIN_HEADER_NAME;

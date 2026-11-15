@@ -6,6 +6,7 @@ const dbPath = path.resolve(__dirname, '../db/data.db');
 const db = new sqlite3.Database(dbPath);
 
 const { userId, username } = require('../config').admin;
+const { createPersistentSessionStore } = require('./persistentSessionStore');
 
 function normalizeTelegramUsername(value) {
   if (value == null) return '';
@@ -84,6 +85,18 @@ db.serialize(() => {
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
   )`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_script_versions_lookup ON script_versions(script_id, script_type, version_number)`);
+  db.run(`CREATE TABLE IF NOT EXISTS outbound_call_submissions (
+    telegram_id TEXT PRIMARY KEY,
+    submission_json TEXT NOT NULL,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  )`);
+  db.run(`CREATE TABLE IF NOT EXISTS bot_persistent_sessions (
+    session_key TEXT PRIMARY KEY,
+    session_json TEXT NOT NULL,
+    expires_at_ms INTEGER NOT NULL,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  )`);
+  db.run('CREATE INDEX IF NOT EXISTS idx_bot_persistent_sessions_expiry ON bot_persistent_sessions(expires_at_ms)');
 });
 
 function getUser(id, usernameOrCb, maybeCb) {
@@ -268,11 +281,83 @@ function getLatestScriptVersion(scriptId, scriptType) {
   });
 }
 
+function getOutboundCallSubmission(telegramId) {
+  const normalizedId = normalizeTelegramId(telegramId);
+  if (!/^\d{1,20}$/.test(normalizedId)) return Promise.reject(new Error('Invalid Telegram user id'));
+  return new Promise((resolve, reject) => {
+    db.get('SELECT submission_json FROM outbound_call_submissions WHERE telegram_id = ?', [normalizedId], (error, row) => {
+      if (error) return reject(error);
+      if (!row) return resolve(null);
+      try { return resolve(JSON.parse(row.submission_json)); }
+      catch (_) { return reject(new Error('Stored outbound call submission is invalid')); }
+    });
+  });
+}
+
+function saveOutboundCallSubmission(telegramId, submission) {
+  const normalizedId = normalizeTelegramId(telegramId);
+  const idempotencyKey = String(submission?.idempotencyKey || '');
+  const requestFingerprint = String(submission?.requestFingerprint || '');
+  if (!/^\d{1,20}$/.test(normalizedId) || !/^[A-Za-z0-9._:-]{8,128}$/.test(idempotencyKey) || !/^[a-f0-9]{64}$/.test(requestFingerprint)) {
+    return Promise.reject(new Error('Invalid outbound call submission state'));
+  }
+  const safeSubmission = {
+    idempotencyKey,
+    requestFingerprint,
+    outcomeUncertain: submission.outcomeUncertain === true,
+    ...(submission.acceptedResult && typeof submission.acceptedResult === 'object'
+      ? { acceptedResult: {
+          call_sid: String(submission.acceptedResult.call_sid || '').slice(0, 160),
+          status: String(submission.acceptedResult.status || '').slice(0, 40),
+          provider: String(submission.acceptedResult.provider || '').slice(0, 40),
+        } }
+      : {}),
+    updatedAt: Number(submission.updatedAt) || Date.now(),
+  };
+  return new Promise((resolve, reject) => {
+    db.run(`INSERT INTO outbound_call_submissions (telegram_id, submission_json, updated_at)
+      VALUES (?, ?, CURRENT_TIMESTAMP)
+      ON CONFLICT(telegram_id) DO UPDATE SET submission_json = excluded.submission_json, updated_at = CURRENT_TIMESTAMP`,
+    [normalizedId, JSON.stringify(safeSubmission)], (error) => error ? reject(error) : resolve(safeSubmission));
+  });
+}
+
+function clearOutboundCallSubmission(telegramId, idempotencyKey) {
+  const normalizedId = normalizeTelegramId(telegramId);
+  const key = String(idempotencyKey || '');
+  if (!/^\d{1,20}$/.test(normalizedId) || !/^[A-Za-z0-9._:-]{8,128}$/.test(key)) {
+    return Promise.reject(new Error('Invalid outbound call submission identity'));
+  }
+  return new Promise((resolve, reject) => {
+    db.get('SELECT submission_json FROM outbound_call_submissions WHERE telegram_id = ?', [normalizedId], (error, row) => {
+      if (error) return reject(error);
+      let current;
+      try { current = row ? JSON.parse(row.submission_json) : null; }
+      catch (_) { return reject(new Error('Stored outbound call submission is invalid')); }
+      if (current?.idempotencyKey !== key) return resolve(false);
+      db.run('DELETE FROM outbound_call_submissions WHERE telegram_id = ?', [normalizedId], (deleteError) => deleteError ? reject(deleteError) : resolve(true));
+    });
+  });
+}
+
+const persistentSessionStore = createPersistentSessionStore(db);
+const getPersistentSession = (...args) => persistentSessionStore.get(...args);
+const savePersistentSession = (...args) => persistentSessionStore.save(...args);
+const deletePersistentSession = (...args) => persistentSessionStore.delete(...args);
+const purgeExpiredPersistentSessions = (...args) => persistentSessionStore.purge(...args);
+
 module.exports = {
   getUser, addUser, getUserList, promoteUser, removeUser,
   isAdmin, expireInactiveUsers,
   saveScriptVersion,
   listScriptVersions,
   getScriptVersion,
-  getLatestScriptVersion
+  getLatestScriptVersion,
+  getOutboundCallSubmission,
+  saveOutboundCallSubmission,
+  clearOutboundCallSubmission,
+  getPersistentSession,
+  savePersistentSession,
+  deletePersistentSession,
+  purgeExpiredPersistentSessions,
 };

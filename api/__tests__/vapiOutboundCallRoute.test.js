@@ -43,7 +43,7 @@ describe("customer outbound Vapi call route", () => {
     const res = makeResponse();
     await handler(req, res);
     assert.deepEqual(calls, [{
-      templateId: 17, templateVersion: 4, mappingId: 91, phoneNumberId: "pn_provider_1", number: "+14155550123", idempotencyKey: "request-id-0001", actorId: "7001",
+      templateId: 17, templateVersion: 4, mappingId: 91, phoneNumberId: "pn_provider_1", number: "+14155550123", idempotencyKey: "request-id-0001", actorId: "7001", requestId: "req-1",
     }]);
     assert.deepEqual(res.body, {
       success: true,
@@ -53,6 +53,7 @@ describe("customer outbound Vapi call route", () => {
       status: "queued",
       deduped: true,
       provider: "vapi",
+      ai_voice_engine: "vapi",
       template_id: 17,
       template_version: 4,
       mapping_id: 91,

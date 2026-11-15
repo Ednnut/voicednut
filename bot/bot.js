@@ -8,6 +8,23 @@ try {
   throw error;
 }
 const { Bot, session, InlineKeyboard } = grammyPkg;
+const botDatabase = require("./db/db");
+const { runInConversation } = require("./utils/conversationEffects");
+const {
+  createActorSequentializer,
+  createPersistentSessionStorage,
+  getActorSessionKey,
+  CONVERSATION_EXTERNAL,
+} = require("./utils/persistentSessions");
+void botDatabase.purgeExpiredPersistentSessions().catch((error) => {
+  console.error("expired_bot_session_cleanup_failed", { code: error?.code || "storage_error" });
+});
+const botSessionCleanupTimer = setInterval(() => {
+  void botDatabase.purgeExpiredPersistentSessions().catch((error) => {
+    console.error("expired_bot_session_cleanup_failed", { code: error?.code || "storage_error" });
+  });
+}, 60_000);
+botSessionCleanupTimer.unref?.();
 
 let conversationsPkg;
 try {
@@ -77,7 +94,8 @@ const bot = new Bot(token);
 function wrapConversation(handler, name) {
   return createConversation(async (conversation, ctx) => {
     try {
-      await handler(conversation, ctx);
+      ctx[CONVERSATION_EXTERNAL] = conversation;
+      await runInConversation(conversation, () => handler(conversation, ctx));
     } catch (error) {
       if (error instanceof OperationCancelledError) {
         console.log(`Conversation ${name} cancelled: ${error.message}`);
@@ -93,11 +111,20 @@ function wrapConversation(handler, name) {
 }
 
 // IMPORTANT: Add session middleware BEFORE conversations
-bot.use(session({ initial: initialSessionState }));
+bot.use(createActorSequentializer());
+bot.use(session({
+  initial: initialSessionState,
+  getSessionKey: getActorSessionKey,
+  storage: createPersistentSessionStorage(botDatabase),
+}));
 
 // Ensure every update touches a session object
 bot.use(async (ctx, next) => {
   ensureSession(ctx);
+  if (ctx.session.recoveryNotice) {
+    delete ctx.session.recoveryNotice;
+    await ctx.reply("Your previous task session expired or could not be restored safely. No action was resumed. Start again with the relevant command, such as /call, /calle, or /menu.");
+  }
   return next();
 });
 
@@ -412,6 +439,7 @@ const {
   calllogSearchFlow,
   calllogDetailsFlow,
   calllogEventsFlow,
+  handleCallActivityAction,
   registerCalllogCommand,
 } = require("./commands/calllog");
 const {
@@ -421,6 +449,7 @@ const {
   renderProviderConfirm,
 } = require("./commands/provider");
 const { registerCallResultsCommand, handleCallResults } = require("./commands/callResults");
+const { registerCallMonitorCommand } = require("./commands/callMonitor");
 const { registerPostCallWorkflowCommands } = require("./commands/postCallWorkflows");
 const { registerCallQualityCommand } = require("./commands/callQuality");
 const { registerCallMissionsCommands, callMissionCreateFlow } = require("./commands/callMissions");
@@ -499,6 +528,7 @@ registerCallCommand(bot);
 registerCallPlanCommand(bot);
 registerCallCampaignsCommand(bot);
 registerCallResultsCommand(bot);
+registerCallMonitorCommand(bot);
 registerPostCallWorkflowCommands(bot);
 registerCallQualityCommand(bot);
 registerCallMissionsCommands(bot);
@@ -566,6 +596,7 @@ function resolveConversationFromPrefix(prefix) {
   if (prefix.startsWith("bulk-sms-")) return "bulk-sms-conversation";
   if (prefix.startsWith("sms-")) return "sms-conversation";
   if (prefix.startsWith("persona-")) return "persona-conversation";
+  if (prefix.startsWith("cartesia-")) return "cartesia-operation-conversation";
   if (
     ["persona", "purpose", "tone", "urgency", "tech", "call-config"].includes(
       prefix,
@@ -1012,6 +1043,15 @@ bot.on("callback_query:data", async (ctx) => {
       VAPI_EVAL_CREATE: "vapi-operation-conversation",
       VAPI_SQUADS: "vapi-operation-conversation",
       CARTESIA_CALL: "cartesia-operation-conversation",
+      CARTESIA_DASHBOARD: "cartesia-operation-conversation",
+      CARTESIA_MANAGE_VOICES: "cartesia-operation-conversation",
+      CARTESIA_MODELS: "cartesia-operation-conversation",
+      CARTESIA_VOICE_SETTINGS: "cartesia-operation-conversation",
+      CARTESIA_TEST_VOICE: "cartesia-operation-conversation",
+      CARTESIA_USAGE: "cartesia-operation-conversation",
+      CARTESIA_CONNECTION_STATUS: "cartesia-operation-conversation",
+      CARTESIA_REFRESH: "cartesia-operation-conversation",
+      CARTESIA_OPERATIONS: "cartesia-operation-conversation",
       CARTESIA_RECONCILE: "cartesia-operation-conversation",
       CARTESIA_CALLS: "cartesia-operation-conversation",
       CARTESIA_REVIEW_QUEUE: "cartesia-operation-conversation",
@@ -1098,6 +1138,17 @@ bot.on("callback_query:data", async (ctx) => {
       await sendEphemeral(ctx, `Starting ${label}...`);
       await ctx.conversation.enter(conversations[action]);
       finishMetric("ok");
+      return;
+    }
+
+    if (action === "CALLLOG_REFRESH" || action === "CALLLOG_RECONCILE" || action.startsWith("CALLLOG_ITEM:")) {
+      try {
+        await handleCallActivityAction(ctx, action);
+        finishMetric("ok", { route: "call_activity" });
+      } catch (error) {
+        await ctx.reply(httpClient.getUserMessage(error, "Could not load call activity."));
+        finishMetric("error", { route: "call_activity" });
+      }
       return;
     }
 
@@ -1330,6 +1381,7 @@ const TELEGRAM_COMMANDS = [
   { command: "callplan", description: "Plan and preview a CALL-E template (no call placed)" },
   { command: "calle", description: "Open the interactive CALL-E Operations center" },
   { command: "calllog", description: "Call history and search" },
+  { command: "callmonitor", description: "Unified call operations monitoring (admin only)" },
   { command: "callcampaigns", description: "List CALL-E campaign drafts and review state (admin only)" },
   { command: "callcampaigncreate", description: "Create a consent-checked CALL-E campaign draft (admin only)" },
   { command: "callcampaigninfo", description: "Show CALL-E campaign fingerprint and approval audit (private chat)" },
@@ -1354,7 +1406,7 @@ const TELEGRAM_COMMANDS = [
   { command: "persona", description: "Manage personas (admin only)" },
   { command: "provider", description: "Manage call provider (admin only)" },
   { command: "vapi", description: "Vapi operations and call controls (admin only)" },
-  { command: "cartesia", description: "Cartesia Managed Agents operations (admin only)" },
+  { command: "cartesia", description: "Manage business-scoped Cartesia speech settings" },
   { command: "callerflags", description: "Manage caller flags (admin only)" },
   { command: "users", description: "Manage users (admin only)" },
   { command: "admin", description: "Open Mini App admin console" },
@@ -1377,6 +1429,7 @@ const TELEGRAM_COMMANDS_USER = [
   { command: "call", description: "Start outbound voice call" },
   { command: "callplan", description: "Plan and preview a CALL-E template (no call placed)" },
   { command: "calle", description: "Open the CALL-E planner" },
+  { command: "cartesia", description: "Manage business-scoped Cartesia speech settings" },
   { command: "calllog", description: "Call history and search" },
   { command: "sms", description: "Open SMS center" },
   { command: "email", description: "Open Email center" },

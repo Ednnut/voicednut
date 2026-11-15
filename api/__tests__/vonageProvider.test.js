@@ -2,8 +2,44 @@ const assert = require("node:assert/strict");
 
 const VonageVoiceAdapter = require("../adapters/VonageVoiceAdapter");
 const { buildCanonicalCallStatusEvent } = require("../adapters/providerFlowPolicy");
+const { __testables: appTestables } = require("../app");
 
 describe("Vonage provider integration", () => {
+  it("reads call status with the installed Vonage voice client", async () => {
+    const reads = [];
+    const adapter = new VonageVoiceAdapter({
+      client: { voice: { async getCall(uuid) { reads.push(uuid); return { status: "completed" }; } } },
+    }, { info: () => {}, warn: () => {} });
+    const result = await adapter.getCall("vonage-call-uuid");
+    assert.equal(result.status, "completed");
+    assert.deepEqual(reads, ["vonage-call-uuid"]);
+  });
+
+  it("does not include the unrelated Plivo webhook secret in Vonage answer URLs", () => {
+    const previous = appTestables.setCallTestConfigForTests({
+      plivo: { webhookSecret: "offline-test-plivo-secret" },
+      vonage: { voice: { answerUrl: "" } },
+    });
+
+    try {
+      const answerUrl = new URL(
+        appTestables.buildVonageAnswerWebhookUrl(
+          { headers: { host: "api.example.test" } },
+          "internal-call-1",
+        ),
+      );
+      assert.equal(answerUrl.origin, "https://api.example.test");
+      assert.equal(answerUrl.pathname, "/va");
+      assert.equal(answerUrl.searchParams.get("callSid"), "internal-call-1");
+      assert.equal(answerUrl.searchParams.has("secret"), false);
+    } finally {
+      appTestables.setCallTestConfigForTests({
+        plivo: previous.plivo,
+        vonage: previous.vonage,
+      });
+    }
+  });
+
   it("creates an outbound Voice API v1 call with webhook URLs and an NCCO", async () => {
     const requests = [];
     const adapter = new VonageVoiceAdapter({

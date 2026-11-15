@@ -55,14 +55,15 @@ describe('Cartesia lifecycle webhook receiver', () => {
     assert.doesNotMatch(JSON.stringify(calls), /sensitive transcript|transcript/);
   });
 
-  it('rejects invalid secrets, malformed events, and unavailable storage without acknowledging them', async () => {
+  it('ignores unsupported future Cartesia event types, rejects invalid secrets and malformed bodies, and refuses unavailable storage', async () => {
     const handler = createCartesiaWebhookHandler({ enabled: true, secret: 'test-cartesia-webhook-secret-is-at-least-32', db: {} });
     const unauthorized = response();
     await handler({ headers: { 'x-webhook-secret': 'wrong' }, body: event }, unauthorized);
     assert.equal(unauthorized.statusCode, 401);
-    const invalid = response();
-    await handler({ headers: { 'x-webhook-secret': 'test-cartesia-webhook-secret-is-at-least-32' }, body: { ...event, type: 'unknown' } }, invalid);
-    assert.equal(invalid.statusCode, 400);
+    const ignored = response();
+    await handler({ headers: { 'x-webhook-secret': 'test-cartesia-webhook-secret-is-at-least-32' }, body: { ...event, type: 'future_unknown_event' } }, ignored);
+    assert.equal(ignored.statusCode, 204);
+    assert.equal(normalizeEvent({ ...event, type: 'future_unknown_event' }).ignored, true);
     const unavailable = response();
     await handler({ headers: { 'x-webhook-secret': 'test-cartesia-webhook-secret-is-at-least-32' }, body: event }, unavailable);
     assert.equal(unavailable.statusCode, 503);

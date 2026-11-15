@@ -1,4 +1,5 @@
 const assert = require("node:assert/strict");
+const config = require("../config");
 
 const { app, __testables } = require("../app");
 
@@ -18,11 +19,91 @@ describe("API app bootstrap", function () {
     }
   });
 
+  it("counts missing Mini App sessions in a route-free authentication bucket", async function () {
+    const before = __testables.getLocalApiAuthFailureMetrics(60).miniapp_session.by_reason.miniapp_missing_session;
+    let responseStatus = 200;
+    let responseBody;
+    let nextCalled = false;
+    const response = {
+      locals: {},
+      status(code) { responseStatus = code; return this; },
+      json(body) { responseBody = body; return this; },
+    };
+    await __testables.requireMiniAppSession({ headers: {}, path: "/miniapp/bootstrap", requestId: "private-request-id" }, response, () => {
+      nextCalled = true;
+    });
+    const after = __testables.getLocalApiAuthFailureMetrics(60);
+    assert.equal(responseStatus, 401);
+    assert.equal(response.locals.apiErrorCode, "miniapp_auth_required");
+    assert.equal(nextCalled, false);
+    assert.equal(after.miniapp_session.by_reason.miniapp_missing_session, before + 1);
+    assert.equal(JSON.stringify(after.miniapp_session).includes("private-request-id"), false);
+    assert.equal(responseBody.code, "miniapp_auth_required");
+  });
+
+  it("counts missing and invalid admin tokens without retaining token or request data", async function () {
+    const previousToken = config.admin.apiToken;
+    config.admin.apiToken = "synthetic-admin-token";
+    try {
+      for (const [headers, reason] of [
+        [{}, "admin_token_missing"],
+        [{ "x-admin-token": "wrong-synthetic-token" }, "admin_token_invalid"],
+      ]) {
+        const before = __testables.getLocalApiAuthFailureMetrics(60).admin_token.by_reason[reason];
+        let responseStatus = 200;
+        await __testables.requireAdminToken({ headers, requestId: "private-request-id", path: "/admin/private" }, {
+          status(code) { responseStatus = code; return this; },
+          json() { return this; },
+        }, () => assert.fail("denied request must not continue"));
+        const after = __testables.getLocalApiAuthFailureMetrics(60);
+        assert.equal(responseStatus, 403);
+        assert.equal(after.admin_token.by_reason[reason], before + 1);
+        assert.equal(JSON.stringify(after.admin_token).includes("private-request-id"), false);
+        assert.equal(JSON.stringify(after.admin_token).includes("synthetic-admin-token"), false);
+        assert.equal(JSON.stringify(after.admin_token).includes("wrong-synthetic-token"), false);
+      }
+    } finally {
+      config.admin.apiToken = previousToken;
+    }
+  });
+
   it("registers the Vapi readiness route behind admin-token authorization", function () {
     const route = app._router.stack.find((layer) => layer.route?.path === "/api/vapi/status");
     assert.ok(route, "Vapi readiness route should be registered");
     assert.equal(route.route.methods.get, true);
     assert.equal(route.route.stack[0].name, "requireAdminToken");
+  });
+
+  it("keeps provider diagnostics behind admin-token authorization and labels process-local observations", async function () {
+    const route = app._router.stack.find((layer) => layer.route?.path === "/admin/provider");
+    assert.ok(route, "provider status route should be registered");
+    assert.equal(route.route.methods.get, true);
+    assert.equal(route.route.stack[0].name, "requireAdminToken");
+
+    const previousDb = __testables.getDb();
+    let responseBody;
+    __testables.setDbForTests({ getSetting: async () => null });
+    try {
+      await route.route.stack[1].handle(
+        { query: {} },
+        {
+          json(value) {
+            responseBody = value;
+            return this;
+          },
+        },
+      );
+    } finally {
+      __testables.setDbForTests(previousDb);
+    }
+
+    const health = responseBody.provider_health?.[responseBody.provider];
+    assert.equal(health.observation_scope, "api_process_memory");
+    assert.equal(typeof health.circuit_state, "string");
+    assert.equal(typeof health.degraded, "boolean");
+    assert.equal(typeof health.consecutive_errors, "number");
+    assert.equal(Object.hasOwn(health, "api_key"), false);
+    assert.equal(Object.hasOwn(health, "last_error"), false);
   });
 
   it("registers Vapi tool policy reads and mutations behind admin-token authorization", function () {

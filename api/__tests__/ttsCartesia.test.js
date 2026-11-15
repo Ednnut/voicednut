@@ -1,6 +1,7 @@
 const assert = require('node:assert/strict');
 const { Readable } = require('node:stream');
 const { TextToSpeechService, iterateCartesiaSseAudio } = require('../routes/tts');
+const { applyBusinessSpeechProfile } = require('../services/cartesiaSpeechSettingsStore');
 
 function makeConfig(overrides = {}) {
   return {
@@ -50,16 +51,116 @@ describe('Cartesia TTS adapter', () => {
     assert.equal(request.body.voice, 'script_voice_01');
   });
 
-  it('rejects malformed per-call speech profiles before changing the selected TTS provider', () => {
+  it('accepts a dated Sonic 3.6 model selected from the current Cartesia model catalog', async () => {
+    let requestBody;
+    const config = makeConfig();
+    config.tts.cartesia.model = 'sonic-3.6-2026-08-27';
+    const service = new TextToSpeechService({
+      config,
+      fetchFn: async (_url, options) => {
+        requestBody = JSON.parse(options.body);
+        return { ok: true, status: 200, body: Readable.from([sseChunk(Buffer.from([1, 0]))]) };
+      },
+    });
+    const result = await service.generate({ partialResponseIndex: 10, partialResponse: 'Snapshot model.' }, 1, { encoding: 'linear16' });
+    assert.equal(result.ok, true);
+    assert.equal(requestBody.model_id, 'sonic-3.6-2026-08-27');
+  });
+
+  it('uses the saved Cartesia profile defaults during call TTS without changing telephony', async () => {
+    let requestBody;
     const config = makeConfig();
     config.tts.provider = 'deepgram';
-    const service = new TextToSpeechService({ config });
+    const service = new TextToSpeechService({
+      config,
+      fetchFn: async (_url, options) => {
+        requestBody = JSON.parse(options.body);
+        return { ok: true, status: 200, body: Readable.from([sseChunk(Buffer.from([1, 0]))]) };
+      },
+    });
+    const callConfiguration = {
+      provider: 'twilio',
+      script_policy: applyBusinessSpeechProfile({
+        agent_config: { speech_settings: { provider: 'cartesia', voice_id: 'script_voice_01' } },
+      }, {
+        provider: 'cartesia', voice_id: 'saved_voice_01', model_id: 'sonic-3.6',
+        language: 'es', speed: 1.1, volume: 0.9, output_format: 'mp3', source: 'business',
+      }),
+    };
+    service.configureSpeechProfile(callConfiguration.script_policy.agent_config.speech_settings);
 
+    const result = await service.generate(
+      { partialResponseIndex: 11, partialResponse: 'Saved profile defaults.' },
+      1,
+      { encoding: 'linear16' },
+    );
+
+    assert.equal(result.ok, true);
+    assert.equal(config.callProvider, undefined);
+    assert.equal(callConfiguration.provider, 'twilio');
+    assert.equal(service.provider, 'cartesia');
+    assert.equal(requestBody.voice, 'script_voice_01');
+    assert.equal(requestBody.model_id, 'sonic-3.6');
+    assert.equal(requestBody.language, 'es');
+    assert.deepEqual(requestBody.generation_config, { speed: 1.1, volume: 0.9 });
+  });
+
+  it('allows a business-scoped Deepgram choice to override a global Cartesia engine per call', async () => {
+    let requestUrl;
+    const config = makeConfig();
+    const service = new TextToSpeechService({
+      config,
+      fetchFn: async (url) => {
+        requestUrl = url;
+        return { status: 200, buffer: async () => Buffer.from([1, 2, 3]) };
+      },
+    });
+    service.configureSpeechProfile({
+      provider: 'deepgram',
+      voice_id: 'saved_cartesia_voice',
+      model_id: 'sonic-3.6',
+      language: 'en',
+      speed: 1,
+      volume: 1,
+      output_format: 'wav',
+    });
+    const result = await service.generate(
+      { partialResponseIndex: 12, partialResponse: 'Business-specific Deepgram.' },
+      1,
+      { encoding: 'linear16' },
+    );
+
+    assert.equal(result.ok, true);
+    assert.equal(service.provider, 'deepgram');
+    assert.equal(config.tts.provider, 'cartesia');
+    assert.match(requestUrl, /^https:\/\/api\.deepgram\.com\/v1\/speak/);
+  });
+
+  it('rejects malformed per-call speech profiles before changing the selected TTS provider', () => {
+    const config = makeConfig();
+    const service = new TextToSpeechService({ config });
     assert.throws(
-      () => service.configureSpeechProfile({ provider: 'cartesia', voice_id: 'https://invalid.example' }),
+      () => service.configureSpeechProfile({
+        provider: 'deepgram',
+        voice_id: 'saved_voice_01',
+        model_id: 'sonic-3.6',
+        language: 'en',
+        speed: 9,
+        volume: 1,
+        output_format: 'wav',
+      }),
       { code: 'cartesia_speech_profile_invalid' },
     );
-    assert.equal(service.provider, 'deepgram');
+    assert.equal(service.provider, 'cartesia');
+
+    config.tts.provider = 'deepgram';
+    const deepgramService = new TextToSpeechService({ config });
+
+    assert.throws(
+      () => deepgramService.configureSpeechProfile({ provider: 'cartesia', voice_id: 'https://invalid.example' }),
+      { code: 'cartesia_speech_profile_invalid' },
+    );
+    assert.equal(deepgramService.provider, 'deepgram');
   });
 
   it('uses a validated per-call Cartesia voice profile override', async () => {

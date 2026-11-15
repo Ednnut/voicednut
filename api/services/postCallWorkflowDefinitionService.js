@@ -3,7 +3,8 @@ const MAX_STEPS = 50;
 const MAX_DEFINITION_BYTES = 64 * 1024;
 const MAX_TOTAL_WAIT_SECONDS = 30 * 24 * 60 * 60;
 const SUPPORTED_ACTIONS = new Set(["send_email", "crm_sync", "create_ticket"]);
-const BUSINESS_SCOPED_TRIGGER_EVENTS = new Set(["call_e_result_ready"]);
+const BUSINESS_SCOPED_TRIGGER_EVENTS = new Set(["call_e_result_ready", "post_call_automation_failed"]);
+const RESULT_READY_TRIGGER_EVENTS = new Set(["call_e_result_ready"]);
 const SUPPORTED_TRIGGER_EVENTS = new Set(["post_call_completed", "post_call_outcome_classified", ...BUSINESS_SCOPED_TRIGGER_EVENTS]);
 const RESULT_CLASSIFICATION_LABELS = new Set(["positive", "negative", "neutral", "requires_review", "unknown"]);
 const ACTION_CONFIG_KEYS = Object.freeze({
@@ -117,7 +118,7 @@ function normalizeWorkflowDefinition(input = {}) {
   } else if (businessId && !/^[A-Za-z0-9._:-]{1,120}$/.test(businessId)) {
     fail("business_id is invalid");
   }
-  if (!BUSINESS_SCOPED_TRIGGER_EVENTS.has(triggerEvent) &&
+  if (!RESULT_READY_TRIGGER_EVENTS.has(triggerEvent) &&
       (input.template_id != null || input.template_version != null ||
         (Array.isArray(input.result_classifications) ? input.result_classifications.length > 0 : input.result_classifications != null))) {
     fail("template pins and result classifications are only supported for CALL-E result-ready workflows");
@@ -128,7 +129,7 @@ function normalizeWorkflowDefinition(input = {}) {
   if (!Array.isArray(resultClassificationsInput) || resultClassificationsInput.length > 16) {
     fail("result_classifications must contain at most 16 entries");
   }
-  if (resultClassificationsInput.length && !BUSINESS_SCOPED_TRIGGER_EVENTS.has(triggerEvent)) {
+  if (resultClassificationsInput.length && !RESULT_READY_TRIGGER_EVENTS.has(triggerEvent)) {
     fail("result_classifications are only supported for business-scoped result-ready workflows");
   }
   if ((templateId === null) !== (templateVersion === null)) {

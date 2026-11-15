@@ -52,6 +52,16 @@ describe('CALL-E mission additive schema migration', () => {
          DROP TABLE call_e_business_provider_routing;
          DROP TABLE call_e_mission_activity;
          DROP TABLE call_e_mission_secondary_approvals;
+         DROP TRIGGER call_e_safety_policy_revision_after_insert;
+         DROP TRIGGER call_e_safety_policy_revision_after_update;
+         DROP TRIGGER call_e_safety_policy_revisions_no_update;
+         DROP TRIGGER call_e_safety_policy_revisions_no_delete;
+         DROP TABLE call_e_business_safety_policy_revisions;
+         DROP TRIGGER call_e_mission_policy_revision_after_insert;
+         DROP TRIGGER call_e_mission_policy_revision_after_update;
+         DROP TRIGGER call_e_mission_policy_revisions_no_update;
+         DROP TRIGGER call_e_mission_policy_revisions_no_delete;
+         DROP TABLE call_e_business_mission_policy_revisions;
          ALTER TABLE call_e_campaign_missions DROP COLUMN scheduled_at;
          ALTER TABLE call_e_campaign_missions DROP COLUMN budget_limit_minor;
          ALTER TABLE call_e_campaign_missions DROP COLUMN per_call_cost_ceiling_minor;

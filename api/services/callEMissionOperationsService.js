@@ -41,15 +41,18 @@ class CallEMissionOperationsService {
     const actorId = String(input.actor_id || '').trim();
     await this.assertMembership(businessId, actorId);
     const row = await this.db.getCallEBusinessMissionPolicy(businessId);
+    const historyLimit = Math.max(1, Math.min(100, Math.floor(Number(input.history_limit) || 20)));
+    const history = await this.db.getCallEBusinessMissionPolicyHistory?.(businessId, historyLimit) || [];
     return { policy: {
       business_id: businessId,
       secondary_approval_threshold: Number(row?.secondary_approval_threshold) || 26,
       approval_ttl_hours: Number(row?.approval_ttl_hours) || 24,
       review_sla_minutes: Number(row?.review_sla_minutes) || 0,
       review_repeat_minutes: Number(row?.review_repeat_minutes) || 0,
+      revision: Number(row?.revision) || null,
       updated_by: row?.updated_by || null,
       updated_at: row?.updated_at || null,
-    } };
+    }, history };
   }
 
   async setApprovalPolicy(input = {}) {
@@ -72,12 +75,34 @@ class CallEMissionOperationsService {
     }) };
   }
 
+  async rollbackApprovalPolicy(input = {}) {
+    const businessId = String(input.business_id || '').trim();
+    const actorId = String(input.actor_id || '').trim();
+    const revision = Number(input.revision);
+    await this.assertMembership(businessId, actorId, true);
+    if (!Number.isSafeInteger(revision) || revision < 1) {
+      throw operationError('call_e_mission_policy_revision_invalid', 'A positive mission approval policy revision is required');
+    }
+    const source = await this.db.getCallEBusinessMissionPolicyRevision(businessId, revision);
+    if (!source) throw operationError('call_e_mission_policy_revision_not_found', 'Mission approval policy revision was not found', 404);
+    const policy = await this.db.setCallEBusinessMissionPolicy({
+      business_id: businessId, actor_id: actorId,
+      secondary_approval_threshold: source.secondary_approval_threshold,
+      approval_ttl_hours: source.approval_ttl_hours,
+      review_sla_minutes: source.review_sla_minutes,
+      review_repeat_minutes: source.review_repeat_minutes,
+      change_type: 'rollback', source_revision: revision,
+    });
+    return { policy, source_revision: revision };
+  }
+
   async getProviderRouting(input = {}) {
     const businessId = String(input.business_id || '').trim();
     const actorId = String(input.actor_id || '').trim();
     await this.assertMembership(businessId, actorId);
     const row = await this.db.getCallEBusinessProviderRouting(businessId);
-    return { policy: { business_id: businessId, provider_order: row?.provider_order || [], updated_by: row?.updated_by || null, updated_at: row?.updated_at || null } };
+        const history = await this.db.getCallEBusinessProviderRoutingHistory(businessId, input.history_limit ?? 20);
+        return { policy: { business_id: businessId, provider_order: row?.provider_order || [], revision: row?.revision || null, updated_by: row?.updated_by || null, updated_at: row?.updated_at || null }, history };
   }
 
   async setProviderRouting(input = {}) {
@@ -90,6 +115,23 @@ class CallEMissionOperationsService {
     }
     return { policy: { business_id: businessId, ...await this.db.setCallEBusinessProviderRouting({ business_id: businessId, actor_id: actorId, provider_order: order }) } };
   }
+
+    async rollbackProviderRouting(input = {}) {
+        const businessId = String(input.business_id || '').trim();
+        const actorId = String(input.actor_id || '').trim();
+        const revision = Number(input.revision);
+        await this.assertMembership(businessId, actorId, true);
+        if (!Number.isSafeInteger(revision) || revision < 1) {
+            throw operationError('call_e_provider_routing_revision_invalid', 'A positive provider-routing revision is required');
+        }
+        const source = await this.db.getCallEBusinessProviderRoutingRevision(businessId, revision);
+        if (!source) throw operationError('call_e_provider_routing_revision_not_found', 'Provider-routing revision was not found', 404);
+        const policy = await this.db.setCallEBusinessProviderRouting({
+            business_id: businessId, actor_id: actorId, provider_order: source.provider_order,
+            change_type: 'rollback', source_revision: revision,
+        });
+        return { policy: { business_id: businessId, ...policy }, source_revision: revision };
+    }
 
   async previewProviderRouting(input = {}) {
     const businessId = String(input.business_id || '').trim();

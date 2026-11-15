@@ -3,6 +3,7 @@ const EventEmitter = require('events');
 const fetch = require('node-fetch');
 const config = require('../config');
 const { sanitizeVoiceOutputText } = require('../utils/voiceOutputGuard');
+const { isCartesiaTtsModelId } = require('../services/cartesiaSpeechSettingsStore');
 
 const TTS_CACHE_TTL_MS = 15 * 60 * 1000;
 const TTS_CACHE_MAX_ITEMS = 200;
@@ -131,6 +132,7 @@ class TextToSpeechService extends EventEmitter {
     this.provider = String(options.provider || this.config.tts?.provider || 'deepgram').trim().toLowerCase();
     this.voiceModel = options.voiceModel || null;
     this.voiceId = options.voiceId || null;
+    this.cartesiaProfile = {};
     this.encoding = String(options.encoding || 'mulaw')
       .toLowerCase()
       .trim();
@@ -157,15 +159,52 @@ class TextToSpeechService extends EventEmitter {
   configureSpeechProfile(settings) {
     if (settings === undefined || settings === null) return;
     if (!settings || typeof settings !== 'object' || Array.isArray(settings) ||
-        String(settings.provider || '').trim().toLowerCase() !== 'cartesia' ||
-        typeof settings.voice_id !== 'string' ||
-        !/^[A-Za-z0-9_-]{1,200}$/.test(settings.voice_id.trim())) {
+        !['cartesia', 'deepgram'].includes(String(settings.provider || '').trim().toLowerCase())) {
+      const error = new Error('Cartesia speech profile is invalid');
+      error.code = 'cartesia_speech_profile_invalid';
+      throw error;
+    }
+    const supported = new Set(['provider', 'voice_id', 'model_id', 'language', 'speed', 'volume', 'output_format']);
+    if (Object.keys(settings).some((key) => !supported.has(key))) {
+      const error = new Error('Cartesia speech profile contains unsupported settings');
+      error.code = 'cartesia_speech_profile_invalid';
+      throw error;
+    }
+    if ((settings.voice_id !== undefined &&
+         (typeof settings.voice_id !== 'string' || !/^[A-Za-z0-9._:-]{1,200}$/.test(settings.voice_id.trim()))) ||
+        (settings.model_id !== undefined && !isCartesiaTtsModelId(settings.model_id)) ||
+        (settings.language !== undefined &&
+         (typeof settings.language !== 'string' || !/^[a-z]{2,3}(?:-[A-Za-z0-9]{2,8}){0,2}$/.test(settings.language))) ||
+        (settings.speed !== undefined &&
+         (typeof settings.speed !== 'number' || !Number.isFinite(settings.speed) || settings.speed < 0.6 || settings.speed > 1.5)) ||
+        (settings.volume !== undefined &&
+         (typeof settings.volume !== 'number' || !Number.isFinite(settings.volume) || settings.volume < 0.5 || settings.volume > 2)) ||
+        (settings.output_format !== undefined && !['wav', 'mp3'].includes(settings.output_format))) {
+      const error = new Error('Cartesia speech profile contains invalid settings');
+      error.code = 'cartesia_speech_profile_invalid';
+      throw error;
+    }
+    if (String(settings.provider).trim().toLowerCase() === 'deepgram') {
+      this.provider = 'deepgram';
+      this.voiceId = null;
+      this.voiceModel = this.config.deepgram?.voiceModel;
+      this.cartesiaProfile = {};
+      return;
+    }
+    if (typeof settings.voice_id !== 'string' ||
+        !settings.voice_id.trim()) {
       const error = new Error('Cartesia speech profile is invalid');
       error.code = 'cartesia_speech_profile_invalid';
       throw error;
     }
     this.provider = 'cartesia';
     this.voiceId = settings.voice_id.trim();
+    this.voiceModel = settings.model_id || this.config.tts?.cartesia?.model || this.voiceModel;
+    this.cartesiaProfile = {
+      ...(settings.language ? { language: settings.language } : {}),
+      ...(settings.speed !== undefined ? { speed: settings.speed } : {}),
+      ...(settings.volume !== undefined ? { volume: settings.volume } : {}),
+    };
   }
 
   async fetchSpeechAudio(text, voiceModel, audioSpec = {}, provider = this.provider) {
@@ -227,7 +266,7 @@ class TextToSpeechService extends EventEmitter {
     if (!['mulaw', 'ulaw', 'linear16', 'pcm_s16le'].includes(encoding)) {
       throw new Error(`Cartesia output encoding ${encoding} is not supported`);
     }
-    if (!['sonic-3.6', 'sonic-3.5', 'sonic-3', 'sonic-latest'].includes(modelId || cartesia.model || 'sonic-3.6')) {
+    if (!isCartesiaTtsModelId(modelId || cartesia.model)) {
       throw new Error('Cartesia TTS model is not in the supported model set');
     }
     if ((cartesia.apiVersion || '2026-08-14') !== '2026-08-14') {
@@ -238,7 +277,7 @@ class TextToSpeechService extends EventEmitter {
       throw new Error('Cartesia output sample rate must be a positive integer');
     }
     const requestBody = {
-      model_id: modelId || cartesia.model || 'sonic-3.6',
+      model_id: modelId || cartesia.model,
       transcript: text,
       voice: voiceId,
       output_format: { container: 'raw', encoding: 'pcm_s16le', sample_rate: sampleRate },
@@ -352,21 +391,28 @@ class TextToSpeechService extends EventEmitter {
         (options.streamPlayback === true || this.streamPlayback === true);
       const providerConfig = provider === 'cartesia' ? this.config.tts?.cartesia || {} : {};
       const voiceModel = options.voiceModel || this.voiceModel || (provider === 'cartesia'
-        ? providerConfig.model || 'sonic-3.6'
+        ? providerConfig.model
         : this.config.deepgram.voiceModel || 'aura-2-andromeda-en');
+      const cartesiaProfile = provider === 'cartesia' ? { ...this.cartesiaProfile } : {};
       const audioSpec = {
         encoding: options.encoding || this.encoding,
         sampleRate: options.sampleRate || this.sampleRate,
         container: options.container || this.container,
         ...(options.transport ? { transport: options.transport } : {}),
         ...(options.voiceId || this.voiceId ? { voiceId: options.voiceId || this.voiceId } : {}),
-        ...(options.language ? { language: options.language } : {}),
+        ...(options.language || cartesiaProfile.language || providerConfig.language
+          ? { language: options.language || cartesiaProfile.language || providerConfig.language } : {}),
         ...(options.locale ? { locale: options.locale } : {}),
         ...(options.accent ? { accent: options.accent } : {}),
         ...(options.normalization ? { normalization: options.normalization } : {}),
         ...(options.pronunciationDictId ? { pronunciationDictId: options.pronunciationDictId } : {}),
-        ...(options.speed !== undefined || options.volume !== undefined || options.emotion !== undefined
-          ? { generationConfig: { speed: options.speed, volume: options.volume, emotion: options.emotion } }
+        ...(options.speed !== undefined || options.volume !== undefined || options.emotion !== undefined ||
+          cartesiaProfile.speed !== undefined || cartesiaProfile.volume !== undefined
+          ? { generationConfig: {
+            speed: options.speed ?? cartesiaProfile.speed ?? providerConfig.speed,
+            volume: options.volume ?? cartesiaProfile.volume ?? providerConfig.volume,
+            emotion: options.emotion,
+          } }
           : {}),
       };
       const key = buildTtsCacheKey(speechText, `${voiceModel}:${audioSpec.voiceId || providerConfig.voiceId || ''}`, audioSpec, provider);

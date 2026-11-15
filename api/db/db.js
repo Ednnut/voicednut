@@ -24,6 +24,19 @@ const CALL_STATUS_ORDER = Object.freeze([
     'failed',
     'canceled',
 ]);
+const CALL_LIFECYCLE_PROVIDERS = new Set([
+    'twilio',
+    'plivo',
+    'vonage',
+    'vapi',
+    'call_e',
+    'cartesia',
+]);
+const CALL_LIFECYCLE_STATUSES = new Set([
+    ...CALL_STATUS_ORDER,
+    'unknown',
+    'submission-pending',
+]);
 const CALL_ACTIVE_STATUSES = Object.freeze([
     'queued',
     'initiated',
@@ -153,6 +166,85 @@ function getCallStatusRank(status) {
     return CALL_STATUS_ORDER.indexOf(normalizeCallStatusForDb(status));
 }
 
+function normalizeLifecycleProvider(value) {
+    const provider = String(value || '').trim().toLowerCase();
+    return CALL_LIFECYCLE_PROVIDERS.has(provider) ? provider : null;
+}
+
+function normalizeLifecycleStatus(value) {
+    const status = normalizeCallStatusForDb(value);
+    if (status === 'cancelled') return 'canceled';
+    return CALL_LIFECYCLE_STATUSES.has(status) ? status : null;
+}
+
+function normalizeLifecycleReference(value) {
+    const reference = String(value || '').trim();
+    return /^[A-Za-z0-9._:-]{1,400}$/.test(reference) ? reference : null;
+}
+
+function normalizeLifecycleEventType(value) {
+    const eventType = String(value || '').trim().toLowerCase();
+    return /^[a-z0-9][a-z0-9_.-]{0,79}$/.test(eventType) ? eventType : null;
+}
+
+function callLifecycleEventFromState(callSid, state, data = {}, stableEventKey = null) {
+    const normalizedState = String(state || '').trim().toLowerCase();
+    const fixedTypes = {
+        call_created: 'call_created',
+        outbound_submission_pending: 'submission_pending',
+        provider_submission_accepted: 'submission_accepted',
+        outbound_submission_uncertain: 'submission_uncertain',
+        outbound_submission_rejected: 'submission_rejected',
+        provider_status_refreshed: 'status_refreshed',
+        provider_call_reconciled: 'reconciled',
+    };
+    let eventType = fixedTypes[normalizedState] || null;
+    let status = normalizeLifecycleStatus(data.status || data.provider_status);
+    if (normalizedState === 'ringing') {
+        eventType = 'provider_status';
+        status = 'ringing';
+    } else if (normalizedState.startsWith('status_')) {
+        eventType = 'provider_status';
+        status = status || normalizeLifecycleStatus(normalizedState.slice('status_'.length));
+    } else if (normalizedState.startsWith('cartesia_')) {
+        eventType = 'provider_status';
+        status = status || normalizeLifecycleStatus(normalizedState.slice('cartesia_'.length));
+    }
+    if (!eventType) return null;
+
+    const provider = normalizeLifecycleProvider(data.telephony_provider || data.provider);
+    const providerStatusValue = String(data.provider_status || '').trim();
+    const providerStatus = /^[A-Za-z0-9._:-]{1,80}$/.test(providerStatusValue)
+        ? providerStatusValue
+        : null;
+    const rawTimestamp = data.event_timestamp || data.at || data.refreshed_at;
+    const parsedTimestamp = rawTimestamp && Number.isFinite(Date.parse(rawTimestamp))
+        ? new Date(rawTimestamp).toISOString()
+        : null;
+    const sourceValue = String(data.source || '').trim().toLowerCase();
+    const source = /^[a-z0-9_.-]{1,40}$/.test(sourceValue) ? sourceValue : 'call_state';
+
+    return {
+        event_key: stableEventKey || (eventType === 'call_created'
+            ? `call-created:${callSid}`
+            : ['provider_status', 'status_changed'].includes(eventType) && status
+                ? `call-status:${callSid}:${status}`
+                : eventType === 'reconciled' && status
+                    ? `call-reconciled:${callSid}:${status}`
+                : `call-milestone:${callSid}:${eventType}`),
+        call_sid: callSid,
+        provider,
+        event_type: eventType,
+        status,
+        provider_status: providerStatus,
+        provider_call_id: normalizeLifecycleReference(data.provider_call_id),
+        outbound_idempotency_key: normalizeLifecycleReference(data.outbound_idempotency_key),
+        ai_voice_engine: data.ai_voice_engine,
+        occurred_at: parsedTimestamp,
+        source,
+    };
+}
+
 class EnhancedDatabase {
     constructor() {
         this.db = null;
@@ -192,6 +284,7 @@ class EnhancedDatabase {
                 console.log('Connected to enhanced SQLite database');
                 this.applyConnectionPragmas()
                     .then(() => this.createEnhancedTables())
+                    .then(() => this.ensureCallEBusinessProviderRoutingHistory())
                     .then(() => this.ensureOutboundContactDispatchCartesiaProvider())
                     .then(() => this.ensureOutboundCallBusinessScopeColumn())
                     .then(() => this.ensureCartesiaCallBusinessScopeResolutionColumn())
@@ -200,9 +293,12 @@ class EnhancedDatabase {
                     .then(() => this.ensureCartesiaVoiceGovernanceColumns())
                     .then(() => this.ensureCallESensitiveDataColumns())
                     .then(() => this.ensureCallEMissionEnhancementColumns())
+                    .then(() => this.ensureCallEBusinessMissionApprovalPolicyHistory())
+                    .then(() => this.ensureCallEBusinessSafetyPolicyHistory())
                     .then(() => this.initializeSMSTables())
                     .then(() => this.initializeEmailTables())
                     .then(() => this.initializePostCallAutomationTables())
+                    .then(() => this.ensureOutgoingWebhookConfigurationHistory())
                     .then(() => this.ensureEmailDlqColumns())
                     .then(() => this.ensureEmailQueueColumns())
                     .then(() => {
@@ -241,7 +337,13 @@ class EnhancedDatabase {
                 error_message TEXT,
                 ring_duration INTEGER,
                 answer_delay INTEGER,
-                business_id TEXT
+                business_id TEXT,
+                provider TEXT,
+                telephony_provider TEXT,
+                provider_call_id TEXT,
+                outbound_idempotency_key TEXT,
+                ai_voice_engine TEXT,
+                cartesia_session_id TEXT
             )`,
 
             // Enhanced call transcripts table with personality tracking
@@ -280,6 +382,22 @@ class EnhancedDatabase {
                 data TEXT,
                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
                 sequence_number INTEGER,
+                FOREIGN KEY(call_sid) REFERENCES calls(call_sid)
+            )`,
+
+            `CREATE TABLE IF NOT EXISTS call_lifecycle_events (
+                event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_key TEXT NOT NULL UNIQUE,
+                call_sid TEXT NOT NULL,
+                actor_id TEXT NOT NULL,
+                business_id TEXT,
+                provider TEXT,
+                event_type TEXT NOT NULL,
+                status TEXT,
+                provider_status TEXT,
+                source TEXT NOT NULL,
+                occurred_at TEXT NOT NULL,
+                recorded_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY(call_sid) REFERENCES calls(call_sid)
             )`,
 
@@ -552,6 +670,39 @@ class EnhancedDatabase {
                 status TEXT NOT NULL,
                 details TEXT,
                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            )`,
+
+            `CREATE TABLE IF NOT EXISTS api_auth_failure_minute_buckets (
+                bucket_minute INTEGER NOT NULL,
+                process_instance_id TEXT NOT NULL,
+                reason TEXT NOT NULL CHECK(reason IN ('missing_headers', 'invalid_timestamp', 'timestamp_out_of_range', 'invalid_signature', 'replay_detected', 'other')),
+                count INTEGER NOT NULL CHECK(count >= 0),
+                updated_at DATETIME NOT NULL,
+                PRIMARY KEY(bucket_minute, process_instance_id, reason)
+            )`,
+            `CREATE TABLE IF NOT EXISTS miniapp_auth_failure_minute_buckets (
+                bucket_minute INTEGER NOT NULL,
+                process_instance_id TEXT NOT NULL,
+                reason TEXT NOT NULL CHECK(reason IN ('miniapp_missing_session', 'miniapp_invalid_session', 'miniapp_access_denied', 'miniapp_revoked_session', 'miniapp_missing_init_data', 'miniapp_invalid_init_data', 'miniapp_invalid_init_signature', 'miniapp_replayed_init_data')),
+                count INTEGER NOT NULL CHECK(count >= 0),
+                updated_at DATETIME NOT NULL,
+                PRIMARY KEY(bucket_minute, process_instance_id, reason)
+            )`,
+            `CREATE TABLE IF NOT EXISTS admin_auth_failure_minute_buckets (
+                bucket_minute INTEGER NOT NULL,
+                process_instance_id TEXT NOT NULL,
+                reason TEXT NOT NULL CHECK(reason IN ('admin_token_missing', 'admin_token_invalid')),
+                count INTEGER NOT NULL CHECK(count >= 0),
+                updated_at DATETIME NOT NULL,
+                PRIMARY KEY(bucket_minute, process_instance_id, reason)
+            )`,
+            `CREATE TABLE IF NOT EXISTS webhook_auth_failure_minute_buckets (
+                bucket_minute INTEGER NOT NULL,
+                process_instance_id TEXT NOT NULL,
+                reason TEXT NOT NULL CHECK(reason IN ('webhook_auth_rejected')),
+                count INTEGER NOT NULL CHECK(count >= 0),
+                updated_at DATETIME NOT NULL,
+                PRIMARY KEY(bucket_minute, process_instance_id, reason)
             )`,
 
             // Application settings
@@ -1309,7 +1460,10 @@ class EnhancedDatabase {
                 emergency_stop INTEGER NOT NULL DEFAULT 1 CHECK(emergency_stop IN (0, 1)),
                 contact_cooldown_hours INTEGER NOT NULL DEFAULT 0 CHECK(contact_cooldown_hours BETWEEN 0 AND 8760),
                 updated_by TEXT NOT NULL,
-                updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+                updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                change_type TEXT NOT NULL DEFAULT 'configured',
+                source_revision INTEGER,
+                write_token TEXT NOT NULL DEFAULT ''
             )`,
             `CREATE TABLE IF NOT EXISTS call_e_mission_worker_controls (
                 business_id TEXT NOT NULL,
@@ -1467,6 +1621,36 @@ class EnhancedDatabase {
                 UNIQUE(business_id, idempotency_key),
                 FOREIGN KEY(mission_id, recipient_position) REFERENCES call_e_campaign_mission_recipients(mission_id, position) ON DELETE CASCADE
             )`,
+            `CREATE TABLE IF NOT EXISTS call_e_mission_usage_revisions (
+                revision_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                business_id TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                recipient_position INTEGER NOT NULL,
+                provider TEXT NOT NULL CHECK(provider IN ('twilio', 'plivo', 'vonage', 'other')),
+                provider_call_id TEXT NOT NULL,
+                usage_id INTEGER NOT NULL,
+                previous_source_type TEXT NOT NULL CHECK(previous_source_type = 'operator_estimate'),
+                previous_amount_minor INTEGER NOT NULL CHECK(previous_amount_minor >= 0),
+                previous_currency TEXT NOT NULL CHECK(previous_currency GLOB '[A-Z][A-Z][A-Z]'),
+                previous_source_reference TEXT NOT NULL,
+                replacement_source_type TEXT NOT NULL CHECK(replacement_source_type IN ('provider_cdr', 'invoice')),
+                replacement_amount_minor INTEGER NOT NULL CHECK(replacement_amount_minor >= 0),
+                replacement_currency TEXT NOT NULL CHECK(replacement_currency GLOB '[A-Z][A-Z][A-Z]'),
+                replacement_source_reference TEXT NOT NULL,
+                recorded_by TEXT NOT NULL,
+                idempotency_key TEXT NOT NULL,
+                request_hash TEXT NOT NULL CHECK(length(request_hash) = 64),
+                occurred_at TEXT NOT NULL,
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(business_id, idempotency_key),
+                FOREIGN KEY(mission_id, recipient_position) REFERENCES call_e_campaign_mission_recipients(mission_id, position) ON DELETE CASCADE,
+                FOREIGN KEY(usage_id) REFERENCES call_e_mission_usage_records(usage_id) ON DELETE CASCADE
+            )`,
+            'CREATE INDEX IF NOT EXISTS idx_call_e_mission_usage_revisions_scope ON call_e_mission_usage_revisions(business_id, mission_id, revision_id DESC)',
+            `CREATE TRIGGER IF NOT EXISTS call_e_mission_usage_revisions_no_update BEFORE UPDATE ON call_e_mission_usage_revisions
+             BEGIN SELECT RAISE(ABORT, 'CALL-E usage revisions are append-only'); END`,
+            `CREATE TRIGGER IF NOT EXISTS call_e_mission_usage_revisions_no_delete BEFORE DELETE ON call_e_mission_usage_revisions
+             BEGIN SELECT RAISE(ABORT, 'CALL-E usage revisions are append-only'); END`,
             `CREATE TABLE IF NOT EXISTS call_e_mission_report_digest_subscriptions (
                 business_id TEXT NOT NULL,
                 actor_id TEXT NOT NULL,
@@ -1500,7 +1684,10 @@ class EnhancedDatabase {
                 business_id TEXT PRIMARY KEY,
                 provider_order_json TEXT NOT NULL,
                 updated_by TEXT NOT NULL,
-                updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+                updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                change_type TEXT NOT NULL DEFAULT 'configured' CHECK(change_type IN ('configured', 'rollback')),
+                source_revision INTEGER,
+                write_token TEXT NOT NULL DEFAULT ''
             )`,
             `CREATE TABLE IF NOT EXISTS call_e_mission_alert_subscriptions (
                 business_id TEXT NOT NULL,
@@ -1708,6 +1895,57 @@ class EnhancedDatabase {
                 FOREIGN KEY(call_sid) REFERENCES calls(call_sid)
             )`,
 
+            `CREATE TABLE IF NOT EXISTS call_structured_extractions (
+                call_sid TEXT PRIMARY KEY,
+                business_id TEXT,
+                extraction_version TEXT NOT NULL,
+                schema_version TEXT NOT NULL,
+                schema_hash TEXT NOT NULL,
+                schema_json TEXT NOT NULL,
+                model_id TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(status IN ('pending_review', 'approved', 'corrected', 'rejected')),
+                data_json TEXT,
+                confidence REAL,
+                evidence_json TEXT NOT NULL DEFAULT '[]',
+                validation_errors_json TEXT NOT NULL DEFAULT '[]',
+                processed_at DATETIME NOT NULL,
+                reviewed_by TEXT,
+                reviewed_at DATETIME,
+                review_note TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(call_sid) REFERENCES calls(call_sid)
+            )`,
+
+            `CREATE TABLE IF NOT EXISTS call_structured_extraction_usage (
+                usage_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                call_sid TEXT NOT NULL,
+                business_id TEXT,
+                provider TEXT NOT NULL CHECK(provider = 'openrouter'),
+                provider_request_id TEXT,
+                model_id TEXT NOT NULL,
+                usage_source TEXT NOT NULL CHECK(usage_source = 'openrouter_chat_completion_response'),
+                prompt_tokens INTEGER CHECK(prompt_tokens IS NULL OR prompt_tokens >= 0),
+                completion_tokens INTEGER CHECK(completion_tokens IS NULL OR completion_tokens >= 0),
+                total_tokens INTEGER CHECK(total_tokens IS NULL OR total_tokens >= 0),
+                recorded_at TEXT NOT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(provider, provider_request_id),
+                FOREIGN KEY(call_sid) REFERENCES calls(call_sid)
+            )`,
+
+            `CREATE TABLE IF NOT EXISTS call_structured_extraction_reviews (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                call_sid TEXT NOT NULL,
+                previous_status TEXT NOT NULL,
+                decision TEXT NOT NULL CHECK(decision IN ('approved', 'corrected', 'rejected')),
+                reviewed_by TEXT NOT NULL,
+                reviewed_at DATETIME NOT NULL,
+                review_note TEXT,
+                corrected_data_json TEXT,
+                FOREIGN KEY(call_sid) REFERENCES call_structured_extractions(call_sid)
+            )`,
+
         ];
 
         for (const table of tables) {
@@ -1733,7 +1971,20 @@ class EnhancedDatabase {
             );
         });
 
-        await this.ensureCallColumns(['digit_summary', 'digit_count', 'last_otp', 'last_otp_masked', 'direction', 'business_id']);
+        await this.ensureCallColumns([
+            'digit_summary',
+            'digit_count',
+            'last_otp',
+            'last_otp_masked',
+            'direction',
+            'business_id',
+            'provider',
+            'telephony_provider',
+            'provider_call_id',
+            'outbound_idempotency_key',
+            'ai_voice_engine',
+            'cartesia_session_id',
+        ]);
         await this.ensureCartesiaBatchReconciliationColumns();
         await this.ensureCallEContactPolicyColumns();
         await this.ensureCallEReconciliationBusinessColumn();
@@ -1805,6 +2056,52 @@ class EnhancedDatabase {
             'CREATE INDEX IF NOT EXISTS idx_states_call_sid ON call_states(call_sid)',
             'CREATE INDEX IF NOT EXISTS idx_states_timestamp ON call_states(timestamp)',
             'CREATE INDEX IF NOT EXISTS idx_states_state ON call_states(state)',
+            'CREATE INDEX IF NOT EXISTS idx_call_lifecycle_events_call ON call_lifecycle_events(call_sid, event_id)',
+            'CREATE INDEX IF NOT EXISTS idx_call_lifecycle_events_actor ON call_lifecycle_events(actor_id, event_id)',
+            'CREATE INDEX IF NOT EXISTS idx_call_lifecycle_events_business ON call_lifecycle_events(business_id, event_id)',
+            `CREATE TRIGGER IF NOT EXISTS calls_lifecycle_event_insert
+             AFTER INSERT ON calls
+             WHEN TRIM(COALESCE(NEW.user_chat_id, '')) != ''
+             BEGIN
+                 INSERT OR IGNORE INTO call_lifecycle_events (
+                     event_key, call_sid, actor_id, business_id, provider, event_type, status, source, occurred_at
+                 ) VALUES (
+                     'call-created:' || NEW.call_sid,
+                     NEW.call_sid,
+                     TRIM(NEW.user_chat_id),
+                     NEW.business_id,
+                     NEW.provider,
+                     'call_created',
+                     LOWER(REPLACE(COALESCE(NEW.status, 'initiated'), '_', '-')),
+                     'call_record_insert',
+                     COALESCE(NEW.created_at, CURRENT_TIMESTAMP)
+                 );
+             END`,
+            `CREATE TRIGGER IF NOT EXISTS calls_lifecycle_event_status_update
+             AFTER UPDATE OF status ON calls
+             WHEN TRIM(COALESCE(NEW.user_chat_id, '')) != ''
+               AND COALESCE(LOWER(REPLACE(OLD.status, '_', '-')), '') != COALESCE(LOWER(REPLACE(NEW.status, '_', '-')), '')
+             BEGIN
+                 INSERT OR IGNORE INTO call_lifecycle_events (
+                     event_key, call_sid, actor_id, business_id, provider, event_type, status, source, occurred_at
+                 ) VALUES (
+                     'call-status:' || NEW.call_sid || ':' || LOWER(REPLACE(NEW.status, '_', '-')),
+                     NEW.call_sid,
+                     TRIM(NEW.user_chat_id),
+                     NEW.business_id,
+                     NEW.provider,
+                     'status_changed',
+                     LOWER(REPLACE(NEW.status, '_', '-')),
+                     'call_record_status',
+                     COALESCE(NEW.ended_at, NEW.started_at, CURRENT_TIMESTAMP)
+                 );
+             END`,
+            `CREATE TRIGGER IF NOT EXISTS call_lifecycle_events_no_update
+             BEFORE UPDATE ON call_lifecycle_events
+             BEGIN SELECT RAISE(ABORT, 'Call lifecycle events are append-only'); END`,
+            `CREATE TRIGGER IF NOT EXISTS call_lifecycle_events_no_delete
+             BEFORE DELETE ON call_lifecycle_events
+             BEGIN SELECT RAISE(ABORT, 'Call lifecycle events are append-only'); END`,
             'CREATE INDEX IF NOT EXISTS idx_call_outcomes_primary_flow ON call_outcomes(primary_flow)',
             'CREATE INDEX IF NOT EXISTS idx_call_outcomes_disposition ON call_outcomes(disposition)',
             'CREATE INDEX IF NOT EXISTS idx_call_outcomes_updated_at ON call_outcomes(updated_at)',
@@ -1895,6 +2192,10 @@ class EnhancedDatabase {
             'CREATE INDEX IF NOT EXISTS idx_call_quality_reports_call_sid ON call_quality_reports(call_sid)',
             'CREATE INDEX IF NOT EXISTS idx_call_quality_reports_status ON call_quality_reports(status)',
             'CREATE INDEX IF NOT EXISTS idx_call_quality_reports_updated_at ON call_quality_reports(updated_at)',
+            'CREATE INDEX IF NOT EXISTS idx_call_structured_extractions_review ON call_structured_extractions(status, processed_at)',
+            'CREATE INDEX IF NOT EXISTS idx_call_structured_extractions_business ON call_structured_extractions(business_id, status, processed_at)',
+            'CREATE INDEX IF NOT EXISTS idx_call_structured_extraction_usage_call ON call_structured_extraction_usage(call_sid)',
+            'CREATE INDEX IF NOT EXISTS idx_call_structured_extraction_usage_business ON call_structured_extraction_usage(business_id, recorded_at DESC)',
         ];
 
         for (const index of indexes) {
@@ -1910,7 +2211,556 @@ class EnhancedDatabase {
             });
         }
 
+        const lifecycleBackfill = await this.backfillCallLifecycleEvents(500);
+        if (lifecycleBackfill.has_unassigned_records) {
+            console.warn('call_lifecycle_backfill_owner_unresolved', {
+                limitation: 'Legacy calls without a verified owner remain excluded from user-scoped lifecycle history.',
+            });
+        }
+
         console.log('✅ Enhanced database tables and indexes created successfully');
+    }
+
+    async ensureOutgoingWebhookConfigurationHistory() {
+        const run = (sql, params = []) => new Promise((resolve, reject) => this.db.run(sql, params, (error) => error ? reject(error) : resolve()));
+        const columns = (table) => new Promise((resolve, reject) => this.db.all(
+            `PRAGMA table_info(${table})`,
+            (error, rows) => error ? reject(error) : resolve(new Set((rows || []).map((row) => row.name))),
+        ));
+        await run('BEGIN IMMEDIATE');
+        try {
+            const subscriptionColumns = await columns('outgoing_webhook_subscriptions');
+            if (!subscriptionColumns.has('updated_by')) {
+                await run("ALTER TABLE outgoing_webhook_subscriptions ADD COLUMN updated_by TEXT NOT NULL DEFAULT ''");
+            }
+            const deliveryColumns = await columns('outgoing_webhook_deliveries');
+            if (!deliveryColumns.has('config_revision')) {
+                await run('ALTER TABLE outgoing_webhook_deliveries ADD COLUMN config_revision INTEGER');
+            }
+            await run(`CREATE TABLE IF NOT EXISTS outgoing_webhook_subscription_revisions (
+                revision_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                subscription_id TEXT NOT NULL,
+                business_id TEXT NOT NULL,
+                revision INTEGER NOT NULL CHECK(revision > 0),
+                name TEXT NOT NULL,
+                target_url TEXT NOT NULL,
+                secret_env_ref TEXT NOT NULL,
+                enabled INTEGER NOT NULL CHECK(enabled IN (0, 1)),
+                event_types_json TEXT NOT NULL,
+                failure_threshold INTEGER NOT NULL,
+                actor_id TEXT NOT NULL,
+                change_type TEXT NOT NULL CHECK(change_type IN ('baseline', 'configured', 'system')),
+                created_at DATETIME NOT NULL,
+                UNIQUE(subscription_id, revision),
+                FOREIGN KEY(subscription_id) REFERENCES outgoing_webhook_subscriptions(subscription_id)
+            )`);
+            await run('CREATE INDEX IF NOT EXISTS idx_outgoing_webhook_subscription_revisions_scope ON outgoing_webhook_subscription_revisions(business_id, subscription_id, revision DESC)');
+            await run(`CREATE TRIGGER IF NOT EXISTS outgoing_webhook_subscription_revisions_no_update
+                BEFORE UPDATE ON outgoing_webhook_subscription_revisions
+                BEGIN SELECT RAISE(ABORT, 'Outgoing webhook revisions are append-only'); END`);
+            await run(`CREATE TRIGGER IF NOT EXISTS outgoing_webhook_subscription_revisions_no_delete
+                BEFORE DELETE ON outgoing_webhook_subscription_revisions
+                BEGIN SELECT RAISE(ABORT, 'Outgoing webhook revisions are append-only'); END`);
+            await run(`INSERT OR IGNORE INTO outgoing_webhook_subscription_revisions
+                (subscription_id, business_id, revision, name, target_url, secret_env_ref, enabled,
+                 event_types_json, failure_threshold, actor_id, change_type, created_at)
+                SELECT subscription.subscription_id, subscription.business_id, 1, subscription.name,
+                    subscription.target_url, subscription.secret_env_ref, subscription.enabled,
+                    subscription.event_types_json, subscription.failure_threshold,
+                    COALESCE(NULLIF(subscription.updated_by, ''), subscription.created_by, 'system'), 'baseline', subscription.created_at
+                FROM outgoing_webhook_subscriptions subscription
+                WHERE NOT EXISTS (SELECT 1 FROM outgoing_webhook_subscription_revisions revision
+                    WHERE revision.subscription_id = subscription.subscription_id)`);
+            await run(`UPDATE outgoing_webhook_deliveries SET config_revision = COALESCE(
+                (SELECT MAX(revision) FROM outgoing_webhook_subscription_revisions
+                 WHERE subscription_id = outgoing_webhook_deliveries.subscription_id), 1)
+                WHERE config_revision IS NULL`);
+            await run(`CREATE TRIGGER IF NOT EXISTS outgoing_webhook_subscription_revision_after_insert
+                AFTER INSERT ON outgoing_webhook_subscriptions
+                BEGIN
+                    INSERT INTO outgoing_webhook_subscription_revisions
+                        (subscription_id, business_id, revision, name, target_url, secret_env_ref, enabled,
+                         event_types_json, failure_threshold, actor_id, change_type, created_at)
+                    SELECT NEW.subscription_id, NEW.business_id, COALESCE(MAX(revision), 0) + 1, NEW.name,
+                        NEW.target_url, NEW.secret_env_ref, NEW.enabled, NEW.event_types_json, NEW.failure_threshold,
+                        COALESCE(NULLIF(NEW.updated_by, ''), NEW.created_by, 'system'), 'configured', NEW.created_at
+                    FROM outgoing_webhook_subscription_revisions WHERE subscription_id = NEW.subscription_id;
+                END`);
+            await run(`CREATE TRIGGER IF NOT EXISTS outgoing_webhook_subscription_revision_after_update
+                AFTER UPDATE OF name, target_url, secret_env_ref, enabled, event_types_json, failure_threshold
+                ON outgoing_webhook_subscriptions
+                WHEN OLD.name IS NOT NEW.name OR OLD.target_url IS NOT NEW.target_url
+                  OR OLD.secret_env_ref IS NOT NEW.secret_env_ref OR OLD.enabled IS NOT NEW.enabled
+                  OR OLD.event_types_json IS NOT NEW.event_types_json OR OLD.failure_threshold IS NOT NEW.failure_threshold
+                BEGIN
+                    INSERT INTO outgoing_webhook_subscription_revisions
+                        (subscription_id, business_id, revision, name, target_url, secret_env_ref, enabled,
+                         event_types_json, failure_threshold, actor_id, change_type, created_at)
+                    SELECT NEW.subscription_id, NEW.business_id, COALESCE(MAX(revision), 0) + 1, NEW.name,
+                        NEW.target_url, NEW.secret_env_ref, NEW.enabled, NEW.event_types_json, NEW.failure_threshold,
+                        COALESCE(NULLIF(NEW.updated_by, ''), NEW.created_by, 'system'),
+                        CASE WHEN NEW.updated_by = 'system' THEN 'system' ELSE 'configured' END, NEW.updated_at
+                    FROM outgoing_webhook_subscription_revisions WHERE subscription_id = NEW.subscription_id;
+                END`);
+            await run('COMMIT');
+        } catch (error) {
+            await new Promise((resolve) => this.db.run('ROLLBACK', () => resolve()));
+            throw error;
+        }
+    }
+
+    async ensureCallEBusinessProviderRoutingHistory() {
+        const run = (sql, params = []) => new Promise((resolve, reject) => this.db.run(sql, params, (error) => error ? reject(error) : resolve()));
+        await run('BEGIN IMMEDIATE');
+        try {
+            const currentColumns = await new Promise((resolve, reject) => this.db.all(
+                'PRAGMA table_info(call_e_business_provider_routing)',
+                (error, rows) => error ? reject(error) : resolve(new Set((rows || []).map((row) => row.name))),
+            ));
+            if (!currentColumns.has('change_type')) {
+                await run("ALTER TABLE call_e_business_provider_routing ADD COLUMN change_type TEXT NOT NULL DEFAULT 'configured'");
+            }
+            if (!currentColumns.has('source_revision')) {
+                await run('ALTER TABLE call_e_business_provider_routing ADD COLUMN source_revision INTEGER');
+            }
+            if (!currentColumns.has('write_token')) {
+                await run("ALTER TABLE call_e_business_provider_routing ADD COLUMN write_token TEXT NOT NULL DEFAULT ''");
+            }
+            await run(`CREATE TABLE IF NOT EXISTS call_e_business_provider_routing_revisions (
+            revision_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            business_id TEXT NOT NULL,
+            revision INTEGER NOT NULL CHECK(revision > 0),
+            provider_order_json TEXT NOT NULL,
+            actor_id TEXT NOT NULL,
+            change_type TEXT NOT NULL CHECK(change_type IN ('baseline', 'configured', 'rollback')),
+            source_revision INTEGER,
+            created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(business_id, revision)
+            )`);
+            await run('CREATE INDEX IF NOT EXISTS idx_call_e_business_provider_routing_revisions_scope ON call_e_business_provider_routing_revisions(business_id, revision DESC)');
+            await run(`CREATE TRIGGER IF NOT EXISTS call_e_business_provider_routing_revisions_no_update
+            BEFORE UPDATE ON call_e_business_provider_routing_revisions
+            BEGIN SELECT RAISE(ABORT, 'CALL-E provider routing revisions are append-only'); END`);
+            await run(`CREATE TRIGGER IF NOT EXISTS call_e_business_provider_routing_revisions_no_delete
+            BEFORE DELETE ON call_e_business_provider_routing_revisions
+            BEGIN SELECT RAISE(ABORT, 'CALL-E provider routing revisions are append-only'); END`);
+            await run(`INSERT OR IGNORE INTO call_e_business_provider_routing_revisions
+            (business_id, revision, provider_order_json, actor_id, change_type, source_revision, created_at)
+            SELECT current.business_id, 1, current.provider_order_json, current.updated_by, 'baseline', NULL, current.updated_at
+            FROM call_e_business_provider_routing current
+            WHERE NOT EXISTS (
+                SELECT 1 FROM call_e_business_provider_routing_revisions revisions
+                WHERE revisions.business_id = current.business_id
+            )`);
+            await run(`CREATE TRIGGER IF NOT EXISTS call_e_business_provider_routing_revision_after_insert
+            AFTER INSERT ON call_e_business_provider_routing
+            BEGIN
+                INSERT INTO call_e_business_provider_routing_revisions
+                    (business_id, revision, provider_order_json, actor_id, change_type, source_revision, created_at)
+                SELECT NEW.business_id, COALESCE(MAX(revision), 0) + 1, NEW.provider_order_json,
+                    NEW.updated_by,
+                    CASE WHEN NEW.write_token <> '' AND NEW.change_type = 'rollback' THEN 'rollback' ELSE 'configured' END,
+                    CASE WHEN NEW.write_token <> '' AND NEW.change_type = 'rollback' THEN NEW.source_revision ELSE NULL END,
+                    NEW.updated_at
+                FROM call_e_business_provider_routing_revisions
+                WHERE business_id = NEW.business_id;
+            END`);
+            await run(`CREATE TRIGGER IF NOT EXISTS call_e_business_provider_routing_revision_after_update
+            AFTER UPDATE OF provider_order_json, updated_by, change_type, source_revision ON call_e_business_provider_routing
+            BEGIN
+                INSERT INTO call_e_business_provider_routing_revisions
+                    (business_id, revision, provider_order_json, actor_id, change_type, source_revision, created_at)
+                SELECT NEW.business_id, COALESCE(MAX(revision), 0) + 1, NEW.provider_order_json,
+                    NEW.updated_by,
+                    CASE WHEN NEW.write_token <> OLD.write_token AND NEW.change_type = 'rollback' THEN 'rollback' ELSE 'configured' END,
+                    CASE WHEN NEW.write_token <> OLD.write_token AND NEW.change_type = 'rollback' THEN NEW.source_revision ELSE NULL END,
+                    NEW.updated_at
+                FROM call_e_business_provider_routing_revisions
+                WHERE business_id = NEW.business_id;
+            END`);
+            await run('COMMIT');
+        } catch (error) {
+            await new Promise((resolve) => this.db.run('ROLLBACK', () => resolve()));
+            throw error;
+        }
+    }
+
+    async ensureCallEBusinessMissionApprovalPolicyHistory() {
+        const run = (sql, params = []) => new Promise((resolve, reject) => this.db.run(sql, params, (error) => error ? reject(error) : resolve()));
+        await run('BEGIN IMMEDIATE');
+        try {
+            const columns = await new Promise((resolve, reject) => this.db.all(
+                'PRAGMA table_info(call_e_business_mission_policies)',
+                (error, rows) => error ? reject(error) : resolve(new Set((rows || []).map((row) => row.name))),
+            ));
+            if (!columns.has('change_type')) await run("ALTER TABLE call_e_business_mission_policies ADD COLUMN change_type TEXT NOT NULL DEFAULT 'configured'");
+            if (!columns.has('source_revision')) await run('ALTER TABLE call_e_business_mission_policies ADD COLUMN source_revision INTEGER');
+            if (!columns.has('write_token')) await run("ALTER TABLE call_e_business_mission_policies ADD COLUMN write_token TEXT NOT NULL DEFAULT ''");
+            await run(`CREATE TABLE IF NOT EXISTS call_e_business_mission_policy_revisions (
+                revision_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                business_id TEXT NOT NULL,
+                revision INTEGER NOT NULL CHECK(revision > 0),
+                secondary_approval_threshold INTEGER NOT NULL CHECK(secondary_approval_threshold BETWEEN 2 AND 26),
+                approval_ttl_hours INTEGER NOT NULL CHECK(approval_ttl_hours BETWEEN 1 AND 720),
+                review_sla_minutes INTEGER NOT NULL CHECK(review_sla_minutes BETWEEN 0 AND 10080),
+                review_repeat_minutes INTEGER NOT NULL CHECK(review_repeat_minutes BETWEEN 0 AND 10080),
+                actor_id TEXT NOT NULL,
+                change_type TEXT NOT NULL CHECK(change_type IN ('baseline', 'configured', 'rollback')),
+                source_revision INTEGER,
+                created_at DATETIME NOT NULL,
+                UNIQUE(business_id, revision)
+            )`);
+            await run('CREATE INDEX IF NOT EXISTS idx_call_e_mission_policy_revisions_scope ON call_e_business_mission_policy_revisions(business_id, revision DESC)');
+            await run(`CREATE TRIGGER IF NOT EXISTS call_e_mission_policy_revisions_no_update
+                BEFORE UPDATE ON call_e_business_mission_policy_revisions
+                BEGIN SELECT RAISE(ABORT, 'CALL-E mission policy revisions are append-only'); END`);
+            await run(`CREATE TRIGGER IF NOT EXISTS call_e_mission_policy_revisions_no_delete
+                BEFORE DELETE ON call_e_business_mission_policy_revisions
+                BEGIN SELECT RAISE(ABORT, 'CALL-E mission policy revisions are append-only'); END`);
+            await run(`INSERT OR IGNORE INTO call_e_business_mission_policy_revisions
+                (business_id, revision, secondary_approval_threshold, approval_ttl_hours, review_sla_minutes,
+                 review_repeat_minutes, actor_id, change_type, source_revision, created_at)
+                SELECT policy.business_id, 1, policy.secondary_approval_threshold, policy.approval_ttl_hours,
+                    policy.review_sla_minutes, policy.review_repeat_minutes, policy.updated_by,
+                    'baseline', NULL, policy.updated_at
+                FROM call_e_business_mission_policies policy
+                WHERE NOT EXISTS (SELECT 1 FROM call_e_business_mission_policy_revisions revision
+                    WHERE revision.business_id = policy.business_id)`);
+            await run(`CREATE TRIGGER IF NOT EXISTS call_e_mission_policy_revision_after_insert
+                AFTER INSERT ON call_e_business_mission_policies
+                BEGIN
+                    INSERT INTO call_e_business_mission_policy_revisions
+                        (business_id, revision, secondary_approval_threshold, approval_ttl_hours, review_sla_minutes,
+                         review_repeat_minutes, actor_id, change_type, source_revision, created_at)
+                    SELECT NEW.business_id, COALESCE(MAX(revision), 0) + 1, NEW.secondary_approval_threshold,
+                        NEW.approval_ttl_hours, NEW.review_sla_minutes, NEW.review_repeat_minutes, NEW.updated_by,
+                        'configured', NULL, NEW.updated_at
+                    FROM call_e_business_mission_policy_revisions WHERE business_id = NEW.business_id;
+                END`);
+            await run(`CREATE TRIGGER IF NOT EXISTS call_e_mission_policy_revision_after_update
+                AFTER UPDATE OF secondary_approval_threshold, approval_ttl_hours, review_sla_minutes, review_repeat_minutes
+                ON call_e_business_mission_policies
+                WHEN OLD.secondary_approval_threshold IS NOT NEW.secondary_approval_threshold
+                  OR OLD.approval_ttl_hours IS NOT NEW.approval_ttl_hours
+                  OR OLD.review_sla_minutes IS NOT NEW.review_sla_minutes
+                  OR OLD.review_repeat_minutes IS NOT NEW.review_repeat_minutes
+                  OR (NEW.write_token <> OLD.write_token AND NEW.change_type = 'rollback')
+                BEGIN
+                    INSERT INTO call_e_business_mission_policy_revisions
+                        (business_id, revision, secondary_approval_threshold, approval_ttl_hours, review_sla_minutes,
+                         review_repeat_minutes, actor_id, change_type, source_revision, created_at)
+                    SELECT NEW.business_id, COALESCE(MAX(revision), 0) + 1, NEW.secondary_approval_threshold,
+                        NEW.approval_ttl_hours, NEW.review_sla_minutes, NEW.review_repeat_minutes, NEW.updated_by,
+                        CASE WHEN NEW.write_token <> OLD.write_token AND NEW.change_type = 'rollback' THEN 'rollback' ELSE 'configured' END,
+                        CASE WHEN NEW.write_token <> OLD.write_token AND NEW.change_type = 'rollback' THEN NEW.source_revision ELSE NULL END,
+                        NEW.updated_at
+                    FROM call_e_business_mission_policy_revisions WHERE business_id = NEW.business_id;
+                END`);
+            await run('COMMIT');
+        } catch (error) {
+            await new Promise((resolve) => this.db.run('ROLLBACK', () => resolve()));
+            throw error;
+        }
+    }
+
+    async ensureCallEBusinessSafetyPolicyHistory() {
+        const run = (sql, params = []) => new Promise((resolve, reject) => this.db.run(sql, params, (error) => error ? reject(error) : resolve()));
+        await run('BEGIN IMMEDIATE');
+        try {
+            const columns = await new Promise((resolve, reject) => this.db.all(
+                'PRAGMA table_info(call_e_business_safety_policies)',
+                (error, rows) => error ? reject(error) : resolve(new Set((rows || []).map((row) => row.name))),
+            ));
+            if (!columns.has('change_type')) await run("ALTER TABLE call_e_business_safety_policies ADD COLUMN change_type TEXT NOT NULL DEFAULT 'configured'");
+            if (!columns.has('source_revision')) await run('ALTER TABLE call_e_business_safety_policies ADD COLUMN source_revision INTEGER');
+            if (!columns.has('write_token')) await run("ALTER TABLE call_e_business_safety_policies ADD COLUMN write_token TEXT NOT NULL DEFAULT ''");
+            await run(`CREATE TABLE IF NOT EXISTS call_e_business_safety_policy_revisions (
+                revision_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                business_id TEXT NOT NULL,
+                revision INTEGER NOT NULL CHECK(revision > 0),
+                max_calls_per_day INTEGER NOT NULL CHECK(max_calls_per_day BETWEEN 0 AND 1000),
+                quiet_hours_start TEXT,
+                quiet_hours_end TEXT,
+                timezone TEXT NOT NULL,
+                emergency_stop INTEGER NOT NULL CHECK(emergency_stop IN (0, 1)),
+                contact_cooldown_hours INTEGER NOT NULL CHECK(contact_cooldown_hours BETWEEN 0 AND 8760),
+                actor_id TEXT NOT NULL,
+                change_type TEXT NOT NULL CHECK(change_type IN ('baseline', 'configured', 'rollback')),
+                source_revision INTEGER,
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(business_id, revision)
+            )`);
+            await run('CREATE INDEX IF NOT EXISTS idx_call_e_safety_policy_revisions_scope ON call_e_business_safety_policy_revisions(business_id, revision DESC)');
+            await run(`CREATE TRIGGER IF NOT EXISTS call_e_safety_policy_revisions_no_update
+                BEFORE UPDATE ON call_e_business_safety_policy_revisions
+                BEGIN SELECT RAISE(ABORT, 'CALL-E safety policy revisions are append-only'); END`);
+            await run(`CREATE TRIGGER IF NOT EXISTS call_e_safety_policy_revisions_no_delete
+                BEFORE DELETE ON call_e_business_safety_policy_revisions
+                BEGIN SELECT RAISE(ABORT, 'CALL-E safety policy revisions are append-only'); END`);
+            await run(`INSERT OR IGNORE INTO call_e_business_safety_policy_revisions
+                (business_id, revision, max_calls_per_day, quiet_hours_start, quiet_hours_end, timezone, emergency_stop,
+                 contact_cooldown_hours, actor_id, change_type, source_revision, created_at)
+                SELECT policy.business_id, 1, policy.max_calls_per_day, policy.quiet_hours_start, policy.quiet_hours_end,
+                    policy.timezone, policy.emergency_stop, policy.contact_cooldown_hours, policy.updated_by,
+                    'baseline', NULL, policy.updated_at
+                FROM call_e_business_safety_policies policy
+                WHERE NOT EXISTS (SELECT 1 FROM call_e_business_safety_policy_revisions revisions
+                    WHERE revisions.business_id = policy.business_id)`);
+            await run(`CREATE TRIGGER IF NOT EXISTS call_e_safety_policy_revision_after_insert
+                AFTER INSERT ON call_e_business_safety_policies
+                BEGIN
+                    INSERT INTO call_e_business_safety_policy_revisions
+                        (business_id, revision, max_calls_per_day, quiet_hours_start, quiet_hours_end, timezone,
+                         emergency_stop, contact_cooldown_hours, actor_id, change_type, source_revision, created_at)
+                    SELECT NEW.business_id, COALESCE(MAX(revision), 0) + 1, NEW.max_calls_per_day,
+                        NEW.quiet_hours_start, NEW.quiet_hours_end, NEW.timezone, NEW.emergency_stop,
+                        NEW.contact_cooldown_hours, NEW.updated_by,
+                        CASE WHEN NEW.write_token <> '' AND NEW.change_type = 'rollback' THEN 'rollback' ELSE 'configured' END,
+                        CASE WHEN NEW.write_token <> '' AND NEW.change_type = 'rollback' THEN NEW.source_revision ELSE NULL END,
+                        NEW.updated_at
+                    FROM call_e_business_safety_policy_revisions WHERE business_id = NEW.business_id;
+                END`);
+            await run(`CREATE TRIGGER IF NOT EXISTS call_e_safety_policy_revision_after_update
+                AFTER UPDATE OF max_calls_per_day, quiet_hours_start, quiet_hours_end, timezone, emergency_stop,
+                    contact_cooldown_hours, updated_by, change_type, source_revision, write_token
+                ON call_e_business_safety_policies
+                BEGIN
+                    INSERT INTO call_e_business_safety_policy_revisions
+                        (business_id, revision, max_calls_per_day, quiet_hours_start, quiet_hours_end, timezone,
+                         emergency_stop, contact_cooldown_hours, actor_id, change_type, source_revision, created_at)
+                    SELECT NEW.business_id, COALESCE(MAX(revision), 0) + 1, NEW.max_calls_per_day,
+                        NEW.quiet_hours_start, NEW.quiet_hours_end, NEW.timezone, NEW.emergency_stop,
+                        NEW.contact_cooldown_hours, NEW.updated_by,
+                        CASE WHEN NEW.write_token <> OLD.write_token AND NEW.change_type = 'rollback' THEN 'rollback' ELSE 'configured' END,
+                        CASE WHEN NEW.write_token <> OLD.write_token AND NEW.change_type = 'rollback' THEN NEW.source_revision ELSE NULL END,
+                        NEW.updated_at
+                    FROM call_e_business_safety_policy_revisions WHERE business_id = NEW.business_id;
+                END`);
+            await run('COMMIT');
+        } catch (error) {
+            await new Promise((resolve) => this.db.run('ROLLBACK', () => resolve()));
+            throw error;
+        }
+    }
+
+    async insertCallLifecycleEvent(event) {
+        const callSid = String(event?.call_sid || '').trim();
+        const actorId = String(event?.actor_id || '').trim();
+        const eventKey = normalizeLifecycleReference(event?.event_key);
+        const eventType = normalizeLifecycleEventType(event?.event_type);
+        const status = event?.status ? normalizeLifecycleStatus(event.status) : null;
+        const occurredAt = event?.occurred_at && Number.isFinite(Date.parse(event.occurred_at))
+            ? new Date(event.occurred_at).toISOString()
+            : new Date().toISOString();
+        const sourceValue = String(event?.source || '').trim().toLowerCase();
+        const source = /^[a-z0-9_.-]{1,40}$/.test(sourceValue) ? sourceValue : 'call_state';
+        if (!callSid || callSid.length > 200 || !actorId || actorId.length > 80 || !eventKey || !eventType ||
+            (event?.status && !status)) return false;
+        const providerStatusValue = String(event?.provider_status || '').trim();
+        const providerStatus = /^[A-Za-z0-9._:-]{1,80}$/.test(providerStatusValue) ? providerStatusValue : null;
+        const provider = normalizeLifecycleProvider(event?.provider);
+        const businessId = String(event?.business_id || '').trim();
+        return new Promise((resolve, reject) => this.db.run(
+            `INSERT OR IGNORE INTO call_lifecycle_events (
+                event_key, call_sid, actor_id, business_id, provider, event_type, status, provider_status, source, occurred_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [eventKey, callSid, actorId, businessId || null, provider, eventType, status, providerStatus, source, occurredAt],
+            function (error) {
+                if (error) return reject(error);
+                resolve(this.changes > 0);
+            },
+        ));
+    }
+
+    async backfillCallLifecycleEvents(batchSize = 500) {
+        const safeBatchSize = Math.max(1, Math.min(500, Math.floor(Number(batchSize) || 500)));
+        const calls = await new Promise((resolve, reject) => this.db.all(
+            `SELECT c.call_sid, c.user_chat_id AS actor_id, c.business_id,
+                    COALESCE(c.telephony_provider, c.provider) AS provider,
+                    c.status, c.created_at, c.started_at, c.ended_at
+             FROM calls c
+             WHERE TRIM(COALESCE(c.user_chat_id, '')) != ''
+               AND (
+                 NOT EXISTS (SELECT 1 FROM call_lifecycle_events e WHERE e.event_key = 'call-created:' || c.call_sid)
+                 OR (
+                   LOWER(REPLACE(COALESCE(c.status, ''), '_', '-')) NOT IN ('', 'initiated')
+                   AND NOT EXISTS (
+                     SELECT 1 FROM call_lifecycle_events e
+                     WHERE e.event_key = 'call-status:' || c.call_sid || ':' || LOWER(REPLACE(COALESCE(c.status, ''), '_', '-'))
+                   )
+                 )
+               )
+             ORDER BY c.id
+             LIMIT ?`,
+            [safeBatchSize],
+            (error, rows) => error ? reject(error) : resolve(rows || []),
+        ));
+        for (const call of calls) {
+            const createdAt = call.created_at && Number.isFinite(Date.parse(call.created_at))
+                ? new Date(call.created_at).toISOString()
+                : new Date().toISOString();
+            await this.insertCallLifecycleEvent({
+                event_key: `call-created:${call.call_sid}`,
+                call_sid: call.call_sid,
+                actor_id: call.actor_id,
+                business_id: call.business_id,
+                provider: call.provider,
+                event_type: 'call_created',
+                status: 'initiated',
+                source: 'historical_call_record',
+                occurred_at: createdAt,
+            });
+            const status = normalizeLifecycleStatus(call.status);
+            if (status && status !== 'initiated') {
+                const statusAt = call.ended_at || call.started_at || call.created_at || createdAt;
+                await this.insertCallLifecycleEvent({
+                    event_key: `call-status:${call.call_sid}:${status}`,
+                    call_sid: call.call_sid,
+                    actor_id: call.actor_id,
+                    business_id: call.business_id,
+                    provider: call.provider,
+                    event_type: 'status_changed',
+                    status,
+                    source: 'historical_call_record',
+                    occurred_at: statusAt,
+                });
+            }
+
+        }
+
+        const states = await new Promise((resolve, reject) => this.db.all(
+            `SELECT s.id, s.call_sid, s.state, s.data, s.timestamp, s.sequence_number,
+                    c.user_chat_id AS actor_id, c.business_id, c.provider, c.telephony_provider
+             FROM call_states s
+             JOIN calls c ON c.call_sid = s.call_sid
+             WHERE TRIM(COALESCE(c.user_chat_id, '')) != ''
+               AND (
+                 s.state IN (
+                   'call_created', 'outbound_submission_pending', 'provider_submission_accepted',
+                   'outbound_submission_uncertain', 'outbound_submission_rejected',
+                   'provider_status_refreshed', 'provider_call_reconciled', 'ringing'
+                 )
+                 OR substr(s.state, 1, 7) = 'status_'
+                 OR substr(s.state, 1, 9) = 'cartesia_'
+               )
+               AND NOT EXISTS (
+                 SELECT 1 FROM call_lifecycle_events e
+                 WHERE e.event_key = CASE
+                   WHEN lower(s.state) = 'call_created' THEN 'call-created:' || s.call_sid
+                   WHEN lower(s.state) = 'provider_status_refreshed' THEN 'call-state:' || s.call_sid || ':' || s.id
+                   WHEN lower(s.state) = 'provider_call_reconciled' THEN 'call-reconciled:' || s.call_sid || ':' ||
+                     lower(replace(COALESCE(json_extract(
+                       CASE WHEN json_valid(s.data) THEN s.data ELSE '{}' END, '$.status'
+                     ), ''), '_', '-'))
+                   WHEN lower(s.state) IN (
+                     'outbound_submission_pending', 'provider_submission_accepted',
+                     'outbound_submission_uncertain', 'outbound_submission_rejected'
+                   ) THEN 'call-milestone:' || s.call_sid || ':' || CASE lower(s.state)
+                     WHEN 'outbound_submission_pending' THEN 'submission_pending'
+                     WHEN 'provider_submission_accepted' THEN 'submission_accepted'
+                     WHEN 'outbound_submission_uncertain' THEN 'submission_uncertain'
+                     ELSE 'submission_rejected'
+                   END
+                   WHEN lower(s.state) = 'ringing' THEN 'call-status:' || s.call_sid || ':ringing'
+                   WHEN substr(lower(s.state), 1, 7) = 'status_' THEN 'call-status:' || s.call_sid || ':' ||
+                     replace(replace(substr(lower(s.state), 8), '_', '-'), 'cancelled', 'canceled')
+                   WHEN substr(lower(s.state), 1, 9) = 'cartesia_' THEN 'call-status:' || s.call_sid || ':' ||
+                     replace(replace(substr(lower(s.state), 10), '_', '-'), 'cancelled', 'canceled')
+                   ELSE 'call-milestone:' || s.call_sid || ':provider_status'
+                 END
+               )
+             ORDER BY s.id
+             LIMIT ?`,
+            [safeBatchSize],
+            (error, rows) => error ? reject(error) : resolve(rows || []),
+        ));
+        for (const state of states) {
+            let data = {};
+            try {
+                const parsed = JSON.parse(state.data || '{}');
+                if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) data = parsed;
+            } catch {
+                data = {};
+            }
+            const event = callLifecycleEventFromState(state.call_sid, state.state, data);
+            if (!event) continue;
+            const eventKey = event.event_type === 'status_refreshed'
+                ? `call-state:${state.call_sid}:${state.id}`
+                : event.event_key;
+            await this.appendCallLifecycleEventForCall(state.call_sid, {
+                ...event,
+                event_key: eventKey,
+                provider: event.provider || state.telephony_provider || state.provider,
+                occurred_at: state.timestamp,
+            });
+        }
+        const hasUnassignedRecords = await new Promise((resolve, reject) => this.db.get(
+            `SELECT 1 AS found FROM calls
+             WHERE user_chat_id IS NULL OR TRIM(user_chat_id) = ''
+             LIMIT 1`,
+            (error, row) => error ? reject(error) : resolve(Boolean(row)),
+        ));
+        return { calls_backfilled: calls.length, states_backfilled: states.length, has_unassigned_records: hasUnassignedRecords };
+    }
+
+    async appendCallLifecycleEventForCall(callSid, event) {
+        const row = await new Promise((resolve, reject) => this.db.get(
+            `SELECT user_chat_id AS actor_id, business_id, provider, telephony_provider,
+                    provider_call_id, outbound_idempotency_key, ai_voice_engine
+             FROM calls WHERE call_sid = ?`,
+            [callSid],
+            (error, result) => error ? reject(error) : resolve(result || null),
+        ));
+        if (!row?.actor_id) return false;
+        const inputProvider = normalizeLifecycleProvider(event.provider);
+        const provider = normalizeLifecycleProvider(row.telephony_provider || row.provider) || inputProvider;
+        const providerCallId = normalizeLifecycleReference(event.provider_call_id);
+        const idempotencyKey = normalizeLifecycleReference(event.outbound_idempotency_key);
+        const aiVoiceEngineValue = String(event.ai_voice_engine || '').trim().toLowerCase();
+        const aiVoiceEngine = /^[a-z0-9_.-]{1,40}$/.test(aiVoiceEngineValue) ? aiVoiceEngineValue : null;
+        const providerIsConfirmed = Boolean(providerCallId) ||
+            ['submission_accepted', 'submission_uncertain', 'provider_status'].includes(event.event_type);
+        if ((provider && providerIsConfirmed) || providerCallId || idempotencyKey || aiVoiceEngine) {
+            await new Promise((resolve, reject) => this.db.run(
+                `UPDATE calls SET
+                    provider = COALESCE(provider, ?),
+                    telephony_provider = COALESCE(telephony_provider, ?),
+                    provider_call_id = COALESCE(provider_call_id, ?),
+                    outbound_idempotency_key = COALESCE(outbound_idempotency_key, ?),
+                    ai_voice_engine = COALESCE(ai_voice_engine, ?)
+                 WHERE call_sid = ?`,
+                [providerIsConfirmed ? provider : null, providerIsConfirmed ? provider : null, providerCallId, idempotencyKey, aiVoiceEngine, callSid],
+                (error) => error ? reject(error) : resolve(),
+            ));
+        }
+        return this.insertCallLifecycleEvent({
+            ...event,
+            call_sid: callSid,
+            actor_id: row.actor_id,
+            business_id: row.business_id,
+            provider,
+        });
+    }
+
+    async listCallLifecycleEvents(callSid, actorId, options = {}) {
+        const normalizedCallSid = String(callSid || '').trim();
+        const normalizedActorId = String(actorId || '').trim();
+        const limit = Math.max(1, Math.min(100, Math.floor(Number(options.limit) || 20)));
+        if (!normalizedCallSid || normalizedCallSid.length > 200 || !normalizedActorId || normalizedActorId.length > 80) {
+            return [];
+        }
+        const rows = await new Promise((resolve, reject) => this.db.all(
+            `SELECT e.event_id, e.call_sid, e.actor_id, e.business_id, e.provider,
+                    e.event_type, e.status, e.provider_status, e.source,
+                    e.occurred_at, e.recorded_at
+             FROM call_lifecycle_events e
+             JOIN calls c ON c.call_sid = e.call_sid
+             WHERE e.call_sid = ? AND e.actor_id = ? AND c.user_chat_id = ?
+             ORDER BY e.event_id DESC LIMIT ?`,
+            [normalizedCallSid, normalizedActorId, normalizedActorId, limit],
+            (error, result) => error ? reject(error) : resolve(result || []),
+        ));
+        return rows.reverse();
     }
 
     async ensureOutboundContactDispatchCartesiaProvider() {
@@ -2254,8 +3104,8 @@ class EnhancedDatabase {
                 await addColumn('last_otp_masked', 'TEXT');
             } else if (column === 'direction') {
                 await addColumn('direction', 'TEXT');
-            } else if (column === 'business_id') {
-                await addColumn('business_id', 'TEXT');
+            } else if (['business_id', 'provider', 'telephony_provider', 'provider_call_id', 'outbound_idempotency_key', 'ai_voice_engine', 'cartesia_session_id'].includes(column)) {
+                await addColumn(column, 'TEXT');
             }
         }
     }
@@ -2368,16 +3218,33 @@ class EnhancedDatabase {
             business_context = null,
             generated_functions = null,
             direction = null,
-            business_id = null
+            business_id = null,
+            status = 'initiated',
+            provider = null,
+            telephony_provider = null,
+            provider_call_id = null,
+            outbound_idempotency_key = null,
+            ai_voice_engine = null,
+            cartesia_session_id = null,
         } = callData;
+        const initialStatus = status === 'submission_pending' ? status : 'initiated';
+        const normalizedProvider = normalizeLifecycleProvider(telephony_provider || provider);
+        const normalizedProviderCallId = normalizeLifecycleReference(provider_call_id);
+        const normalizedIdempotencyKey = normalizeLifecycleReference(outbound_idempotency_key);
+        const normalizedAiVoiceEngine = /^[a-z0-9_.-]{1,40}$/.test(String(ai_voice_engine || '').trim().toLowerCase())
+            ? String(ai_voice_engine).trim().toLowerCase()
+            : null;
+        const normalizedCartesiaSessionId = normalizeLifecycleReference(cartesia_session_id);
         
         return new Promise((resolve, reject) => {
             const stmt = this.db.prepare(`
                 INSERT INTO calls (
                     call_sid, phone_number, prompt, first_message, 
-                    user_chat_id, status, business_context, generated_functions, direction, business_id
+                    user_chat_id, status, business_context, generated_functions, direction, business_id,
+                    provider, telephony_provider, provider_call_id, outbound_idempotency_key,
+                    ai_voice_engine, cartesia_session_id
                 )
-                VALUES (?, ?, ?, ?, ?, 'initiated', ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             `);
             
             stmt.run([
@@ -2386,10 +3253,17 @@ class EnhancedDatabase {
                 prompt, 
                 first_message, 
                 user_chat_id, 
+                initialStatus,
                 business_context,
                 generated_functions,
                 direction,
-                business_id
+                business_id,
+                normalizedProvider,
+                normalizedProvider,
+                normalizedProviderCallId,
+                normalizedIdempotencyKey,
+                normalizedAiVoiceEngine,
+                normalizedCartesiaSessionId,
             ], function(err) {
                 if (err) {
                     reject(err);
@@ -2544,6 +3418,23 @@ class EnhancedDatabase {
                     values.push(additionalData[key]);
                 }
             });
+            const provider = normalizeLifecycleProvider(additionalData.telephony_provider || additionalData.provider);
+            const providerCallId = normalizeLifecycleReference(additionalData.provider_call_id);
+            const idempotencyKey = normalizeLifecycleReference(additionalData.outbound_idempotency_key);
+            const aiVoiceEngineValue = String(additionalData.ai_voice_engine || '').trim().toLowerCase();
+            const aiVoiceEngine = /^[a-z0-9_.-]{1,40}$/.test(aiVoiceEngineValue) ? aiVoiceEngineValue : null;
+            const identityFields = {
+                provider,
+                telephony_provider: provider,
+                provider_call_id: providerCallId,
+                outbound_idempotency_key: idempotencyKey,
+                ai_voice_engine: aiVoiceEngine,
+            };
+            for (const [field, value] of Object.entries(identityFields)) {
+                if (value === null || additionalData[field] === undefined) continue;
+                updateFields.push(`${field} = COALESCE(${field}, ?)`);
+                values.push(value);
+            }
 
             values.push(call_sid);
 
@@ -2561,25 +3452,30 @@ class EnhancedDatabase {
 
     // Enhanced call state tracking
     async updateCallState(call_sid, state, data = null) {
-        return new Promise((resolve, reject) => {
-            const stmt = this.db.prepare(`
-                INSERT INTO call_states (call_sid, state, data, sequence_number)
-                VALUES (?, ?, ?, (
-                    SELECT COALESCE(MAX(sequence_number), 0) + 1 
-                    FROM call_states 
-                    WHERE call_sid = ?
-                ))
-            `);
-            
-            stmt.run([call_sid, state, data ? JSON.stringify(data) : null, call_sid], function(err) {
-                if (err) {
-                    reject(err);
-                } else {
-                    resolve(this.lastID);
-                }
-            });
-            stmt.finalize();
-        });
+        const callSid = String(call_sid || '').trim();
+        if (!callSid || callSid.length > 200) throw new Error('call_sid is invalid');
+        const stateData = data && typeof data === 'object' && !Array.isArray(data) ? data : {};
+        const serializedData = data && typeof data === 'object' ? JSON.stringify(data) : null;
+        const stateId = await new Promise((resolve, reject) => this.db.run(
+            `INSERT INTO call_states (call_sid, state, data, sequence_number)
+             VALUES (?, ?, ?, (
+                 SELECT COALESCE(MAX(sequence_number), 0) + 1
+                 FROM call_states WHERE call_sid = ?
+             ))`,
+            [callSid, String(state || '').slice(0, 80) || 'event', serializedData, callSid],
+            function (error) {
+                if (error) return reject(error);
+                resolve(this.lastID);
+            },
+        ));
+        const event = callLifecycleEventFromState(callSid, state, stateData);
+        if (event) {
+            const eventKey = event.event_type === 'status_refreshed'
+                ? `call-state:${callSid}:${stateId}`
+                : event.event_key;
+            await this.appendCallLifecycleEventForCall(callSid, { ...event, event_key: eventKey });
+        }
+        return stateId;
     }
 
     async getLatestCallState(call_sid, state) {
@@ -2810,6 +3706,48 @@ class EnhancedDatabase {
                 resolve(parsed);
             });
         });
+    }
+
+    async getCallExecutionStates(call_sid, options = {}) {
+        const callSid = String(call_sid || '').trim();
+        if (!callSid) return [];
+        const limit = Math.max(1, Math.min(Number(options.limit) || 40, 100));
+        const contextStateNames = [
+            'call_created',
+            'outbound_submission_pending',
+            'provider_submission_accepted',
+            'outbound_submission_uncertain',
+            'outbound_submission_rejected',
+            'post_call_automation_queued',
+            'post_call_automation_completed',
+            'post_call_automation_failed',
+        ];
+        const query = (sql, params) => new Promise((resolve, reject) => this.db.all(sql, params, (error, rows) => error ? reject(error) : resolve(rows || [])));
+        const contextPlaceholders = contextStateNames.map(() => '?').join(', ');
+        const [contextRows, stepRows] = await Promise.all([
+            query(
+                `SELECT state, data, timestamp, sequence_number FROM call_states
+                 WHERE call_sid = ? AND state IN (${contextPlaceholders})
+                   AND CASE WHEN json_valid(data) THEN json_type(data, '$.execution_context') ELSE NULL END = 'object'
+                 ORDER BY sequence_number DESC LIMIT 1`,
+                [callSid, ...contextStateNames],
+            ),
+            query(
+                `SELECT state, data, timestamp, sequence_number FROM call_states
+                 WHERE call_sid = ? AND state = 'execution_step'
+                 ORDER BY sequence_number DESC LIMIT ?`,
+                [callSid, limit],
+            ),
+        ]);
+        return [...contextRows, ...stepRows]
+            .sort((left, right) => Number(right.sequence_number) - Number(left.sequence_number))
+            .map((row) => {
+                let data = row.data;
+                if (typeof data === 'string' && data) {
+                    try { data = JSON.parse(data); } catch (_) { /* keep malformed data out of execution normalization */ }
+                }
+                return { state: row.state, data, timestamp: row.timestamp, sequence_number: row.sequence_number };
+            });
     }
 
     async getCallStatesAfter(call_sid, after = 0, limit = 100) {
@@ -5546,6 +6484,24 @@ class EnhancedDatabase {
         });
     }
 
+    async deleteProviderEventIdempotency(payload = {}) {
+        const source = String(payload.source || '').trim();
+        const eventKey = String(payload.event_key || '').trim();
+        if (!source || !eventKey) {
+            return { deleted: false };
+        }
+        return new Promise((resolve, reject) => {
+            this.db.run(
+                `DELETE FROM provider_event_idempotency WHERE source = ? AND event_key = ?`,
+                [source, eventKey],
+                function(error) {
+                    if (error) reject(error);
+                    else resolve({ deleted: (this.changes || 0) > 0 });
+                },
+            );
+        });
+    }
+
     async isProviderEventIdempotencyActive(payload = {}) {
         const source = String(payload.source || '').trim();
         const payloadHash = String(payload.payload_hash || '').trim();
@@ -7700,7 +8656,7 @@ class EnhancedDatabase {
         try {
             await new Promise((resolve, reject) => this.db.run('BEGIN IMMEDIATE', (error) => error ? reject(error) : resolve()));
             const mission = await new Promise((resolve, reject) => this.db.get(
-                'SELECT budget_limit_minor, per_call_cost_ceiling_minor FROM call_e_campaign_missions WHERE mission_id = ? AND business_id = ?',
+                'SELECT budget_limit_minor, per_call_cost_ceiling_minor, budget_currency FROM call_e_campaign_missions WHERE mission_id = ? AND business_id = ?',
                 [missionId, businessId], (error, row) => error ? reject(error) : resolve(row || null),
             ));
             if (!mission || mission.budget_limit_minor == null || mission.per_call_cost_ceiling_minor == null) {
@@ -7720,10 +8676,16 @@ class EnhancedDatabase {
                  WHERE mission_id = ? AND status = 'reserved'`,
                 [missionId], (error, row) => error ? reject(error) : resolve(Number(row?.reserved_minor) || 0),
             ));
+            const committed = await new Promise((resolve, reject) => this.db.get(
+                `SELECT COALESCE(SUM(amount_minor), 0) AS committed_minor FROM call_e_mission_usage_records
+                 WHERE business_id = ? AND mission_id = ? AND currency = ?`,
+                [businessId, missionId, mission.budget_currency],
+                (error, row) => error ? reject(error) : resolve(Number(row?.committed_minor) || 0),
+            ));
             const amount = Number(mission.per_call_cost_ceiling_minor);
-            if (reserved + amount > Number(mission.budget_limit_minor)) {
+            if (committed + reserved + amount > Number(mission.budget_limit_minor)) {
                 await new Promise((resolve, reject) => this.db.run('COMMIT', (error) => error ? reject(error) : resolve()));
-                return { allowed: false, reason: 'budget_exhausted', reserved_minor: reserved };
+                return { allowed: false, reason: 'budget_exhausted', committed_minor: committed, reserved_minor: reserved };
             }
             await new Promise((resolve, reject) => this.db.run(
                 `INSERT INTO call_e_mission_budget_reservations (mission_id, recipient_position, reserved_minor, status, created_at, released_at)
@@ -7733,7 +8695,7 @@ class EnhancedDatabase {
                 [missionId, position, amount], (error) => error ? reject(error) : resolve(),
             ));
             await new Promise((resolve, reject) => this.db.run('COMMIT', (error) => error ? reject(error) : resolve()));
-            return { allowed: true, reserved_minor: reserved + amount, budget_limit_minor: Number(mission.budget_limit_minor) };
+            return { allowed: true, committed_minor: committed, reserved_minor: reserved + amount, budget_limit_minor: Number(mission.budget_limit_minor) };
         } catch (error) {
             await new Promise((resolve) => this.db.run('ROLLBACK', () => resolve()));
             throw error;
@@ -7786,7 +8748,10 @@ class EnhancedDatabase {
         try {
             await run('BEGIN IMMEDIATE');
             transactionStarted = true;
-            const prior = await get('SELECT request_hash FROM call_e_mission_usage_records WHERE business_id = ? AND idempotency_key = ?', [businessId, idempotencyKey]);
+            const prior = await get(`SELECT request_hash FROM call_e_mission_usage_records WHERE business_id = ? AND idempotency_key = ?
+                UNION ALL
+                SELECT request_hash FROM call_e_mission_usage_revisions WHERE business_id = ? AND idempotency_key = ? LIMIT 1`,
+            [businessId, idempotencyKey, businessId, idempotencyKey]);
             if (prior) {
                 await run('COMMIT');
                 transactionStarted = false;
@@ -7798,24 +8763,73 @@ class EnhancedDatabase {
                 await run('COMMIT'); transactionStarted = false;
                 return { recorded: false, not_found: true };
             }
-            await run(`INSERT INTO call_e_mission_usage_records (
-                business_id, mission_id, recipient_position, provider, provider_call_id, amount_minor, currency,
-                billed_duration_seconds, source_type, source_reference, recorded_by, idempotency_key, request_hash, occurred_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [
-                businessId, missionId, position, provider, providerCallId, amountMinor, currency, duration,
-                sourceType, sourceReference, recordedBy, idempotencyKey, requestHash, new Date(Date.parse(occurredAt)).toISOString(),
-            ]);
-            const totals = await get(`SELECT COALESCE(SUM(amount_minor), 0) AS actual_minor, COUNT(*) AS record_count
+            const existingUsage = await get(`SELECT usage_id, mission_id, recipient_position, amount_minor, currency, source_type, source_reference
+                FROM call_e_mission_usage_records WHERE business_id = ? AND provider = ? AND provider_call_id = ?`,
+            [businessId, provider, providerCallId]);
+            let replacedEstimate = false;
+            if (existingUsage) {
+                const actualSource = sourceType === 'provider_cdr' || sourceType === 'invoice';
+                if (!actualSource || existingUsage.source_type !== 'operator_estimate' || existingUsage.mission_id !== missionId ||
+                    Number(existingUsage.recipient_position) !== position) {
+                    await run('COMMIT'); transactionStarted = false;
+                    return { recorded: false, conflict: true };
+                }
+                await run(`INSERT INTO call_e_mission_usage_revisions (
+                    business_id, mission_id, recipient_position, provider, provider_call_id, usage_id,
+                    previous_source_type, previous_amount_minor, previous_currency, previous_source_reference,
+                    replacement_source_type, replacement_amount_minor, replacement_currency, replacement_source_reference,
+                    recorded_by, idempotency_key, request_hash, occurred_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [
+                    businessId, missionId, position, provider, providerCallId, existingUsage.usage_id,
+                    existingUsage.source_type, Number(existingUsage.amount_minor), existingUsage.currency, existingUsage.source_reference,
+                    sourceType, amountMinor, currency, sourceReference, recordedBy, idempotencyKey, requestHash,
+                    new Date(Date.parse(occurredAt)).toISOString(),
+                ]);
+                const updated = await run(`UPDATE call_e_mission_usage_records SET amount_minor = ?, currency = ?, billed_duration_seconds = ?,
+                    source_type = ?, source_reference = ?, recorded_by = ?, occurred_at = ?
+                    WHERE usage_id = ? AND source_type = 'operator_estimate'`, [
+                    amountMinor, currency, duration, sourceType, sourceReference, recordedBy,
+                    new Date(Date.parse(occurredAt)).toISOString(), existingUsage.usage_id,
+                ]);
+                if (updated.changes !== 1) throw new Error('CALL-E estimate replacement did not update exactly one usage row');
+                replacedEstimate = true;
+            } else {
+                await run(`INSERT INTO call_e_mission_usage_records (
+                    business_id, mission_id, recipient_position, provider, provider_call_id, amount_minor, currency,
+                    billed_duration_seconds, source_type, source_reference, recorded_by, idempotency_key, request_hash, occurred_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [
+                    businessId, missionId, position, provider, providerCallId, amountMinor, currency, duration,
+                    sourceType, sourceReference, recordedBy, idempotencyKey, requestHash, new Date(Date.parse(occurredAt)).toISOString(),
+                ]);
+            }
+            if ((sourceType === 'provider_cdr' || sourceType === 'invoice') && mission.budget_currency === currency) {
+                await run(`UPDATE call_e_mission_budget_reservations SET status = 'released', released_at = CURRENT_TIMESTAMP
+                    WHERE mission_id = ? AND recipient_position = ? AND status = 'reserved'`, [missionId, position]);
+            }
+            const totals = await get(`SELECT
+                    COALESCE(SUM(CASE WHEN source_type IN ('provider_cdr', 'invoice') THEN amount_minor ELSE 0 END), 0) AS actual_minor,
+                    COALESCE(SUM(CASE WHEN source_type = 'operator_estimate' THEN amount_minor ELSE 0 END), 0) AS estimated_minor,
+                    COALESCE(SUM(amount_minor), 0) AS committed_minor,
+                    COUNT(*) AS record_count
                 FROM call_e_mission_usage_records WHERE business_id = ? AND mission_id = ? AND currency = ?`, [businessId, missionId, currency]);
+            const reserved = await get(`SELECT COALESCE(SUM(reserved_minor), 0) AS reserved_minor FROM call_e_mission_budget_reservations
+                    WHERE mission_id = ? AND status = 'reserved'`, [missionId]);
+            const reservedMinor = Number(reserved?.reserved_minor) || 0;
+            const exposureMinor = Number(totals?.committed_minor) + (mission.budget_currency === currency ? reservedMinor : 0);
             const exceedsBudget = mission.budget_currency === currency && mission.budget_limit_minor != null &&
-                Number(totals?.actual_minor) > Number(mission.budget_limit_minor);
+                exposureMinor > Number(mission.budget_limit_minor);
             if (exceedsBudget) {
                 await run(`INSERT OR IGNORE INTO call_e_mission_activity (business_id, mission_id, event_key, actor_id, event_type, state)
                     VALUES (?, ?, ?, ?, 'mission_advanced', 'budget_exceeded')`, [businessId, missionId,
                     `usage-budget-exceeded:${missionId}:${currency}`, recordedBy]);
             }
             await run('COMMIT'); transactionStarted = false;
-            return { recorded: true, idempotent_replay: false, currency, actual_minor: Number(totals?.actual_minor) || 0,
+            return { recorded: true, idempotent_replay: false, replaced_estimate: replacedEstimate, currency,
+                actual_minor: Number(totals?.actual_minor) || 0,
+                estimated_minor: Number(totals?.estimated_minor) || 0,
+                committed_minor: Number(totals?.committed_minor) || 0,
+                reserved_minor: reservedMinor,
+                budget_exposure_minor: exposureMinor || 0,
                 record_count: Number(totals?.record_count) || 0, budget_limit_minor: mission.budget_currency === currency ? Number(mission.budget_limit_minor) || null : null,
                 budget_exceeded: exceedsBudget, budget_currency: mission.budget_currency || null };
         } catch (error) {
@@ -7837,27 +8851,69 @@ class EnhancedDatabase {
             (error, row) => error ? reject(error) : resolve(row || null),
         ));
         if (!mission) return null;
-        const [reservations, totalsRows, usage] = await Promise.all([
+        const [reservations, totalsRows, usage, revisions, coverageRow] = await Promise.all([
             new Promise((resolve, reject) => this.db.get(`SELECT COALESCE(SUM(reserved_minor), 0) AS reserved_minor
                 FROM call_e_mission_budget_reservations WHERE mission_id = ? AND status = 'reserved'`, [normalizedMissionId],
             (error, row) => error ? reject(error) : resolve(Number(row?.reserved_minor) || 0))),
-            new Promise((resolve, reject) => this.db.all(`SELECT currency, COALESCE(SUM(amount_minor), 0) AS amount_minor
+            new Promise((resolve, reject) => this.db.all(`SELECT currency,
+                    COALESCE(SUM(CASE WHEN source_type IN ('provider_cdr', 'invoice') THEN amount_minor ELSE 0 END), 0) AS actual_minor,
+                    COALESCE(SUM(CASE WHEN source_type = 'operator_estimate' THEN amount_minor ELSE 0 END), 0) AS estimated_minor,
+                    COALESCE(SUM(amount_minor), 0) AS committed_minor
                 FROM call_e_mission_usage_records WHERE business_id = ? AND mission_id = ? GROUP BY currency`,
             [normalizedBusinessId, normalizedMissionId], (error, rows) => error ? reject(error) : resolve(rows || []))),
             new Promise((resolve, reject) => this.db.all(`SELECT provider, amount_minor, currency, billed_duration_seconds, source_type, occurred_at
                 FROM call_e_mission_usage_records WHERE business_id = ? AND mission_id = ? ORDER BY usage_id DESC LIMIT 100`,
             [normalizedBusinessId, normalizedMissionId], (error, rows) => error ? reject(error) : resolve(rows || []))),
+            new Promise((resolve, reject) => this.db.all(`SELECT revision_id, provider, provider_call_id,
+                    previous_source_type, previous_amount_minor, previous_currency,
+                    replacement_source_type, replacement_amount_minor, replacement_currency, created_at
+                FROM call_e_mission_usage_revisions WHERE business_id = ? AND mission_id = ? ORDER BY revision_id DESC LIMIT 100`,
+            [normalizedBusinessId, normalizedMissionId], (error, rows) => error ? reject(error) : resolve(rows || []))),
+            new Promise((resolve, reject) => this.db.get(`SELECT COUNT(DISTINCT r.position) AS recipient_count,
+                    COUNT(DISTINCT CASE WHEN r.local_call_id IS NOT NULL THEN r.position END) AS dispatched_count,
+                    COUNT(DISTINCT CASE WHEN r.local_call_id IS NOT NULL AND u.usage_id IS NOT NULL THEN r.position END) AS recorded_count
+                FROM call_e_campaign_mission_recipients r
+                LEFT JOIN call_e_mission_usage_records u
+                  ON u.mission_id = r.mission_id AND u.recipient_position = r.position
+                WHERE r.mission_id = ?`, [normalizedMissionId],
+            (error, row) => error ? reject(error) : resolve(row || {}))),
         ]);
-        const totals = {};
-        for (const row of totalsRows) totals[row.currency] = Number(row.amount_minor) || 0;
+        const actual = {};
+        const estimated = {};
+        const committed = {};
+        for (const row of totalsRows) {
+            actual[row.currency] = Number(row.actual_minor) || 0;
+            estimated[row.currency] = Number(row.estimated_minor) || 0;
+            committed[row.currency] = Number(row.committed_minor) || 0;
+        }
+        const budgetExposure = { ...committed };
+        if (mission.budget_currency) {
+            budgetExposure[mission.budget_currency] = (budgetExposure[mission.budget_currency] || 0) + reservations;
+        }
+        const recipientCount = Number(coverageRow.recipient_count) || 0;
+        const dispatchedCount = Number(coverageRow.dispatched_count) || 0;
+        const recordedCount = Number(coverageRow.recorded_count) || 0;
         return { budget_limit_minor: mission.budget_limit_minor == null ? null : Number(mission.budget_limit_minor),
             per_call_cost_ceiling_minor: mission.per_call_cost_ceiling_minor == null ? null : Number(mission.per_call_cost_ceiling_minor),
-            budget_currency: mission.budget_currency || null, reserved_minor: reservations, actual_by_currency: totals,
+            budget_currency: mission.budget_currency || null, reserved_minor: reservations,
+            actual_by_currency: actual, estimated_by_currency: estimated, committed_by_currency: committed,
+            budget_exposure_by_currency: budgetExposure,
+            usage_coverage: { recipient_count: recipientCount, dispatched_recipients: dispatchedCount,
+                usage_recorded_recipients: recordedCount, unknown_cost_recipients: Math.max(0, dispatchedCount - recordedCount),
+                not_dispatched_recipients: Math.max(0, recipientCount - dispatchedCount) },
             budget_exceeded: Boolean(mission.budget_currency && mission.budget_limit_minor != null &&
-                (totals[mission.budget_currency] || 0) > Number(mission.budget_limit_minor)),
+                (budgetExposure[mission.budget_currency] || 0) > Number(mission.budget_limit_minor)),
             records: usage.map((row) => ({ provider: row.provider, amount_minor: Number(row.amount_minor), currency: row.currency,
                 billed_duration_seconds: row.billed_duration_seconds == null ? null : Number(row.billed_duration_seconds),
-                source_type: row.source_type, occurred_at: row.occurred_at })) };
+                source_type: row.source_type,
+                cost_classification: row.source_type === 'operator_estimate' ? 'estimated' : 'reported_actual',
+                recording_provenance: 'operator_entered',
+                occurred_at: row.occurred_at })),
+            revisions: revisions.map((row) => ({ revision_id: Number(row.revision_id), provider: row.provider,
+                provider_call_id: row.provider_call_id,
+                previous: { source_type: row.previous_source_type, amount_minor: Number(row.previous_amount_minor), currency: row.previous_currency },
+                replacement: { source_type: row.replacement_source_type, amount_minor: Number(row.replacement_amount_minor), currency: row.replacement_currency },
+                recording_provenance: 'operator_entered', created_at: row.created_at })) };
     }
 
     async stageCallEMissionCdrImport(input = {}) {
@@ -7887,28 +8943,51 @@ class EnhancedDatabase {
         const seen = new Set();
         const previewRecords = [];
         const newTotals = {};
+        const committedAdjustments = {};
         for (const record of normalizedRecords) {
             const key = `${record.provider}:${record.provider_call_id}`;
             const intraBatchDuplicate = seen.has(key);
             seen.add(key);
             const existing = await new Promise((resolve, reject) => this.db.get(
-                'SELECT usage_id FROM call_e_mission_usage_records WHERE business_id = ? AND provider = ? AND provider_call_id = ?',
+                'SELECT usage_id, mission_id, recipient_position, amount_minor, currency, source_type FROM call_e_mission_usage_records WHERE business_id = ? AND provider = ? AND provider_call_id = ?',
                 [businessId, record.provider, record.provider_call_id], (error, row) => error ? reject(error) : resolve(row || null)));
-            const duplicate = Boolean(intraBatchDuplicate || existing);
+            const replacesEstimate = !intraBatchDuplicate && existing?.source_type === 'operator_estimate' &&
+                existing.mission_id === missionId && Number(existing.recipient_position) === Number(record.recipient_position);
+            const duplicate = Boolean(intraBatchDuplicate || (existing && !replacesEstimate));
             previewRecords.push({ recipient_position: Number(record.recipient_position), provider: record.provider,
-                duplicate, duplicate_reason: intraBatchDuplicate ? 'duplicate_in_import' : existing ? 'already_imported' : null,
+                duplicate, replaces_estimate: replacesEstimate,
+                duplicate_reason: intraBatchDuplicate ? 'duplicate_in_import' : existing && !replacesEstimate ? 'already_imported' : null,
                 amount_minor: Number(record.amount_minor), currency: record.currency });
-            if (!duplicate) newTotals[record.currency] = (newTotals[record.currency] || 0) + Number(record.amount_minor);
+            if (!duplicate) {
+                newTotals[record.currency] = (newTotals[record.currency] || 0) + Number(record.amount_minor);
+                if (replacesEstimate) {
+                    committedAdjustments[existing.currency] = (committedAdjustments[existing.currency] || 0) - Number(existing.amount_minor);
+                }
+            }
         }
         const report = await this.getCallEMissionUsageReport(businessId, missionId);
         const projectedByCurrency = { ...(report?.actual_by_currency || {}) };
         for (const [currency, amount] of Object.entries(newTotals)) projectedByCurrency[currency] = (projectedByCurrency[currency] || 0) + amount;
+        const projectedCommittedByCurrency = { ...(report?.committed_by_currency || {}) };
+        for (const [currency, amount] of Object.entries(committedAdjustments)) {
+            projectedCommittedByCurrency[currency] = Math.max(0, (projectedCommittedByCurrency[currency] || 0) + amount);
+        }
+        for (const [currency, amount] of Object.entries(newTotals)) {
+            projectedCommittedByCurrency[currency] = (projectedCommittedByCurrency[currency] || 0) + amount;
+        }
         const preview = { record_count: normalizedRecords.length, duplicate_count: previewRecords.filter((row) => row.duplicate).length,
-            new_record_count: previewRecords.filter((row) => !row.duplicate).length, new_totals_by_currency: newTotals,
+            new_record_count: previewRecords.filter((row) => !row.duplicate && !row.replaces_estimate).length,
+            replacement_count: previewRecords.filter((row) => row.replaces_estimate).length, new_totals_by_currency: newTotals,
             projected_actual_by_currency: projectedByCurrency,
+            projected_committed_by_currency: projectedCommittedByCurrency,
+            projected_budget_exposure_by_currency: { ...projectedCommittedByCurrency },
             budget_exceeded: Boolean(mission.budget_currency && mission.budget_limit_minor != null &&
-                Number(projectedByCurrency[mission.budget_currency] || 0) > Number(mission.budget_limit_minor)),
+                Number(projectedCommittedByCurrency[mission.budget_currency] || 0) + Number(report?.reserved_minor || 0) > Number(mission.budget_limit_minor)),
             records: previewRecords };
+        if (mission.budget_currency) {
+            preview.projected_budget_exposure_by_currency[mission.budget_currency] =
+                Number(preview.projected_budget_exposure_by_currency[mission.budget_currency] || 0) + Number(report?.reserved_minor || 0);
+        }
         const importId = `cdrimp_${crypto.randomUUID()}`;
         await new Promise((resolve, reject) => this.db.run(
             `INSERT INTO call_e_mission_cdr_imports (import_id, business_id, mission_id, created_by, idempotency_key, request_hash, records_json, preview_json, status)
@@ -8511,9 +9590,32 @@ class EnhancedDatabase {
 
     async getCallEBusinessSafetyPolicy(businessId) {
         return new Promise((resolve, reject) => this.db.get(
-            `SELECT business_id, max_calls_per_day, quiet_hours_start, quiet_hours_end, timezone, emergency_stop, contact_cooldown_hours, updated_by, updated_at
+            `SELECT business_id, max_calls_per_day, quiet_hours_start, quiet_hours_end, timezone, emergency_stop, contact_cooldown_hours, updated_by, updated_at,
+                    (SELECT MAX(revision) FROM call_e_business_safety_policy_revisions WHERE business_id = call_e_business_safety_policies.business_id) AS revision
              FROM call_e_business_safety_policies WHERE business_id = ?`,
             [businessId], (error, row) => error ? reject(error) : resolve(row ? { ...row, emergency_stop: Number(row.emergency_stop) === 1 } : null),
+        ));
+    }
+
+    async getCallEBusinessSafetyPolicyHistory(businessId, limit = 20) {
+        const safeLimit = Math.max(1, Math.min(100, Math.floor(Number(limit) || 20)));
+        return new Promise((resolve, reject) => this.db.all(
+            `SELECT revision_id, business_id, revision, max_calls_per_day, quiet_hours_start, quiet_hours_end,
+                    timezone, emergency_stop, contact_cooldown_hours, actor_id, change_type, source_revision, created_at
+             FROM call_e_business_safety_policy_revisions WHERE business_id = ? ORDER BY revision DESC LIMIT ?`,
+            [businessId, safeLimit], (error, rows) => error ? reject(error) : resolve((rows || []).map((row) => ({
+                ...row,
+                emergency_stop: Number(row.emergency_stop) === 1,
+            }))),
+        ));
+    }
+
+    async getCallEBusinessSafetyPolicyRevision(businessId, revision) {
+        return new Promise((resolve, reject) => this.db.get(
+            `SELECT revision_id, business_id, revision, max_calls_per_day, quiet_hours_start, quiet_hours_end,
+                    timezone, emergency_stop, contact_cooldown_hours, actor_id, change_type, source_revision, created_at
+             FROM call_e_business_safety_policy_revisions WHERE business_id = ? AND revision = ?`,
+            [businessId, revision], (error, row) => error ? reject(error) : resolve(row ? { ...row, emergency_stop: Number(row.emergency_stop) === 1 } : null),
         ));
     }
 
@@ -8525,25 +9627,33 @@ class EnhancedDatabase {
         const start = input.quiet_hours_start == null ? null : String(input.quiet_hours_start);
         const end = input.quiet_hours_end == null ? null : String(input.quiet_hours_end);
         const contactCooldownHours = Number(input.contact_cooldown_hours ?? 0);
+        const changeType = input.change_type == null ? 'configured' : String(input.change_type);
+        const sourceRevision = input.source_revision == null ? null : Number(input.source_revision);
         if (!/^[A-Za-z0-9._:-]{1,120}$/.test(businessId) || !/^\d{1,20}$/.test(actorId) || !Number.isSafeInteger(maxCalls) || maxCalls < 0 || maxCalls > 1000 ||
             !Number.isSafeInteger(contactCooldownHours) || contactCooldownHours < 0 || contactCooldownHours > 8760 ||
             !timezone || timezone.length > 100 || (start !== null && !/^([01]\d|2[0-3]):[0-5]\d$/.test(start)) || (end !== null && !/^([01]\d|2[0-3]):[0-5]\d$/.test(end)) ||
-            ((start === null) !== (end === null)) || typeof input.emergency_stop !== 'boolean') {
+            ((start === null) !== (end === null)) || typeof input.emergency_stop !== 'boolean' || !['configured', 'rollback'].includes(changeType) ||
+            (changeType === 'rollback' && (!Number.isSafeInteger(sourceRevision) || sourceRevision < 1))) {
             throw Object.assign(new Error('CALL-E safety policy is invalid'), { code: 'call_e_safety_policy_invalid' });
         }
+        if (changeType === 'rollback' && !(await this.getCallEBusinessSafetyPolicyRevision(businessId, sourceRevision))) {
+            throw Object.assign(new Error('CALL-E safety policy rollback source is invalid'), { code: 'call_e_safety_policy_revision_not_found' });
+        }
         await new Promise((resolve, reject) => this.db.run(
-            `INSERT INTO call_e_business_safety_policies (business_id, max_calls_per_day, quiet_hours_start, quiet_hours_end, timezone, emergency_stop, contact_cooldown_hours, updated_by, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            `INSERT INTO call_e_business_safety_policies (business_id, max_calls_per_day, quiet_hours_start, quiet_hours_end, timezone, emergency_stop, contact_cooldown_hours, updated_by, updated_at, change_type, source_revision, write_token)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?, ?)
              ON CONFLICT(business_id) DO UPDATE SET max_calls_per_day = excluded.max_calls_per_day,
                 quiet_hours_start = excluded.quiet_hours_start, quiet_hours_end = excluded.quiet_hours_end,
                 timezone = excluded.timezone, emergency_stop = excluded.emergency_stop,
                 contact_cooldown_hours = excluded.contact_cooldown_hours,
-                updated_by = excluded.updated_by, updated_at = CURRENT_TIMESTAMP`,
-            [businessId, maxCalls, start, end, timezone, input.emergency_stop ? 1 : 0, contactCooldownHours, actorId], (error) => error ? reject(error) : resolve(),
+                updated_by = excluded.updated_by, updated_at = CURRENT_TIMESTAMP,
+                change_type = excluded.change_type, source_revision = excluded.source_revision, write_token = excluded.write_token`,
+            [businessId, maxCalls, start, end, timezone, input.emergency_stop ? 1 : 0, contactCooldownHours, actorId,
+                changeType, sourceRevision, crypto.randomUUID()], (error) => error ? reject(error) : resolve(),
         ));
         await this.insertCallEOperationsAudit({ business_id: businessId, actor_id: actorId, action: 'safety_policy_updated', metadata: {
             max_calls_per_day: maxCalls, quiet_hours_start: start, quiet_hours_end: end, timezone, emergency_stop: input.emergency_stop,
-            contact_cooldown_hours: contactCooldownHours,
+            contact_cooldown_hours: contactCooldownHours, change_type: changeType, source_revision: sourceRevision,
         } });
         return this.getCallEBusinessSafetyPolicy(businessId);
     }
@@ -8924,8 +10034,35 @@ class EnhancedDatabase {
 
     async getCallEBusinessMissionPolicy(businessId) {
         return new Promise((resolve, reject) => this.db.get(
-            'SELECT business_id, secondary_approval_threshold, approval_ttl_hours, review_sla_minutes, review_repeat_minutes, updated_by, updated_at FROM call_e_business_mission_policies WHERE business_id = ?',
+            `SELECT policy.business_id, policy.secondary_approval_threshold, policy.approval_ttl_hours,
+                    policy.review_sla_minutes, policy.review_repeat_minutes, policy.updated_by, policy.updated_at,
+                    (SELECT MAX(revision) FROM call_e_business_mission_policy_revisions WHERE business_id = policy.business_id) AS revision
+             FROM call_e_business_mission_policies policy WHERE policy.business_id = ?`,
             [String(businessId || '').trim()], (error, row) => error ? reject(error) : resolve(row || null),
+        ));
+    }
+
+    async getCallEBusinessMissionPolicyHistory(businessId, limit = 20) {
+        const normalizedBusinessId = String(businessId || '').trim();
+        if (!/^[A-Za-z0-9._:-]{1,120}$/.test(normalizedBusinessId)) return [];
+        const boundedLimit = Number.isSafeInteger(Number(limit)) ? Math.max(1, Math.min(100, Number(limit))) : 20;
+        return new Promise((resolve, reject) => this.db.all(
+            `SELECT revision, secondary_approval_threshold, approval_ttl_hours, review_sla_minutes,
+                    review_repeat_minutes, actor_id, change_type, source_revision, created_at
+             FROM call_e_business_mission_policy_revisions WHERE business_id = ? ORDER BY revision DESC LIMIT ?`,
+            [normalizedBusinessId, boundedLimit], (error, rows) => error ? reject(error) : resolve(rows || []),
+        ));
+    }
+
+    async getCallEBusinessMissionPolicyRevision(businessId, revision) {
+        const normalizedBusinessId = String(businessId || '').trim();
+        const normalizedRevision = Number(revision);
+        if (!/^[A-Za-z0-9._:-]{1,120}$/.test(normalizedBusinessId) || !Number.isSafeInteger(normalizedRevision) || normalizedRevision < 1) return null;
+        return new Promise((resolve, reject) => this.db.get(
+            `SELECT revision, secondary_approval_threshold, approval_ttl_hours, review_sla_minutes,
+                    review_repeat_minutes, actor_id, change_type, source_revision, created_at
+             FROM call_e_business_mission_policy_revisions WHERE business_id = ? AND revision = ?`,
+            [normalizedBusinessId, normalizedRevision], (error, row) => error ? reject(error) : resolve(row || null),
         ));
     }
 
@@ -8971,13 +10108,16 @@ class EnhancedDatabase {
             throw Object.assign(new Error('CALL-E mission approval policy is invalid'), { code: 'call_e_mission_policy_invalid' });
         }
         await new Promise((resolve, reject) => this.db.run(
-            `INSERT INTO call_e_business_mission_policies (business_id, secondary_approval_threshold, approval_ttl_hours, review_sla_minutes, review_repeat_minutes, updated_by, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            `INSERT INTO call_e_business_mission_policies (business_id, secondary_approval_threshold, approval_ttl_hours, review_sla_minutes, review_repeat_minutes, updated_by, updated_at, change_type, source_revision, write_token)
+             VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?, ?)
              ON CONFLICT(business_id) DO UPDATE SET secondary_approval_threshold = excluded.secondary_approval_threshold,
                approval_ttl_hours = excluded.approval_ttl_hours, review_sla_minutes = excluded.review_sla_minutes,
                review_repeat_minutes = excluded.review_repeat_minutes,
-               updated_by = excluded.updated_by, updated_at = CURRENT_TIMESTAMP`,
-            [businessId, threshold, ttl, reviewSlaMinutes, reviewRepeatMinutes, actorId], (error) => error ? reject(error) : resolve(),
+               updated_by = excluded.updated_by, updated_at = CURRENT_TIMESTAMP,
+               change_type = excluded.change_type, source_revision = excluded.source_revision, write_token = excluded.write_token`,
+            [businessId, threshold, ttl, reviewSlaMinutes, reviewRepeatMinutes, actorId,
+                input.change_type === 'rollback' ? 'rollback' : 'configured', input.source_revision || null, crypto.randomUUID()],
+            (error) => error ? reject(error) : resolve(),
         ));
         return this.getCallEBusinessMissionPolicy(businessId);
     }
@@ -8990,23 +10130,60 @@ class EnhancedDatabase {
         if (!row) return null;
         let order = [];
         try { order = JSON.parse(row.provider_order_json); } catch (_) {}
-        return { provider_order: Array.isArray(order) ? order : [], updated_by: row.updated_by, updated_at: row.updated_at };
+        const revision = await new Promise((resolve, reject) => this.db.get(
+            'SELECT MAX(revision) AS revision FROM call_e_business_provider_routing_revisions WHERE business_id = ?',
+            [String(businessId || '').trim()], (error, result) => error ? reject(error) : resolve(Number(result?.revision) || null),
+        ));
+        return { provider_order: Array.isArray(order) ? order : [], revision, updated_by: row.updated_by, updated_at: row.updated_at };
+    }
+
+    async getCallEBusinessProviderRoutingHistory(businessId, limit = 20) {
+        const normalizedBusinessId = String(businessId || '').trim();
+        if (!/^[A-Za-z0-9._:-]{1,120}$/.test(normalizedBusinessId)) return [];
+        const boundedLimit = Number.isSafeInteger(Number(limit)) ? Math.max(1, Math.min(100, Number(limit))) : 20;
+        const rows = await new Promise((resolve, reject) => this.db.all(
+            `SELECT revision, provider_order_json, actor_id, change_type, source_revision, created_at
+             FROM call_e_business_provider_routing_revisions
+             WHERE business_id = ? ORDER BY revision DESC LIMIT ?`,
+            [normalizedBusinessId, boundedLimit], (error, result) => error ? reject(error) : resolve(result || []),
+        ));
+        return rows.map((row) => {
+            let order = [];
+            try { order = JSON.parse(row.provider_order_json); } catch (_) {}
+            return {
+                revision: Number(row.revision), provider_order: Array.isArray(order) ? order : [],
+                actor_id: row.actor_id, change_type: row.change_type,
+                source_revision: row.source_revision == null ? null : Number(row.source_revision), created_at: row.created_at,
+            };
+        });
+    }
+
+    async getCallEBusinessProviderRoutingRevision(businessId, revision) {
+        const rows = await this.getCallEBusinessProviderRoutingHistory(businessId, 100);
+        return rows.find((row) => row.revision === Number(revision)) || null;
     }
 
     async setCallEBusinessProviderRouting(input = {}) {
         const businessId = String(input.business_id || '').trim();
         const actorId = String(input.actor_id || '').trim();
         const order = Array.isArray(input.provider_order) ? input.provider_order : [];
+        const changeType = input.change_type === 'rollback' ? 'rollback' : 'configured';
+        const sourceRevision = input.source_revision == null ? null : Number(input.source_revision);
         if (!/^[A-Za-z0-9._:-]{1,120}$/.test(businessId) || !/^\d{1,20}$/.test(actorId) ||
-            order.length < 1 || order.length > 3 || order.some((provider) => !['twilio', 'plivo', 'vonage'].includes(provider)) || new Set(order).size !== order.length) {
+            order.length < 1 || order.length > 3 || order.some((provider) => !['twilio', 'plivo', 'vonage'].includes(provider)) || new Set(order).size !== order.length ||
+            (changeType === 'rollback' && (!Number.isSafeInteger(sourceRevision) || sourceRevision < 1))) {
             throw Object.assign(new Error('CALL-E business provider routing policy is invalid'), { code: 'call_e_provider_routing_invalid' });
         }
         await new Promise((resolve, reject) => this.db.run(
-            `INSERT INTO call_e_business_provider_routing (business_id, provider_order_json, updated_by, updated_at)
-             VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+            `INSERT INTO call_e_business_provider_routing
+             (business_id, provider_order_json, updated_by, updated_at, change_type, source_revision, write_token)
+             VALUES (?, ?, ?, CURRENT_TIMESTAMP, ?, ?, ?)
              ON CONFLICT(business_id) DO UPDATE SET provider_order_json = excluded.provider_order_json,
-               updated_by = excluded.updated_by, updated_at = CURRENT_TIMESTAMP`,
-            [businessId, JSON.stringify(order), actorId], (error) => error ? reject(error) : resolve(),
+               updated_by = excluded.updated_by, updated_at = CURRENT_TIMESTAMP,
+               change_type = excluded.change_type, source_revision = excluded.source_revision,
+               write_token = excluded.write_token`,
+            [businessId, JSON.stringify(order), actorId, changeType, sourceRevision, crypto.randomUUID()],
+            (error) => error ? reject(error) : resolve(),
         ));
         return this.getCallEBusinessProviderRouting(businessId);
     }
@@ -9674,6 +10851,22 @@ class EnhancedDatabase {
                 if (err) return reject(err);
                 resolve({ saved: this.changes > 0 });
             });
+        });
+    }
+
+    async getCartesiaCallRecord(providerCallId) {
+        const id = String(providerCallId || '').trim();
+        if (!/^[A-Za-z0-9_-]{1,200}$/.test(id)) return null;
+        return new Promise((resolve, reject) => {
+            this.db.get(
+                `SELECT local_call_id, provider_call_id, business_id, agent_id,
+                        from_number_id, phone_number, direction, business_scope_resolved,
+                        status, start_time, end_time, end_reason, telephony_account_type,
+                        last_event_timestamp
+                 FROM cartesia_calls WHERE provider_call_id = ? LIMIT 1`,
+                [id],
+                (error, row) => error ? reject(error) : resolve(row || null),
+            );
         });
     }
 
@@ -11064,6 +12257,7 @@ class EnhancedDatabase {
         let search = null;
         let start = null;
         let end = null;
+        let userChatId = null;
 
         if (typeof limitOrOptions === 'object' && limitOrOptions !== null) {
             limit = Number(limitOrOptions.limit ?? 10);
@@ -11073,6 +12267,7 @@ class EnhancedDatabase {
             search = limitOrOptions.query ?? null;
             start = limitOrOptions.start ?? null;
             end = limitOrOptions.end ?? null;
+            userChatId = limitOrOptions.userChatId ?? limitOrOptions.user_chat_id ?? null;
         } else {
             limit = Number(limitOrOptions ?? 10);
             actualOffset = Number(offset ?? 0);
@@ -11125,15 +12320,27 @@ class EnhancedDatabase {
             params.push(end);
         }
 
+        if (userChatId) {
+            where.push('c.user_chat_id = ?');
+            params.push(String(userChatId));
+        }
+
         const whereClause = where.length ? `WHERE ${where.join(' AND ')}` : '';
 
         return new Promise((resolve, reject) => {
             const query = `
                 SELECT 
                     c.*,
-                    COUNT(t.id) as transcript_count
+                    COUNT(t.id) as transcript_count,
+                    (SELECT s.data FROM call_states s
+                     WHERE s.call_sid = c.call_sid AND s.state = 'call_created'
+                     ORDER BY s.timestamp DESC, s.id DESC LIMIT 1) as call_created_state,
+                    cr.provider as runtime_provider,
+                    co.provider_used as provider_used
                 FROM calls c
                 LEFT JOIN transcripts t ON c.call_sid = t.call_sid
+                LEFT JOIN call_runtime_state cr ON cr.call_sid = c.call_sid
+                LEFT JOIN call_outcomes co ON co.call_sid = c.call_sid
                 ${whereClause}
                 GROUP BY c.call_sid
                 ORDER BY c.created_at DESC
@@ -11155,9 +12362,13 @@ class EnhancedDatabase {
     }
 
     // NEW: Get total calls count (REQUIRED FOR API ENDPOINTS)
-    async getCallsCount() {
+    async getCallsCount(userChatId = null) {
         return new Promise((resolve, reject) => {
-            this.db.get('SELECT COUNT(*) as count FROM calls', (err, row) => {
+            const query = userChatId
+                ? 'SELECT COUNT(*) as count FROM calls WHERE user_chat_id = ?'
+                : 'SELECT COUNT(*) as count FROM calls';
+            const params = userChatId ? [String(userChatId)] : [];
+            this.db.get(query, params, (err, row) => {
                 if (err) {
                     console.error('Database error in getCallsCount:', err);
                     reject(err);
@@ -12415,6 +13626,221 @@ class EnhancedDatabase {
         });
     }
 
+    async recordCallStructuredExtractionUsage(record = {}) {
+        const callSid = String(record.call_sid || '').trim();
+        const businessId = String(record.business_id || '').trim() || null;
+        const usageSource = String(record.usage_source || '');
+        const modelId = String(record.model_id || 'unknown').trim().slice(0, 200);
+        const providerRequestId = typeof record.provider_request_id === 'string' &&
+            /^[A-Za-z0-9][A-Za-z0-9._:-]{0,179}$/.test(record.provider_request_id)
+            ? record.provider_request_id : null;
+        const tokenCount = (value) => Number.isSafeInteger(value) && value >= 0 && value <= 1000000000 ? value : null;
+        const promptTokens = tokenCount(record.prompt_tokens);
+        const completionTokens = tokenCount(record.completion_tokens);
+        const totalTokens = tokenCount(record.total_tokens);
+        if (!callSid || usageSource !== 'openrouter_chat_completion_response' ||
+            [promptTokens, completionTokens, totalTokens].every((value) => value === null)) return { recorded: false };
+        return new Promise((resolve, reject) => {
+            this.db.run(`INSERT OR IGNORE INTO call_structured_extraction_usage (
+                call_sid, business_id, provider, provider_request_id, model_id, usage_source,
+                prompt_tokens, completion_tokens, total_tokens, recorded_at
+            ) VALUES (?, ?, 'openrouter', ?, ?, ?, ?, ?, ?, ?)`, [
+                callSid, businessId, providerRequestId, modelId, usageSource,
+                promptTokens, completionTokens, totalTokens,
+                String(record.recorded_at || new Date().toISOString()),
+            ], function (error) {
+                if (error) return reject(error);
+                resolve({ recorded: this.changes === 1, duplicate: this.changes === 0 });
+            });
+        });
+    }
+
+    async getCallStructuredExtractionUsageReport(businessId, options = {}) {
+        const normalizedBusinessId = String(businessId || '').trim();
+        const days = Number(options.days ?? 30);
+        if (!/^[A-Za-z0-9._:-]{1,120}$/.test(normalizedBusinessId) ||
+            !Number.isSafeInteger(days) || days < 1 || days > 90) {
+            throw Object.assign(new Error('Structured extraction usage scope is invalid'), { code: 'validation_error' });
+        }
+        const since = new Date(Date.now() - (days * 24 * 60 * 60 * 1000)).toISOString();
+        const aggregate = (row = {}) => ({
+            request_count: Number(row.request_count) || 0,
+            prompt_tokens: {
+                reported_requests: Number(row.prompt_reported_requests) || 0,
+                total: row.prompt_reported_requests ? Number(row.prompt_token_total) : null,
+            },
+            completion_tokens: {
+                reported_requests: Number(row.completion_reported_requests) || 0,
+                total: row.completion_reported_requests ? Number(row.completion_token_total) : null,
+            },
+            total_tokens: {
+                reported_requests: Number(row.total_reported_requests) || 0,
+                total: row.total_reported_requests ? Number(row.total_token_total) : null,
+            },
+        });
+        const summarizeSql = `SELECT COUNT(*) AS request_count,
+            COUNT(prompt_tokens) AS prompt_reported_requests, SUM(prompt_tokens) AS prompt_token_total,
+            COUNT(completion_tokens) AS completion_reported_requests, SUM(completion_tokens) AS completion_token_total,
+            COUNT(total_tokens) AS total_reported_requests, SUM(total_tokens) AS total_token_total
+            FROM call_structured_extraction_usage WHERE business_id = ? AND recorded_at >= ?`;
+        const all = (sql, params) => new Promise((resolve, reject) => this.db.all(sql, params, (error, rows) => error ? reject(error) : resolve(rows || [])));
+        const get = (sql, params) => new Promise((resolve, reject) => this.db.get(sql, params, (error, row) => error ? reject(error) : resolve(row || {})));
+        const [totalsRow, modelRows, modelCountRow] = await Promise.all([
+            get(summarizeSql, [normalizedBusinessId, since]),
+            all(`SELECT model_id, COUNT(*) AS request_count,
+                    COUNT(prompt_tokens) AS prompt_reported_requests, SUM(prompt_tokens) AS prompt_token_total,
+                    COUNT(completion_tokens) AS completion_reported_requests, SUM(completion_tokens) AS completion_token_total,
+                    COUNT(total_tokens) AS total_reported_requests, SUM(total_tokens) AS total_token_total
+                FROM call_structured_extraction_usage WHERE business_id = ? AND recorded_at >= ?
+                GROUP BY model_id ORDER BY request_count DESC, model_id ASC LIMIT 50`, [normalizedBusinessId, since]),
+            get(`SELECT COUNT(DISTINCT model_id) AS model_count FROM call_structured_extraction_usage
+                WHERE business_id = ? AND recorded_at >= ?`, [normalizedBusinessId, since]),
+        ]);
+        const modelGroupCount = Number(modelCountRow.model_count) || 0;
+        return {
+            business_id: normalizedBusinessId,
+            period_days: days,
+            usage_source: 'openrouter_chat_completion_response',
+            provenance: 'provider_reported',
+            cost_status: 'unknown',
+            totals: aggregate(totalsRow),
+            by_model: modelRows.map((row) => ({ model_id: String(row.model_id || 'unknown'), ...aggregate(row) })),
+            model_group_count: modelGroupCount,
+            model_groups_truncated: modelGroupCount > modelRows.length,
+        };
+    }
+
+    async upsertCallStructuredExtraction(record = {}) {
+        const callSid = String(record.call_sid || '').trim();
+        const schemaJson = JSON.stringify(record.schema || {});
+        if (!callSid || !String(record.schema_hash || '').trim() || Buffer.byteLength(schemaJson, 'utf8') > 16000 ||
+            !['pending_review', 'approved', 'corrected', 'rejected'].includes(record.status || 'pending_review')) {
+            throw new Error('Structured extraction record is invalid');
+        }
+        return new Promise((resolve, reject) => {
+            const sql = `INSERT INTO call_structured_extractions (
+                call_sid, business_id, extraction_version, schema_version, schema_hash, schema_json,
+                model_id, status, data_json, confidence, evidence_json, validation_errors_json,
+                processed_at, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            ON CONFLICT(call_sid) DO UPDATE SET
+                business_id = CASE WHEN call_structured_extractions.status = 'pending_review' THEN excluded.business_id ELSE call_structured_extractions.business_id END,
+                extraction_version = CASE WHEN call_structured_extractions.status = 'pending_review' THEN excluded.extraction_version ELSE call_structured_extractions.extraction_version END,
+                schema_version = CASE WHEN call_structured_extractions.status = 'pending_review' THEN excluded.schema_version ELSE call_structured_extractions.schema_version END,
+                schema_hash = CASE WHEN call_structured_extractions.status = 'pending_review' THEN excluded.schema_hash ELSE call_structured_extractions.schema_hash END,
+                schema_json = CASE WHEN call_structured_extractions.status = 'pending_review' THEN excluded.schema_json ELSE call_structured_extractions.schema_json END,
+                model_id = CASE WHEN call_structured_extractions.status = 'pending_review' THEN excluded.model_id ELSE call_structured_extractions.model_id END,
+                status = CASE WHEN call_structured_extractions.status = 'pending_review' THEN excluded.status ELSE call_structured_extractions.status END,
+                data_json = CASE WHEN call_structured_extractions.status = 'pending_review' THEN excluded.data_json ELSE call_structured_extractions.data_json END,
+                confidence = CASE WHEN call_structured_extractions.status = 'pending_review' THEN excluded.confidence ELSE call_structured_extractions.confidence END,
+                evidence_json = CASE WHEN call_structured_extractions.status = 'pending_review' THEN excluded.evidence_json ELSE call_structured_extractions.evidence_json END,
+                validation_errors_json = CASE WHEN call_structured_extractions.status = 'pending_review' THEN excluded.validation_errors_json ELSE call_structured_extractions.validation_errors_json END,
+                processed_at = CASE WHEN call_structured_extractions.status = 'pending_review' THEN excluded.processed_at ELSE call_structured_extractions.processed_at END,
+                updated_at = CURRENT_TIMESTAMP`;
+            this.db.run(sql, [
+                callSid,
+                String(record.business_id || '').trim() || null,
+                String(record.extraction_version || 'structured_extraction_v1'),
+                String(record.schema_version || '1'),
+                String(record.schema_hash),
+                schemaJson,
+                String(record.model_id || 'unknown'),
+                record.status || 'pending_review',
+                record.data === null || record.data === undefined ? null : JSON.stringify(record.data),
+                Number.isFinite(record.confidence) ? record.confidence : null,
+                JSON.stringify(Array.isArray(record.evidence) ? record.evidence : []),
+                JSON.stringify(Array.isArray(record.validation_errors) ? record.validation_errors : []),
+                String(record.processed_at || new Date().toISOString()),
+            ], function (error) {
+                if (error) reject(error);
+                else resolve({ ok: true, changes: this.changes || 0 });
+            });
+        });
+    }
+
+    async listCallStructuredExtractions(options = {}) {
+        const status = ['pending_review', 'approved', 'corrected', 'rejected'].includes(String(options.status || '')) ? String(options.status) : null;
+        const limitValue = Number(options.limit);
+        const limit = Number.isFinite(limitValue) ? Math.max(1, Math.min(100, Math.floor(limitValue))) : 50;
+        const businessId = String(options.business_id || '').trim() || null;
+        const where = [status ? 'status = ?' : '', businessId ? 'business_id = ?' : ''].filter(Boolean);
+        const params = [...(status ? [status] : []), ...(businessId ? [businessId] : []), limit];
+        return new Promise((resolve, reject) => {
+            this.db.all(`SELECT * FROM call_structured_extractions${where.length ? ` WHERE ${where.join(' AND ')}` : ''} ORDER BY processed_at DESC LIMIT ?`, params, (error, rows) => {
+                if (error) return reject(error);
+                const parse = (row) => ({
+                    ...row,
+                    data: row.data_json ? JSON.parse(row.data_json) : null,
+                    schema: row.schema_json ? JSON.parse(row.schema_json) : null,
+                    evidence: JSON.parse(row.evidence_json || '[]'),
+                    validation_errors: JSON.parse(row.validation_errors_json || '[]'),
+                });
+                try { resolve((rows || []).map(parse)); } catch (parseError) { reject(parseError); }
+            });
+        });
+    }
+
+    async getCallStructuredExtraction(callSidValue, businessIdValue = null) {
+        const callSid = String(callSidValue || '').trim();
+        if (!callSid) return null;
+        const businessId = String(businessIdValue || '').trim() || null;
+        return new Promise((resolve, reject) => {
+            this.db.get('SELECT * FROM call_structured_extractions WHERE call_sid = ? AND (? IS NULL OR business_id = ?) LIMIT 1', [callSid, businessId, businessId], (error, row) => {
+                if (error) return reject(error);
+                if (!row) return resolve(null);
+                try {
+                    resolve({
+                        ...row,
+                        data: row.data_json ? JSON.parse(row.data_json) : null,
+                        schema: JSON.parse(row.schema_json || '{}'),
+                        evidence: JSON.parse(row.evidence_json || '[]'),
+                        validation_errors: JSON.parse(row.validation_errors_json || '[]'),
+                    });
+                } catch (parseError) { reject(parseError); }
+            });
+        });
+    }
+
+    async reviewCallStructuredExtraction(input = {}) {
+        const callSid = String(input.call_sid || '').trim();
+        const decision = String(input.decision || '').trim();
+        const actor = String(input.reviewed_by || '').trim();
+        const businessId = String(input.business_id || '').trim() || null;
+        if (!callSid || !['approved', 'corrected', 'rejected'].includes(decision) || !actor) throw new Error('Structured extraction review is invalid');
+        const reviewedAt = String(input.reviewed_at || new Date().toISOString());
+        const correctedJson = decision === 'corrected' ? JSON.stringify(input.corrected_data) : null;
+        if (correctedJson && Buffer.byteLength(correctedJson, 'utf8') > 16000) throw new Error('Corrected extraction exceeds 16 KB');
+        return new Promise((resolve, reject) => {
+            this.db.serialize(() => {
+                this.db.run('BEGIN IMMEDIATE');
+                this.db.get('SELECT status FROM call_structured_extractions WHERE call_sid = ? AND (? IS NULL OR business_id = ?)', [callSid, businessId, businessId], (getError, row) => {
+                    if (getError) return this.db.run('ROLLBACK', () => reject(getError));
+                    if (!row) return this.db.run('ROLLBACK', () => resolve(null));
+                    if (row.status !== 'pending_review') return this.db.run('ROLLBACK', () => reject(Object.assign(new Error('Structured extraction has already been reviewed'), { code: 'conflict' })));
+                    this.db.run(`UPDATE call_structured_extractions SET status = ?, data_json = CASE WHEN ? = 'corrected' THEN ? ELSE data_json END,
+                        reviewed_by = ?, reviewed_at = ?, review_note = ?, updated_at = CURRENT_TIMESTAMP
+                        WHERE call_sid = ? AND (? IS NULL OR business_id = ?) AND status = 'pending_review'`,
+                    [decision, decision, correctedJson, actor, reviewedAt, String(input.review_note || '').slice(0, 1000) || null, callSid, businessId, businessId], function (updateError) {
+                        if (updateError) return this.db.run('ROLLBACK', () => reject(updateError));
+                        this.db.run(`INSERT INTO call_structured_extraction_reviews
+                            (call_sid, previous_status, decision, reviewed_by, reviewed_at, review_note, corrected_data_json)
+                            VALUES (?, ?, ?, ?, ?, ?, ?)`,
+                        [callSid, row.status, decision, actor, reviewedAt, String(input.review_note || '').slice(0, 1000) || null, correctedJson], (insertError) => {
+                            if (insertError) return this.db.run('ROLLBACK', () => reject(insertError));
+                            this.db.get('SELECT * FROM call_structured_extractions WHERE call_sid = ?', [callSid], (selectError, updated) => {
+                                if (selectError) return this.db.run('ROLLBACK', () => reject(selectError));
+                                this.db.run('COMMIT', (commitError) => {
+                                    if (commitError) return reject(commitError);
+                                    resolve(updated ? { ...updated, data: updated.data_json ? JSON.parse(updated.data_json) : null } : null);
+                                });
+                            });
+                        });
+                    }.bind(this));
+                });
+            });
+        });
+    }
+
     async getCallQualitySummary(options = {}) {
         const hoursRaw = Number(options.hours);
         const hours = Number.isFinite(hoursRaw) ? Math.max(1, Math.min(24 * 30, Math.floor(hoursRaw))) : 24 * 7;
@@ -12796,6 +14222,198 @@ class EnhancedDatabase {
                }
            });
        });
+   }
+
+   async recordApiAuthFailureBuckets(entries = []) {
+       const hmacReasons = new Set(['missing_headers', 'invalid_timestamp', 'timestamp_out_of_range', 'invalid_signature', 'replay_detected', 'other']);
+       const miniappReasons = new Set(['miniapp_missing_session', 'miniapp_invalid_session', 'miniapp_access_denied', 'miniapp_revoked_session', 'miniapp_missing_init_data', 'miniapp_invalid_init_data', 'miniapp_invalid_init_signature', 'miniapp_replayed_init_data']);
+       const adminReasons = new Set(['admin_token_missing', 'admin_token_invalid']);
+       const webhookReasons = new Set(['webhook_auth_rejected']);
+       const currentBucket = Math.floor(Date.now() / 60000);
+       const oldestBucket = currentBucket - 1440 + 1;
+       if (!Array.isArray(entries) || entries.length > 24480) {
+           throw Object.assign(new Error('API authentication metric batch is invalid'), { code: 'api_auth_metrics_invalid' });
+       }
+       const rows = entries.map((entry) => {
+           const bucket = Number(entry?.bucket_minute);
+           const processId = String(entry?.process_instance_id || '');
+           const reason = String(entry?.reason || '');
+           const count = Number(entry?.count);
+           if (!Number.isSafeInteger(bucket) || bucket < oldestBucket || bucket > currentBucket ||
+               !/^[A-Za-z0-9-]{1,80}$/.test(processId) || (!hmacReasons.has(reason) && !miniappReasons.has(reason) && !adminReasons.has(reason) && !webhookReasons.has(reason)) ||
+               !Number.isSafeInteger(count) || count < 1) {
+               throw Object.assign(new Error('API authentication metric entry is invalid'), { code: 'api_auth_metrics_invalid' });
+           }
+           const table = miniappReasons.has(reason) ? 'miniapp_auth_failure_minute_buckets'
+               : adminReasons.has(reason) ? 'admin_auth_failure_minute_buckets'
+                   : webhookReasons.has(reason) ? 'webhook_auth_failure_minute_buckets' : 'api_auth_failure_minute_buckets';
+           return { bucket, processId, reason, count: Math.min(count, 1_000_000_000), table };
+       });
+       const run = (sql, params = []) => new Promise((resolve, reject) =>
+           this.db.run(sql, params, (error) => error ? reject(error) : resolve()));
+       for (const table of ['api_auth_failure_minute_buckets', 'miniapp_auth_failure_minute_buckets', 'admin_auth_failure_minute_buckets', 'webhook_auth_failure_minute_buckets']) {
+           const tableRows = rows.filter((row) => row.table === table);
+           for (let offset = 0; offset < tableRows.length; offset += 100) {
+               const chunk = tableRows.slice(offset, offset + 100);
+               const tuples = chunk.map(() => '(?, ?, ?, ?, CURRENT_TIMESTAMP)').join(', ');
+               const params = chunk.flatMap((row) => [row.bucket, row.processId, row.reason, row.count]);
+               await run(`INSERT INTO ${table}
+                   (bucket_minute, process_instance_id, reason, count, updated_at) VALUES ${tuples}
+                   ON CONFLICT(bucket_minute, process_instance_id, reason) DO UPDATE SET
+                       count = MAX(${table}.count, excluded.count), updated_at = CURRENT_TIMESTAMP`, params);
+           }
+       }
+       await run('DELETE FROM api_auth_failure_minute_buckets WHERE bucket_minute < ?', [oldestBucket]);
+       await run('DELETE FROM miniapp_auth_failure_minute_buckets WHERE bucket_minute < ?', [oldestBucket]);
+       await run('DELETE FROM admin_auth_failure_minute_buckets WHERE bucket_minute < ?', [oldestBucket]);
+       await run('DELETE FROM webhook_auth_failure_minute_buckets WHERE bucket_minute < ?', [oldestBucket]);
+       return { recorded: rows.length };
+   }
+
+   async getApiAuthFailureMetrics(windowMinutes = 60) {
+       const hmacReasons = ['missing_headers', 'invalid_timestamp', 'timestamp_out_of_range', 'invalid_signature', 'replay_detected', 'other'];
+       const miniappReasons = ['miniapp_missing_session', 'miniapp_invalid_session', 'miniapp_access_denied', 'miniapp_revoked_session', 'miniapp_missing_init_data', 'miniapp_invalid_init_data', 'miniapp_invalid_init_signature', 'miniapp_replayed_init_data'];
+       const adminReasons = ['admin_token_missing', 'admin_token_invalid'];
+       const webhookReasons = ['webhook_auth_rejected'];
+       const parsedWindow = Number(windowMinutes);
+       const window = Number.isFinite(parsedWindow) ? Math.max(1, Math.min(1440, Math.floor(parsedWindow))) : 60;
+       const currentBucket = Math.floor(Date.now() / 60000);
+       const firstBucket = currentBucket - window + 1;
+       await new Promise((resolve, reject) => this.db.run(
+           'DELETE FROM api_auth_failure_minute_buckets WHERE bucket_minute < ?',
+           [currentBucket - 1440 + 1], (error) => error ? reject(error) : resolve(),
+       ));
+       await new Promise((resolve, reject) => this.db.run(
+           'DELETE FROM miniapp_auth_failure_minute_buckets WHERE bucket_minute < ?',
+           [currentBucket - 1440 + 1], (error) => error ? reject(error) : resolve(),
+       ));
+       await new Promise((resolve, reject) => this.db.run(
+           'DELETE FROM admin_auth_failure_minute_buckets WHERE bucket_minute < ?',
+           [currentBucket - 1440 + 1], (error) => error ? reject(error) : resolve(),
+       ));
+       await new Promise((resolve, reject) => this.db.run(
+           'DELETE FROM webhook_auth_failure_minute_buckets WHERE bucket_minute < ?',
+           [currentBucket - 1440 + 1], (error) => error ? reject(error) : resolve(),
+       ));
+       const read = (table) => new Promise((resolve, reject) => this.db.all(
+           `SELECT reason, SUM(count) AS count FROM ${table}
+            WHERE bucket_minute >= ? AND bucket_minute <= ? GROUP BY reason`,
+           [firstBucket, currentBucket], (error, result) => error ? reject(error) : resolve(result || []),
+       ));
+       const [hmacRows, miniappRows, adminRows, webhookRows] = await Promise.all([
+           read('api_auth_failure_minute_buckets'), read('miniapp_auth_failure_minute_buckets'), read('admin_auth_failure_minute_buckets'),
+           read('webhook_auth_failure_minute_buckets'),
+       ]);
+       const aggregate = (reasons, rows) => {
+           const byReason = Object.fromEntries(reasons.map((reason) => [reason, 0]));
+           for (const row of rows) {
+               if (Object.hasOwn(byReason, row.reason)) byReason[row.reason] = Number(row.count) || 0;
+           }
+           return {
+               total: reasons.reduce((sum, reason) => Math.min(Number.MAX_SAFE_INTEGER, sum + byReason[reason]), 0),
+               by_reason: byReason,
+           };
+       };
+       const hmac = aggregate(hmacReasons, hmacRows);
+       const miniappSession = aggregate(miniappReasons, miniappRows);
+       const adminToken = aggregate(adminReasons, adminRows);
+       const webhookAuth = aggregate(webhookReasons, webhookRows);
+       return {
+           window_minutes: window,
+           ...hmac,
+           miniapp_session: miniappSession,
+           admin_token: adminToken,
+           webhook_auth: webhookAuth,
+           scope: 'shared_sqlite',
+           retention_minutes: 1440,
+       };
+   }
+
+   async getPlatformAnomalyMetrics(windowMinutes = 60) {
+       const safeWindow = Math.max(1, Math.min(1440, Math.floor(Number(windowMinutes) || 60)));
+       const currentWindow = `-${safeWindow} minutes`;
+       const previousWindow = `-${safeWindow * 2} minutes`;
+       const get = (sql, params = []) => new Promise((resolve, reject) =>
+           this.db.get(sql, params, (error, row) => error ? reject(error) : resolve(row || {})));
+       const all = (sql, params = []) => new Promise((resolve, reject) =>
+           this.db.all(sql, params, (error, rows) => error ? reject(error) : resolve(rows || [])));
+       const [calls, failedCalls, providerCallErrors, dispatchRetries, campaignReservations, webhookFailures, workflowFailures, workflowRetries, authAlerts, providerRows] = await Promise.all([
+           get(`SELECT
+                   SUM(CASE WHEN created_at >= datetime('now', ?) THEN 1 ELSE 0 END) AS current_window,
+                   SUM(CASE WHEN created_at < datetime('now', ?) AND created_at >= datetime('now', ?) THEN 1 ELSE 0 END) AS previous_window
+                FROM calls WHERE created_at >= datetime('now', ?)`, [currentWindow, currentWindow, previousWindow, previousWindow]),
+           get(`SELECT COUNT(*) AS count FROM calls WHERE created_at >= datetime('now', ?)
+                AND LOWER(COALESCE(status, '')) IN ('failed', 'error', 'no-answer', 'no_answer', 'busy')`, [currentWindow]),
+           all(`SELECT provider, COUNT(*) AS count FROM (
+                    SELECT CASE
+                        WHEN LOWER(COALESCE(NULLIF(telephony_provider, ''), NULLIF(provider, ''), '')) IN ('twilio', 'plivo', 'vonage', 'vapi', 'cartesia')
+                          THEN LOWER(COALESCE(NULLIF(telephony_provider, ''), NULLIF(provider, ''), ''))
+                        ELSE 'other'
+                    END AS provider
+                    FROM calls
+                    WHERE COALESCE(ended_at, created_at) >= datetime('now', ?)
+                      AND LOWER(COALESCE(status, '')) IN ('failed', 'error')
+                      AND LENGTH(TRIM(COALESCE(error_code, ''))) > 0
+                ) GROUP BY provider ORDER BY count DESC, provider ASC LIMIT 8`, [currentWindow]),
+           get(`SELECT COUNT(DISTINCT j.id) AS count FROM call_jobs j
+                LEFT JOIN call_job_dlq d ON d.job_id = j.id
+                WHERE (j.attempts > 1 OR d.job_id IS NOT NULL)
+                  AND (j.updated_at >= datetime('now', ?) OR d.created_at >= datetime('now', ?))`, [currentWindow, currentWindow]),
+           get(`SELECT
+                   (SELECT COUNT(*) FROM call_e_business_dispatch_reservations
+                     WHERE usage_date = date('now') AND status = 'reserved') AS active_reservations,
+                   (SELECT COUNT(*) FROM call_e_campaign_mission_recipients
+                     WHERE local_call_id IS NOT NULL AND status IN ('accepted', 'completed', 'failed', 'in_progress')
+                       AND date(updated_at) = date('now')) AS dispatched_recipients`),
+           get(`SELECT
+                   (SELECT COUNT(*) FROM outgoing_webhook_delivery_attempts
+                     WHERE outcome IN ('retry', 'dead_letter') AND created_at >= datetime('now', ?)) +
+                   (SELECT COUNT(*) FROM service_health_logs WHERE service_name = 'webhook_system'
+                     AND status IN ('error', 'failed') AND timestamp >= datetime('now', ?)) AS count`, [currentWindow, currentWindow]),
+           get(`SELECT
+                   (SELECT COUNT(*) FROM post_call_workflow_events
+                     WHERE status = 'dead_letter' AND dead_lettered_at >= datetime('now', ?)) +
+                   (SELECT COUNT(*) FROM post_call_workflow_runs
+                     WHERE status = 'failed' AND updated_at >= datetime('now', ?)) AS count`, [currentWindow, currentWindow]),
+           get(`SELECT COUNT(*) AS count FROM post_call_workflow_events
+                WHERE attempts > 1 AND updated_at >= datetime('now', ?)` , [currentWindow]),
+           get(`SELECT COUNT(*) AS count FROM service_health_logs
+                WHERE service_name = 'miniapp_alert' AND status = 'auth_failures_threshold'
+                  AND timestamp >= datetime('now', ?)`, [currentWindow]),
+           all(`SELECT status, details, timestamp FROM service_health_logs
+                WHERE service_name = 'provider_diagnostics' AND timestamp >= datetime('now', ?)
+                ORDER BY datetime(timestamp) DESC, id DESC LIMIT 500`, [currentWindow]),
+       ]);
+       const latestProviderState = new Map();
+       for (const row of providerRows) {
+           let details = {};
+           try { details = JSON.parse(row.details || '{}'); } catch (_) { continue; }
+           const provider = ['twilio', 'plivo', 'vonage'].includes(String(details.provider || '').toLowerCase())
+               ? String(details.provider).toLowerCase() : null;
+           if (provider && !latestProviderState.has(provider)) {
+               latestProviderState.set(provider, { provider, circuit_state: ['open', 'closed', 'half_open'].includes(row.status) ? row.status : 'unknown', recorded_at: row.timestamp });
+           }
+       }
+       const openProviders = [...latestProviderState.values()].filter((entry) => entry.circuit_state === 'open');
+       const providerCallErrorRows = providerCallErrors.map((row) => ({
+           provider: ['twilio', 'plivo', 'vonage', 'vapi', 'cartesia', 'other'].includes(row.provider) ? row.provider : 'other',
+           count: Number(row.count) || 0,
+       }));
+       return {
+           window_minutes: safeWindow,
+           calls: { current_window: Number(calls.current_window) || 0, previous_window: Number(calls.previous_window) || 0, failed: Number(failedCalls.count) || 0 },
+           provider_open_count: openProviders.length,
+           open_providers: openProviders,
+           provider_call_error_count: providerCallErrorRows.reduce((total, row) => total + row.count, 0),
+           provider_call_errors: providerCallErrorRows,
+           dispatch_retry_count: Number(dispatchRetries.count) || 0,
+           campaign_reservations_active: Number(campaignReservations.active_reservations) || 0,
+           campaign_dispatches_today: Number(campaignReservations.dispatched_recipients) || 0,
+           webhook_failure_count: Number(webhookFailures.count) || 0,
+           workflow_failure_count: Number(workflowFailures.count) || 0,
+           workflow_retry_count: Number(workflowRetries.count) || 0,
+           authorization_alert_count: Number(authAlerts.count) || 0,
+       };
    }
 
    async getGptObservabilitySummary(windowMinutes = 60) {
@@ -13458,6 +15076,73 @@ class EnhancedDatabase {
                approved_at DATETIME,
                PRIMARY KEY(workflow_id, version)
            )`,
+           `CREATE TABLE IF NOT EXISTS post_call_workflow_events (
+               event_id TEXT PRIMARY KEY,
+               event_key TEXT NOT NULL UNIQUE,
+               call_sid TEXT,
+               business_id TEXT,
+               trigger_event TEXT NOT NULL,
+               definition_versions_json TEXT NOT NULL,
+               payload_json TEXT NOT NULL,
+               status TEXT NOT NULL CHECK(status IN ('pending', 'processing', 'completed', 'dead_letter')),
+               attempts INTEGER NOT NULL DEFAULT 0,
+               max_attempts INTEGER NOT NULL DEFAULT 5,
+               next_attempt_at DATETIME,
+               last_enqueued_at DATETIME,
+               locked_at DATETIME,
+               error_code TEXT,
+               created_at DATETIME NOT NULL,
+               updated_at DATETIME NOT NULL,
+               processed_at DATETIME,
+               dead_lettered_at DATETIME
+           )`,
+           `CREATE TABLE IF NOT EXISTS outgoing_webhook_subscriptions (
+               subscription_id TEXT PRIMARY KEY,
+               business_id TEXT NOT NULL,
+               name TEXT NOT NULL,
+               target_url TEXT NOT NULL,
+               secret_env_ref TEXT NOT NULL,
+               enabled INTEGER NOT NULL DEFAULT 1,
+               event_types_json TEXT NOT NULL,
+               failure_count INTEGER NOT NULL DEFAULT 0,
+               failure_threshold INTEGER NOT NULL DEFAULT 10,
+               created_by TEXT NOT NULL,
+               created_at DATETIME NOT NULL,
+               updated_at DATETIME NOT NULL,
+               disabled_at DATETIME
+           )`,
+           `CREATE TABLE IF NOT EXISTS outgoing_webhook_deliveries (
+               delivery_id TEXT PRIMARY KEY,
+               subscription_id TEXT NOT NULL,
+               event_id TEXT NOT NULL,
+               event_type TEXT NOT NULL,
+               payload_json TEXT NOT NULL,
+               status TEXT NOT NULL CHECK(status IN ('pending', 'processing', 'delivered', 'dead_letter')),
+               attempts INTEGER NOT NULL DEFAULT 0,
+               max_attempts INTEGER NOT NULL DEFAULT 8,
+               next_attempt_at DATETIME,
+               response_status INTEGER,
+               last_error_code TEXT,
+               created_at DATETIME NOT NULL,
+               updated_at DATETIME NOT NULL,
+               delivered_at DATETIME,
+               dead_lettered_at DATETIME,
+               UNIQUE(subscription_id, event_id),
+               FOREIGN KEY(subscription_id) REFERENCES outgoing_webhook_subscriptions(subscription_id)
+           )`,
+           `CREATE TABLE IF NOT EXISTS outgoing_webhook_delivery_attempts (
+               attempt_id TEXT PRIMARY KEY,
+               delivery_id TEXT NOT NULL,
+               attempt_number INTEGER NOT NULL,
+               outcome TEXT NOT NULL,
+               response_status INTEGER,
+               error_code TEXT,
+               created_at DATETIME NOT NULL,
+               FOREIGN KEY(delivery_id) REFERENCES outgoing_webhook_deliveries(delivery_id),
+               UNIQUE(delivery_id, attempt_number)
+           )`,
+           'CREATE INDEX IF NOT EXISTS idx_outgoing_webhook_due ON outgoing_webhook_deliveries(status, next_attempt_at, created_at)',
+           'CREATE INDEX IF NOT EXISTS idx_outgoing_webhook_subscription ON outgoing_webhook_deliveries(subscription_id, created_at)',
            `CREATE TABLE IF NOT EXISTS call_e_result_workflow_action_approvals (
                workflow_id TEXT NOT NULL,
                version INTEGER NOT NULL,
@@ -13540,6 +15225,7 @@ class EnhancedDatabase {
            'CREATE INDEX IF NOT EXISTS idx_post_call_runs_call_sid ON post_call_automation_runs(call_sid)',
            'CREATE INDEX IF NOT EXISTS idx_post_call_runs_idempotency ON post_call_automation_runs(idempotency_key)',
            'CREATE INDEX IF NOT EXISTS idx_post_call_workflow_status ON post_call_workflow_definitions(status, created_at)',
+           'CREATE INDEX IF NOT EXISTS idx_post_call_workflow_events_due ON post_call_workflow_events(status, next_attempt_at, created_at)',
            'CREATE INDEX IF NOT EXISTS idx_post_call_workflow_runs_due ON post_call_workflow_runs(status, next_run_at, created_at)',
            'CREATE INDEX IF NOT EXISTS idx_post_call_workflow_runs_workflow ON post_call_workflow_runs(workflow_id, created_at)',
            'CREATE INDEX IF NOT EXISTS idx_post_call_workflow_steps_status ON post_call_workflow_step_runs(run_id, status)',
@@ -14681,14 +16367,199 @@ class EnhancedDatabase {
        });
    }
 
+   async createOutgoingWebhookSubscription(subscription = {}) {
+       const now = new Date().toISOString();
+       await new Promise((resolve, reject) => {
+           this.db.run(
+               `INSERT INTO outgoing_webhook_subscriptions
+                (subscription_id, business_id, name, target_url, secret_env_ref, enabled, event_types_json,
+                 failure_threshold, created_by, updated_by, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)`,
+               [subscription.subscription_id, subscription.business_id, subscription.name, subscription.target_url,
+                   subscription.secret_env_ref, JSON.stringify(subscription.event_types || []),
+                   subscription.failure_threshold || 10, subscription.created_by, subscription.created_by, now, now],
+               (err) => err ? reject(err) : resolve(),
+           );
+       });
+       return this.getOutgoingWebhookSubscription(subscription.subscription_id, subscription.business_id);
+   }
+
+   async getOutgoingWebhookSubscription(subscriptionId, businessId) {
+       return new Promise((resolve, reject) => {
+            this.db.get(`SELECT subscription.*,
+                (SELECT MAX(revision) FROM outgoing_webhook_subscription_revisions WHERE subscription_id = subscription.subscription_id) AS config_revision
+                FROM outgoing_webhook_subscriptions subscription WHERE subscription_id = ? AND business_id = ?`,
+               [subscriptionId, businessId], (err, row) => err ? reject(err) : resolve(row || null));
+       });
+   }
+
+   async listOutgoingWebhookSubscriptions(businessId) {
+       return new Promise((resolve, reject) => {
+            this.db.all(`SELECT subscription.*,
+                (SELECT MAX(revision) FROM outgoing_webhook_subscription_revisions WHERE subscription_id = subscription.subscription_id) AS config_revision
+                FROM outgoing_webhook_subscriptions subscription WHERE business_id = ? ORDER BY created_at DESC`,
+               [businessId], (err, rows) => err ? reject(err) : resolve(rows || []));
+       });
+   }
+
+    async listOutgoingWebhookSubscriptionRevisions(subscriptionId, businessId, limit = 50) {
+        const safeLimit = Math.max(1, Math.min(100, Math.floor(Number(limit) || 50)));
+        return new Promise((resolve, reject) => this.db.all(
+            `SELECT revision.* FROM outgoing_webhook_subscription_revisions revision
+             WHERE revision.subscription_id = ? AND revision.business_id = ?
+             ORDER BY revision.revision DESC LIMIT ?`,
+            [subscriptionId, businessId, safeLimit], (err, rows) => err ? reject(err) : resolve(rows || []),
+        ));
+    }
+
+    async updateOutgoingWebhookSubscription(subscriptionId, businessId, changes = {}, actor = '') {
+       const now = new Date().toISOString();
+       return new Promise((resolve, reject) => {
+           this.db.run(
+                `UPDATE outgoing_webhook_subscriptions SET name = ?, target_url = ?, secret_env_ref = ?, enabled = ?, updated_by = ?,
+                   event_types_json = ?, failure_threshold = ?, failure_count = CASE WHEN ? = 1 THEN 0 ELSE failure_count END,
+                   disabled_at = CASE WHEN ? = 1 THEN NULL WHEN ? = 0 THEN ? ELSE disabled_at END, updated_at = ?
+                WHERE subscription_id = ? AND business_id = ?`,
+               [changes.name, changes.target_url, changes.secret_env_ref, changes.enabled ? 1 : 0, String(actor || ''),
+                   JSON.stringify(changes.event_types || []), changes.failure_threshold || 10,
+                   changes.enabled ? 1 : 0, changes.enabled ? 1 : 0, changes.enabled ? 1 : 0, now, now,
+                   subscriptionId, businessId],
+               function (err) { err ? reject(err) : resolve(this.changes || 0); },
+           );
+       });
+   }
+
+   async enqueueOutgoingWebhookDelivery(delivery = {}) {
+       const now = new Date().toISOString();
+       await new Promise((resolve, reject) => {
+           this.db.run(
+                `INSERT OR IGNORE INTO outgoing_webhook_deliveries
+                (delivery_id, subscription_id, event_id, event_type, payload_json, status, max_attempts, next_attempt_at, config_revision, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, COALESCE(?, (SELECT MAX(revision) FROM outgoing_webhook_subscription_revisions WHERE subscription_id = ?)), ?, ?)`,
+               [delivery.delivery_id, delivery.subscription_id, delivery.event_id, delivery.event_type,
+                   delivery.payload_json, Math.max(1, Math.min(12, Number(delivery.max_attempts) || 8)), now,
+                   delivery.config_revision || null, delivery.subscription_id, now, now],
+               (err) => err ? reject(err) : resolve(),
+           );
+       });
+       return new Promise((resolve, reject) => {
+           this.db.get('SELECT * FROM outgoing_webhook_deliveries WHERE subscription_id = ? AND event_id = ?',
+               [delivery.subscription_id, delivery.event_id], (err, row) => err ? reject(err) : resolve(row || null));
+       });
+   }
+
+   async listDueOutgoingWebhookDeliveries(limit = 20) {
+       const safeLimit = Math.max(1, Math.min(100, Math.floor(Number(limit) || 20)));
+       return new Promise((resolve, reject) => {
+           this.db.all(
+                `SELECT d.*, revision.target_url, revision.secret_env_ref, s.enabled AS subscription_enabled
+                FROM outgoing_webhook_deliveries d JOIN outgoing_webhook_subscriptions s USING(subscription_id)
+                JOIN outgoing_webhook_subscription_revisions revision
+                  ON revision.subscription_id = d.subscription_id AND revision.revision = d.config_revision
+                WHERE s.enabled = 1 AND d.attempts < d.max_attempts AND (
+                  (d.status = 'pending' AND (d.next_attempt_at IS NULL OR julianday(d.next_attempt_at) <= julianday(?)))
+                  OR (d.status = 'processing' AND julianday(d.updated_at) <= julianday(?, '-120 seconds'))
+                )
+                ORDER BY d.created_at ASC LIMIT ?`,
+                [new Date().toISOString(), new Date().toISOString(), safeLimit], (err, rows) => err ? reject(err) : resolve(rows || []),
+           );
+       });
+   }
+
+   async claimOutgoingWebhookDelivery(deliveryId) {
+       const now = new Date().toISOString();
+       return new Promise((resolve, reject) => {
+           this.db.run(
+               `UPDATE outgoing_webhook_deliveries SET status = 'processing', attempts = attempts + 1, updated_at = ?
+                WHERE delivery_id = ? AND attempts < max_attempts AND (
+                  status = 'pending' OR (status = 'processing' AND julianday(updated_at) <= julianday(?, '-120 seconds'))
+                )`,
+               [now, deliveryId, now], function (err) { err ? reject(err) : resolve(this.changes || 0); },
+           );
+       });
+   }
+
+   async finishOutgoingWebhookAttempt(deliveryId, result = {}) {
+       const now = new Date().toISOString();
+       await new Promise((resolve, reject) => this.db.run(
+           `INSERT INTO outgoing_webhook_delivery_attempts (attempt_id, delivery_id, attempt_number, outcome, response_status, error_code, created_at)
+            SELECT ?, delivery_id, attempts, ?, ?, ?, ? FROM outgoing_webhook_deliveries WHERE delivery_id = ?`,
+           [crypto.randomUUID(), result.delivered ? 'delivered' : result.retry ? 'retry' : 'dead_letter',
+               result.response_status || null, result.error_code || null, now, deliveryId],
+           (err) => err ? reject(err) : resolve(),
+       ));
+       await new Promise((resolve, reject) => this.db.run(
+           `UPDATE outgoing_webhook_deliveries SET status = ?, response_status = ?, last_error_code = ?,
+                next_attempt_at = ?, delivered_at = ?, dead_lettered_at = ?, updated_at = ? WHERE delivery_id = ?`,
+           [result.delivered ? 'delivered' : result.retry ? 'pending' : 'dead_letter', result.response_status || null,
+               result.error_code || null, result.next_attempt_at || null, result.delivered ? now : null,
+               result.retry ? null : result.delivered ? null : now, now, deliveryId],
+           (err) => err ? reject(err) : resolve(),
+       ));
+       if (result.subscription_id) {
+           await new Promise((resolve, reject) => this.db.run(
+                `UPDATE outgoing_webhook_subscriptions SET failure_count = CASE WHEN ? = 1 THEN 0 ELSE failure_count + 1 END,
+                   enabled = CASE WHEN ? = 1 THEN enabled WHEN failure_count + 1 >= failure_threshold THEN 0 ELSE enabled END,
+                   disabled_at = CASE WHEN ? = 1 THEN NULL WHEN failure_count + 1 >= failure_threshold THEN ? ELSE disabled_at END,
+                   updated_by = CASE WHEN ? = 1 THEN updated_by WHEN failure_count + 1 >= failure_threshold THEN 'system' ELSE updated_by END,
+                   updated_at = ? WHERE subscription_id = ?`,
+               [result.delivered ? 1 : 0, result.delivered ? 1 : 0, result.delivered ? 1 : 0, now,
+                   result.delivered ? 1 : 0, now, result.subscription_id],
+               (err) => err ? reject(err) : resolve(),
+           ));
+       }
+   }
+
+   async getOutgoingWebhookDelivery(deliveryId, subscriptionId) {
+       return new Promise((resolve, reject) => {
+           this.db.get('SELECT * FROM outgoing_webhook_deliveries WHERE delivery_id = ? AND subscription_id = ?',
+               [deliveryId, subscriptionId], (err, row) => err ? reject(err) : resolve(row || null));
+       });
+   }
+
+   async listOutgoingWebhookDeliveries(subscriptionId, businessId, limit = 50) {
+       const safeLimit = Math.max(1, Math.min(100, Math.floor(Number(limit) || 50)));
+       return new Promise((resolve, reject) => this.db.all(
+           `SELECT d.delivery_id, d.event_id, d.event_type, d.status, d.attempts, d.max_attempts, d.response_status,
+                   d.last_error_code, d.created_at, d.updated_at, d.delivered_at, d.dead_lettered_at
+            FROM outgoing_webhook_deliveries d JOIN outgoing_webhook_subscriptions s USING(subscription_id)
+            WHERE d.subscription_id = ? AND s.business_id = ? ORDER BY d.created_at DESC LIMIT ?`,
+           [subscriptionId, businessId, safeLimit], (err, rows) => err ? reject(err) : resolve(rows || []),
+       ));
+   }
+
+   async replayOutgoingWebhookDelivery(deliveryId, subscriptionId) {
+       const now = new Date().toISOString();
+       return new Promise((resolve, reject) => this.db.run(
+           `UPDATE outgoing_webhook_deliveries SET status = 'pending', max_attempts = attempts + 8,
+                next_attempt_at = ?, last_error_code = NULL, dead_lettered_at = NULL, updated_at = ?
+            WHERE delivery_id = ? AND subscription_id = ? AND status = 'dead_letter'
+              AND EXISTS (SELECT 1 FROM outgoing_webhook_subscriptions WHERE subscription_id = ? AND enabled = 1)`,
+           [now, now, deliveryId, subscriptionId, subscriptionId], function (err) { err ? reject(err) : resolve(this.changes || 0); },
+       ));
+   }
+
    async createPostCallWorkflowEvent(event = {}) {
        const now = new Date().toISOString();
        await new Promise((resolve, reject) => {
            this.db.run(
                `INSERT OR IGNORE INTO post_call_workflow_events (
-                   event_id, event_key, business_id, trigger_event, definition_versions_json, payload_json, status, created_at, updated_at
-               ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)`,
-               [event.event_id, event.event_key, event.business_id ?? null, event.trigger_event, event.definition_versions_json, event.payload_json, now, now],
+                   event_id, event_key, call_sid, business_id, trigger_event, definition_versions_json, payload_json,
+                   status, max_attempts, next_attempt_at, created_at, updated_at
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)`,
+               [
+                   event.event_id,
+                   event.event_key,
+                   event.call_sid ?? null,
+                   event.business_id ?? null,
+                   event.trigger_event,
+                   event.definition_versions_json,
+                   event.payload_json,
+                   Math.max(1, Math.min(10, Math.floor(Number(event.max_attempts) || 5))),
+                   now,
+                   now,
+                   now,
+               ],
                (err) => err ? reject(err) : resolve(),
            );
        });
@@ -14709,12 +16580,59 @@ class EnhancedDatabase {
        });
    }
 
+   async listPostCallWorkflowEvents(filters = {}) {
+       const where = [];
+       const params = [];
+       if (filters.status) {
+           where.push('status = ?');
+           params.push(filters.status);
+       }
+       if (filters.trigger_event) {
+           where.push('trigger_event = ?');
+           params.push(filters.trigger_event);
+       }
+       if (Object.prototype.hasOwnProperty.call(filters, 'business_id')) {
+           where.push('business_id IS ?');
+           params.push(filters.business_id ?? null);
+       }
+       const safeLimit = Math.max(1, Math.min(100, Math.floor(Number(filters.limit) || 20)));
+       params.push(safeLimit);
+       return new Promise((resolve, reject) => {
+           this.db.all(
+               `SELECT event_id, event_key, call_sid, business_id, trigger_event, status, attempts, max_attempts,
+                       next_attempt_at, error_code, created_at, updated_at, processed_at, dead_lettered_at
+                FROM post_call_workflow_events
+                ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
+                ORDER BY created_at DESC LIMIT ?`,
+               params,
+               (err, rows) => err ? reject(err) : resolve(rows || []),
+           );
+       });
+   }
+
+   async requeueDeadLetterPostCallWorkflowEvent(eventId) {
+       const now = new Date().toISOString();
+       return new Promise((resolve, reject) => {
+           this.db.run(
+               `UPDATE post_call_workflow_events
+                SET status = 'pending', attempts = 0, next_attempt_at = ?, last_enqueued_at = NULL,
+                    locked_at = NULL, error_code = NULL, dead_lettered_at = NULL, updated_at = ?
+                WHERE event_id = ? AND status = 'dead_letter'`,
+               [now, now, eventId],
+               function (err) { err ? reject(err) : resolve(this.changes || 0); },
+           );
+       });
+   }
+
    async listPendingPostCallWorkflowEvents(limit = 100) {
        const safeLimit = Math.max(1, Math.min(200, Math.floor(Number(limit) || 100)));
        return new Promise((resolve, reject) => {
            this.db.all(
-               `SELECT * FROM post_call_workflow_events WHERE status = 'pending' ORDER BY created_at ASC LIMIT ?`,
-               [safeLimit], (err, rows) => err ? reject(err) : resolve(rows || []),
+               `SELECT * FROM post_call_workflow_events
+                WHERE status = 'pending' AND attempts < max_attempts
+                  AND (next_attempt_at IS NULL OR julianday(next_attempt_at) <= julianday(?))
+                ORDER BY created_at ASC LIMIT ?`,
+               [new Date().toISOString(), safeLimit], (err, rows) => err ? reject(err) : resolve(rows || []),
            );
        });
    }
@@ -14724,21 +16642,30 @@ class EnhancedDatabase {
            this.db.run(
                `UPDATE post_call_workflow_events SET last_enqueued_at = ?, updated_at = ?
                 WHERE event_id = ? AND status = 'pending'
+                 AND attempts < max_attempts
+                 AND (next_attempt_at IS NULL OR julianday(next_attempt_at) <= julianday(?))
                   AND (last_enqueued_at IS NULL OR julianday(last_enqueued_at) <= julianday(?))`,
-               [now, now, eventId, staleBefore],
+               [now, now, eventId, now, staleBefore],
                function (err) { err ? reject(err) : resolve(this.changes || 0); },
            );
        });
    }
 
-   async claimPostCallWorkflowEvent(eventId, { now = new Date().toISOString(), staleBefore = now } = {}) {
+   async claimPostCallWorkflowEvent(eventId, {
+       now = new Date().toISOString(),
+       staleBefore = new Date(Date.parse(now) - 90_000).toISOString(),
+   } = {}) {
        return new Promise((resolve, reject) => {
            this.db.run(
-               `UPDATE post_call_workflow_events SET status = 'processing', locked_at = ?, updated_at = ?, error_code = NULL
+               `UPDATE post_call_workflow_events
+                SET status = 'processing', locked_at = ?, updated_at = ?, error_code = NULL,
+                    attempts = CASE WHEN status = 'pending' THEN attempts + 1 ELSE attempts END
                 WHERE event_id = ? AND (
-                    status = 'pending' OR (status = 'processing' AND julianday(updated_at) <= julianday(?))
+                   (status = 'pending' AND attempts < max_attempts
+                    AND (next_attempt_at IS NULL OR julianday(next_attempt_at) <= julianday(?)))
+                   OR (status = 'processing' AND julianday(updated_at) <= julianday(?))
                 )`,
-               [now, now, eventId, staleBefore],
+               [now, now, eventId, now, staleBefore],
                function (err) { err ? reject(err) : resolve(this.changes || 0); },
            );
        });
@@ -14756,14 +16683,18 @@ class EnhancedDatabase {
        });
    }
 
-   async resetPostCallWorkflowEvent(eventId, errorCode = 'workflow_event_processing_failed') {
+   async resetPostCallWorkflowEvent(eventId, errorCode = 'workflow_event_processing_failed', nextAttemptAt = null) {
        const now = new Date().toISOString();
        return new Promise((resolve, reject) => {
            this.db.run(
-               `UPDATE post_call_workflow_events SET status = 'pending', locked_at = NULL,
-                   error_code = ?, updated_at = ?
+               `UPDATE post_call_workflow_events
+                SET status = CASE WHEN attempts >= max_attempts THEN 'dead_letter' ELSE 'pending' END,
+                   locked_at = NULL, error_code = ?, next_attempt_at = ?,
+                   dead_lettered_at = CASE WHEN attempts >= max_attempts THEN ? ELSE NULL END,
+                   updated_at = ?
                 WHERE event_id = ? AND status = 'processing'`,
-               [errorCode, now, eventId], function (err) { err ? reject(err) : resolve(this.changes || 0); },
+               [errorCode, nextAttemptAt, now, now, eventId],
+               function (err) { err ? reject(err) : resolve(this.changes || 0); },
            );
        });
    }
@@ -14771,10 +16702,13 @@ class EnhancedDatabase {
    async requeueStalePostCallWorkflowEvents({ now = new Date().toISOString(), staleBefore = now } = {}) {
        return new Promise((resolve, reject) => {
            this.db.run(
-               `UPDATE post_call_workflow_events SET status = 'pending', locked_at = NULL,
-                   error_code = 'event_processing_interrupted', updated_at = ?
+               `UPDATE post_call_workflow_events
+                SET status = CASE WHEN attempts >= max_attempts THEN 'dead_letter' ELSE 'pending' END,
+                   locked_at = NULL, error_code = 'event_processing_interrupted',
+                   dead_lettered_at = CASE WHEN attempts >= max_attempts THEN ? ELSE NULL END,
+                   updated_at = ?
                 WHERE status = 'processing' AND julianday(updated_at) <= julianday(?)`,
-               [now, staleBefore], function (err) { err ? reject(err) : resolve(this.changes || 0); },
+               [now, now, staleBefore], function (err) { err ? reject(err) : resolve(this.changes || 0); },
            );
        });
    }
@@ -14856,7 +16790,7 @@ class EnhancedDatabase {
    }
 
    async listApprovedPostCallWorkflowDefinitions(triggerEvent, businessId = null) {
-       const requiresBusinessScope = triggerEvent === 'call_e_result_ready';
+       const requiresBusinessScope = ['call_e_result_ready', 'post_call_automation_failed'].includes(triggerEvent);
        if ((requiresBusinessScope && !businessId) || (businessId && !/^[A-Za-z0-9._:-]{1,120}$/.test(String(businessId)))) return [];
        const scoped = Boolean(businessId);
        const scopeClause = scoped ? 'business_id = ?' : 'business_id IS NULL';

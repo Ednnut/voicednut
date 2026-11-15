@@ -40,6 +40,23 @@ function createResponseRecorder() {
 }
 
 describe("Plivo provider integration", () => {
+  it("reads a provider call status without retrying or dispatching a second call", async () => {
+    const requests = [];
+    const adapter = new PlivoVoiceAdapter({
+      authId: "auth-id", authToken: "auth-token", voice: { retryAttempts: 3 },
+      fetch: async (url, options) => {
+        requests.push({ url, options });
+        return { ok: true, status: 200, text: async () => JSON.stringify({ call_status: "completed" }) };
+      },
+    }, { info: () => {}, warn: () => {} });
+    const result = await adapter.getCall("plivo-uuid");
+    assert.equal(result.call_status, "completed");
+    assert.equal(requests.length, 1);
+    assert.match(requests[0].url, /\/Call\/plivo-uuid\/$/);
+    assert.equal(requests[0].options.method, "GET");
+    assert.equal(requests[0].options.body, undefined);
+  });
+
   it("builds outbound voice calls with Plivo REST fields and request_uuid correlation", async () => {
     const requests = [];
     const adapter = new PlivoVoiceAdapter(

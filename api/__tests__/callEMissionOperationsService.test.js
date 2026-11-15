@@ -9,8 +9,14 @@ describe('CALL-E mission operations service', () => {
     const service = new CallEMissionOperationsService({
       db: {
         async getCallEBusinessMissionPolicy() { return null; },
+        async getCallEBusinessMissionPolicyHistory(_businessId, limit) { return [{ revision: 1 }].slice(0, limit); },
+        async getCallEBusinessMissionPolicyRevision(_businessId, revision) { return revision === 1 ? {
+          revision: 1, secondary_approval_threshold: 12, approval_ttl_hours: 36, review_sla_minutes: 60, review_repeat_minutes: 15,
+        } : null; },
         async setCallEBusinessMissionPolicy(input) { writes.push(input); return input; },
         async getCallEBusinessProviderRouting() { return null; },
+        async getCallEBusinessProviderRoutingHistory() { return []; },
+        async getCallEBusinessProviderRoutingRevision(_businessId, revision) { return revision === 1 ? { revision: 1, provider_order: ['twilio'] } : null; },
         async setCallEBusinessProviderRouting(input) { writes.push(input); return input; },
         async getCallECampaignMissionReport() { return { mission_count: 2, completed_missions: 1, attention_missions: 1, completed_recipients: 3, failed_recipients: 1, review_recipients: 0, canceled_recipients: 1, open_recipients: 0 }; },
         async setCallEMissionAlertSubscription(input) { return input; },
@@ -23,7 +29,7 @@ describe('CALL-E mission operations service', () => {
         async recordCallEMissionUsageRecord(input) { writes.push(input); return { recorded: true, budget_exceeded: true, confidence: input.source_type }; },
         async getCallEMissionUsageReport() { return { reserved_minor: 1000, actual_by_currency: { USD: 1250 }, budget_currency: 'USD', budget_exceeded: true }; },
       },
-      campaignService: { async assertMembership(_businessId, _actorId, roles) { if (roles && !roles.has('policy_manager')) throw new Error('role denied'); return { telegram_id: '222' }; } },
+      campaignService: { async assertMembership(_businessId, actorId, roles) { if (roles && actorId === '444') throw Object.assign(new Error('role denied'), { code: 'call_e_business_operator_access_denied' }); return { telegram_id: actorId }; } },
       providerRoutingPreview: async ({ configuredOrder }) => ({ selected_provider: configuredOrder[0], eligible_order: configuredOrder, dispatch_performed: false }),
       idempotencySecret: 'x'.repeat(64),
       now: () => new Date('2026-10-31T00:00:00Z'),
@@ -49,6 +55,19 @@ describe('CALL-E mission operations service', () => {
     await assert.rejects(service.setApprovalPolicy({
       business_id: 'biz-a', actor_id: '222', secondary_approval_threshold: 8, approval_ttl_hours: 72, review_sla_minutes: 10081,
     }), (error) => error.code === 'call_e_mission_policy_invalid');
+  });
+
+  it('returns scoped approval history and requires a policy manager to record rollback', async () => {
+    const { service, writes } = setup();
+    const view = await service.getApprovalPolicy({ business_id: 'biz-a', actor_id: '333', history_limit: 5 });
+    assert.equal(view.history.length, 1);
+    assert.equal(view.policy.revision, null);
+    await assert.rejects(service.rollbackApprovalPolicy({ business_id: 'biz-a', actor_id: '444', revision: 1 }),
+      (error) => error.code === 'call_e_business_operator_access_denied');
+    const result = await service.rollbackApprovalPolicy({ business_id: 'biz-a', actor_id: '222', revision: 1 });
+    assert.equal(result.source_revision, 1);
+    assert.equal(writes.at(-1).change_type, 'rollback');
+    assert.equal(writes.at(-1).secondary_approval_threshold, 12);
   });
 
   it('keeps deadline-extension idempotency stable when an operator retries after a lost response', async () => {
@@ -134,6 +153,21 @@ describe('CALL-E mission operations service', () => {
     assert.equal(report.report.canceled_recipients, 1);
     assert.equal('destination' in report.report, false);
     await assert.rejects(service.report({ business_id: 'biz-a', actor_id: '222', from: '2026-01-01', to: '2026-10-31' }), (error) => error.code === 'call_e_report_range_invalid');
+  });
+
+  it('returns provider-routing history and permits audited rollback only for a policy manager', async () => {
+    const { service, writes } = setup();
+    service.db.getCallEBusinessProviderRoutingHistory = async () => [{ revision: 2, provider_order: ['plivo'], actor_id: '333' }];
+    const current = await service.getProviderRouting({ business_id: 'biz-a', actor_id: '222' });
+    assert.equal(current.history[0].revision, 2);
+    assert.deepEqual(current.policy.provider_order, []);
+
+    const rolledBack = await service.rollbackProviderRouting({ business_id: 'biz-a', actor_id: '222', revision: 1 });
+    assert.deepEqual(rolledBack.policy.provider_order, ['twilio']);
+    assert.equal(writes.at(-1).change_type, 'rollback');
+    assert.equal(writes.at(-1).source_revision, 1);
+    await assert.rejects(service.rollbackProviderRouting({ business_id: 'biz-a', actor_id: '222', revision: 9 }),
+      (error) => error.code === 'call_e_provider_routing_revision_not_found');
   });
 
   it('previews provider routing without dispatch and limits review actions to eligible missions and managers', async () => {

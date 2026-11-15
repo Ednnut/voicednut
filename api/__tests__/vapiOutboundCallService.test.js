@@ -41,6 +41,29 @@ describe("VapiOutboundCallService", () => {
     };
   }
 
+  it("records accepted Vapi calls in the actor- and business-scoped common activity history", async () => {
+    const writes = [];
+    const service = new VapiOutboundCallService({
+      db: {
+        async createCall(call) { writes.push(["call", call]); },
+        async updateCallState(...args) { writes.push(["state", ...args]); },
+        async getCall() { return null; },
+      },
+    });
+    await service.recordCommonCall({ actorId: "7003", requestId: "request-vapi-1" }, { business_id: "biz-vapi" }, "+14155550123", {
+      providerCallId: "call_123", status: "queued",
+    });
+    assert.equal(writes[0][1].call_sid, "vapi_call_123");
+    assert.equal(writes[0][1].user_chat_id, "7003");
+    assert.equal(writes[0][1].business_id, "biz-vapi");
+    assert.equal(writes[1][3].provider_call_id, "call_123");
+    assert.equal(writes[1][3].execution_context.request_id, "request-vapi-1");
+    assert.equal(writes[1][3].execution_context.internal_call_id, "vapi_call_123");
+    assert.equal(writes[2][2], "execution_step");
+    assert.equal(writes[2][3].step_name, "provider_dispatch");
+    assert.equal(writes[2][3].result, "accepted");
+  });
+
   it("creates one outbound call from an explicit synced template mapping and Vapi number", async () => {
     const calls = [];
     const service = new VapiOutboundCallService({
@@ -68,6 +91,87 @@ describe("VapiOutboundCallService", () => {
       phoneNumberId: "phone_789",
       customer: { number: "+14155550123" },
     }]);
+  });
+
+  it("records Vapi provider dispatch duration from before the provider request", async () => {
+    const states = [];
+    const db = createIdempotencyDb();
+    db.createCall = async () => {};
+    db.getCall = async () => null;
+    db.updateCallState = async (...args) => states.push(args);
+    let providerRequestStartedAt;
+    const service = new VapiOutboundCallService({
+      db,
+      client: {
+        isConfigured: () => true,
+        async createCall() {
+          providerRequestStartedAt = Date.now();
+          await new Promise((resolve) => setTimeout(resolve, 5));
+          return { id: "call_timing_1", status: "queued" };
+        },
+      },
+      getMapping: async () => mapping,
+      getTemplate: async () => ({ id: 5, version: 3, business_id: "biz-vapi" }),
+    });
+
+    await service.createOutboundCall({
+      mappingId: 12,
+      idempotencyKey: "request-timing-01",
+      phoneNumberId: "phone_789",
+      number: "+14155550123",
+      requestId: "request-vapi-timing",
+    });
+
+    const step = states.find(([, state]) => state === "execution_step")[2];
+    assert.equal(step.correlation_id, "request-vapi-timing");
+    assert.ok(Date.parse(step.started_at) <= providerRequestStartedAt);
+    assert.ok(Date.parse(step.completed_at) >= providerRequestStartedAt);
+  });
+
+  it("sends validated script first-message overrides and placeholder values to Vapi", async () => {
+    let request;
+    const service = new VapiOutboundCallService({
+      db: createIdempotencyDb(),
+      client: { isConfigured: () => true, createCall: async (body) => { request = body; return { id: "call_variables", status: "queued" }; } },
+      getMapping: async () => mapping,
+      getTemplate: async () => ({ id: 5, version: 3, prompt: "Hi {{name}}", first_message: "Hello {{name}}" }),
+    });
+    await service.createOutboundCall({
+      mappingId: 12, idempotencyKey: "variable-request-01", phoneNumberId: "phone_789", number: "+14155550123",
+      firstMessage: "Hello Jordan", variableValues: { name: "Jordan" },
+    });
+    assert.deepEqual(request.assistantOverrides, { firstMessage: "Hello Jordan", variableValues: { name: "Jordan" } });
+  });
+
+  it("records accepted Vapi calls in lifecycle history without provider I/O", async () => {
+    const events = [];
+    const db = createIdempotencyDb();
+    db.recordVapiCallEvent = async (event) => { events.push(event); return { inserted: true }; };
+    const service = new VapiOutboundCallService({
+      db,
+      client: { isConfigured: () => true, createCall: async () => ({ id: "call_history_1", status: "queued" }) },
+      getMapping: async () => mapping,
+      getTemplate: async () => ({ id: 5, version: 3 }),
+    });
+    await service.createOutboundCall({ mappingId: 12, idempotencyKey: "history-vapi-01", phoneNumberId: "phone_789", number: "+14155550123" });
+    assert.equal(events.length, 1);
+    assert.equal(events[0].provider_call_id, "call_history_1");
+    assert.equal(events[0].event_type, "call_created");
+  });
+
+  it("rejects Vapi placeholder values outside the selected script", async () => {
+    let providerCalls = 0;
+    const service = new VapiOutboundCallService({
+      db: createIdempotencyDb(),
+      client: { isConfigured: () => true, createCall: async () => { providerCalls += 1; return { id: "call" }; } },
+      getMapping: async () => mapping,
+      getTemplate: async () => ({ id: 5, version: 3, prompt: "Hi {{name}}" }),
+    });
+    await assert.rejects(service.createOutboundCall({
+      mappingId: 12, idempotencyKey: "invalid-variable-01", phoneNumberId: "phone_789", number: "+14155550123",
+      variableValues: { unauthorized: "value" },
+    }), (error) => error.code === "vapi_variables_invalid");
+    assert.equal(providerCalls, 0);
   });
 
   it("refuses stale, incompatible, unsynced, or missing mappings before calling Vapi", async () => {

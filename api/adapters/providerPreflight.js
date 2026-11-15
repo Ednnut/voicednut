@@ -1123,15 +1123,16 @@ function runWebhookAuthCheck(provider, channel, config, options = {}) {
         suggestedFix: "Set PLIVO_WEBHOOK_VALIDATION to warn or strict.",
       };
     }
+    const hasPlivoAuthToken = Boolean(String(config?.plivo?.authToken || "").trim());
     const hasPlivoSecret = Boolean(String(config?.plivo?.webhookSecret || "").trim());
     const hasHmacSecret = Boolean(String(config?.apiAuth?.hmacSecret || "").trim());
-    if (mode === "strict" && !hasPlivoSecret && !hasHmacSecret) {
+    if (mode === "strict" && !hasPlivoAuthToken && !hasPlivoSecret && !hasHmacSecret) {
       return {
         status: CHECK_STATUS.FAIL,
         reason:
-          "Strict Plivo webhook validation requires PLIVO_WEBHOOK_SECRET or API_SECRET/API_HMAC_SECRET",
+          "Strict Plivo webhook validation requires PLIVO_AUTH_TOKEN, PLIVO_WEBHOOK_SECRET, or API_SECRET/API_HMAC_SECRET",
         suggestedFix:
-          "Set PLIVO_WEBHOOK_SECRET (or shared HMAC secret) or lower PLIVO_WEBHOOK_VALIDATION risk mode.",
+          "Set PLIVO_AUTH_TOKEN, PLIVO_WEBHOOK_SECRET (or shared HMAC secret), or lower PLIVO_WEBHOOK_VALIDATION risk mode.",
       };
     }
     if (options?.guards?.plivo !== true) {

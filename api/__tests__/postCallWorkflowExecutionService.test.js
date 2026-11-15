@@ -97,6 +97,103 @@ function createHarness(options = {}) {
 }
 
 describe("PostCallWorkflowExecutionService", () => {
+  it("durably enqueues approved workflow versions idempotently before dispatch", async () => {
+    const definition = makeDefinition([{ id: "done", type: "end" }]);
+    definition.business_id = "biz-42";
+    const workflowRow = {
+      workflow_id: definition.workflow_id,
+      version: 3,
+      business_id: "biz-42",
+      status: "approved",
+      trigger_event: "post_call_completed",
+      definition_json: JSON.stringify(definition),
+    };
+    const events = new Map();
+    const states = [];
+    const db = {
+      async listApprovedPostCallWorkflowDefinitions(triggerEvent, businessId) {
+        assert.deepEqual([triggerEvent, businessId], ["post_call_completed", "biz-42"]);
+        return [workflowRow];
+      },
+      async createPostCallWorkflowEvent(event) {
+        const existing = events.get(event.event_key);
+        if (existing) return existing;
+        const row = { ...event, status: "pending" };
+        events.set(event.event_key, row);
+        return row;
+      },
+      async updateCallState(callSid, state, data) { states.push({ callSid, state, data }); },
+    };
+    const service = new PostCallWorkflowExecutionService({
+      db,
+      definitionService: new PostCallWorkflowDefinitionService({ db }),
+      enabled: true,
+    });
+    service.reconcilePendingEvents = async () => 1;
+    const payload = {
+      trigger_event: "post_call_completed",
+      business_id: "biz-42",
+      call_sid: "call_42",
+      idempotency_key: "call-completed:call_42",
+      request_id: "req-42",
+      actor_id: "101",
+      transcript: "private transcript",
+    };
+
+    const first = await service.enqueueEvent(payload);
+    const second = await service.enqueueEvent(payload);
+
+    assert.equal(first.accepted, true);
+    assert.equal(first.matched, 1);
+    assert.equal(second.event_id, first.event_id);
+    assert.equal(events.size, 1);
+    const stored = [...events.values()][0];
+    assert.deepEqual(JSON.parse(stored.definition_versions_json), [{ workflow_id: "workflow_test", version: 3 }]);
+    assert.equal(stored.payload_json.includes("private transcript"), false);
+    const envelope = JSON.parse(stored.payload_json);
+    assert.equal(envelope.event_id, first.event_id);
+    assert.equal(envelope.event_type, "post_call_completed");
+    assert.equal(envelope.event_version, 1);
+    assert.equal(envelope.organization_id, "biz-42");
+    assert.equal(envelope.actor_id, "101");
+    assert.equal(envelope.correlation_id, "req-42");
+    assert.equal(envelope.aggregate_type, "call");
+    assert.equal(envelope.aggregate_id, "call_42");
+    assert.match(envelope.idempotency_key, /^sha256:[a-f0-9]{64}$/);
+    assert.equal(envelope.event_source, "voicednut.post_call_automation");
+    assert.ok(Number.isFinite(Date.parse(envelope.occurred_at)));
+    assert.ok(Number.isFinite(Date.parse(envelope.received_at)));
+    assert.equal(states[0].state, "post_call_automation_queued");
+    assert.equal(states[0].data.event_id, first.event_id);
+  });
+
+  it("allows explicit recovery only for dead-lettered workflow events", async () => {
+    const event = {
+      event_id: "event_dead",
+      call_sid: "call_dead",
+      business_id: "biz-42",
+      trigger_event: "post_call_completed",
+      status: "dead_letter",
+    };
+    const states = [];
+    const db = {
+      async getPostCallWorkflowEvent() { return event; },
+      async requeueDeadLetterPostCallWorkflowEvent() {
+        if (event.status !== "dead_letter") return 0;
+        event.status = "pending";
+        return 1;
+      },
+      async updateCallState(callSid, state, data) { states.push({ callSid, state, data }); },
+    };
+    const service = new PostCallWorkflowExecutionService({ db });
+    service.reconcilePendingEvents = async () => 1;
+
+    const recovered = await service.retryEvent("event_dead");
+    assert.equal(recovered.status, "pending");
+    assert.equal(states[0].state, "post_call_automation_queued");
+    await assert.rejects(service.retryEvent("event_dead"), (error) => error.code === "conflict");
+  });
+
   it("queues approved definitions idempotently and strips private content and credentials from stored payloads", async () => {
     const { service, runs } = createHarness();
     const payload = {
@@ -257,7 +354,12 @@ describe("PostCallWorkflowExecutionService", () => {
       enabled: true,
       db: {
         async listApprovedPostCallWorkflowDefinitions(...args) { scopeArgs = args; return [row]; },
-        async createPostCallWorkflowRun(input) { runs.push(input); return { row: input, created: true }; },
+        async createPostCallWorkflowRun(input) {
+          const prior = runs.find((run) => run.idempotency_key === input.idempotency_key);
+          if (prior) return { row: prior, created: false };
+          runs.push(input);
+          return { row: input, created: true };
+        },
       },
     });
     service.drain = async () => ({ processed: 0 });
@@ -275,6 +377,42 @@ describe("PostCallWorkflowExecutionService", () => {
     assert.equal(runs[0].idempotency_key, `workflow:${row.workflow_id}:call_e_result_ready:biz-42:${require("crypto").createHash("sha256").update("call_provider_123").digest("hex")}`);
     assert.equal(runs[0].payload_json.includes("private result"), false);
     assert.equal(runs[0].payload_json.includes("private transcript"), false);
+  });
+
+  it("routes automation-failure events to business-scoped workflows with idempotency", async () => {
+    const definition = makeDefinition([{ id: "done", type: "end" }], undefined, "post_call_automation_failed");
+    definition.business_id = "biz-42";
+    const row = { workflow_id: definition.workflow_id, version: 1, business_id: "biz-42", status: "approved", definition_json: JSON.stringify(definition) };
+    let scopeArgs;
+    const runs = [];
+    const service = new PostCallWorkflowExecutionService({
+      enabled: true,
+      db: {
+        async listApprovedPostCallWorkflowDefinitions(...args) { scopeArgs = args; return [row]; },
+        async createPostCallWorkflowRun(input) {
+          const prior = runs.find((run) => run.idempotency_key === input.idempotency_key);
+          if (prior) return { row: prior, created: false };
+          runs.push(input);
+          return { row: input, created: true };
+        },
+      },
+    });
+    service.drain = async () => ({ processed: 0 });
+    const event = {
+      trigger_event: "post_call_automation_failed", business_id: "biz-42", call_sid: "CA-42",
+      idempotency_key: "post-call-automation-failed:CA-42:automation_execution",
+      payload: { failure_stage: "automation_execution", error_code: "post_call_automation_failed" },
+    };
+    const first = await service.trigger(event);
+    const firstIdempotencyKey = runs[0].idempotency_key;
+    const second = await service.trigger(event);
+    assert.deepEqual(scopeArgs, ["post_call_automation_failed", "biz-42"]);
+    assert.equal(first.matched, 1);
+    assert.equal(runs.length, 1);
+    assert.equal(runs[0].business_id, "biz-42");
+    assert.equal(runs[0].trigger_event, "post_call_automation_failed");
+    assert.equal(runs[0].idempotency_key, firstIdempotencyKey);
+    assert.equal(second.runs[0].deduped, true);
   });
 
   it("does not query or enqueue result-ready workflows without a valid business scope", async () => {

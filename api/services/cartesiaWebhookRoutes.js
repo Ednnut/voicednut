@@ -15,10 +15,21 @@ function webhookError(code, message, status) {
 const safeEqual = safeCompareSecret;
 
 function normalizeEvent(body = {}) {
-  if (!body || typeof body !== 'object' || Array.isArray(body) || !EVENT_TYPES.has(body.type)) {
+  if (!body || typeof body !== 'object' || Array.isArray(body) || !body.type) {
     throw webhookError('cartesia_webhook_invalid', 'Cartesia webhook event is invalid', 400);
   }
   const event = normalizeCartesiaWebhookEvent(body);
+  if (event?.ignored) {
+    return {
+      ignored: true,
+      callId: String(body.call_id || '').trim(),
+      agentId: String(body.agent_id || '').trim(),
+      webhookId: String(body.webhook_id || '').trim(),
+      requestId: String(body.webhook_request_id || '').trim(),
+      timestamp: event.timestamp,
+      type: String(body.type || '').trim(),
+    };
+  }
   return {
     callId: event.providerCallId,
     agentId: String(body.agent_id || '').trim(),

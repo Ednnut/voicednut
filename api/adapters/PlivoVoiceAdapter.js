@@ -355,6 +355,18 @@ class PlivoVoiceAdapter {
       },
     );
   }
+
+  async getCall(callUuid) {
+    const normalized = String(callUuid || "").trim();
+    if (!normalized || normalized.length > 200) throw new Error("PlivoVoiceAdapter.getCall requires call UUID");
+    return this.executeVoiceRequest(
+      "get_call",
+      "GET",
+      `/v1/Account/${encodeURIComponent(this.authId)}/Call/${encodeURIComponent(normalized)}/`,
+      null,
+      { retryAttempts: 0, meta: { call_uuid: normalized } },
+    );
+  }
 }
 
 PlivoVoiceAdapter.extractPlivoCallUuid = extractPlivoCallUuid;

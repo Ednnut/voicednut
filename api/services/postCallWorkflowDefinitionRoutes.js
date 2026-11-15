@@ -53,6 +53,33 @@ function registerPostCallWorkflowDefinitionRoutes(app, options = {}) {
     }
   });
 
+  app.get("/post-call/workflows/events", requireAdminToken, async (req, res) => {
+    try {
+      const service = getWorkflowExecutionService(req, res);
+      if (!service) return;
+      const events = await service.listEvents({
+        status: String(req.query?.status || "").trim() || undefined,
+        trigger_event: String(req.query?.trigger_event || "").trim() || undefined,
+        business_id: String(req.query?.business_id || "").trim() || undefined,
+        limit: req.query?.limit,
+      });
+      res.json({ success: true, request_id: req.requestId || null, events });
+    } catch (error) {
+      sendApiError(res, routeErrorStatus(error), error.code || "post_call_workflow_events_failed", routeErrorMessage(error, "Workflow events could not be listed"), req.requestId);
+    }
+  });
+
+  app.post("/post-call/workflows/events/:event_id/retry", requireAdminToken, async (req, res) => {
+    try {
+      const service = getWorkflowExecutionService(req, res);
+      if (!service) return;
+      const event = await service.retryEvent(req.params.event_id);
+      res.json({ success: true, request_id: req.requestId || null, event });
+    } catch (error) {
+      sendApiError(res, routeErrorStatus(error), error.code || "post_call_workflow_event_retry_failed", routeErrorMessage(error, "Workflow event could not be retried"), req.requestId);
+    }
+  });
+
   app.get("/post-call/workflows/runs/:run_id", requireAdminToken, async (req, res) => {
     try {
       const service = getWorkflowExecutionService(req, res);

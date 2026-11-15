@@ -1,3 +1,66 @@
+const { EXECUTION_STATUSES, safeExecutionReference } = require("./executionContext");
+
+const EXECUTION_STEP_STATUSES = new Set(["started", "completed", "failed", "skipped", "requires_attention"]);
+const EXECUTION_RESULTS = new Set(["accepted", "rejected", "pending", "not_applicable", "unknown"]);
+const EXECUTION_FAILURE_CLASSES = new Set(["retryable", "non_retryable", "ambiguous"]);
+
+function safeIsoTimestamp(value) {
+  return typeof value === "string" && Number.isFinite(Date.parse(value))
+    ? new Date(value).toISOString()
+    : null;
+}
+
+function normalizeExecutionProgress(states = [], createdState = null) {
+  const recentStates = Array.isArray(states) ? states : [];
+  const contextState = recentStates.find((entry) =>
+    entry?.data?.execution_context && typeof entry.data.execution_context === "object" && !Array.isArray(entry.data.execution_context));
+  const rawContext = contextState?.data?.execution_context || createdState?.execution_context;
+  if (!rawContext) return null;
+  const context = {
+    internal_execution_id: safeExecutionReference(rawContext.internal_execution_id),
+    request_id: safeExecutionReference(rawContext.request_id),
+    internal_call_id: safeExecutionReference(rawContext.internal_call_id),
+    organization_id: safeExecutionReference(rawContext.organization_id),
+    business_id: safeExecutionReference(rawContext.business_id),
+    actor_id: safeExecutionReference(rawContext.actor_id),
+    agent_id: safeExecutionReference(rawContext.agent_id),
+    agent_version: Number.isSafeInteger(rawContext.agent_version) && rawContext.agent_version > 0
+      ? rawContext.agent_version
+      : null,
+    provider: safeExecutionReference(rawContext.provider)?.toLowerCase() || null,
+    provider_call_id: safeExecutionReference(rawContext.provider_call_id),
+    workflow_id: safeExecutionReference(rawContext.workflow_id),
+    campaign_id: safeExecutionReference(rawContext.campaign_id),
+    execution_type: safeExecutionReference(rawContext.execution_type),
+    status: EXECUTION_STATUSES.includes(rawContext.status) ? rawContext.status : null,
+    current_stage: safeExecutionReference(rawContext.current_stage),
+    created_at: safeIsoTimestamp(rawContext.created_at),
+    updated_at: safeIsoTimestamp(rawContext.updated_at),
+    error_classification: EXECUTION_FAILURE_CLASSES.has(rawContext.error_classification) ? rawContext.error_classification : null,
+    idempotency_reference: /^sha256:[a-f0-9]{64}$/.test(String(rawContext.idempotency_reference || ""))
+      ? rawContext.idempotency_reference
+      : null,
+  };
+  const steps = recentStates
+    .filter((entry) => entry?.state === "execution_step" && entry.data && typeof entry.data === "object" && !Array.isArray(entry.data))
+    .slice(0, 20)
+    .map(({ data }) => ({
+      execution_id: safeExecutionReference(data.execution_id),
+      correlation_id: safeExecutionReference(data.correlation_id),
+      call_id: safeExecutionReference(data.call_id),
+      step_name: safeExecutionReference(data.step_name),
+      status: EXECUTION_STEP_STATUSES.has(data.status) ? data.status : null,
+      started_at: safeIsoTimestamp(data.started_at),
+      completed_at: safeIsoTimestamp(data.completed_at),
+      result: EXECUTION_RESULTS.has(data.result) ? data.result : null,
+      error_classification: EXECUTION_FAILURE_CLASSES.has(data.error_classification) ? data.error_classification : null,
+      retry_count: Number.isSafeInteger(data.retry_count) && data.retry_count >= 0 ? Math.min(data.retry_count, 1000) : 0,
+      related_entity: safeExecutionReference(data.related_entity),
+    }))
+    .reverse();
+  return { context, steps };
+}
+
 function createGetCallStatusHandler(ctx = {}) {
   const {
     isSafeId,
@@ -24,7 +87,25 @@ function createGetCallStatusHandler(ctx = {}) {
       if (!call) {
         return res.status(404).json({ error: "Call not found" });
       }
-      const normalizedCall = normalizeCallRecordForApi(call);
+      const requesterChatId = String(
+        req.headers?.["x-telegram-chat-id"] ||
+          req.query?.telegram_chat_id ||
+          req.query?.chat_id ||
+          "",
+      ).trim();
+      if (
+        requesterChatId &&
+        String(call.user_chat_id || "") !== requesterChatId
+      ) {
+        return res.status(403).json({ error: "Not authorized for this call" });
+      }
+      const createdState = await db
+        .getLatestCallState(callSid, "call_created")
+        .catch(() => null);
+      const normalizedCall = normalizeCallRecordForApi({
+        ...call,
+        call_created_state: createdState || null,
+      });
       if (!normalizedCall.digit_summary) {
         const digitEvents = await db.getCallDigits(callSid).catch(() => []);
         const digitSummary = buildDigitSummary(digitEvents);
@@ -33,6 +114,9 @@ function createGetCallStatusHandler(ctx = {}) {
       }
 
       const recentStates = await db.getCallStates(callSid, { limit: 15 });
+      const executionStates = typeof db.getCallExecutionStates === "function"
+        ? await db.getCallExecutionStates(callSid, { limit: 40 }).catch(() => recentStates)
+        : recentStates;
 
       const notificationStatus = await new Promise((resolve, reject) => {
         db.db.all(
@@ -83,6 +167,7 @@ function createGetCallStatusHandler(ctx = {}) {
           timing_metrics: timingMetrics,
         },
         recent_states: recentStates,
+        execution_progress: normalizeExecutionProgress(executionStates, createdState),
         live_console:
           webhookService &&
           typeof webhookService.getLiveConsoleSnapshot === "function"
@@ -163,6 +248,46 @@ function createProviderCompatibilityHandler(ctx = {}) {
       return res.status(500).json({
         success: false,
         error: "Failed to compute provider compatibility report",
+      });
+    }
+  };
+}
+
+function createProviderRecommendationHandler(ctx = {}) {
+  const { getProviderRecommendation } = ctx;
+  return function handleProviderRecommendation(req, res) {
+    if (typeof getProviderRecommendation !== "function") {
+      return res.status(503).json({
+        success: false,
+        error: { code: "provider_recommendation_unavailable", message: "Provider recommendations are unavailable" },
+        request_id: req.requestId || null,
+      });
+    }
+    const operation = String(req.query?.operation || "outbound_call.create").trim().toLowerCase();
+    const preferredProvider = String(req.query?.preferred_provider || "").trim().toLowerCase() || null;
+    const rawCapabilities = req.query?.required_capabilities ?? req.query?.capability ?? [];
+    const requiredCapabilities = (Array.isArray(rawCapabilities) ? rawCapabilities : [rawCapabilities])
+      .flatMap((value) => String(value || "").split(","))
+      .map((value) => value.trim().toLowerCase())
+      .filter(Boolean);
+    if (operation.length > 80 || (preferredProvider && preferredProvider.length > 80) || requiredCapabilities.length > 8) {
+      return res.status(400).json({
+        success: false,
+        error: { code: "provider_recommendation_input_invalid", message: "Provider recommendation input is invalid" },
+        request_id: req.requestId || null,
+      });
+    }
+    try {
+      const recommendation = getProviderRecommendation({ operation, preferredProvider, requiredCapabilities });
+      return res.json({ success: true, request_id: req.requestId || null, ...recommendation });
+    } catch (error) {
+      const code = ["provider_operation_unknown", "provider_operation_not_recommendable", "provider_capability_limit_exceeded", "provider_capability_unknown"]
+        .includes(error?.code) ? error.code : "provider_recommendation_failed";
+      const status = code === "provider_recommendation_failed" ? 500 : 400;
+      return res.status(status).json({
+        success: false,
+        error: { code, message: status === 400 ? error.message : "Provider recommendation failed" },
+        request_id: req.requestId || null,
       });
     }
   };
@@ -492,6 +617,131 @@ function createGptObservabilityHandler(ctx = {}) {
   };
 }
 
+function createAnomalyObservabilityHandler(ctx = {}) {
+  const { config, hasAdminToken } = ctx;
+  return async function handleAnomalyObservability(req, res) {
+    try {
+      const db = typeof ctx.getDb === "function" ? ctx.getDb() : ctx.db;
+      if (!db || typeof db.getPlatformAnomalyMetrics !== "function") {
+        return res.status(503).json({ success: false, error: "Anomaly observability is unavailable" });
+      }
+      const adminOk = typeof hasAdminToken === "function" && hasAdminToken(req);
+      // HMAC-authenticated routes have already passed the global request middleware.
+      // Re-verifying here would consume a strict replay key twice for one request.
+      if (!config.apiAuth?.hmacSecret && !adminOk) return res.status(401).json({ success: false, error: "Unauthorized" });
+
+      const windowMinutes = parseWindowMinutes(req.query?.window_minutes, 60);
+      const metrics = await db.getPlatformAnomalyMetrics(windowMinutes);
+      let apiAuthFailures = { window_minutes: windowMinutes, total: 0, by_reason: {}, scope: "unavailable" };
+      try {
+        if (typeof ctx.flushApiAuthFailureMetrics === "function") await ctx.flushApiAuthFailureMetrics();
+        if (typeof ctx.getApiAuthFailureMetrics === "function") apiAuthFailures = await ctx.getApiAuthFailureMetrics(windowMinutes);
+      } catch (_) {
+        apiAuthFailures = typeof ctx.getLocalApiAuthFailureMetrics === "function"
+          ? ctx.getLocalApiAuthFailureMetrics(windowMinutes)
+          : apiAuthFailures;
+      }
+      const configured = config.anomalyDetection || {};
+      const threshold = (value, fallback, min = 1, max = 1000000) => {
+        const parsed = Number(value);
+        return Number.isFinite(parsed) ? Math.max(min, Math.min(max, parsed)) : fallback;
+      };
+      const thresholds = {
+        call_volume_min_current: threshold(configured.callVolumeMinCurrent, 25, 1, 1000000),
+        call_volume_growth_factor: threshold(configured.callVolumeGrowthFactor, 3, 1.1, 100),
+        provider_open_count: threshold(configured.providerOpenCount, 1, 1, 10),
+        provider_call_failures: threshold(configured.providerFailureCount, 5, 1, 100000),
+        dispatch_retry_count: threshold(configured.dispatchRetryCount, 5, 1, 100000),
+        campaign_dispatches_today: threshold(configured.campaignDispatchCount, 100, 1, 1000000),
+        webhook_failure_count: threshold(configured.webhookFailureCount, 5, 1, 100000),
+        workflow_failure_count: threshold(configured.workflowFailureCount, 3, 1, 100000),
+        workflow_retry_count: threshold(configured.workflowRetryCount, 10, 1, 100000),
+        authorization_alert_count: threshold(configured.authAlertCount, 3, 1, 100000),
+        api_authentication_failures: threshold(configured.apiAuthFailureCount, 10, 1, 100000),
+        miniapp_authentication_failures: threshold(configured.miniAppAuthFailureCount, 10, 1, 100000),
+        admin_token_authentication_failures: threshold(configured.adminAuthFailureCount, 10, 1, 100000),
+        webhook_authentication_failures: threshold(configured.webhookAuthFailureCount, 10, 1, 100000),
+      };
+      const alerts = [];
+      const currentCalls = Number(metrics.calls?.current_window) || 0;
+      const previousCalls = Number(metrics.calls?.previous_window) || 0;
+      const volumeBaseline = Math.max(1, previousCalls);
+      if (currentCalls >= thresholds.call_volume_min_current && currentCalls >= volumeBaseline * thresholds.call_volume_growth_factor) {
+        alerts.push({ code: "call_volume_surge", severity: "medium", current: currentCalls, previous_window: previousCalls,
+          threshold: thresholds.call_volume_min_current, growth_factor: thresholds.call_volume_growth_factor });
+      }
+      if ((Number(metrics.provider_open_count) || 0) >= thresholds.provider_open_count) {
+        alerts.push({ code: "provider_circuit_open", severity: "high", current: Number(metrics.provider_open_count) || 0,
+          threshold: thresholds.provider_open_count, providers: metrics.open_providers || [] });
+      }
+      const providerFailureCount = Number(metrics.provider_call_error_count) || 0;
+      if (providerFailureCount >= thresholds.provider_call_failures) {
+        alerts.push({ code: "provider_call_failures", severity: "high", current: providerFailureCount,
+          threshold: thresholds.provider_call_failures, providers: metrics.provider_call_errors || [] });
+      }
+      const apiAuthFailureCount = Number(apiAuthFailures?.total) || 0;
+      if (apiAuthFailureCount >= thresholds.api_authentication_failures) {
+        alerts.push({ code: "api_authentication_failures", severity: "high", current: apiAuthFailureCount,
+          threshold: thresholds.api_authentication_failures, by_reason: apiAuthFailures.by_reason || {} });
+      }
+      const miniAppAuthFailures = apiAuthFailures?.miniapp_session || { total: 0, by_reason: {} };
+      const miniAppAuthFailureCount = Number(miniAppAuthFailures.total) || 0;
+      if (miniAppAuthFailureCount >= thresholds.miniapp_authentication_failures) {
+        alerts.push({ code: "miniapp_authentication_failures", severity: "high", current: miniAppAuthFailureCount,
+          threshold: thresholds.miniapp_authentication_failures, by_reason: miniAppAuthFailures.by_reason || {} });
+      }
+      const adminTokenFailures = apiAuthFailures?.admin_token || { total: 0, by_reason: {} };
+      const adminTokenFailureCount = Number(adminTokenFailures.total) || 0;
+      if (adminTokenFailureCount >= thresholds.admin_token_authentication_failures) {
+        alerts.push({ code: "admin_token_authentication_failures", severity: "high", current: adminTokenFailureCount,
+          threshold: thresholds.admin_token_authentication_failures, by_reason: adminTokenFailures.by_reason || {} });
+      }
+      const webhookAuthFailures = apiAuthFailures?.webhook_auth || { total: 0, by_reason: {} };
+      const webhookAuthFailureCount = Number(webhookAuthFailures.total) || 0;
+      if (webhookAuthFailureCount >= thresholds.webhook_authentication_failures) {
+        alerts.push({ code: "webhook_authentication_failures", severity: "high", current: webhookAuthFailureCount,
+          threshold: thresholds.webhook_authentication_failures, by_reason: webhookAuthFailures.by_reason || {} });
+      }
+      const countRules = [
+        ["call_dispatch_retries", "dispatch_retry_count", "dispatch_retry_count", "high"],
+        ["campaign_consumption_high", "campaign_dispatches_today", "campaign_dispatches_today", "medium"],
+        ["outgoing_webhook_failures", "webhook_failure_count", "webhook_failure_count", "high"],
+        ["workflow_failures_high", "workflow_failure_count", "workflow_failure_count", "medium"],
+        ["workflow_retries_high", "workflow_retry_count", "workflow_retry_count", "medium"],
+        ["authorization_failure_alerts", "authorization_alert_count", "authorization_alert_count", "high"],
+      ];
+      for (const [code, metricName, thresholdName, severity] of countRules) {
+        const current = Number(metrics[metricName]) || 0;
+        if (current >= thresholds[thresholdName]) alerts.push({ code, severity, current, threshold: thresholds[thresholdName] });
+      }
+      return res.json({
+        success: true,
+        timestamp: new Date().toISOString(),
+        window_minutes: windowMinutes,
+        informational_only: true,
+        thresholds,
+        alerts,
+        summary: { ...metrics, api_hmac_auth_failures: apiAuthFailures,
+          miniapp_session_auth_failures: miniAppAuthFailures, admin_token_auth_failures: adminTokenFailures,
+          webhook_auth_failures: webhookAuthFailures },
+        data_notes: {
+          provider_failures: "Includes latest provider diagnostic circuit snapshots and failed/error call rows with a persisted error code grouped by selected provider. It excludes failures without a local call error record.",
+          campaign_consumption: "Counts CALL-E recipients with a local call ID dispatched during the current UTC day; active reservations are reported separately.",
+          authorization_failures: "The authorization_failure_alerts metric counts configured Mini App threshold-alert events. Mini App session denials are separately reason-bucketed without user, route, token, or request identifiers.",
+          api_authentication_failures: "Counts global HMAC middleware rejections only; bypass webhook routes and webhook signature failures are excluded. Counts are batched from each API process into shared SQLite buckets; at most the latest flush interval can be missing after abrupt process termination.",
+          miniapp_authentication_failures: "Counts missing, invalid, revoked, replayed, or unauthorized Mini App sessions/init data across processes sharing the SQLite file. Counts are reason-bucketed, omit user, route, token, and request identifiers, and are retained up to 24 hours.",
+          admin_token_authentication_failures: "Counts missing or invalid admin-token attempts at centrally guarded routes across processes sharing SQLite. Token values, route names, and request identifiers are omitted; counts are retained up to 24 hours.",
+          webhook_authentication_failures: "Counts rejected webhook authentication verifiers across guarded webhook routes as a single fixed reason. Provider, route, signature, request, and payload values are omitted; counts are retained up to 24 hours.",
+          workflow_retries: "Counts durable post-call workflow event rows with more than one processing attempt in the selected window. It does not count action-level retries performed by external systems.",
+        },
+      });
+    } catch (error) {
+      console.error("Error fetching platform anomaly summary:", error);
+      return res.status(500).json({ success: false, error: "Failed to fetch platform anomaly summary" });
+    }
+  };
+}
+
 function registerStatusRoutes(app, ctx = {}) {
   const requireOutboundAuthorization =
     typeof ctx.requireOutboundAuthorization === "function"
@@ -500,12 +750,19 @@ function registerStatusRoutes(app, ctx = {}) {
   const handleGetCallStatus = createGetCallStatusHandler(ctx);
   const handleSystemStatus = createSystemStatusHandler(ctx);
   const handleProviderCompatibility = createProviderCompatibilityHandler(ctx);
+  const handleProviderRecommendation = createProviderRecommendationHandler(ctx);
   const handleHealth = createHealthHandler(ctx);
   const handleGptObservability = createGptObservabilityHandler(ctx);
+  const handleAnomalyObservability = createAnomalyObservabilityHandler(ctx);
+  const requireAdminToken = typeof ctx.requireAdminToken === "function"
+    ? ctx.requireAdminToken
+    : (_req, _res, next) => next();
 
   app.get("/api/calls/:callSid/status", requireOutboundAuthorization, handleGetCallStatus);
   app.get("/api/observability/gpt", requireOutboundAuthorization, handleGptObservability);
+  app.get("/api/observability/anomalies", requireOutboundAuthorization, handleAnomalyObservability);
   app.get("/status/provider-compat", requireOutboundAuthorization, handleProviderCompatibility);
+  app.get("/admin/provider/recommendation", requireAdminToken, handleProviderRecommendation);
   app.get("/ready", handleHealth);
   app.get("/status", handleSystemStatus);
   app.get("/health", handleHealth);
@@ -515,5 +772,9 @@ module.exports = {
   registerStatusRoutes,
   __testables: {
     createHealthHandler,
+    createGetCallStatusHandler,
+    createProviderRecommendationHandler,
+    createAnomalyObservabilityHandler,
+    normalizeExecutionProgress,
   },
 };

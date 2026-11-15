@@ -106,7 +106,30 @@ describe("CrmContactSyncService", () => {
 
     await assert.rejects(
       () => service.upsertContact({ contact: { name: "No Identity" } }),
-      /requires an email, phone, external_id, or contact_id/,
+      /requires an email, external_id, or contact_id/,
     );
+  });
+
+  it("keeps phone-only contact data but refuses to use it as a deduplication identity", async () => {
+    const records = [];
+    const service = new CrmContactSyncService({
+      db: { upsertCrmContactSyncRecord: async (record) => records.push(record) },
+      logger: { error: () => {}, warn: () => {}, log: () => {} },
+    });
+    const identity = service.buildContactIdentity({ phone: "+1 555 0100", first_name: "Ada" });
+
+    assert.equal(identity.phone, "+1 555 0100");
+    assert.equal(identity.identity_key, "");
+    await assert.rejects(
+      () => service.upsertContact({ provider: "stub", contact: { phone: "+1 555 0100", first_name: "Ada" } }),
+      (error) => error.code === "validation_error" && /phone alone is not a stable identity/.test(error.message),
+    );
+    assert.deepEqual(records, []);
+  });
+
+  it("prefers stable local or external identifiers over a phone attribute", () => {
+    const service = new CrmContactSyncService({ logger: { error: () => {}, warn: () => {}, log: () => {} } });
+    assert.equal(service.buildContactIdentity({ phone: "+1 555 0100", external_id: "crm-42" }).identity_key, "crm-42");
+    assert.equal(service.buildContactIdentity({ phone: "+1 555 0100", contact_id: "local-42" }).identity_key, "local-42");
   });
 });

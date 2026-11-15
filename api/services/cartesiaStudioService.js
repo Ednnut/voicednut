@@ -3,6 +3,7 @@
 const crypto = require("node:crypto");
 const { isIP } = require("node:net");
 const { MAX_REALTIME_STT_AUDIO_BYTES } = require("./cartesiaStudioClient");
+const { isCartesiaTtsModelId } = require("./cartesiaSpeechSettingsStore");
 
 const ID_PATTERN = /^[A-Za-z0-9._:-]{1,200}$/;
 const NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9 _.-]{0,79}$/;
@@ -277,7 +278,9 @@ function normalizeVoice(voice = {}) {
   return {
     id,
     name: safeText(voice.name, 120, "Unnamed Cartesia voice"),
+    description: safeText(voice.description, 240) || null,
     language: safeText(voice.language, 20) || null,
+    gender: safeText(voice.gender, 32) || null,
     access: ["private", "public"].includes(String(voice.access || "").toLowerCase()) ? String(voice.access).toLowerCase() : null,
     isOwner: voice.is_owner === true || voice.isOwner === true,
     isPro: voice.is_pro === true || voice.isPro === true,
@@ -392,18 +395,45 @@ function validateTtsPreview(input = {}) {
   if (!Number.isFinite(speed) || speed < 0.6 || speed > 1.5 || !Number.isFinite(volume) || volume < 0.5 || volume > 2) {
     throw serviceError("cartesia_tts_preview_config_invalid", "Speed must be 0.6–1.5 and volume must be 0.5–2", 400);
   }
-  const outputFormat = input.outputFormat || { container: "wav", encoding: "pcm_s16le", sample_rate: 24000 };
+  const rawOutputFormat = input.outputFormat || input.output_format;
+  const outputFormat = typeof rawOutputFormat === "string"
+    ? { container: rawOutputFormat }
+    : rawOutputFormat || { container: "wav", encoding: "pcm_s16le", sample_rate: 24000 };
   const allowedContainers = new Set(["wav", "mp3", "raw"]);
   const allowedEncodings = new Set(["pcm_s16le", "pcm_f32le", "pcm_mulaw", "pcm_alaw"]);
   const allowedRates = new Set([8000, 16000, 22050, 24000, 44100, 48000]);
-  if (!allowedContainers.has(outputFormat.container) || !allowedEncodings.has(outputFormat.encoding) || !allowedRates.has(Number(outputFormat.sample_rate))) {
+  const container = String(outputFormat.container || "");
+  const sampleRate = Number(outputFormat.sample_rate || 24000);
+  const format = { container };
+  if (!allowedContainers.has(container) || !allowedRates.has(sampleRate)) {
     throw serviceError("cartesia_tts_preview_format_invalid", "Unsupported Cartesia audio output format", 400);
+  }
+  if (container === "mp3") {
+    if (Object.keys(outputFormat).some((key) => !["container", "sample_rate", "bit_rate"].includes(key))) {
+      throw serviceError("cartesia_tts_preview_format_invalid", "MP3 output contains unsupported format fields", 400);
+    }
+    const bitrate = Number(outputFormat.bit_rate || 128000);
+    if (![32000, 64000, 96000, 128000, 192000].includes(bitrate)) {
+      throw serviceError("cartesia_tts_preview_format_invalid", "Unsupported MP3 bitrate", 400);
+    }
+    format.sample_rate = sampleRate;
+    format.bit_rate = bitrate;
+  } else {
+    if (Object.keys(outputFormat).some((key) => !["container", "sample_rate", "encoding"].includes(key))) {
+      throw serviceError("cartesia_tts_preview_format_invalid", "Audio output contains unsupported format fields", 400);
+    }
+    const encoding = String(outputFormat.encoding || "pcm_s16le");
+    if (!allowedEncodings.has(encoding)) {
+      throw serviceError("cartesia_tts_preview_format_invalid", "Unsupported Cartesia audio encoding", 400);
+    }
+    format.encoding = encoding;
+    format.sample_rate = sampleRate;
   }
   const body = {
     model_id: modelId,
     transcript,
     voice: voiceId,
-    output_format: { container: outputFormat.container, encoding: outputFormat.encoding, sample_rate: Number(outputFormat.sample_rate) },
+    output_format: format,
     generation_config: { speed, volume },
   };
   const emotion = safeText(input.emotion || input.generationConfig?.emotion || input.generation_config?.emotion, 32).toLowerCase();
@@ -678,8 +708,33 @@ class CartesiaStudioService {
   }
 
   async listVoices(query = {}) {
-    const result = await this.client.listVoices({ isOwner: query.isOwner !== false, limit: query.limit, startingAfter: query.startingAfter });
-    return { voices: listFrom(result, "voices", "data", "summaries").slice(0, 100).map(normalizeVoice).filter(Boolean) };
+    const limit = query.limit === undefined ? 20 : Number(query.limit);
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw serviceError("cartesia_voice_query_invalid", "Voice page size must be between 1 and 100", 400);
+    const q = safeText(query.q, 100);
+    const language = safeText(query.language, 24);
+    const gender = safeText(query.gender, 32);
+    const startingAfter = safeText(query.starting_after || query.startingAfter, 200);
+    const endingBefore = safeText(query.ending_before || query.endingBefore, 200);
+    if ((query.q !== undefined && (!q || String(query.q).length > 100)) ||
+        (query.language !== undefined && (!language || String(query.language).length > 24)) ||
+        (query.gender !== undefined && !new Set(["masculine", "feminine", "gender_neutral"]).has(gender)) ||
+        (startingAfter && endingBefore)) {
+      throw serviceError("cartesia_voice_query_invalid", "Voice search or pagination options are invalid", 400);
+    }
+    const result = await this.client.listVoices({
+      isOwner: query.isOwner === true || query.is_owner === "true",
+      limit,
+      ...(q ? { q } : {}),
+      ...(language ? { language } : {}),
+      ...(gender ? { gender } : {}),
+      ...(startingAfter ? { startingAfter } : {}),
+      ...(endingBefore ? { endingBefore } : {}),
+    });
+    return {
+      voices: listFrom(result, "voices", "data", "summaries").slice(0, 100).map(normalizeVoice).filter(Boolean),
+      hasMore: result?.has_more === true || result?.hasMore === true,
+      nextPage: typeof (result?.next_page || result?.nextPage) === "string" ? (result.next_page || result.nextPage) : null,
+    };
   }
   async listModels(query = {}) {
     const capability = safeText(query.capability, 12).toLowerCase();
@@ -701,7 +756,13 @@ class CartesiaStudioService {
         const supportedLanguages = Array.isArray(model?.supported_languages)
           ? [...new Set(model.supported_languages.map((language) => safeText(language, 20)).filter(Boolean))].slice(0, 100)
           : [];
-        return { id, capability: modelCapability, modes, supportedLanguages };
+        return {
+          id,
+          capability: modelCapability,
+          modes,
+          supportedLanguages,
+          callCompatible: modelCapability === "tts" && isCartesiaTtsModelId(id),
+        };
       }).filter(Boolean),
     };
   }

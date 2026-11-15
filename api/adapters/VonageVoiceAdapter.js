@@ -403,6 +403,16 @@ class VonageVoiceAdapter {
       },
     );
   }
+
+  async getCall(callUuid) {
+    const normalized = String(callUuid || "").trim();
+    if (!normalized || normalized.length > 200) throw new Error("VonageVoiceAdapter.getCall requires call UUID");
+    return this.executeVoiceOperation(
+      "get_call",
+      () => this.client.voice.getCall(normalized),
+      { timeoutLabel: "vonage_get_call_timeout", retryAttempts: 0, meta: { call_uuid: normalized } },
+    );
+  }
 }
 
 module.exports = VonageVoiceAdapter;

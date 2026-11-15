@@ -18,7 +18,9 @@ function makeResponse() {
 
 function makeHarness(overrides = {}) {
   const routes = new Map();
-  const app = Object.fromEntries(['get', 'post', 'patch', 'delete'].map((verb) => [verb, (path, ...handlers) => routes.set(`${verb.toUpperCase()} ${path}`, handlers)]));
+  const verbs = ['get', 'post', 'patch', 'delete'];
+  if (overrides.withPut) verbs.push('put');
+  const app = Object.fromEntries(verbs.map((verb) => [verb, (path, ...handlers) => routes.set(`${verb.toUpperCase()} ${path}`, handlers)]));
   const limiter = () => {};
   const authorization = () => {};
   const actorAssertion = () => {};
@@ -64,6 +66,14 @@ function makeHarness(overrides = {}) {
     cartesiaApprovalLimiter: limiter, requireOutboundAuthorization: authorization,
     requireCallEActorAssertion: actorAssertion,
     async isCartesiaAdminActor(actorId) { return actorId === '7001'; },
+    db: overrides.db || {
+      async hasCallTemplateBusinessId(businessId) { return businessId === 'biz-1'; },
+      async getCallEBusinessOperator(_businessId, actorId) {
+        return actorId === '8001' ? { role: 'call_operator' }
+          : actorId === '8002' ? { role: 'policy_manager' } : null;
+      },
+    },
+    cartesiaSpeechSettingsStore: overrides.speechSettingsStore,
     createCartesiaStudioService() { return methods; },
     sendApiError(res, status, code, message) { return res.status(status).json({ success: false, code, error: message }); },
   }, { raw(options) { return Object.assign(() => {}, { options }); } });
@@ -71,6 +81,139 @@ function makeHarness(overrides = {}) {
 }
 
 describe('Cartesia Studio API routes', () => {
+  it('protects the global speech profile and requires explicit confirmations for save and reset', async () => {
+    const calls = [];
+    const speechSettingsStore = {
+      async getProfile() { return { voice_id: 'voice_saved' }; },
+      async save(profile, studio) { calls.push(['save', profile, studio]); return { profile }; },
+      async reset() { calls.push(['reset']); return { profile: { voice_id: 'voice_default' } }; },
+    };
+    const { routes, methods, limiter, authorization, actorAssertion } = makeHarness({ withPut: true, speechSettingsStore });
+    const getHandlers = routes.get('GET /api/cartesia/studio/speech-profile');
+    assert.deepEqual(getHandlers.slice(0, 3), [limiter, authorization, actorAssertion]);
+    const denied = makeResponse();
+    await getHandlers.at(-1)({ callEActorId: '7002' }, denied);
+    assert.equal(denied.statusCode, 403);
+    const allowed = makeResponse();
+    await getHandlers.at(-1)({ callEActorId: '7001' }, allowed);
+    assert.deepEqual(allowed.body, { success: true, profile: { voice_id: 'voice_saved' } });
+
+    const put = routes.get('PUT /api/cartesia/studio/speech-profile').at(-1);
+    const missingConfirmation = makeResponse();
+    await put({ callEActorId: '7001', body: { profile: { voice_id: 'voice_new' } } }, missingConfirmation);
+    assert.equal(missingConfirmation.statusCode, 400);
+    assert.equal(calls.length, 0);
+    const saved = makeResponse();
+    await put({
+      callEActorId: '7001',
+      body: { profile: { voice_id: 'voice_new' }, confirmation_phrase: 'SAVE CARTESIA TTS PROFILE' },
+    }, saved);
+    assert.equal(saved.statusCode, 200);
+    assert.deepEqual(calls[0], ['save', { voice_id: 'voice_new' }, methods]);
+
+    const reset = routes.get('POST /api/cartesia/studio/speech-profile/reset').at(-1);
+    const resetDenied = makeResponse();
+    await reset({ callEActorId: '7001', body: {} }, resetDenied);
+    assert.equal(resetDenied.statusCode, 400);
+    assert.equal(calls.length, 1);
+    const resetAllowed = makeResponse();
+    await reset({ callEActorId: '7001', body: { confirmation_phrase: 'RESET CARTESIA TTS PROFILE' } }, resetAllowed);
+    assert.equal(resetAllowed.statusCode, 200);
+    assert.deepEqual(calls[1], ['reset']);
+  });
+
+  it('scopes speech settings to a registered business and enforces business roles', async () => {
+    const calls = [];
+    const speechSettingsStore = {
+      async getBusinessProfile(businessId) {
+        calls.push(['read', businessId]);
+        return { voice_id: `voice_${businessId}`, source: 'business' };
+      },
+      async saveBusinessProfile(businessId, profile, studio) {
+        calls.push(['save', businessId, profile, studio]);
+        return { profile };
+      },
+      async resetBusinessProfile(businessId) {
+        calls.push(['reset', businessId]);
+        return { profile: { voice_id: 'default' } };
+      },
+    };
+    const { routes, methods } = makeHarness({ withPut: true, speechSettingsStore });
+    const get = routes.get('GET /api/cartesia/studio/speech-profile').at(-1);
+    const read = makeResponse();
+    await get({ query: { business_id: 'biz-1' }, callEActorId: '8001' }, read);
+    assert.deepEqual(read.body, {
+      success: true,
+      profile: { voice_id: 'voice_biz-1', source: 'business' },
+      business_id: 'biz-1',
+    });
+
+    const put = routes.get('PUT /api/cartesia/studio/speech-profile').at(-1);
+    const operatorWrite = makeResponse();
+    await put({
+      callEActorId: '8001',
+      body: {
+        business_id: 'biz-1',
+        profile: { voice_id: 'voice_new' },
+        confirmation_phrase: 'SAVE CARTESIA TTS PROFILE',
+      },
+    }, operatorWrite);
+    assert.equal(operatorWrite.statusCode, 403);
+    assert.deepEqual(calls, [['read', 'biz-1']]);
+
+    const managerWrite = makeResponse();
+    await put({
+      callEActorId: '8002',
+      body: {
+        business_id: 'biz-1',
+        profile: { voice_id: 'voice_new' },
+        confirmation_phrase: 'SAVE CARTESIA TTS PROFILE',
+      },
+    }, managerWrite);
+    assert.equal(managerWrite.statusCode, 200);
+    assert.deepEqual(calls[1], ['save', 'biz-1', { voice_id: 'voice_new' }, methods]);
+
+    const unregistered = makeResponse();
+    await get({ query: { business_id: 'biz-unknown' }, callEActorId: '7001' }, unregistered);
+    assert.equal(unregistered.statusCode, 404);
+  });
+
+  it('allows business members to browse voices and generate only scoped previews', async () => {
+    const calls = [];
+    const { routes } = makeHarness({
+      methods: {
+        async listVoices(query) { calls.push(['voices', query]); return { voices: [{ id: 'voice_1' }] }; },
+        async synthesizePreview(input) { calls.push(['preview', input]); return { audioBase64: 'bW9jaw==', byteLength: 4 }; },
+      },
+    });
+    const voices = routes.get('GET /api/cartesia/studio/voices').at(-1);
+    const allowed = makeResponse();
+    await voices({ query: { business_id: 'biz-1', limit: '8' }, callEActorId: '8001' }, allowed);
+    assert.equal(allowed.statusCode, 200);
+    assert.deepEqual(calls[0], ['voices', { business_id: 'biz-1', limit: '8' }]);
+
+    const denied = makeResponse();
+    await voices({ query: { limit: '8' }, callEActorId: '8001' }, denied);
+    assert.equal(denied.statusCode, 403);
+    assert.equal(calls.length, 1);
+
+    const preview = routes.get('POST /api/cartesia/studio/tts-preview').at(-1);
+    const previewResponse = makeResponse();
+    await preview({
+      callEActorId: '8001',
+      body: {
+        business_id: 'biz-1',
+        confirmation_phrase: 'GENERATE CARTESIA TTS PREVIEW',
+        voice_id: 'voice_1',
+        transcript: 'Synthetic preview text.',
+      },
+    }, previewResponse);
+    assert.equal(previewResponse.statusCode, 200);
+    assert.equal(calls[1][0], 'preview');
+    assert.equal(calls[1][1].business_id, undefined);
+    assert.equal(calls[1][1].voice_id, 'voice_1');
+  });
+
   it('protects reads with limiter, API authorization, actor assertion, and admin verification', async () => {
     const { routes, limiter, authorization, actorAssertion } = makeHarness();
     const handlers = routes.get('GET /api/cartesia/studio/voices');

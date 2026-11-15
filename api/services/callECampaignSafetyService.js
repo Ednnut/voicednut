@@ -24,7 +24,7 @@ function localDateTime(date, timeZone) {
 function normalizePolicy(policy) {
   if (!policy) return Object.freeze({
     configured: false, max_calls_per_day: 0, quiet_hours_start: null, quiet_hours_end: null,
-    timezone: 'UTC', emergency_stop: true, updated_by: null, updated_at: null,
+    timezone: 'UTC', emergency_stop: true, updated_by: null, updated_at: null, revision: null,
   });
   return Object.freeze({
     configured: true,
@@ -36,6 +36,7 @@ function normalizePolicy(policy) {
     contact_cooldown_hours: Math.max(0, Math.min(8760, Math.floor(Number(policy.contact_cooldown_hours) || 0))),
     updated_by: ACTOR_ID_PATTERN.test(String(policy.updated_by || '')) ? String(policy.updated_by) : null,
     updated_at: policy.updated_at || null,
+    revision: Number.isSafeInteger(Number(policy.revision)) && Number(policy.revision) > 0 ? Number(policy.revision) : null,
   });
 }
 
@@ -62,7 +63,11 @@ class CallECampaignSafetyService {
     const policy = normalizePolicy(await this.db.getCallEBusinessSafetyPolicy(businessId));
     const local = localDateTime(this.now(), policy.timezone);
     const usage = await this.db.getCallEBusinessDispatchUsage?.(businessId, local.date) || { used: 0 };
-    return { safety_policy: { ...policy, calls_used_today: Number(usage.used) || 0, local_date: local.date } };
+    const historyLimit = Math.max(1, Math.min(100, Math.floor(Number(input.history_limit) || 20)));
+    const history = typeof this.db.getCallEBusinessSafetyPolicyHistory === 'function'
+      ? await this.db.getCallEBusinessSafetyPolicyHistory(businessId, historyLimit)
+      : [];
+    return { safety_policy: { ...policy, calls_used_today: Number(usage.used) || 0, local_date: local.date }, history };
   }
 
   async updatePolicy(input = {}) {
@@ -87,6 +92,30 @@ class CallECampaignSafetyService {
       contact_cooldown_hours: contactCooldownHours,
     });
     return { safety_policy: normalizePolicy({ ...policy, updated_by: membership?.telegram_id || policy.updated_by }) };
+  }
+
+  async rollbackPolicy(input = {}) {
+    const businessId = String(input.business_id || '').trim();
+    const actorId = String(input.actor_id || '').trim();
+    const revision = Number(input.revision);
+    await this.assertMembership(businessId, actorId, 'policy_manager');
+    if (!Number.isSafeInteger(revision) || revision < 1) throw safetyError('call_e_safety_policy_revision_invalid', 'A positive safety policy revision is required');
+    if (typeof this.db.getCallEBusinessSafetyPolicyRevision !== 'function') throw safetyError('call_e_safety_policy_history_unavailable', 'Safety policy history is unavailable', 503);
+    const source = await this.db.getCallEBusinessSafetyPolicyRevision(businessId, revision);
+    if (!source) throw safetyError('call_e_safety_policy_revision_not_found', 'Safety policy revision was not found', 404);
+    const policy = await this.db.setCallEBusinessSafetyPolicy({
+      business_id: businessId,
+      actor_id: actorId,
+      max_calls_per_day: source.max_calls_per_day,
+      quiet_hours_start: source.quiet_hours_start,
+      quiet_hours_end: source.quiet_hours_end,
+      timezone: source.timezone,
+      emergency_stop: source.emergency_stop,
+      contact_cooldown_hours: source.contact_cooldown_hours,
+      change_type: 'rollback',
+      source_revision: revision,
+    });
+    return { safety_policy: normalizePolicy({ ...policy, updated_by: actorId }), source_revision: revision };
   }
 
   async setWorkerPaused(input = {}) {
