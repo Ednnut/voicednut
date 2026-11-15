@@ -217,6 +217,63 @@ async function fetchProviderStatus({ force = false } = {}) {
     return response.data;
 }
 
+function buildProviderRecommendationUrl({ operation = 'outbound_call.create', requiredCapabilities = [], preferredProvider = null } = {}) {
+    const baseUrl = String(config.apiUrl || '').replace(/\/+$/, '');
+    const query = new URLSearchParams({ operation });
+    if (Array.isArray(requiredCapabilities) && requiredCapabilities.length) {
+        query.set('required_capabilities', requiredCapabilities.join(','));
+    }
+    if (preferredProvider) query.set('preferred_provider', String(preferredProvider));
+    return `${baseUrl}/admin/provider/recommendation?${query.toString()}`;
+}
+
+async function fetchProviderRecommendation(options = {}) {
+    const response = await httpClient.get(
+        null,
+        buildProviderRecommendationUrl(options),
+        {
+            timeout: 10000,
+            headers: {
+                [ADMIN_HEADER_NAME]: config.admin.apiToken,
+                'Content-Type': 'application/json',
+            },
+        },
+    );
+    return response.data;
+}
+
+function formatProviderRecommendation(data = {}) {
+    const recommendation = data.recommendation || {};
+    const lines = [];
+    if (recommendation.provider) {
+        lines.push(buildLine('•', 'Recommended provider', String(recommendation.provider).toUpperCase()));
+        lines.push(buildLine('•', 'Reason', escapeMarkdown(recommendation.reason || 'capability and configuration match')));
+    } else {
+        lines.push(buildLine('•', 'Recommendation', `None (${escapeMarkdown(recommendation.reason || 'no eligible provider')})`));
+    }
+    const selected = Array.isArray(data.providers)
+        ? data.providers.find((item) => item.provider === recommendation.provider)
+        : null;
+    if (selected?.operational_state === 'unverified') {
+        lines.push('• Provider reachability is not verified by this recommendation.');
+    }
+    if (Array.isArray(data.alternatives) && data.alternatives.length) {
+        lines.push('', 'Alternatives:');
+        for (const alternative of data.alternatives.slice(0, 8)) {
+            lines.push(`• ${escapeMarkdown(String(alternative.provider || 'unknown').toUpperCase())} — ${escapeMarkdown(alternative.reasons?.join(', ') || 'eligible')}`);
+        }
+    }
+    const blocked = Array.isArray(data.providers) ? data.providers.filter((item) => !item.eligible) : [];
+    if (blocked.length) {
+        lines.push('', 'Not eligible:');
+        for (const provider of blocked.slice(0, 8)) {
+            lines.push(`• ${escapeMarkdown(String(provider.provider || 'unknown').toUpperCase())} — ${escapeMarkdown(provider.blockers?.join(', ') || 'not eligible')}`);
+        }
+    }
+    lines.push('', 'This is a read-only recommendation; dispatch still validates provider readiness.');
+    return section('🔎 Provider Recommendation', lines);
+}
+
 function formatProviderError(error, actionLabel) {
     const authMessage = httpClient.getUserMessage(error, null);
     if (authMessage && (error.response?.status === 401 || error.response?.status === 403)) {
@@ -378,6 +435,17 @@ function registerProviderCommand(bot) {
                 return;
             }
 
+            if (requestedAction === 'recommend') {
+                const requiredCapabilities = args.slice(1).map((value) => value.toLowerCase());
+                if (requiredCapabilities.length > 8 || requiredCapabilities.some((value) => !/^[a-z][a-z0-9_]{0,79}$/.test(value))) {
+                    await ctx.reply('Usage: /provider recommend [capability ...] (up to 8 registered capabilities)');
+                    return;
+                }
+                const recommendation = await fetchProviderRecommendation({ requiredCapabilities });
+                await ctx.reply(formatProviderRecommendation(recommendation), { parse_mode: 'Markdown' });
+                return;
+            }
+
             await handleProviderSwitch(ctx, requestedAction);
         } catch (error) {
             console.error('Failed to manage provider via Telegram command:', error);
@@ -393,6 +461,9 @@ function initializeProviderCommand(bot) {
 module.exports = initializeProviderCommand;
 module.exports.registerProviderCommand = registerProviderCommand;
 module.exports.fetchProviderStatus = fetchProviderStatus;
+module.exports.fetchProviderRecommendation = fetchProviderRecommendation;
+module.exports.buildProviderRecommendationUrl = buildProviderRecommendationUrl;
+module.exports.formatProviderRecommendation = formatProviderRecommendation;
 module.exports.updateProvider = updateProvider;
 module.exports.formatProviderStatus = formatProviderStatus;
 module.exports.handleProviderSwitch = handleProviderSwitch;

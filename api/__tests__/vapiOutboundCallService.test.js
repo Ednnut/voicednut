@@ -50,13 +50,18 @@ describe("VapiOutboundCallService", () => {
         async getCall() { return null; },
       },
     });
-    await service.recordCommonCall({ actorId: "7003" }, { business_id: "biz-vapi" }, "+14155550123", {
+    await service.recordCommonCall({ actorId: "7003", requestId: "request-vapi-1" }, { business_id: "biz-vapi" }, "+14155550123", {
       providerCallId: "call_123", status: "queued",
     });
     assert.equal(writes[0][1].call_sid, "vapi_call_123");
     assert.equal(writes[0][1].user_chat_id, "7003");
     assert.equal(writes[0][1].business_id, "biz-vapi");
     assert.equal(writes[1][3].provider_call_id, "call_123");
+    assert.equal(writes[1][3].execution_context.request_id, "request-vapi-1");
+    assert.equal(writes[1][3].execution_context.internal_call_id, "vapi_call_123");
+    assert.equal(writes[2][2], "execution_step");
+    assert.equal(writes[2][3].step_name, "provider_dispatch");
+    assert.equal(writes[2][3].result, "accepted");
   });
 
   it("creates one outbound call from an explicit synced template mapping and Vapi number", async () => {
@@ -86,6 +91,41 @@ describe("VapiOutboundCallService", () => {
       phoneNumberId: "phone_789",
       customer: { number: "+14155550123" },
     }]);
+  });
+
+  it("records Vapi provider dispatch duration from before the provider request", async () => {
+    const states = [];
+    const db = createIdempotencyDb();
+    db.createCall = async () => {};
+    db.getCall = async () => null;
+    db.updateCallState = async (...args) => states.push(args);
+    let providerRequestStartedAt;
+    const service = new VapiOutboundCallService({
+      db,
+      client: {
+        isConfigured: () => true,
+        async createCall() {
+          providerRequestStartedAt = Date.now();
+          await new Promise((resolve) => setTimeout(resolve, 5));
+          return { id: "call_timing_1", status: "queued" };
+        },
+      },
+      getMapping: async () => mapping,
+      getTemplate: async () => ({ id: 5, version: 3, business_id: "biz-vapi" }),
+    });
+
+    await service.createOutboundCall({
+      mappingId: 12,
+      idempotencyKey: "request-timing-01",
+      phoneNumberId: "phone_789",
+      number: "+14155550123",
+      requestId: "request-vapi-timing",
+    });
+
+    const step = states.find(([, state]) => state === "execution_step")[2];
+    assert.equal(step.correlation_id, "request-vapi-timing");
+    assert.ok(Date.parse(step.started_at) <= providerRequestStartedAt);
+    assert.ok(Date.parse(step.completed_at) >= providerRequestStartedAt);
   });
 
   it("sends validated script first-message overrides and placeholder values to Vapi", async () => {

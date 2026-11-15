@@ -3,7 +3,7 @@ const axios = require('axios');
 const { InlineKeyboard } = require('grammy');
 const config = require('../config');
 const httpClient = require('../utils/httpClient');
-const { withRetry } = require('../utils/httpClient');
+const { withRetry, withConversationExternal } = require('../utils/httpClient');
 const {
   getBusinessOptions,
   findBusinessOption,
@@ -84,7 +84,7 @@ function nonJsonResponseError(endpoint, response) {
 async function scriptsApiRequest(options) {
   const endpoint = `${(options.method || 'GET').toUpperCase()} ${options.url}`;
   try {
-    const response = await withRetry(() => scriptsApi.request(options), options.retry || {});
+    const response = await withConversationExternal(null, () => withRetry(() => scriptsApi.request(options), options.retry || {}), options.method);
     const contentType = response.headers?.['content-type'] || '';
     if (!contentType.includes('application/json')) {
       throw nonJsonResponseError(endpoint, response);

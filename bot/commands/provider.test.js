@@ -15,6 +15,8 @@ const {
   SUPPORTED_AI_VOICE_ENGINES,
   buildProviderKeyboard,
   formatProviderStatus,
+  buildProviderRecommendationUrl,
+  formatProviderRecommendation,
   normalizeProviders,
 } = require('./provider');
 
@@ -83,4 +85,34 @@ test('provider status separates configuration from process-observed provider act
   assert.match(message, /Provider circuit.*open/);
   assert.match(message, /Provider is degraded or circuit-open/);
   assert.match(message, /not a live connectivity probe/);
+});
+
+test('provider recommendation URL encodes bounded, read-only capability inputs', () => {
+  const url = new URL(buildProviderRecommendationUrl({
+    operation: 'outbound_call.create',
+    requiredCapabilities: ['voice_stream', 'outbound_voice'],
+    preferredProvider: 'twilio',
+  }));
+  assert.equal(url.pathname, '/admin/provider/recommendation');
+  assert.equal(url.searchParams.get('operation'), 'outbound_call.create');
+  assert.equal(url.searchParams.get('required_capabilities'), 'voice_stream,outbound_voice');
+  assert.equal(url.searchParams.get('preferred_provider'), 'twilio');
+});
+
+test('provider recommendation clearly separates alternatives from provider health certainty', () => {
+  const message = formatProviderRecommendation({
+    recommendation: { provider: 'twilio', reason: 'configured_order' },
+    alternatives: [{ provider: 'plivo', reasons: ['operation_supported', 'provider_configured'] }],
+    providers: [
+      { provider: 'twilio', eligible: true, operational_state: 'unverified' },
+      { provider: 'plivo', eligible: true, operational_state: 'unverified' },
+      { provider: 'vonage', eligible: false, blockers: ['provider_not_configured'] },
+    ],
+  });
+
+  assert.match(message, /Recommended provider.*TWILIO/);
+  assert.match(message, /reachability is not verified/);
+  assert.match(message, /Alternatives:[\s\S]*PLIVO/);
+  assert.match(message, /Not eligible:[\s\S]*VONAGE.*provider\\_not\\_configured/);
+  assert.match(message, /read-only recommendation/);
 });

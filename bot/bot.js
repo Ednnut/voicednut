@@ -8,6 +8,23 @@ try {
   throw error;
 }
 const { Bot, session, InlineKeyboard } = grammyPkg;
+const botDatabase = require("./db/db");
+const { runInConversation } = require("./utils/conversationEffects");
+const {
+  createActorSequentializer,
+  createPersistentSessionStorage,
+  getActorSessionKey,
+  CONVERSATION_EXTERNAL,
+} = require("./utils/persistentSessions");
+void botDatabase.purgeExpiredPersistentSessions().catch((error) => {
+  console.error("expired_bot_session_cleanup_failed", { code: error?.code || "storage_error" });
+});
+const botSessionCleanupTimer = setInterval(() => {
+  void botDatabase.purgeExpiredPersistentSessions().catch((error) => {
+    console.error("expired_bot_session_cleanup_failed", { code: error?.code || "storage_error" });
+  });
+}, 60_000);
+botSessionCleanupTimer.unref?.();
 
 let conversationsPkg;
 try {
@@ -77,7 +94,8 @@ const bot = new Bot(token);
 function wrapConversation(handler, name) {
   return createConversation(async (conversation, ctx) => {
     try {
-      await handler(conversation, ctx);
+      ctx[CONVERSATION_EXTERNAL] = conversation;
+      await runInConversation(conversation, () => handler(conversation, ctx));
     } catch (error) {
       if (error instanceof OperationCancelledError) {
         console.log(`Conversation ${name} cancelled: ${error.message}`);
@@ -93,11 +111,20 @@ function wrapConversation(handler, name) {
 }
 
 // IMPORTANT: Add session middleware BEFORE conversations
-bot.use(session({ initial: initialSessionState }));
+bot.use(createActorSequentializer());
+bot.use(session({
+  initial: initialSessionState,
+  getSessionKey: getActorSessionKey,
+  storage: createPersistentSessionStorage(botDatabase),
+}));
 
 // Ensure every update touches a session object
 bot.use(async (ctx, next) => {
   ensureSession(ctx);
+  if (ctx.session.recoveryNotice) {
+    delete ctx.session.recoveryNotice;
+    await ctx.reply("Your previous task session expired or could not be restored safely. No action was resumed. Start again with the relevant command, such as /call, /calle, or /menu.");
+  }
   return next();
 });
 

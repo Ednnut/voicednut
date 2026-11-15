@@ -1,4 +1,5 @@
 const { runPostCallQaEvaluation } = require("./postCallQaService");
+const { createExecutionContext } = require("./executionContext");
 
 function createOutboundCallHandler(ctx = {}) {
   const {
@@ -38,6 +39,7 @@ function createOutboundCallHandler(ctx = {}) {
             agent_id: agentId,
             from_number_id: fromNumberId,
             idempotency_key: idempotencyKey,
+            request_id: req.requestId,
             approval_token: req.body?.approval_token,
             dynamic_variables: req.body?.dynamic_variables,
           });
@@ -105,6 +107,7 @@ function createOutboundCallHandler(ctx = {}) {
             ...(req.body?.first_message_override !== undefined ? { firstMessage: req.body.first_message_override } : {}),
             ...(req.body?.variable_values !== undefined ? { variableValues: req.body.variable_values } : {}),
             actorId: req.callEActorId,
+            requestId: req.requestId,
           });
           const providerCallId = String(result?.providerCallId || "").trim();
           if (!providerCallId) {
@@ -198,6 +201,16 @@ function createOutboundCallHandler(ctx = {}) {
           req.headers?.["idempotency-key"] ||
           req.headers?.["Idempotency-Key"] ||
           null,
+        execution_context: createExecutionContext({
+          request_id: req.requestId,
+          business_id: req.body?.business_id,
+          actor_id: req.callEActorId,
+          provider: req.body?.preferred_provider || req.body?.call_provider || req.body?.provider,
+          execution_type: "outbound_call",
+          status: "created",
+          current_stage: "request_validated",
+          idempotency_reference: req.body?.idempotency_key || req.headers?.["idempotency-key"] || req.headers?.["Idempotency-Key"],
+        }),
         user_chat_id: req.callEActorId,
         customer_name: resolvedCustomerName,
         business_id: req.body?.business_id,
@@ -1004,7 +1017,7 @@ function createCallActivityHandlers(ctx = {}) {
     ended_at: call.ended_at || null,
     duration: Number(call.duration) || 0,
     business_id: call.business_id || created.business_id || null,
-    refresh_available: Boolean(created.provider_call_id || created.provider_metadata?.twilio_call_sid || created.provider_metadata?.plivo_uuid || created.provider_metadata?.vonage_uuid ||
+    refresh_available: Boolean(call.provider_call_id || created.provider_call_id || created.provider_metadata?.twilio_call_sid || created.provider_metadata?.plivo_uuid || created.provider_metadata?.vonage_uuid ||
       ((String(created.telephony_provider || created.provider || call.provider || "").toLowerCase() === "vapi" && String(call.call_sid || "").startsWith("vapi_")) ||
        (String(created.telephony_provider || created.provider || call.provider || "").toLowerCase() === "cartesia" && String(call.call_sid || "").startsWith("cartesia_")))),
   });

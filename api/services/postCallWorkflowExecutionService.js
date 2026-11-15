@@ -2,6 +2,7 @@ const crypto = require("crypto");
 const { buildContext, matchesConditionSpec } = require("./postCallAutomationService");
 const { normalizeWorkflowDefinition, SUPPORTED_TRIGGER_EVENTS } = require("./postCallWorkflowDefinitionService");
 const { validateCallEResult } = require("../adapters/callETemplateAdapter");
+const { safeExecutionReference } = require("./executionContext");
 
 const MAX_PAYLOAD_BYTES = 24 * 1024;
 const MAX_STEPS_PER_TICK = 50;
@@ -140,6 +141,115 @@ class PostCallWorkflowExecutionService {
     }
     void this.drain().catch((error) => this.logError("workflow_trigger_drain_failed", error));
     return { skipped: false, trigger_event: triggerEvent, matched: definitions.length, runs };
+  }
+
+  async enqueueEvent(payload = {}) {
+    if (!this.enabled) return { accepted: false, skipped: true, reason: "workflow_execution_disabled" };
+    const triggerEvent = String(payload.trigger_event || "").trim().toLowerCase().replace(/[\s.-]+/g, "_");
+    if (!SUPPORTED_TRIGGER_EVENTS.has(triggerEvent)) {
+      return { accepted: false, skipped: true, reason: "unsupported_trigger" };
+    }
+    if (triggerEvent === "call_e_result_ready") {
+      return { accepted: false, skipped: true, reason: "validated_result_required" };
+    }
+    if (!this.db || typeof this.db.createPostCallWorkflowEvent !== "function" ||
+        typeof this.db.listApprovedPostCallWorkflowDefinitions !== "function") {
+      fail("Workflow event persistence is not available", "service_unavailable");
+    }
+    const { safe: input } = minimizePayload({ ...payload, trigger_event: triggerEvent });
+    const sourceKey = String(input.idempotency_key || input.call_sid || input.call?.call_sid || "").trim();
+    if (!sourceKey) return { accepted: false, skipped: true, reason: "missing_stable_event_id" };
+    const businessId = input.business_id == null || input.business_id === ""
+      ? null
+      : String(input.business_id).trim();
+    if (businessId && !/^[A-Za-z0-9._:-]{1,120}$/.test(businessId)) fail("business_id is invalid");
+
+    const definitions = await this.db.listApprovedPostCallWorkflowDefinitions(triggerEvent, businessId);
+    if (definitions.length > 100) fail("Too many approved workflows matched this event");
+    const definitionVersions = definitions.map((row) => {
+      const definition = this.definitionService?.hydrate
+        ? this.definitionService.hydrate(row).definition
+        : JSON.parse(row.definition_json || "{}");
+      const normalized = normalizeWorkflowDefinition(definition);
+      if ((normalized.business_id || null) !== businessId || (row.business_id || null) !== businessId) {
+        fail("Approved workflow scope does not match the call");
+      }
+      const version = Number(row.version);
+      if (!Number.isSafeInteger(version) || version < 1) fail("Approved workflow version is invalid");
+      return { workflow_id: row.workflow_id, version };
+    });
+    const sourceHash = crypto.createHash("sha256").update(sourceKey).digest("hex");
+    const scopeKey = businessId || "global";
+    const eventKey = `post-call:${triggerEvent}:${scopeKey}:${sourceHash}`;
+    const eventId = crypto.randomUUID();
+    const receivedAt = new Date().toISOString();
+    const occurredAt = input.occurred_at && Number.isFinite(Date.parse(input.occurred_at))
+      ? new Date(input.occurred_at).toISOString()
+      : receivedAt;
+    const aggregateId = safeExecutionReference(input.aggregate_id || input.call_sid || input.call?.call_sid || input.local_call_id);
+    const aggregateType = ["call", "contact", "workflow", "campaign"].includes(input.aggregate_type)
+      ? input.aggregate_type
+      : aggregateId ? "call" : null;
+    const { serialized } = minimizePayload({
+      ...input,
+      event_id: eventId,
+      event_type: triggerEvent,
+      event_version: 1,
+      occurred_at: occurredAt,
+      received_at: receivedAt,
+      organization_id: businessId,
+      actor_id: safeExecutionReference(input.actor_id || input.user_chat_id || input.execution_context?.actor_id),
+      correlation_id: safeExecutionReference(input.correlation_id || input.request_id || input.execution_context?.request_id),
+      aggregate_type: aggregateType,
+      aggregate_id: aggregateId,
+      idempotency_key: `sha256:${sourceHash}`,
+      event_source: "voicednut.post_call_automation",
+    });
+    const event = await this.db.createPostCallWorkflowEvent({
+      event_id: eventId,
+      event_key: eventKey,
+      call_sid: input.call_sid || input.call?.call_sid || null,
+      business_id: businessId,
+      trigger_event: triggerEvent,
+      definition_versions_json: JSON.stringify(definitionVersions),
+      payload_json: serialized,
+    });
+    if (!event) fail("Workflow event could not be persisted", "service_unavailable");
+    let matched = definitionVersions.length;
+    try {
+      const selected = JSON.parse(event.definition_versions_json || "[]");
+      if (Array.isArray(selected)) matched = selected.length;
+    } catch (_) {
+      fail("Stored workflow event selection is invalid", "service_unavailable");
+    }
+
+    const callSid = String(input.call_sid || input.call?.call_sid || "").trim();
+    if (callSid && typeof this.db.updateCallState === "function") {
+      const callState = event.status === "dead_letter"
+        ? "post_call_automation_dead_lettered"
+        : event.status === "completed"
+          ? "post_call_automation_workflows_completed"
+          : "post_call_automation_queued";
+      await this.recordCallEventState(callSid, callState, {
+        event_id: event.event_id,
+        trigger_event: triggerEvent,
+        status: event.status,
+        matched,
+      });
+    }
+    try {
+      await this.reconcilePendingEvents();
+    } catch (error) {
+      this.logError("workflow_event_dispatch_deferred", error);
+    }
+    return {
+      accepted: event.status !== "dead_letter",
+      event_id: event.event_id,
+      status: event.status,
+      trigger_event: triggerEvent,
+      matched,
+      ...(event.status === "dead_letter" ? { reason: "workflow_event_requires_recovery" } : {}),
+    };
   }
 
   async triggerCallEResultReady(payload = {}, resultSchema, result) {
@@ -334,11 +444,54 @@ class PostCallWorkflowExecutionService {
       if (!await this.db.completePostCallWorkflowEvent(event.event_id)) {
         fail("Workflow event changed before completion", "conflict");
       }
+      const callSid = String(payload.call_sid || payload.call?.call_sid || "").trim();
+      if (callSid) {
+        await this.recordCallEventState(callSid, "post_call_automation_workflows_completed", {
+          event_id: event.event_id,
+          trigger_event: triggerEvent,
+          workflow_count: runs.length,
+        });
+      }
       void this.drain().catch((error) => this.logError("workflow_event_drain_failed", error));
       return { event_id: event.event_id, status: "completed", runs };
     } catch (error) {
-      await this.db.resetPostCallWorkflowEvent(event.event_id, safeErrorCode(error)).catch(() => {});
+      const attempt = Number(event.attempts || 0) + (event.status === "pending" ? 1 : 0);
+      const retryDelayMs = Math.min(60 * 60 * 1000, 30_000 * (2 ** Math.max(0, attempt - 1)));
+      const nextAttemptAt = new Date(Date.now() + retryDelayMs).toISOString();
+      await this.db.resetPostCallWorkflowEvent(event.event_id, safeErrorCode(error), nextAttemptAt).catch(() => {});
+      const updatedEvent = await this.db.getPostCallWorkflowEvent(event.event_id).catch(() => null);
+      const callSid = String(event.payload_json ? (() => {
+        try {
+          const storedPayload = JSON.parse(event.payload_json);
+          return storedPayload.call_sid || storedPayload.call?.call_sid || "";
+        } catch (_) {
+          return "";
+        }
+      })() : "").trim();
+      if (callSid) {
+        await this.recordCallEventState(
+          callSid,
+          updatedEvent?.status === "dead_letter" ? "post_call_automation_dead_lettered" : "post_call_automation_retry_scheduled",
+          {
+            event_id: event.event_id,
+            trigger_event: event.trigger_event,
+            status: updatedEvent?.status || "pending",
+            attempts: Number(updatedEvent?.attempts) || attempt,
+            error_code: safeErrorCode(error),
+            next_attempt_at: updatedEvent?.next_attempt_at || nextAttemptAt,
+          },
+        );
+      }
       throw error;
+    }
+  }
+
+  async recordCallEventState(callSid, state, data) {
+    if (typeof this.db?.updateCallState !== "function") return;
+    try {
+      await this.db.updateCallState(callSid, state, data);
+    } catch (error) {
+      this.logError("workflow_event_call_state_failed", error);
     }
   }
 
@@ -362,6 +515,60 @@ class PostCallWorkflowExecutionService {
       }
     }
     return queued;
+  }
+
+  async listEvents(filters = {}) {
+    const status = String(filters.status || "").trim().toLowerCase();
+    if (status && !["pending", "processing", "completed", "dead_letter"].includes(status)) {
+      fail("Workflow event status is invalid");
+    }
+    const triggerEvent = String(filters.trigger_event || "").trim().toLowerCase().replace(/[\s.-]+/g, "_");
+    if (triggerEvent && !SUPPORTED_TRIGGER_EVENTS.has(triggerEvent)) fail("Workflow event trigger is invalid");
+    const businessId = filters.business_id == null ? undefined : String(filters.business_id).trim();
+    if (businessId && !/^[A-Za-z0-9._:-]{1,120}$/.test(businessId)) fail("business_id is invalid");
+    if (!this.db || typeof this.db.listPostCallWorkflowEvents !== "function") {
+      fail("Workflow event persistence is not available", "service_unavailable");
+    }
+    return this.db.listPostCallWorkflowEvents({
+      status: status || undefined,
+      trigger_event: triggerEvent || undefined,
+      ...(businessId !== undefined ? { business_id: businessId } : {}),
+      limit: filters.limit,
+    });
+  }
+
+  async retryEvent(eventId) {
+    const normalizedEventId = String(eventId || "").trim();
+    if (!/^[A-Za-z0-9_-]{1,160}$/.test(normalizedEventId)) fail("event_id is invalid");
+    if (!this.db || typeof this.db.getPostCallWorkflowEvent !== "function" ||
+        typeof this.db.requeueDeadLetterPostCallWorkflowEvent !== "function") {
+      fail("Workflow event persistence is not available", "service_unavailable");
+    }
+    const event = await this.db.getPostCallWorkflowEvent(normalizedEventId);
+    if (!event) fail("Workflow event was not found", "not_found");
+    if (event.status !== "dead_letter") fail("Only dead-lettered events can be retried", "conflict");
+    const changed = await this.db.requeueDeadLetterPostCallWorkflowEvent(normalizedEventId);
+    if (!changed) fail("Workflow event changed before retry", "conflict");
+    try {
+      await this.reconcilePendingEvents();
+    } catch (error) {
+      this.logError("workflow_event_retry_dispatch_deferred", error);
+    }
+    if (event.call_sid) {
+      await this.recordCallEventState(event.call_sid, "post_call_automation_queued", {
+        event_id: event.event_id,
+        trigger_event: event.trigger_event,
+        status: "pending",
+        retry: true,
+      });
+    }
+    return {
+      event_id: event.event_id,
+      call_sid: event.call_sid || null,
+      business_id: event.business_id || null,
+      trigger_event: event.trigger_event,
+      status: "pending",
+    };
   }
 
   async reconcileInterruptedRuns() {

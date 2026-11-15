@@ -1,6 +1,6 @@
 const axios = require('axios');
 const config = require('../config');
-const { withRetry } = require('../utils/httpClient');
+const { withRetry, withConversationExternal } = require('../utils/httpClient');
 const { getAccessProfile } = require('../utils/capabilities');
 const { attachHmacAuth } = require('../utils/apiAuth');
 const {
@@ -57,10 +57,10 @@ async function personaApiRequest(ctx, ensureActive, options) {
   const controller = new AbortController();
   const release = registerAbortController(ctx, controller);
   try {
-    const response = await withRetry(() => personaApi.request({
+    const response = await withConversationExternal(ctx, () => withRetry(() => personaApi.request({
       ...options,
       signal: controller.signal
-    }), options.retry || {});
+    }), options.retry || {}), options.method);
     ensureActive();
     return response.data;
   } finally {

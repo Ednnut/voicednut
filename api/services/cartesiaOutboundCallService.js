@@ -1,6 +1,7 @@
 "use strict";
 
 const crypto = require("node:crypto");
+const { createExecutionContext, buildExecutionStep } = require("./executionContext");
 
 const ID_PATTERN = /^[A-Za-z0-9._:-]{1,200}$/;
 const IDEMPOTENCY_PATTERN = /^[A-Za-z0-9._:-]{8,180}$/;
@@ -65,6 +66,7 @@ function normalizeCallInput(input = {}) {
     agentId: String(input.agentId || input.agent_id || "").trim(),
     fromNumberId: String(input.fromNumberId || input.from_number_id || "").trim(),
     idempotencyKey: String(input.idempotencyKey || input.idempotency_key || "").trim(),
+    requestId: String(input.requestId || input.request_id || "").trim(),
     dynamicVariables: normalizeDynamicVariables(input.dynamicVariables || input.dynamic_variables),
   };
   if (!BUSINESS_ID_PATTERN.test(normalized.businessId) || !/^\d{1,20}$/.test(normalized.actorId) ||
@@ -686,6 +688,7 @@ class CartesiaOutboundCallService {
     }
 
     let result;
+    const dispatchStartedAt = new Date().toISOString();
     try {
       result = await this.client.createOutboundCall({
         agentId: normalized.agentId,
@@ -726,13 +729,13 @@ class CartesiaOutboundCallService {
       response_payload: response,
     });
     await this.outboundSafety.completeDispatch(safetyReservation, "accepted");
-    await this.recordAcceptedCall(normalized, providerCallId).catch((error) => {
+    await this.recordAcceptedCall(normalized, providerCallId, dispatchStartedAt).catch((error) => {
       console.error("cartesia_call_history_write_failed", { code: String(error?.code || "database_error").slice(0, 80) });
     });
     return { ...response, idempotentReplay: false };
   }
 
-  async recordAcceptedCall(normalized, providerCallId) {
+  async recordAcceptedCall(normalized, providerCallId, dispatchStartedAt = null) {
     if (typeof this.db?.upsertCartesiaCallRecord === "function") {
       await this.db.upsertCartesiaCallRecord({
         local_call_id: `cartesia_${providerCallId}`,
@@ -750,6 +753,25 @@ class CartesiaOutboundCallService {
     if (typeof this.db?.createCall === "function") {
       const callSid = `cartesia_${providerCallId}`;
       const existing = typeof this.db.getCall === "function" ? await this.db.getCall(callSid).catch(() => null) : null;
+      const priorCallState = existing && typeof this.db.getLatestCallState === "function"
+        ? await this.db.getLatestCallState(callSid, "call_created").catch(() => null)
+        : null;
+      const priorExecutionContext = priorCallState?.execution_context && typeof priorCallState.execution_context === "object"
+        ? priorCallState.execution_context
+        : null;
+      const executionContext = priorExecutionContext || createExecutionContext({
+        request_id: normalized.requestId,
+        internal_call_id: callSid,
+        business_id: normalized.businessId,
+        actor_id: normalized.actorId,
+        agent_id: normalized.agentId,
+        provider: "cartesia",
+        provider_call_id: providerCallId,
+        execution_type: "outbound_call",
+        status: "accepted",
+        current_stage: "provider_accepted",
+        idempotency_reference: normalized.idempotencyKey,
+      });
       if (!existing) {
         await this.db.createCall({
           call_sid: callSid,
@@ -764,12 +786,22 @@ class CartesiaOutboundCallService {
         });
       }
       await this.db.updateCallState?.(callSid, "call_created", {
+        execution_context: executionContext,
         provider: "cartesia",
         telephony_provider: "cartesia",
         provider_call_id: providerCallId,
         business_id: normalized.businessId,
         source: "cartesia_outbound",
       });
+      if (!priorExecutionContext) {
+        await this.db.updateCallState?.(callSid, "execution_step", buildExecutionStep(executionContext, {
+          step_name: "provider_dispatch",
+          status: "completed",
+          result: "accepted",
+          started_at: dispatchStartedAt,
+          related_entity: providerCallId,
+        }));
+      }
     }
   }
 

@@ -6,6 +6,7 @@ const dbPath = path.resolve(__dirname, '../db/data.db');
 const db = new sqlite3.Database(dbPath);
 
 const { userId, username } = require('../config').admin;
+const { createPersistentSessionStore } = require('./persistentSessionStore');
 
 function normalizeTelegramUsername(value) {
   if (value == null) return '';
@@ -89,6 +90,13 @@ db.serialize(() => {
     submission_json TEXT NOT NULL,
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
   )`);
+  db.run(`CREATE TABLE IF NOT EXISTS bot_persistent_sessions (
+    session_key TEXT PRIMARY KEY,
+    session_json TEXT NOT NULL,
+    expires_at_ms INTEGER NOT NULL,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  )`);
+  db.run('CREATE INDEX IF NOT EXISTS idx_bot_persistent_sessions_expiry ON bot_persistent_sessions(expires_at_ms)');
 });
 
 function getUser(id, usernameOrCb, maybeCb) {
@@ -332,6 +340,12 @@ function clearOutboundCallSubmission(telegramId, idempotencyKey) {
   });
 }
 
+const persistentSessionStore = createPersistentSessionStore(db);
+const getPersistentSession = (...args) => persistentSessionStore.get(...args);
+const savePersistentSession = (...args) => persistentSessionStore.save(...args);
+const deletePersistentSession = (...args) => persistentSessionStore.delete(...args);
+const purgeExpiredPersistentSessions = (...args) => persistentSessionStore.purge(...args);
+
 module.exports = {
   getUser, addUser, getUserList, promoteUser, removeUser,
   isAdmin, expireInactiveUsers,
@@ -342,4 +356,8 @@ module.exports = {
   getOutboundCallSubmission,
   saveOutboundCallSubmission,
   clearOutboundCallSubmission,
+  getPersistentSession,
+  savePersistentSession,
+  deletePersistentSession,
+  purgeExpiredPersistentSessions,
 };

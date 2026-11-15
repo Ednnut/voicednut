@@ -396,7 +396,9 @@ class CrmContactSyncService {
       phone,
       external_id: externalId,
       local_contact_id: localId,
-      identity_key: email || phone || externalId || localId,
+      // A phone number is mutable and may be shared; retain it as an attribute,
+      // but never use it alone to deduplicate CRM contacts.
+      identity_key: email || externalId || localId,
     };
   }
 
@@ -405,7 +407,7 @@ class CrmContactSyncService {
     const contact = safeObject(payload.contact || payload.customer || payload);
     const identity = this.buildContactIdentity(contact);
     if (!identity.identity_key) {
-      const error = new Error("CRM contact sync requires an email, phone, external_id, or contact_id");
+      const error = new Error("CRM contact sync requires an email, external_id, or contact_id; phone alone is not a stable identity");
       error.code = "validation_error";
       throw error;
     }

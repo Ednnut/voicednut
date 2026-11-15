@@ -1,6 +1,9 @@
 const axios = require('axios');
+const crypto = require('crypto');
 const config = require('../config');
 const { createCallEActorAssertionHeaders } = require('./callEActorAssertion');
+const { CONVERSATION_EXTERNAL } = require('./persistentSessions');
+const { getCurrentConversation } = require('./conversationEffects');
 
 const DEFAULT_TIMEOUT_MS = 12000;
 const ADMIN_HEADER = 'x-admin-token';
@@ -89,6 +92,10 @@ function normalizeOptions(options = {}, url) {
   const enableAdmin = options.admin !== false && shouldAttachAdmin(url);
   const headers = withAdminHeader(options.headers || {}, enableAdmin);
   const timeout = Number.isFinite(options.timeout) ? options.timeout : DEFAULT_TIMEOUT_MS;
+  const hasRequestId = Object.keys(headers).some((key) => key.toLowerCase() === 'x-request-id');
+  if (shouldAttachAdmin(url) && !hasRequestId) {
+    headers['x-request-id'] = crypto.randomUUID();
+  }
   return {
     ...options,
     headers,
@@ -106,10 +113,42 @@ function extractRequestId(error) {
   );
 }
 
+function extractApiErrorCode(error) {
+  const data = error?.response?.data;
+  const candidate = data?.error && typeof data.error === 'object'
+    ? data.error.code
+    : data?.code;
+  const normalized = String(candidate || '').trim().toLowerCase();
+  return /^[a-z][a-z0-9_.-]{0,99}$/.test(normalized) ? normalized : '';
+}
+
 function mapErrorToUserMessage(error) {
   const status = error?.response?.status;
+  const code = extractApiErrorCode(error) || String(error?.code || '').trim().toLowerCase();
+  const method = String(error?.config?.method || '').toUpperCase();
+  if (code === 'conversation_response_too_large') {
+    return 'The API completed without a usable response. Check the operation status before retrying.';
+  }
+  if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(method) && (status >= 500 || (!error?.response && error?.request))) {
+    return 'The operation may have reached the service, but its result is uncertain. Check its status before retrying.';
+  }
   if (status === 401 || status === 403) {
     return 'Not authorized. Check the ADMIN token / API secret.';
+  }
+  if (/provider_(not_configured|credentials_missing|preflight_failed)|(?:vapi|cartesia)_not_configured/.test(code)) {
+    return 'Provider configuration is incomplete. Ask an administrator to review the provider setup.';
+  }
+  if (/(?:agent|template|runtime).*incompatible|incompatible.*(?:agent|template|runtime)/.test(code)) {
+    return 'This agent or template is incompatible with the selected provider or runtime.';
+  }
+  if (/consent|opted_out|destination_(?:invalid|not_eligible)|contact_policy_.*(?:ineligible|blocked)/.test(code)) {
+    return 'The destination is not eligible for this operation. Review its consent and contact policy status.';
+  }
+  if (/(?:submission|call|dispatch|provider).*?(?:ambiguous|unknown|unresolved)|reconcil/.test(code)) {
+    return 'The request may have reached the provider and is being reconciled. Do not submit it again until its status is confirmed.';
+  }
+  if (/dead_letter|needs_review|requires_attention|manual_review|workflow_event_requires_recovery/.test(code)) {
+    return 'This operation needs administrator review before it can continue.';
   }
   if (status === 404) {
     return 'API endpoint not found.';
@@ -177,20 +216,15 @@ async function request(method, ctx, url, data, options = {}) {
   }
   normalized.headers = { ...normalized.headers, ...callEActorHeaders };
   const { retry, ...axiosOptions } = normalized;
+  const perform = async () => {
+    if (method === 'get') return withRetry(() => axios.get(url, axiosOptions), retry);
+    if (method === 'delete') return withRetry(() => axios.delete(url, { ...axiosOptions, ...(data !== undefined && data !== null ? { data } : {}) }), retry);
+    if (method === 'put') return withRetry(() => axios.put(url, data, axiosOptions), retry);
+    if (method === 'patch') return withRetry(() => axios.patch(url, data, axiosOptions), retry);
+    return withRetry(() => axios.post(url, data, axiosOptions), retry);
+  };
   try {
-    if (method === 'get') {
-      return await withRetry(() => axios.get(url, axiosOptions), retry);
-    }
-    if (method === 'delete') {
-      return await withRetry(() => axios.delete(url, { ...axiosOptions, ...(data !== undefined && data !== null ? { data } : {}) }), retry);
-    }
-    if (method === 'put') {
-      return await withRetry(() => axios.put(url, data, axiosOptions), retry);
-    }
-    if (method === 'patch') {
-      return await withRetry(() => axios.patch(url, data, axiosOptions), retry);
-    }
-    return await withRetry(() => axios.post(url, data, axiosOptions), retry);
+    return await withConversationExternal(ctx, perform, method);
   } catch (error) {
     logError(error, { method: method.toUpperCase(), url });
     const enriched = enrichError(error, { method: method.toUpperCase(), url });
@@ -199,6 +233,75 @@ async function request(method, ctx, url, data, options = {}) {
     }
     throw enriched;
   }
+}
+
+function serializeHttpResponse(response = {}) {
+  const headers = {};
+  for (const name of ['content-type', 'x-request-id', 'retry-after']) {
+    const value = response.headers?.[name];
+    if (value !== undefined && value !== null) headers[name] = String(value).slice(0, 200);
+  }
+  const value = {
+    status: Number(response.status) || 200,
+    statusText: String(response.statusText || '').slice(0, 120),
+    headers,
+    data: response.data,
+  };
+  if (Buffer.byteLength(JSON.stringify(value), 'utf8') > 512 * 1024) {
+    throw Object.assign(new Error('Conversation response exceeds the replay storage limit'), { code: 'conversation_response_too_large' });
+  }
+  return value;
+}
+
+function restoreHttpResponse(value = {}) {
+  return {
+    status: Number(value.status) || 200,
+    statusText: String(value.statusText || ''),
+    headers: value.headers && typeof value.headers === 'object' ? value.headers : {},
+    data: value.data,
+  };
+}
+
+function serializeHttpError(error = {}, method = '') {
+  const status = Number(error.response?.status);
+  const code = String(extractApiErrorCode(error) || error.code || '').slice(0, 100);
+  return {
+    message: 'API request failed',
+    code: /^[A-Za-z0-9_.-]{1,100}$/.test(code) ? code : '',
+    method: String(method || error.config?.method || '').toUpperCase().slice(0, 10),
+    ...(Number.isFinite(status) ? {
+      response: {
+        status,
+        statusText: String(error.response?.statusText || '').slice(0, 120),
+        headers: {},
+        data: { ...(code ? { code } : {}), error: 'API request failed' },
+      },
+    } : error.request ? { request: true } : {}),
+  };
+}
+
+function restoreHttpError(value = {}) {
+  const error = new Error('API request failed');
+  if (value.code) error.code = value.code;
+  if (value.method) error.config = { method: value.method.toLowerCase() };
+  if (value.response) error.response = restoreHttpResponse(value.response);
+  if (value.request) error.request = true;
+  return error;
+}
+
+async function withConversationExternal(ctx, task, method = '') {
+  const conversation = ctx?.[CONVERSATION_EXTERNAL] || getCurrentConversation();
+  if (!conversation || typeof conversation.external !== 'function') return task();
+  const outcome = await conversation.external(async () => {
+    try {
+      return { ok: true, response: serializeHttpResponse(await task()) };
+    } catch (error) {
+      return { ok: false, error: serializeHttpError(error, method) };
+    }
+  });
+  if (outcome?.ok === false) throw restoreHttpError(outcome.error);
+  if (outcome?.ok === true) return restoreHttpResponse(outcome.response);
+  throw new Error('Conversation HTTP result is invalid');
 }
 
 async function get(ctx, url, options = {}) {
@@ -230,5 +333,6 @@ module.exports = {
   post,
   put,
   del,
-  patch
+  patch,
+  withConversationExternal,
 };

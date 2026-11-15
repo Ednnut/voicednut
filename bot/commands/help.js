@@ -25,6 +25,31 @@ function appendMiniAppLaunchButton(keyboard, label = '🧭 Admin Console') {
     return true;
 }
 
+function buildContextualSuggestions({ isAuthorized, isAdmin }) {
+    if (!isAuthorized) {
+        return [
+            'Request Bot access from the administrator before using operational commands.',
+            'After approval, use /help for commands available to your role.',
+        ];
+    }
+    const suggestions = [
+        'Prepare a no-call plan with /callplan; it checks a live CALL-E template without dialing.',
+        'Start a standard outbound call with /call; the Bot shows a launch summary and asks for confirmation.',
+        'Review recent activity with /calllog. If a submission is uncertain, check status before retrying.',
+        'Use /calle for CALL-E campaigns, mission status, approval queues, and recovery actions.',
+    ];
+    if (isAdmin) {
+        suggestions.push(
+            'For an uncertain submission, use /callmonitor to review provider state before retrying.',
+            'Check configured provider status with /provider status; use /provider recommend to compare capability fit without dispatch.',
+            'Create or configure voice scripts and agent runtime settings with /scripts and /persona.',
+            'Inspect workflow execution with /workflowruns [status] and /workflowrun <run_id> in a private chat.',
+            'Create and approve post-call workflow definitions in the Admin Console under Post-call Workflows.',
+        );
+    }
+    return suggestions;
+}
+
 async function handleHelp(ctx) {
     try {
         const access = await getAccessProfile(ctx);
@@ -76,15 +101,18 @@ async function handleHelp(ctx) {
         ];
 
         const quickUsage = [
-            'Use /call or the 📞 button to get started',
-            'Enter phone numbers in E.164 format (+1234567890)',
-            'Describe the AI agent personality and first message',
-            'Monitor live updates and ask for transcripts',
-            'End the call with the ✋ Interrupt or ⏹️ End button if needed'
+            ...buildContextualSuggestions({ isAuthorized, isAdmin: isOwner }),
+            isOwner
+                ? 'A confirmed call may reach the selected provider; check /calllog or /callmonitor and do not retry an uncertain submission.'
+                : 'A confirmed call may reach the selected provider; check /calllog, and contact an administrator if an uncertain request needs reconciliation. Do not retry it.',
         ];
 
         const exampleUsage = [
-            '+1234567890 (not 123-456-7890)',
+            '/callplan',
+            '/provider recommend voice',
+            '/call advanced',
+            ...(isAuthorized ? ['/calle'] : []),
+            ...(isOwner ? ['/workflowruns waiting_approval'] : []),
             '/calllog',
             '/health'
         ];
@@ -96,6 +124,11 @@ async function handleHelp(ctx) {
 
         const helpSections = [
             `<b>${escapeHtml('AI calling controls and command guide.')}</b>`,
+            `<b>Permissions</b>\n${formatLines([
+                isAuthorized ? 'Your Bot account has operational access; business-scoped actions still check current API membership.' : 'Operational commands require Bot access.',
+                isOwner ? 'Admin commands are included below.' : 'Admin-only commands are hidden from this list.',
+                'Real outbound calls and other sensitive operations require their own confirmation step.'
+            ])}`,
             `<b>Call Tools</b>\n${formatLines(callList)}`,
             `<b>SMS Tools</b>\n${formatLines(smsList)}`,
             `<b>Email Tools</b>\n${formatLines(emailList)}`,
@@ -114,6 +147,7 @@ async function handleHelp(ctx) {
                 '🧰 /scripts — manage reusable prompts',
                 '🍃 /persona — sculpt adaptive agents',
                 '🔀 /provider — view or switch voice providers',
+                '🔎 /provider recommend [capability ...] — compare eligible providers without dispatching',
                 '🧭 /cartesia — view Cartesia status; preview/apply a script voice profile'
             ];
             helpSections.push(`<b>Admin Toolkit</b>\n${formatLines(adminList)}`);
@@ -195,5 +229,6 @@ function registerHelpCommand(bot) {
 
 module.exports = {
     registerHelpCommand,
-    handleHelp
+    handleHelp,
+    buildContextualSuggestions,
 };

@@ -4,10 +4,12 @@ const assert = require('node:assert/strict');
 const { CallECampaignSafetyService } = require('../services/callECampaignSafetyService');
 
 function harness(now = new Date('2026-10-31T18:30:00.000Z')) {
-  const state = { policy: null, control: { paused: false }, lease: null, mission: { mission_id: `mission_${'a'.repeat(64)}` }, usage: { used: 0 } };
+  const state = { policy: null, history: [], control: { paused: false }, lease: null, mission: { mission_id: `mission_${'a'.repeat(64)}` }, usage: { used: 0 } };
   const db = {
     async getCallEBusinessSafetyPolicy() { return state.policy; },
     async setCallEBusinessSafetyPolicy(input) { state.policy = { ...input, emergency_stop: input.emergency_stop, updated_by: input.actor_id }; return state.policy; },
+    async getCallEBusinessSafetyPolicyHistory(_businessId, limit) { return state.history.slice(0, limit); },
+    async getCallEBusinessSafetyPolicyRevision(_businessId, revision) { return state.history.find((entry) => entry.revision === revision) || null; },
     async getCallEBusinessDispatchUsage() { return state.usage; },
     async getCallECampaignMissionWorkerControl() { return state.control; },
     async setCallECampaignMissionWorkerControl(input) { state.control = { paused: input.paused, updated_by: input.actor_id }; return state.control; },
@@ -35,6 +37,20 @@ describe('CALL-E mission safety controls', () => {
     assert.equal(saved.safety_policy.configured, true);
     assert.equal(saved.safety_policy.emergency_stop, true);
     assert.equal(saved.safety_policy.contact_cooldown_hours, 72);
+  });
+
+  it('returns scoped policy history and only allows policy managers to roll back a recorded revision', async () => {
+    const { service, state } = harness();
+    state.history = [{ revision: 1, max_calls_per_day: 12, quiet_hours_start: '21:00', quiet_hours_end: '06:00',
+      timezone: 'UTC', emergency_stop: false, contact_cooldown_hours: 24, actor_id: '54321', change_type: 'configured' }];
+    const viewed = await service.getPolicy({ business_id: 'biz-a', actor_id: '12345', history_limit: 5 });
+    assert.equal(viewed.safety_policy.revision, null);
+    assert.equal(viewed.history.length, 1);
+    await assert.rejects(service.rollbackPolicy({ business_id: 'biz-a', actor_id: '12345', revision: 1 }),
+      (error) => error.code === 'call_e_business_operator_access_denied');
+    const result = await service.rollbackPolicy({ business_id: 'biz-a', actor_id: '54321', revision: 1 });
+    assert.equal(result.source_revision, 1);
+    assert.equal(result.safety_policy.max_calls_per_day, 12);
   });
 
   it('blocks emergency stop, quiet hours, and paused workers before dispatch reservation', async () => {

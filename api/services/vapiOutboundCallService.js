@@ -1,4 +1,5 @@
 const crypto = require("node:crypto");
+const { createExecutionContext, buildExecutionStep } = require("./executionContext");
 
 function readSummary(value) {
   if (value && typeof value === "object" && !Array.isArray(value)) return value;
@@ -186,7 +187,10 @@ class VapiOutboundCallService {
       if (!safetyReservation.idempotentReplay) await this.outboundSafety.completeDispatch(safetyReservation, "released");
       const existing = await this.db.getOutboundCallIdempotency(idempotencyKey);
       const replay = resolveExistingRequest(existing, requestHash);
-      if (replay.providerCallId) await this.recordCommonCall(input, template, number, replay).catch(() => {});
+      if (replay.providerCallId) {
+        const executionContext = this.createExecutionContext(input, template, replay);
+        await this.recordCommonCall(input, template, number, replay, executionContext).catch(() => {});
+      }
       return replay;
     }
 
@@ -201,6 +205,7 @@ class VapiOutboundCallService {
       ...(Object.keys(assistantOverrides).length ? { assistantOverrides } : {}),
     };
     let call;
+    const dispatchStartedAt = new Date().toISOString();
     try {
       call = await this.client.createCall(request);
     } catch (error) {
@@ -228,6 +233,7 @@ class VapiOutboundCallService {
       mappingId: Number(mapping.id),
       localCallId: `vapi_${providerCallId}`,
     };
+    const executionContext = this.createExecutionContext(input, template, result);
     await this.db.completeOutboundCallIdempotency({
       idempotency_key: idempotencyKey,
       provider: "vapi",
@@ -237,12 +243,28 @@ class VapiOutboundCallService {
       response_payload: result,
     });
     await this.outboundSafety.completeDispatch(safetyReservation, "accepted");
-    await this.recordCommonCall(input, template, number, result).catch(() => {});
+    await this.recordCommonCall(input, template, number, result, executionContext, dispatchStartedAt).catch(() => {});
     await this.recordAcceptanceEvent(result).catch(() => {});
     return result;
   }
 
-  async recordCommonCall(input, template, number, result) {
+  createExecutionContext(input, template, result) {
+    return createExecutionContext({
+      request_id: input.requestId,
+      internal_call_id: result.localCallId || `vapi_${result.providerCallId}`,
+      business_id: template.business_id || template.businessId,
+      actor_id: input.actorId || input.actor_id,
+      agent_id: template.agent_id || template.agentId,
+      provider: "vapi",
+      provider_call_id: result.providerCallId,
+      execution_type: "outbound_call",
+      status: "accepted",
+      current_stage: "provider_accepted",
+      idempotency_reference: input.idempotencyKey || input.idempotency_key,
+    });
+  }
+
+  async recordCommonCall(input, template, number, result, executionContext = null, dispatchStartedAt = null) {
     if (typeof this.db?.createCall !== "function") return;
     const callSid = `vapi_${result.providerCallId}`;
     const existing = typeof this.db.getCall === "function" ? await this.db.getCall(callSid).catch(() => null) : null;
@@ -259,12 +281,23 @@ class VapiOutboundCallService {
       outbound_idempotency_key: input.idempotencyKey || input.idempotency_key || null,
     });
     await this.db.updateCallState?.(callSid, "call_created", {
+      execution_context: executionContext || this.createExecutionContext(input, template, result),
       provider: "vapi",
       telephony_provider: "vapi",
       provider_call_id: result.providerCallId,
       business_id: String(template.business_id || template.businessId || "") || null,
       source: "vapi_outbound",
     });
+    await this.db.updateCallState?.(callSid, "execution_step", buildExecutionStep(
+      executionContext || this.createExecutionContext(input, template, result),
+      {
+        step_name: "provider_dispatch",
+        status: "completed",
+        result: "accepted",
+        started_at: dispatchStartedAt,
+        related_entity: result.providerCallId,
+      },
+    ));
   }
 
   async recordAcceptanceEvent(result = {}) {

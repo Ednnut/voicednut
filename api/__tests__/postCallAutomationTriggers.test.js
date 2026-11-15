@@ -2,9 +2,11 @@ const assert = require("node:assert/strict");
 
 const {
   buildCallCompletionAutomationPayload,
+  buildPostCallAutomationFailurePayload,
   buildPostCallOutcomeClassificationPayload,
   maybeRunPaymentAutomation,
   runPostCallAutomationTrigger,
+  triggerPostCallOutcomeWebhook,
   triggerPostCallOutcomeWorkflow,
 } = require("../services/postCallAutomationTriggers");
 
@@ -75,7 +77,7 @@ describe("PostCallAutomationTriggers", () => {
     assert.equal(payloads[0].idempotency_key, "payment:stripe:evt_123");
     assert.equal(payloads[0].payment_state, "paid");
     assert.equal(payloads[0].customer.email, "ada@example.com");
-    assert.equal(states[0].state, "post_call_automation_completed");
+    assert.equal(states[0].state, "post_call_automation_queued");
     assert.equal(states[0].data.workflow_event_id, "workflow-event-1");
     assert.equal(liveEvents[0].callSid, "CA123");
     assert.equal(liveEvents[0].line, "Automation ran 1 rule; workflow event queued");
@@ -113,6 +115,7 @@ describe("PostCallAutomationTriggers", () => {
     const states = [];
     const liveEvents = [];
     const workflowEvents = [];
+    const outgoingEvents = [];
     const result = await runPostCallAutomationTrigger({
       service: {
         evaluateAndRun: async () => {
@@ -125,6 +128,7 @@ describe("PostCallAutomationTriggers", () => {
           return { accepted: true, event_id: "workflow-event-2", status: "pending", trigger_event: payload.trigger_event };
         },
       },
+      outgoingWebhookService: { enqueueEvent: async (event) => { outgoingEvents.push(event); return 1; } },
       webhookService: {
         addLiveEvent: (callSid, line, options) => {
           liveEvents.push({ callSid, line, options });
@@ -137,27 +141,45 @@ describe("PostCallAutomationTriggers", () => {
       },
       logger: createSilentLogger(),
       callSid: "CA999",
-      payload: { trigger_event: "post_call_completed", call_sid: "CA999" },
+      payload: { trigger_event: "post_call_completed", business_id: "biz-1", call_sid: "CA999" },
     });
 
     assert.equal(result.ok, false);
     assert.equal(workflowEvents.length, 1);
+    assert.equal(outgoingEvents.length, 2);
+    assert.equal(outgoingEvents[1].trigger_event, "post_call_automation_failed");
+    assert.deepEqual(outgoingEvents[1].payload, { failure_stage: "automation_execution",
+      error_code: "post_call_automation_failed" });
     assert.equal(states[0].state, "post_call_automation_failed");
     assert.equal(liveEvents[0].line, "Automation failed");
+  });
+
+  it("requires business, call, and an allowlisted stage for failure webhook events", () => {
+    assert.deepEqual(buildPostCallAutomationFailurePayload({ callSid: "CA321", businessId: "biz-1",
+      failureStage: "workflow_trigger", errorCode: "workflow_event_requires_recovery" }), {
+      trigger_event: "post_call_automation_failed", business_id: "biz-1", call_sid: "CA321",
+      idempotency_key: "post-call-automation-failed:CA321:workflow_trigger",
+      payload: { failure_stage: "workflow_trigger", error_code: "workflow_event_requires_recovery" },
+    });
+    assert.equal(buildPostCallAutomationFailurePayload({ callSid: "CA321", businessId: null,
+      failureStage: "workflow_trigger", errorCode: "private@example.com" }), null);
   });
 
   it("dispatches workflow events alongside existing post-call rules and records sanitized workflow state", async () => {
     const states = [];
     const liveEvents = [];
     const eventPayloads = [];
+    const executionOrder = [];
     const result = await runPostCallAutomationTrigger({
       service: {
         async evaluateAndRun(payload) {
+          executionOrder.push("legacy_automation");
           return { trigger_event: payload.trigger_event, matched: 0, runs: [] };
         },
       },
       workflowService: {
         async enqueueEvent(payload) {
+          executionOrder.push("durable_enqueue");
           eventPayloads.push(payload);
           return { accepted: true, event_id: "workflow-event-3", status: "pending", trigger_event: payload.trigger_event };
         },
@@ -170,11 +192,52 @@ describe("PostCallAutomationTriggers", () => {
     });
 
     assert.equal(result.ok, true);
+    assert.deepEqual(executionOrder, ["durable_enqueue", "legacy_automation"]);
     assert.equal(eventPayloads.length, 1);
     assert.equal(result.workflow_result.status, "pending");
     assert.equal(states[0].data.workflow_event_id, "workflow-event-3");
     assert.deepEqual(states[0].data.workflow_runs, []);
     assert.equal(liveEvents[0].line, "Workflow event queued");
+  });
+
+  it("carries the stored execution context into the post-call event correlation envelope", async () => {
+    let eventPayload;
+    const result = await runPostCallAutomationTrigger({
+      workflowService: {
+        async enqueueEvent(payload) {
+          eventPayload = payload;
+          return { accepted: true, event_id: "workflow-event-context", status: "pending" };
+        },
+      },
+      db: {
+        async getLatestCallState() {
+          return {
+            execution_context: {
+              internal_execution_id: "exec_call_1",
+              request_id: "request-1",
+              internal_call_id: "call-context-1",
+              organization_id: "business-1",
+              actor_id: "7001",
+              provider: "twilio",
+              status: "accepted",
+              current_stage: "call_created",
+              idempotency_reference: "key-1",
+              created_at: "2026-01-01T00:00:00.000Z",
+            },
+          };
+        },
+        async updateCallState() {},
+      },
+      callSid: "call-context-1",
+      payload: { trigger_event: "post_call_completed", call_sid: "call-context-1" },
+      logger: createSilentLogger(),
+    });
+
+    assert.equal(result.ok, true);
+    assert.equal(eventPayload.execution_context.internal_execution_id, "exec_call_1");
+    assert.equal(eventPayload.execution_context.current_stage, "post_call_automation");
+    assert.equal(eventPayload.execution_context.internal_call_id, "call-context-1");
+    assert.equal(eventPayload.execution_context.updated_at > eventPayload.execution_context.created_at, true);
   });
 
   it("builds post-call completion payloads from call summaries and transcripts", () => {
@@ -198,6 +261,7 @@ describe("PostCallAutomationTriggers", () => {
   it("builds a separate data-minimized post-call outcome classification payload", () => {
     const payload = buildPostCallOutcomeClassificationPayload({
       callSid: "CA321",
+      businessId: "biz-1",
       finalStatus: "no-answer",
       notificationType: "call_no_answer",
     });
@@ -205,6 +269,7 @@ describe("PostCallAutomationTriggers", () => {
     assert.equal(payload.trigger_event, "post_call_outcome_classified");
     assert.equal(payload.idempotency_key, "call-outcome-classified:CA321");
     assert.equal(payload.call_outcome, "no_answer");
+    assert.equal(payload.business_id, "biz-1");
     assert.equal(payload.context.outcome_classification, "not_connected");
     assert.equal(Object.hasOwn(payload, "customer"), false);
     assert.equal(Object.hasOwn(payload, "transcript_summary"), false);
@@ -223,5 +288,23 @@ describe("PostCallAutomationTriggers", () => {
     });
     assert.deepEqual(result, { skipped: true, reason: "workflow_trigger_failed" });
     assert.deepEqual(errors, [["post_call_outcome_workflow_trigger_failed", { call_sid: "CA321", error_code: "workflow_trigger_failed" }]]);
+  });
+
+  it("forwards classification to outgoing webhooks and sanitizes enqueue errors", async () => {
+    const errors = [];
+    const payload = buildPostCallOutcomeClassificationPayload({
+      callSid: "CA321", businessId: "biz-1", finalStatus: "failed", notificationType: "call_failed",
+    });
+    const result = await triggerPostCallOutcomeWebhook({
+      outgoingWebhookService: { enqueueEvent: async (event) => event.business_id === "biz-1" ? 1 : 0 },
+      payload,
+    });
+    assert.deepEqual(result, { queued: 1 });
+    const failed = await triggerPostCallOutcomeWebhook({
+      outgoingWebhookService: { enqueueEvent: async () => { throw Object.assign(new Error("private text"), { code: "private@example.com" }); } },
+      payload, logger: { error: (...args) => errors.push(args) },
+    });
+    assert.deepEqual(failed, { skipped: true, reason: "outgoing_webhook_enqueue_failed" });
+    assert.deepEqual(errors, [["post_call_outcome_webhook_enqueue_failed", { call_sid: "CA321", error_code: "outgoing_webhook_enqueue_failed" }]]);
   });
 });

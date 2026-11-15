@@ -3,6 +3,7 @@ const {
   listSupportedProviders,
   listProviderFlows,
 } = require('../adapters/providerFlowPolicy');
+const { validateSchema: validatePostCallExtractionSchema } = require('./postCallExtractionService');
 
 const CALL_AGENT_SCHEMA_VERSION = 1;
 const CALL_AGENT_PROVIDER_CAPABILITY_SCHEMA_VERSION = 1;
@@ -35,7 +36,7 @@ function normalizeCallAgentBusinessContext(value, errors) {
     errors.push('business_context must be an object.');
     return null;
   }
-  if (Object.keys(value).some((key) => !['business_name', 'facts'].includes(key))) {
+  if (Object.keys(value).some((key) => !['business_name', 'facts', 'post_call_extraction'].includes(key))) {
     errors.push('business_context contains unsupported fields.');
   }
   const businessName = value.business_name === undefined
@@ -62,9 +63,27 @@ function normalizeCallAgentBusinessContext(value, errors) {
     if (!content || content.length > 500) errors.push('Business context fact values must contain 1 to 500 characters.');
     return { label, value: content };
   }).filter(Boolean) : [];
+  let postCallExtraction;
+  if (value.post_call_extraction !== undefined) {
+    const extraction = value.post_call_extraction;
+    if (!extraction || typeof extraction !== 'object' || Array.isArray(extraction) ||
+        Object.keys(extraction).some((key) => !['schema_version', 'schema'].includes(key)) ||
+        !/^[A-Za-z0-9._:-]{1,120}$/.test(String(extraction.schema_version || '')) ||
+        !extraction.schema || typeof extraction.schema !== 'object' || Array.isArray(extraction.schema)) {
+      errors.push('business_context.post_call_extraction must contain a schema_version and JSON Schema object.');
+    } else {
+      try {
+        validatePostCallExtractionSchema(extraction.schema);
+        postCallExtraction = { schema_version: String(extraction.schema_version), schema: extraction.schema };
+      } catch (_) {
+        errors.push('business_context.post_call_extraction schema is invalid.');
+      }
+    }
+  }
   const normalized = {
     ...(businessName ? { business_name: businessName } : {}),
     ...(facts.length ? { facts } : {}),
+    ...(postCallExtraction ? { post_call_extraction: postCallExtraction } : {}),
   };
   const serializedLength = JSON.stringify(normalized).length;
   if (serializedLength > 4000) errors.push('business_context must be 4000 characters or fewer.');
@@ -74,7 +93,10 @@ function normalizeCallAgentBusinessContext(value, errors) {
 
 function renderCallAgentBusinessContext(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return '';
-  const safeJson = JSON.stringify(value)
+  const renderable = { ...value };
+  delete renderable.post_call_extraction;
+  if (!Object.keys(renderable).length) return '';
+  const safeJson = JSON.stringify(renderable)
     .replace(/&/g, '\\u0026')
     .replace(/</g, '\\u003c')
     .replace(/>/g, '\\u003e');

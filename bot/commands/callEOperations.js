@@ -949,7 +949,7 @@ async function runMissionReadiness(conversation, ctx, ensureActive) {
     });
     const readiness = response?.data?.readiness || {};
     const checks = (readiness.checks || []).map((item) => `${item.ready ? '✅' : '⛔'} ${escapeHtml(String(item.key))}${item.reason ? ` · ${escapeHtml(String(item.reason))}` : ''}`).join('\n');
-    await ctx.reply(`<b>Mission readiness</b> · ${readiness.ready ? 'ready' : 'blocked'}\n${checks}\nBudget: ${Number(readiness.budget?.actual_minor) || 0} actual + ${Number(readiness.budget?.reserved_minor) || 0} reserved / ${readiness.budget?.cap_minor == null ? 'no cap' : `${readiness.budget.cap_minor} ${escapeHtml(String(readiness.budget.currency || ''))} minor units`}\nProvider: ${escapeHtml(String(readiness.provider?.selected_provider || 'none ready'))}\n\nThis report is read-only and never dispatches.`, { parse_mode: 'HTML' });
+    await ctx.reply(`<b>Mission readiness</b> · ${readiness.ready ? 'ready' : 'blocked'}\n${checks}\nBudget: ${Number(readiness.budget?.actual_minor) || 0} reported actual + ${Number(readiness.budget?.estimated_minor) || 0} estimated + ${Number(readiness.budget?.reserved_minor) || 0} reserved / ${readiness.budget?.cap_minor == null ? 'no cap' : `${readiness.budget.cap_minor} ${escapeHtml(String(readiness.budget.currency || ''))} minor units`}\nProvider: ${escapeHtml(String(readiness.provider?.selected_provider || 'none ready'))}\n\nThis report is read-only and never dispatches. Usage entries are operator-entered and not independently verified.`, { parse_mode: 'HTML' });
   } catch (error) { await ctx.reply(httpClient.getUserMessage(error, 'Mission readiness could not be checked.')); }
 }
 
@@ -987,7 +987,7 @@ async function runCdrImport(conversation, ctx, ensureActive) {
     }, { timeout: 20000 });
     const data = staged?.data || {};
     const preview = data.preview || {};
-    await ctx.reply(`<b>CDR import preview</b>\nRecords: ${Number(preview.record_count) || 0} · duplicates skipped: ${Number(preview.duplicate_count) || 0} · new: ${Number(preview.new_record_count) || 0}\nBudget exceeded after import: ${preview.budget_exceeded ? 'yes' : 'no'}\nProjected totals: ${escapeHtml(JSON.stringify(preview.projected_actual_by_currency || {}))}\n\nRecords are operator-supplied and provider-account data is not fetched.`, { parse_mode: 'HTML' });
+    await ctx.reply(`<b>CDR import preview</b>\nRecords: ${Number(preview.record_count) || 0} · duplicates skipped: ${Number(preview.duplicate_count) || 0} · estimates replaced: ${Number(preview.replacement_count) || 0} · new: ${Number(preview.new_record_count) || 0}\nBudget exceeded after import: ${preview.budget_exceeded ? 'yes' : 'no'}\nProjected reported actual: ${escapeHtml(JSON.stringify(preview.projected_actual_by_currency || {}))}\nProjected committed including estimates: ${escapeHtml(JSON.stringify(preview.projected_committed_by_currency || preview.projected_actual_by_currency || {}))}\n\nRecords are operator-supplied; provider-account data is not fetched or independently verified. Estimate replacements are recorded in the usage revision audit.`, { parse_mode: 'HTML' });
     const confirm = await ask(conversation, ctx, 'Type COMMIT CDR IMPORT to save the staged non-duplicate records.', ensureActive);
     if (confirm !== 'COMMIT CDR IMPORT') { await ctx.reply(`Import remains staged as ${escapeHtml(String(data.import_id || 'unknown'))}.`); return; }
     const committed = await httpClient.post(ctx, `${callEApiBase()}/mission-cdr-imports/${encodeURIComponent(data.import_id)}/commit`, {
@@ -1012,8 +1012,10 @@ async function runMissionUsage(conversation, ctx, ensureActive) {
         params: { business_id: businessId, actor_id: actorId }, timeout: 12000,
       });
       const report = response?.data?.report || {};
-      const amounts = Object.entries(report.actual_by_currency || {}).map(([currency, amount]) => `${Number(amount)} ${currency} minor units`).join(', ') || 'none recorded';
-      await ctx.reply(`<b>Mission usage reconciliation</b>\nReserved: ${report.budget_currency ? `${Number(report.reserved_minor) || 0} ${escapeHtml(report.budget_currency)} minor units` : 'not configured'}\nActual usage: ${escapeHtml(amounts)}\nBudget alert: ${report.budget_exceeded ? '<b>exceeded</b>' : 'not exceeded'}. Imported entries are operator-entered records; this report does not fetch or verify provider accounts.`, { parse_mode: 'HTML' });
+      const formatAmounts = (totals = {}) => Object.entries(totals).map(([currency, amount]) => `${Number(amount)} ${currency} minor units`).join(', ') || 'none recorded';
+      const actualAmounts = formatAmounts(report.actual_by_currency);
+      const estimatedAmounts = formatAmounts(report.estimated_by_currency);
+      await ctx.reply(`<b>Mission usage reconciliation</b>\nReserved: ${report.budget_currency ? `${Number(report.reserved_minor) || 0} ${escapeHtml(report.budget_currency)} minor units` : 'not configured'}\nReported actual usage: ${escapeHtml(actualAmounts)}\nEstimated usage: ${escapeHtml(estimatedAmounts)}\nBudget alert: ${report.budget_exceeded ? '<b>exceeded</b>' : 'not exceeded'}. Usage sources are operator-entered and are not independently verified.`, { parse_mode: 'HTML' });
       return;
     }
     const positionText = await ask(conversation, ctx, 'Recipient position, starting at 0.', ensureActive);
@@ -1022,9 +1024,9 @@ async function runMissionUsage(conversation, ctx, ensureActive) {
     if (!Number.isSafeInteger(recipientPosition) || recipientPosition < 0 || recipientPosition > 24) { await ctx.reply('Recipient position must be an integer from 0 through 24.'); return; }
     const provider = await ask(conversation, ctx, 'Provider: twilio, plivo, vonage, or other.', ensureActive, ['twilio', 'plivo', 'vonage', 'other']);
     if (provider === null) return;
-    const providerCallId = await ask(conversation, ctx, 'Provider call identifier from its CDR.', ensureActive);
+    const providerCallId = await ask(conversation, ctx, 'Provider call identifier associated with this estimate or source record. Keep it stable so later reported usage can replace an estimate.', ensureActive);
     if (providerCallId === null) return;
-    const amount = await ask(conversation, ctx, 'Actual billed amount in minor units (integer from provider record).', ensureActive);
+    const amount = await ask(conversation, ctx, 'Usage amount in currency minor units (non-negative integer). Mark estimates with source type operator_estimate.', ensureActive);
     if (amount === null) return;
     const amountMinor = Number(amount);
     if (!Number.isSafeInteger(amountMinor) || amountMinor < 0) { await ctx.reply('Billed amount must be a non-negative integer in minor units.'); return; }
@@ -1036,7 +1038,7 @@ async function runMissionUsage(conversation, ctx, ensureActive) {
     if (sourceReference === null) return;
     const durationText = await ask(conversation, ctx, 'Billed duration in seconds, or skip.', ensureActive);
     if (durationText === null) return;
-    const confirmation = await ask(conversation, ctx, `Type RECORD USAGE to save ${amountMinor} ${currency.toUpperCase()} minor units. The API stores this as an operator-entered CDR/invoice value.`, ensureActive);
+    const confirmation = await ask(conversation, ctx, `Type RECORD USAGE to save ${amountMinor} ${currency.toUpperCase()} minor units as ${sourceType}. This operator-entered value is not independently verified. Later CDR or invoice data can replace an estimate for the same call.`, ensureActive);
     if (confirmation !== 'RECORD USAGE') { await ctx.reply('Usage entry canceled.'); return; }
     const saved = await httpClient.post(ctx, `${callEApiBase()}/mission-usage`, {
       business_id: businessId, mission_id: missionId, actor_id: actorId, recipient_position: recipientPosition,

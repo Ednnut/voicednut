@@ -4,6 +4,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const sqlite3 = require('sqlite3').verbose();
 const Database = require('../db/db');
 
 describe('CALL-E campaign mission persistence', () => {
@@ -55,6 +56,35 @@ describe('CALL-E campaign mission persistence', () => {
       ...overrides,
     };
   }
+
+  it('records append-only approval policy revisions and audited rollback', async () => {
+    const first = await db.setCallEBusinessMissionPolicy({
+      business_id: 'biz-policy', actor_id: '111', secondary_approval_threshold: 10, approval_ttl_hours: 24,
+      review_sla_minutes: 0, review_repeat_minutes: 0,
+    });
+    assert.equal(first.revision, 1);
+    await db.setCallEBusinessMissionPolicy({
+      business_id: 'biz-policy', actor_id: '222', secondary_approval_threshold: 8, approval_ttl_hours: 48,
+      review_sla_minutes: 90, review_repeat_minutes: 30,
+    });
+    const source = await db.getCallEBusinessMissionPolicyRevision('biz-policy', 1);
+    await db.setCallEBusinessMissionPolicy({
+      business_id: 'biz-policy', actor_id: '333', secondary_approval_threshold: source.secondary_approval_threshold,
+      approval_ttl_hours: source.approval_ttl_hours, review_sla_minutes: source.review_sla_minutes,
+      review_repeat_minutes: source.review_repeat_minutes, change_type: 'rollback', source_revision: 1,
+    });
+    const current = await db.getCallEBusinessMissionPolicy('biz-policy');
+    const history = await db.getCallEBusinessMissionPolicyHistory('biz-policy', 10);
+    assert.equal(current.revision, 3);
+    assert.deepEqual(history.map((row) => row.revision), [3, 2, 1]);
+    assert.equal(history[0].actor_id, '333');
+    assert.equal(history[0].change_type, 'rollback');
+    assert.equal(history[0].source_revision, 1);
+    await assert.rejects(new Promise((resolve, reject) => db.db.run(
+      "UPDATE call_e_business_mission_policy_revisions SET actor_id = 'tampered' WHERE business_id = 'biz-policy' AND revision = 1",
+      (error) => error ? reject(error) : resolve(),
+    )), /append-only/);
+  });
 
   it('records append-only campaign review decisions and replays the original reviewer decision', async () => {
     const created = await db.createCallECampaignReviewDraft({
@@ -288,6 +318,31 @@ describe('CALL-E campaign mission persistence', () => {
     assert.equal((await db.getCallEBusinessMissionPolicy('biz-a')).approval_ttl_hours, 48);
     await db.setCallEBusinessProviderRouting({ business_id: 'biz-a', actor_id: '222', provider_order: ['plivo', 'vonage'] });
     assert.deepEqual((await db.getCallEBusinessProviderRouting('biz-a')).provider_order, ['plivo', 'vonage']);
+    await db.setCallEBusinessProviderRouting({ business_id: 'biz-a', actor_id: '333', provider_order: ['twilio'] });
+    const routing = await db.getCallEBusinessProviderRouting('biz-a');
+    assert.equal(routing.revision, 2);
+    assert.deepEqual((await db.getCallEBusinessProviderRoutingHistory('biz-a')).map((entry) => [entry.revision, entry.actor_id, entry.change_type]), [
+      [2, '333', 'configured'], [1, '222', 'configured'],
+    ]);
+    await assert.rejects(new Promise((resolve, reject) => db.db.run(
+      'UPDATE call_e_business_provider_routing_revisions SET actor_id = ? WHERE business_id = ? AND revision = 1', ['999', 'biz-a'],
+      (error) => error ? reject(error) : resolve(),
+    )), /append-only/);
+    await Promise.all([
+      db.setCallEBusinessProviderRouting({ business_id: 'biz-a', actor_id: '444', provider_order: ['plivo'] }),
+      db.setCallEBusinessProviderRouting({ business_id: 'biz-a', actor_id: '555', provider_order: ['vonage'] }),
+    ]);
+    assert.deepEqual((await db.getCallEBusinessProviderRoutingHistory('biz-a', 10)).map((entry) => entry.revision), [4, 3, 2, 1]);
+
+    await db.setCallEBusinessProviderRouting({ business_id: 'legacy-writer-biz', actor_id: '222', provider_order: ['twilio'] });
+    await db.setCallEBusinessProviderRouting({ business_id: 'legacy-writer-biz', actor_id: '222', provider_order: ['twilio'], change_type: 'rollback', source_revision: 1 });
+    await new Promise((resolve, reject) => db.db.run(
+      `UPDATE call_e_business_provider_routing SET provider_order_json = ?, updated_by = ?, updated_at = CURRENT_TIMESTAMP
+       WHERE business_id = ?`, ['["plivo"]', '333', 'legacy-writer-biz'],
+      (error) => error ? reject(error) : resolve(),
+    ));
+    const legacyWriterHistory = await db.getCallEBusinessProviderRoutingHistory('legacy-writer-biz');
+    assert.deepEqual([legacyWriterHistory[0].change_type, legacyWriterHistory[0].source_revision], ['configured', null]);
     await db.grantCallEBusinessOperator({ business_id: 'biz-a', telegram_id: '222', role: 'call_operator' });
     await db.setCallEMissionAlertSubscription({ business_id: 'biz-a', actor_id: '222', enabled: true });
     assert.equal((await db.getCallEMissionAlertSubscription('biz-a', '222')).enabled, true);
@@ -307,6 +362,111 @@ describe('CALL-E campaign mission persistence', () => {
     assert.ok((await db.getCallECampaignMission(missionId, 'biz-a')).activity.length >= 3);
   });
 
+  it('backfills a legacy routing row once when the history migration is repeated', async () => {
+    await new Promise((resolve, reject) => db.db.run(
+      'DROP TRIGGER call_e_business_provider_routing_revision_after_insert',
+      (error) => error ? reject(error) : resolve(),
+    ));
+    await new Promise((resolve, reject) => db.db.run(
+      `INSERT INTO call_e_business_provider_routing (business_id, provider_order_json, updated_by, updated_at)
+       VALUES (?, ?, ?, ?)`, ['legacy-biz', '["vonage"]', '444', '2025-01-02 03:04:05'],
+      (error) => error ? reject(error) : resolve(),
+    ));
+    await db.ensureCallEBusinessProviderRoutingHistory();
+    await db.ensureCallEBusinessProviderRoutingHistory();
+    const history = await db.getCallEBusinessProviderRoutingHistory('legacy-biz');
+    assert.deepEqual(history.map((entry) => [entry.revision, entry.provider_order, entry.actor_id, entry.change_type, entry.created_at]), [
+      [1, ['vonage'], '444', 'baseline', '2025-01-02 03:04:05'],
+    ]);
+  });
+
+  it('adds revision columns and history to a database with the pre-versioning routing schema', async () => {
+    const legacyDb = new Database();
+    legacyDb.db = new sqlite3.Database(':memory:');
+    try {
+      await new Promise((resolve, reject) => legacyDb.db.run(`CREATE TABLE call_e_business_provider_routing (
+        business_id TEXT PRIMARY KEY, provider_order_json TEXT NOT NULL, updated_by TEXT NOT NULL,
+        updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+      )`, (error) => error ? reject(error) : resolve()));
+      await new Promise((resolve, reject) => legacyDb.db.run(
+        `INSERT INTO call_e_business_provider_routing (business_id, provider_order_json, updated_by, updated_at)
+         VALUES (?, ?, ?, ?)`, ['legacy-schema-biz', '["plivo"]', '777', '2024-08-09 10:11:12'],
+        (error) => error ? reject(error) : resolve(),
+      ));
+
+      await legacyDb.ensureCallEBusinessProviderRoutingHistory();
+      assert.deepEqual((await legacyDb.getCallEBusinessProviderRouting('legacy-schema-biz')).provider_order, ['plivo']);
+      const migratedHistory = await legacyDb.getCallEBusinessProviderRoutingHistory('legacy-schema-biz');
+      assert.deepEqual(migratedHistory.map((entry) => [entry.revision, entry.actor_id, entry.change_type]), [[1, '777', 'baseline']]);
+      await legacyDb.setCallEBusinessProviderRouting({ business_id: 'legacy-schema-biz', actor_id: '888', provider_order: ['vonage'] });
+      assert.deepEqual((await legacyDb.getCallEBusinessProviderRoutingHistory('legacy-schema-biz')).map((entry) => entry.revision), [2, 1]);
+    } finally {
+      if (legacyDb.db) await new Promise((resolve) => legacyDb.db.close(resolve));
+    }
+  });
+
+  it('versions safety policies, preserves append-only history, and records rollback as a new revision', async () => {
+    const first = await db.setCallEBusinessSafetyPolicy({
+      business_id: 'safety-history-biz', actor_id: '111', max_calls_per_day: 10,
+      quiet_hours_start: '22:00', quiet_hours_end: '07:00', timezone: 'UTC', emergency_stop: false,
+      contact_cooldown_hours: 12,
+    });
+    assert.equal(first.revision, 1);
+    await db.setCallEBusinessSafetyPolicy({
+      business_id: 'safety-history-biz', actor_id: '222', max_calls_per_day: 20,
+      quiet_hours_start: null, quiet_hours_end: null, timezone: 'America/New_York', emergency_stop: true,
+      contact_cooldown_hours: 24,
+    });
+    const rolledBack = await db.setCallEBusinessSafetyPolicy({
+      business_id: 'safety-history-biz', actor_id: '333', max_calls_per_day: 10,
+      quiet_hours_start: '22:00', quiet_hours_end: '07:00', timezone: 'UTC', emergency_stop: false,
+      contact_cooldown_hours: 12, change_type: 'rollback', source_revision: 1,
+    });
+    assert.equal(rolledBack.revision, 3);
+    const history = await db.getCallEBusinessSafetyPolicyHistory('safety-history-biz');
+    assert.deepEqual(history.map((entry) => [entry.revision, entry.actor_id, entry.change_type, entry.source_revision]), [
+      [3, '333', 'rollback', 1], [2, '222', 'configured', null], [1, '111', 'configured', null],
+    ]);
+    await assert.rejects(new Promise((resolve, reject) => db.db.run(
+      `UPDATE call_e_business_safety_policy_revisions SET timezone = 'UTC' WHERE business_id = ? AND revision = 1`,
+      ['safety-history-biz'], (error) => error ? reject(error) : resolve(),
+    )), /append-only/);
+    await assert.rejects(new Promise((resolve, reject) => db.db.run(
+      `DELETE FROM call_e_business_safety_policy_revisions WHERE business_id = ? AND revision = 1`,
+      ['safety-history-biz'], (error) => error ? reject(error) : resolve(),
+    )), /append-only/);
+  });
+
+  it('backfills a legacy safety policy once and adds revisions after the migration', async () => {
+    const legacyDb = new Database();
+    legacyDb.db = new sqlite3.Database(':memory:');
+    try {
+      await new Promise((resolve, reject) => legacyDb.db.run(`CREATE TABLE call_e_business_safety_policies (
+        business_id TEXT PRIMARY KEY, max_calls_per_day INTEGER NOT NULL, quiet_hours_start TEXT, quiet_hours_end TEXT,
+        timezone TEXT NOT NULL, emergency_stop INTEGER NOT NULL, contact_cooldown_hours INTEGER NOT NULL DEFAULT 0,
+        updated_by TEXT NOT NULL, updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+      )`, (error) => error ? reject(error) : resolve()));
+      await new Promise((resolve, reject) => legacyDb.db.run(`CREATE TABLE call_e_operations_audit (
+        audit_id INTEGER PRIMARY KEY AUTOINCREMENT, business_id TEXT NOT NULL, actor_id TEXT NOT NULL,
+        action TEXT NOT NULL, mission_id TEXT, metadata_json TEXT NOT NULL DEFAULT '{}', created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      )`, (error) => error ? reject(error) : resolve()));
+      await new Promise((resolve, reject) => legacyDb.db.run(
+        `INSERT INTO call_e_business_safety_policies
+          (business_id, max_calls_per_day, quiet_hours_start, quiet_hours_end, timezone, emergency_stop, contact_cooldown_hours, updated_by, updated_at)
+         VALUES ('legacy-safety-biz', 15, NULL, NULL, 'UTC', 0, 0, '777', '2025-01-02 03:04:05')`,
+        (error) => error ? reject(error) : resolve(),
+      ));
+      await legacyDb.ensureCallEBusinessSafetyPolicyHistory();
+      await legacyDb.ensureCallEBusinessSafetyPolicyHistory();
+      assert.deepEqual((await legacyDb.getCallEBusinessSafetyPolicyHistory('legacy-safety-biz')).map((entry) => [entry.revision, entry.actor_id, entry.change_type]), [[1, '777', 'baseline']]);
+      await legacyDb.setCallEBusinessSafetyPolicy({ business_id: 'legacy-safety-biz', actor_id: '888', max_calls_per_day: 25,
+        quiet_hours_start: null, quiet_hours_end: null, timezone: 'UTC', emergency_stop: false, contact_cooldown_hours: 0 });
+      assert.deepEqual((await legacyDb.getCallEBusinessSafetyPolicyHistory('legacy-safety-biz')).map((entry) => entry.revision), [2, 1]);
+    } finally {
+      if (legacyDb.db) await new Promise((resolve) => legacyDb.db.close(resolve));
+    }
+  });
+
   it('persists scheduled launches, one-time review escalations, hard budget reservations, and contact cooldowns', async () => {
     const dueMissionId = `mission_${'c'.repeat(64)}`;
     await db.createCallECampaignMission(missionInput({
@@ -323,7 +483,7 @@ describe('CALL-E campaign mission persistence', () => {
     const budget2 = await db.reserveCallECampaignMissionBudget({ mission_id: dueMissionId, business_id: 'biz-a', recipient_position: 1 });
     const budgetReplay = await db.reserveCallECampaignMissionBudget({ mission_id: dueMissionId, business_id: 'biz-a', recipient_position: 0 });
     assert.equal(budget1.allowed, true);
-    assert.deepEqual(budget2, { allowed: false, reason: 'budget_exhausted', reserved_minor: 200 });
+    assert.deepEqual(budget2, { allowed: false, reason: 'budget_exhausted', committed_minor: 0, reserved_minor: 200 });
     assert.equal(budgetReplay.idempotent_replay, true);
 
     await db.setCallEBusinessMissionPolicy({ business_id: 'biz-a', actor_id: '222', secondary_approval_threshold: 10, approval_ttl_hours: 24, review_sla_minutes: 10 });
@@ -428,16 +588,27 @@ describe('CALL-E campaign mission persistence', () => {
     await db.createCallECampaignMission(missionInput({ mission_id: cdrMissionId, request_hash: '2'.repeat(64), budget_limit_minor: 1000,
       per_call_cost_ceiling_minor: 250, budget_currency: 'USD',
       recipients: missionInput().recipients.map((recipient) => ({ ...recipient, idempotency_key: `${recipient.idempotency_key}-cdr-stage` })) }));
+    await db.recordCallEMissionUsageRecord({ business_id: 'biz-a', mission_id: cdrMissionId, recipient_position: 0,
+      provider: 'twilio', provider_call_id: 'estimate-before-cdr-001', amount_minor: 400, currency: 'USD',
+      source_type: 'operator_estimate', source_reference: 'estimate-before-cdr-ref', recorded_by: '222',
+      idempotency_key: 'estimate-before-cdr-key', request_hash: '8'.repeat(64), occurred_at: '2026-10-31T09:00:00Z' });
+    await db.recordCallEMissionUsageRecord({ business_id: 'biz-a', mission_id: cdrMissionId, recipient_position: 1,
+      provider: 'twilio', provider_call_id: 'estimate-other-001', amount_minor: 500, currency: 'USD',
+      source_type: 'operator_estimate', source_reference: 'estimate-other-ref-01', recorded_by: '222',
+      idempotency_key: 'estimate-other-key-0001', request_hash: '9'.repeat(64), occurred_at: '2026-10-31T09:00:00Z' });
     const records = [
-      { recipient_position: 0, provider: 'twilio', provider_call_id: 'cdr-stage-call-001', amount_minor: 700, currency: 'USD', occurred_at: '2026-10-31T10:00:00.000Z', source_reference: 'source-test-0001' },
-      { recipient_position: 1, provider: 'twilio', provider_call_id: 'cdr-stage-call-001', amount_minor: 700, currency: 'USD', occurred_at: '2026-10-31T10:00:00.000Z', source_reference: 'source-test-0001' },
+      { recipient_position: 0, provider: 'twilio', provider_call_id: 'estimate-before-cdr-001', amount_minor: 700, currency: 'USD', occurred_at: '2026-10-31T10:00:00.000Z', source_reference: 'source-test-0001' },
+      { recipient_position: 1, provider: 'twilio', provider_call_id: 'estimate-before-cdr-001', amount_minor: 700, currency: 'USD', occurred_at: '2026-10-31T10:00:00.000Z', source_reference: 'source-test-0001' },
     ];
     const staged = await db.stageCallEMissionCdrImport({ business_id: 'biz-a', mission_id: cdrMissionId, created_by: '222',
       idempotency_key: 'cdr-import-stage-0001', request_hash: 'f'.repeat(64), records });
     assert.equal(staged.status, 'staged');
     assert.equal(staged.preview.duplicate_count, 1);
-    assert.equal(staged.preview.new_record_count, 1);
-    assert.equal(staged.preview.budget_exceeded, false);
+    assert.equal(staged.preview.new_record_count, 0);
+    assert.equal(staged.preview.replacement_count, 1);
+    assert.equal(staged.preview.budget_exceeded, true);
+    assert.deepEqual(staged.preview.projected_actual_by_currency, { USD: 700 });
+    assert.deepEqual(staged.preview.projected_committed_by_currency, { USD: 1200 });
     const replay = await db.stageCallEMissionCdrImport({ business_id: 'biz-a', mission_id: cdrMissionId, created_by: '222',
       idempotency_key: 'cdr-import-stage-0001', request_hash: 'f'.repeat(64), records });
     assert.equal(replay.idempotent_replay, true);
@@ -467,12 +638,21 @@ describe('CALL-E campaign mission persistence', () => {
     await db.createCallECampaignMission(missionInput({ mission_id: usageMissionId, request_hash: '5'.repeat(64), budget_limit_minor: 1000,
       per_call_cost_ceiling_minor: 250, budget_currency: 'USD',
       recipients: missionInput().recipients.map((recipient) => ({ ...recipient, idempotency_key: `${recipient.idempotency_key}-usage` })) }));
+    await new Promise((resolve, reject) => db.db.run(
+      `UPDATE call_e_campaign_mission_recipients SET local_call_id = CASE position
+         WHEN 0 THEN 'local-call-usage-0' WHEN 1 THEN 'local-call-usage-1' END
+       WHERE mission_id = ? AND position IN (0, 1)`, [usageMissionId],
+      (error) => error ? reject(error) : resolve(),
+    ));
     const record = { business_id: 'biz-a', mission_id: usageMissionId, recipient_position: 0, provider: 'plivo', provider_call_id: 'cdr-test-call-0001',
       amount_minor: 1250, currency: 'USD', billed_duration_seconds: 60, source_type: 'provider_cdr', source_reference: 'provider-cdr-ref-0001',
       recorded_by: '222', idempotency_key: 'usage-test-idempotency-0001', request_hash: 'a'.repeat(64), occurred_at: '2026-10-31T10:00:00Z' };
     const first = await db.recordCallEMissionUsageRecord(record);
     assert.equal(first.recorded, true);
     assert.equal(first.budget_exceeded, true);
+    assert.equal(first.actual_minor, 1250);
+    assert.equal(first.estimated_minor, 0);
+    assert.equal(first.committed_minor, 1250);
     const replay = await db.recordCallEMissionUsageRecord(record);
     assert.equal(replay.idempotent_replay, true);
     await Promise.all(Array.from({ length: 100 }, (_, index) => new Promise((resolve, reject) => db.db.run(
@@ -483,12 +663,92 @@ describe('CALL-E campaign mission persistence', () => {
       ['biz-a', usageMissionId, 1, `cdr-extra-${index}`, `source-extra-${index}`, `usage-extra-${index}`, String(index).padStart(64, '0')],
       (error) => error ? reject(error) : resolve(),
     ))));
+    const estimate = await db.recordCallEMissionUsageRecord({ ...record, recipient_position: 1,
+      provider: 'twilio', provider_call_id: 'estimated-call-0001', amount_minor: 200,
+      source_type: 'operator_estimate', source_reference: 'operator-estimate-ref-01',
+      idempotency_key: 'usage-estimate-idempotency-01', request_hash: 'b'.repeat(64) });
+    assert.equal(estimate.actual_minor, 1350);
+    assert.equal(estimate.estimated_minor, 200);
+    assert.equal(estimate.committed_minor, 1550);
     const report = await db.getCallEMissionUsageReport('biz-a', usageMissionId);
     assert.equal(report.budget_exceeded, true);
     assert.deepEqual(report.actual_by_currency, { USD: 1350 });
+    assert.deepEqual(report.estimated_by_currency, { USD: 200 });
+    assert.deepEqual(report.committed_by_currency, { USD: 1550 });
     assert.equal(report.records.length, 100);
+    assert.equal(report.records[0].cost_classification, 'estimated');
+    assert.equal(report.records[0].recording_provenance, 'operator_entered');
+    assert.deepEqual(report.usage_coverage, { recipient_count: 2, dispatched_recipients: 2,
+      usage_recorded_recipients: 2, unknown_cost_recipients: 0, not_dispatched_recipients: 0 });
+    const reservation = await db.reserveCallECampaignMissionBudget({ mission_id: usageMissionId, business_id: 'biz-a', recipient_position: 1 });
+    assert.deepEqual(reservation, { allowed: false, reason: 'budget_exhausted', committed_minor: 1550, reserved_minor: 0 });
     const events = await db.listCallEMissionActivity('biz-a', usageMissionId);
     assert.equal(events.filter((event) => event.state === 'budget_exceeded').length, 1);
+  });
+
+  it('reports dispatched recipients without usage records as unknown cost', async () => {
+    const unknownUsageMissionId = `mission_${'6'.repeat(64)}`;
+    await db.createCallECampaignMission(missionInput({ mission_id: unknownUsageMissionId, request_hash: '6'.repeat(64),
+      recipients: missionInput().recipients.map((recipient) => ({ ...recipient, idempotency_key: `${recipient.idempotency_key}-unknown-usage` })) }));
+    await new Promise((resolve, reject) => db.db.run(
+      `UPDATE call_e_campaign_mission_recipients SET local_call_id = 'local-call-unknown-usage'
+       WHERE mission_id = ? AND position = 0`, [unknownUsageMissionId],
+      (error) => error ? reject(error) : resolve(),
+    ));
+
+    const report = await db.getCallEMissionUsageReport('biz-a', unknownUsageMissionId);
+    assert.deepEqual(report.usage_coverage, { recipient_count: 2, dispatched_recipients: 1,
+      usage_recorded_recipients: 0, unknown_cost_recipients: 1, not_dispatched_recipients: 1 });
+  });
+
+  it('replaces an estimate with reported usage, releases its reservation, and keeps an append-only revision', async () => {
+    const revisionMissionId = `mission_${'7'.repeat(64)}`;
+    await db.createCallECampaignMission(missionInput({ mission_id: revisionMissionId, request_hash: '6'.repeat(64),
+      budget_limit_minor: 2000, per_call_cost_ceiling_minor: 250, budget_currency: 'USD',
+      recipients: missionInput().recipients.map((recipient) => ({ ...recipient, idempotency_key: `${recipient.idempotency_key}-revision` })) }));
+    const estimate = { business_id: 'biz-a', mission_id: revisionMissionId, recipient_position: 0, provider: 'twilio',
+      provider_call_id: 'revision-call-0001', amount_minor: 400, currency: 'USD', source_type: 'operator_estimate',
+      source_reference: 'estimate-source-ref-01', recorded_by: '222', idempotency_key: 'estimate-revision-key-01',
+      request_hash: 'a'.repeat(64), occurred_at: '2026-10-31T09:00:00Z' };
+    await db.recordCallEMissionUsageRecord(estimate);
+    assert.deepEqual(await db.reserveCallECampaignMissionBudget({ mission_id: revisionMissionId, business_id: 'biz-a', recipient_position: 0 }), {
+      allowed: true, committed_minor: 400, reserved_minor: 250, budget_limit_minor: 2000,
+    });
+    const actual = await db.recordCallEMissionUsageRecord({ ...estimate, amount_minor: 500, source_type: 'provider_cdr',
+      source_reference: 'provider-cdr-source-01', idempotency_key: 'actual-revision-key-01', request_hash: 'b'.repeat(64),
+      occurred_at: '2026-10-31T10:00:00Z' });
+    assert.equal(actual.replaced_estimate, true);
+    assert.equal(actual.actual_minor, 500);
+    assert.equal(actual.estimated_minor, 0);
+    assert.equal(actual.reserved_minor, 0);
+    const report = await db.getCallEMissionUsageReport('biz-a', revisionMissionId);
+    assert.deepEqual(report.actual_by_currency, { USD: 500 });
+    assert.deepEqual(report.estimated_by_currency, { USD: 0 });
+    assert.equal(report.reserved_minor, 0);
+    assert.equal(report.revisions.length, 1);
+    assert.deepEqual(report.revisions[0].previous, { source_type: 'operator_estimate', amount_minor: 400, currency: 'USD' });
+    assert.deepEqual(report.revisions[0].replacement, { source_type: 'provider_cdr', amount_minor: 500, currency: 'USD' });
+    assert.equal((await db.recordCallEMissionUsageRecord({ ...estimate, amount_minor: 500, source_type: 'provider_cdr',
+      source_reference: 'provider-cdr-source-01', idempotency_key: 'actual-revision-key-01', request_hash: 'b'.repeat(64),
+      occurred_at: '2026-10-31T10:00:00Z' })).idempotent_replay, true);
+    assert.equal((await db.recordCallEMissionUsageRecord(estimate)).idempotent_replay, true);
+  });
+
+  it('keeps a budget-currency reservation when reported usage is recorded in a different currency', async () => {
+    const currencyMissionId = `mission_${'4'.repeat(64)}`;
+    await db.createCallECampaignMission(missionInput({ mission_id: currencyMissionId, request_hash: '4'.repeat(64),
+      budget_limit_minor: 2000, per_call_cost_ceiling_minor: 250, budget_currency: 'USD',
+      recipients: missionInput().recipients.map((recipient) => ({ ...recipient, idempotency_key: `${recipient.idempotency_key}-currency` })) }));
+    await db.reserveCallECampaignMissionBudget({ mission_id: currencyMissionId, business_id: 'biz-a', recipient_position: 0 });
+    const result = await db.recordCallEMissionUsageRecord({ business_id: 'biz-a', mission_id: currencyMissionId, recipient_position: 0,
+      provider: 'twilio', provider_call_id: 'eur-invoice-call-001', amount_minor: 500, currency: 'EUR', source_type: 'invoice',
+      source_reference: 'eur-invoice-ref-01', recorded_by: '222', idempotency_key: 'eur-invoice-usage-key-01',
+      request_hash: 'c'.repeat(64), occurred_at: '2026-10-31T10:00:00Z' });
+    assert.equal(result.reserved_minor, 250);
+    const report = await db.getCallEMissionUsageReport('biz-a', currencyMissionId);
+    assert.deepEqual(report.actual_by_currency, { EUR: 500 });
+    assert.deepEqual(report.budget_exposure_by_currency, { EUR: 500, USD: 250 });
+    assert.equal(report.budget_exceeded, false);
   });
 
   it('claims and advances daily or weekly report digest subscriptions only for current operators', async () => {

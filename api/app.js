@@ -29,6 +29,7 @@ const { EnhancedSmsService } = require("./routes/sms.js");
 const { EmailService } = require("./routes/email");
 const { createTwilioGatherHandler } = require("./routes/gather");
 const { registerCallRoutes } = require("./services/callRoutes");
+const { createExecutionContext, transitionExecutionContext, classifyExecutionFailure, buildExecutionStep } = require("./services/executionContext");
 const { CartesiaClient } = require("./services/cartesiaClient");
 const { CartesiaOutboundCallService } = require("./services/cartesiaOutboundCallService");
 const { CartesiaCampaignService } = require("./services/cartesiaCampaignService");
@@ -53,6 +54,7 @@ const { CartesiaSipProviderClient } = require("./services/cartesiaSipProviderCli
 const { CartesiaSipProviderService } = require("./services/cartesiaSipProviderService");
 const { registerCartesiaSipProviderRoutes } = require("./services/cartesiaSipProviderRoutes");
 const { registerStatusRoutes } = require("./services/statusRoutes");
+const { ApiAuthFailureMetrics } = require("./services/apiAuthFailureMetrics");
 const { registerWebhookRoutes } = require("./services/webhookRoutes");
 const Database = require("./db/db");
 const { webhookService } = require("./routes/status");
@@ -157,7 +159,7 @@ const { CallEMissionAlertWorker } = require("./services/callEMissionAlertWorker"
 const { CallEMissionAutomationWorker } = require("./services/callEMissionAutomationWorker");
 const { CallEMissionOperationsService } = require("./services/callEMissionOperationsService");
 const { CallEResultFollowupService } = require("./services/callEResultFollowupService");
-const { buildConfiguredProviderOrder, summarizeCallRoutingPolicy } = require("./services/callRoutingPolicy");
+const { buildConfiguredProviderOrder, summarizeCallRoutingPolicy, recommendVoiceProvider } = require("./services/callRoutingPolicy");
 const { CallEGoalRunService } = require("./services/callEGoalRunService");
 const { createCallECampaignRouteHandlers } = require("./services/callECampaignRouteHandlers");
 const { createCallEActorAssertionMiddleware, verifyCallEActorAssertion } = require("./services/callEActorAssertion");
@@ -242,10 +244,14 @@ const {
   evaluateCallCanarySloGuardrail,
 } = require("./services/callCanary");
 const { runPostCallQaEvaluation } = require("./services/postCallQaService");
+const { runStructuredExtraction } = require("./services/postCallExtractionService");
+const { registerPostCallExtractionRoutes } = require("./services/postCallExtractionRoutes");
 const { PostCallAutomationService } = require("./services/postCallAutomationService");
 const { PostCallWorkflowDefinitionService } = require("./services/postCallWorkflowDefinitionService");
 const { PostCallWorkflowExecutionService } = require("./services/postCallWorkflowExecutionService");
 const { registerPostCallWorkflowDefinitionRoutes } = require("./services/postCallWorkflowDefinitionRoutes");
+const { OutgoingWebhookService } = require("./services/outgoingWebhookService");
+const { registerOutgoingWebhookRoutes } = require("./services/outgoingWebhookRoutes");
 const { BusinessIntegrationSecretResolver } = require("./services/businessIntegrationSecretResolver");
 const { BusinessIntegrationConnectionService } = require("./services/businessIntegrationConnectionService");
 const { registerBusinessIntegrationConnectionRoutes } = require("./services/businessIntegrationConnectionRoutes");
@@ -254,6 +260,7 @@ const {
   buildPostCallOutcomeClassificationPayload,
   runPostCallAutomationTrigger,
   triggerPostCallOutcomeWorkflow,
+  triggerPostCallOutcomeWebhook,
 } = require("./services/postCallAutomationTriggers");
 const { CrmContactSyncService } = require("./services/crmContactSyncService");
 const { assertWebhookAuthConfiguration } = require("./services/webhookAuthConfig");
@@ -364,6 +371,7 @@ const HMAC_BYPASS_PATH_PREFIXES = [
 
 let db;
 let digitService;
+const apiAuthFailureMetrics = new ApiAuthFailureMetrics();
 const functionEngine = new DynamicFunctionEngine();
 let smsService = new EnhancedSmsService({
   getActiveProvider: () => getActiveSmsProvider(),
@@ -373,6 +381,7 @@ let crmContactSyncService;
 let postCallAutomationService;
 let postCallWorkflowDefinitionService;
 let postCallWorkflowExecutionService;
+let outgoingWebhookService;
 let callECampaignMissionWorker = null;
 let callECampaignRetentionWorker = null;
 let callEMissionAlertWorker = null;
@@ -10053,6 +10062,7 @@ app.use((req, res, next) => {
 
   const verification = verifyHmacSignature(req);
   if (!verification.ok) {
+    apiAuthFailureMetrics.record(verification.reason);
     res.locals.apiErrorCode =
       verification.reason === "replay_detected"
         ? "api_auth_replay_detected"
@@ -15003,6 +15013,7 @@ function startBackgroundWorkers() {
   backgroundWorkersStarted = true;
 
   postCallWorkflowExecutionService?.start();
+  outgoingWebhookService?.start();
 
   const missionWorkerConfig = {
     enabled: config.callE?.missionWorkerEnabled === true,
@@ -15507,6 +15518,12 @@ async function startServer(options = {}) {
       automationService: postCallAutomationService,
       enabled: config.postCallWorkflows?.enabled === true,
       pollMs: config.postCallWorkflows?.pollIntervalMs,
+      logger: console,
+    });
+    outgoingWebhookService = new OutgoingWebhookService({
+      db,
+      enabled: config.outgoingWebhooks?.enabled === true,
+      pollMs: config.outgoingWebhooks?.pollIntervalMs,
       logger: console,
     });
     const defaultAutomationRules = await postCallAutomationService.ensureDefaultRules();
@@ -19300,6 +19317,41 @@ async function handleCallEnd(callSid, callStartTime) {
     const callDetails = await db.getCall(callSid);
     const qaCallRecord = callDetails || initialCallDetails || {};
 
+    await runPostCallAutomationTrigger({
+      service: postCallAutomationService,
+      workflowService: postCallWorkflowExecutionService,
+      outgoingWebhookService,
+      webhookService,
+      db,
+      logger: console,
+      callSid,
+      payload: buildCallCompletionAutomationPayload({
+        callSid,
+        call: qaCallRecord,
+        transcripts,
+        summary,
+        finalStatus,
+        notificationType,
+        duration,
+      }),
+    });
+    const outcomePayload = buildPostCallOutcomeClassificationPayload({
+      callSid,
+      businessId: qaCallRecord.business_id || qaCallRecord.businessId,
+      finalStatus,
+      notificationType,
+    });
+    await triggerPostCallOutcomeWorkflow({
+      workflowService: postCallWorkflowExecutionService,
+      logger: console,
+      payload: outcomePayload,
+    });
+    await triggerPostCallOutcomeWebhook({
+      outgoingWebhookService,
+      logger: console,
+      payload: outcomePayload,
+    });
+
     void runPostCallQaEvaluation({
       callSid,
       call: qaCallRecord,
@@ -19343,32 +19395,41 @@ async function handleCallEnd(callSid, callStartTime) {
           .catch(() => {});
       });
 
-    void runPostCallAutomationTrigger({
-      service: postCallAutomationService,
-      workflowService: postCallWorkflowExecutionService,
-      webhookService,
-      db,
-      logger: console,
-      callSid,
-      payload: buildCallCompletionAutomationPayload({
+    const completedSession = activeCalls.get(callSid);
+    let extractionContext = qaCallRecord.business_context;
+    if (typeof extractionContext === "string") {
+      try { extractionContext = JSON.parse(extractionContext); } catch (_) { extractionContext = null; }
+    }
+    const extractionSettings = completedSession?.callConfig?.script_policy?.agent_config?.business_context?.post_call_extraction ||
+      (extractionContext && typeof extractionContext === "object" && !Array.isArray(extractionContext)
+        ? extractionContext.post_call_extraction
+        : null);
+    if (extractionSettings && typeof extractionSettings === "object" && !Array.isArray(extractionSettings)) {
+      void runStructuredExtraction({
         callSid,
         call: qaCallRecord,
         transcripts,
-        summary,
-        finalStatus,
-        notificationType,
-        duration,
-      }),
-    });
-    void triggerPostCallOutcomeWorkflow({
-      workflowService: postCallWorkflowExecutionService,
-      logger: console,
-      payload: buildPostCallOutcomeClassificationPayload({
-        callSid,
-        finalStatus,
-        notificationType,
-      }),
-    });
+        schema: extractionSettings.schema,
+        schemaVersion: extractionSettings.schema_version,
+        config,
+        db,
+        logger: console,
+      }).then(async (result) => {
+        await db.updateCallState(callSid, "post_call_extraction_completed", {
+          status: result?.status || "unknown",
+          reason: result?.reason || null,
+          persisted: result?.persisted === true,
+          version: result?.extraction_version || null,
+          processed_at: new Date().toISOString(),
+        }).catch(() => {});
+      }).catch(async (error) => {
+        console.error("post_call_extraction_failed", { call_sid: callSid, code: error?.code || "extraction_failed" });
+        await db.updateCallState(callSid, "post_call_extraction_error", {
+          error: error?.code || "post_call_extraction_failed",
+          at: new Date().toISOString(),
+        }).catch(() => {});
+      });
+    }
 
     // Create enhanced webhook notification for completion
     if (callDetails && callDetails.user_chat_id) {
@@ -25336,14 +25397,30 @@ function sendCallECampaignSafetyError(res, error, requestId) {
 
 app.get('/api/call-e/mission-safety', callEReconciliationLimiter, requireOutboundAuthorization, requireCallEActorAssertion, async (req, res) => {
   try {
-    const result = await createCallECampaignSafetyService().getPolicy({ business_id: req.query?.business_id, actor_id: req.query?.actor_id });
+    const result = await createCallECampaignSafetyService().getPolicy({ business_id: req.query?.business_id, actor_id: req.query?.actor_id, history_limit: req.query?.history_limit });
     return res.json({ success: true, request_id: req.requestId || null, ...result });
   } catch (error) { return sendCallECampaignSafetyError(res, error, req.requestId); }
 });
 
 app.put('/api/call-e/mission-safety', callEPolicyWriteLimiter, requireOutboundAuthorization, requireCallEActorAssertion, async (req, res) => {
+  const body = isPlainObject(req.body) ? req.body : {};
+  const allowed = new Set(['business_id', 'actor_id', 'max_calls_per_day', 'quiet_hours_start', 'quiet_hours_end', 'timezone', 'emergency_stop', 'contact_cooldown_hours']);
+  if (Object.keys(body).some((key) => !allowed.has(key))) {
+    return sendApiError(res, 400, 'call_e_safety_policy_invalid', 'Safety policy contains unsupported fields', req.requestId || null);
+  }
   try {
-    const result = await createCallECampaignSafetyService().updatePolicy(isPlainObject(req.body) ? req.body : {});
+    const result = await createCallECampaignSafetyService().updatePolicy(body);
+    return res.json({ success: true, request_id: req.requestId || null, ...result });
+  } catch (error) { return sendCallECampaignSafetyError(res, error, req.requestId); }
+});
+
+app.post('/api/call-e/mission-safety/rollback', callEPolicyWriteLimiter, requireOutboundAuthorization, requireCallEActorAssertion, async (req, res) => {
+  const body = isPlainObject(req.body) ? req.body : {};
+  if (Object.keys(body).some((key) => !['business_id', 'actor_id', 'revision'].includes(key))) {
+    return sendApiError(res, 400, 'call_e_safety_policy_rollback_invalid', 'Safety policy rollback contains unsupported fields', req.requestId || null);
+  }
+  try {
+    const result = await createCallECampaignSafetyService().rollbackPolicy(body);
     return res.json({ success: true, request_id: req.requestId || null, ...result });
   } catch (error) { return sendCallECampaignSafetyError(res, error, req.requestId); }
 });
@@ -25397,8 +25474,21 @@ app.get('/api/call-e/mission-approval-policy', requireOutboundAuthorization, req
 });
 
 app.put('/api/call-e/mission-approval-policy', callEPolicyWriteLimiter, requireOutboundAuthorization, requireCallEActorAssertion, async (req, res) => {
-  try { return res.json({ success: true, request_id: req.requestId || null, ...(await createCallEMissionOperationsService().setApprovalPolicy(isPlainObject(req.body) ? req.body : {})) }); }
+  const body = isPlainObject(req.body) ? req.body : {};
+  if (Object.keys(body).some((key) => !['business_id', 'actor_id', 'secondary_approval_threshold', 'approval_ttl_hours', 'review_sla_minutes', 'review_repeat_minutes'].includes(key))) {
+    return sendApiError(res, 400, 'call_e_mission_policy_invalid', 'Mission approval policy contains unsupported fields', req.requestId || null);
+  }
+  try { return res.json({ success: true, request_id: req.requestId || null, ...(await createCallEMissionOperationsService().setApprovalPolicy(body)) }); }
   catch (error) { return sendApiError(res, Number(error?.status) || (error?.code === 'call_e_business_operator_access_denied' ? 403 : 400), String(error?.code || 'call_e_mission_policy_update_failed'), error?.message || 'Mission approval policy could not be saved', req.requestId || null); }
+});
+
+app.post('/api/call-e/mission-approval-policy/rollback', callEPolicyWriteLimiter, requireOutboundAuthorization, requireCallEActorAssertion, async (req, res) => {
+  const body = isPlainObject(req.body) ? req.body : {};
+  if (Object.keys(body).some((key) => !['business_id', 'actor_id', 'revision'].includes(key))) {
+    return sendApiError(res, 400, 'call_e_mission_policy_rollback_invalid', 'Mission approval policy rollback contains unsupported fields', req.requestId || null);
+  }
+  try { return res.json({ success: true, request_id: req.requestId || null, ...(await createCallEMissionOperationsService().rollbackApprovalPolicy(body)) }); }
+  catch (error) { return sendApiError(res, Number(error?.status) || (error?.code === 'call_e_business_operator_access_denied' ? 403 : 400), String(error?.code || 'call_e_mission_policy_rollback_failed'), error?.message || 'Mission approval policy could not be rolled back', req.requestId || null); }
 });
 
 app.get('/api/call-e/provider-routing', requireOutboundAuthorization, requireCallEActorAssertion, async (req, res) => {
@@ -25409,6 +25499,15 @@ app.get('/api/call-e/provider-routing', requireOutboundAuthorization, requireCal
 app.put('/api/call-e/provider-routing', callEPolicyWriteLimiter, requireOutboundAuthorization, requireCallEActorAssertion, async (req, res) => {
   try { return res.json({ success: true, request_id: req.requestId || null, ...(await createCallEMissionOperationsService().setProviderRouting(isPlainObject(req.body) ? req.body : {})) }); }
   catch (error) { return sendApiError(res, Number(error?.status) || (error?.code === 'call_e_business_operator_access_denied' ? 403 : 400), String(error?.code || 'call_e_provider_routing_update_failed'), error?.message || 'Provider routing policy could not be saved', req.requestId || null); }
+});
+
+app.post('/api/call-e/provider-routing/rollback', callEPolicyWriteLimiter, requireOutboundAuthorization, requireCallEActorAssertion, async (req, res) => {
+  const body = isPlainObject(req.body) ? req.body : {};
+  if (Object.keys(body).some((key) => !['business_id', 'actor_id', 'revision'].includes(key))) {
+    return sendApiError(res, 400, 'call_e_provider_routing_rollback_invalid', 'Provider routing rollback contains unsupported fields', req.requestId || null);
+  }
+  try { return res.json({ success: true, request_id: req.requestId || null, ...(await createCallEMissionOperationsService().rollbackProviderRouting(body)) }); }
+  catch (error) { return sendApiError(res, Number(error?.status) || (error?.code === 'call_e_business_operator_access_denied' ? 403 : 400), String(error?.code || 'call_e_provider_routing_rollback_failed'), error?.message || 'Provider routing policy could not be rolled back', req.requestId || null); }
 });
 
 app.post('/api/call-e/provider-routing/preview', callEReconciliationLimiter, requireOutboundAuthorization, requireCallEActorAssertion, async (req, res) => {
@@ -26242,6 +26341,7 @@ app.post(
         variableValues: body.variable_values,
         idempotencyKey: body.idempotency_key,
         actorId: req.callEActorId,
+        requestId: req.requestId,
       });
       return res.status(result.idempotentReplay ? 200 : 201).json({ success: true, result });
     } catch (error) {
@@ -28440,6 +28540,7 @@ async function placeOutboundCall(payload, hostOverride = null) {
     payment_failure_message,
     payment_retry_message,
     payment_policy,
+    execution_context,
   } = payload || {};
   const payloadObject =
     payload && typeof payload === "object" ? payload : {};
@@ -28582,6 +28683,8 @@ async function placeOutboundCall(payload, hostOverride = null) {
   );
 
   let callId;
+  let executionContext = null;
+  let dispatchStepStartedAt = null;
   let callStatus = "queued";
   let providerMetadata = {};
   let selectedProvider = null;
@@ -28878,11 +28981,42 @@ async function placeOutboundCall(payload, hostOverride = null) {
       outbound_idempotency_key: normalizedOutboundIdempotencyKey || null,
       ai_voice_engine: aiVoiceEngine,
     });
+    executionContext = createExecutionContext({
+      ...execution_context,
+      internal_call_id: callId,
+      organization_id: execution_context?.organization_id,
+      business_id: outboundBusinessId || execution_context?.business_id,
+      actor_id: user_chat_id || execution_context?.actor_id,
+      provider: providerPlan.selected_provider || preferredProvider || currentProvider,
+      execution_type: "outbound_call",
+      status: "created",
+      current_stage: "request_validated",
+      idempotency_reference: normalizedOutboundIdempotencyKey || execution_context?.idempotency_reference,
+    });
+    executionContext = transitionExecutionContext(executionContext, "dispatching", {
+      current_stage: "provider_submission",
+    });
     await db.updateCallState(callId, "outbound_submission_pending", {
+      execution_context: executionContext,
       provider: providerPlan.selected_provider || preferredProvider || currentProvider,
       ai_voice_engine: aiVoiceEngine,
       at: new Date().toISOString(),
     });
+    await db.updateCallState(callId, "execution_step", buildExecutionStep(executionContext, {
+      step_name: "execution_created",
+      status: "completed",
+      result: "accepted",
+      started_at: executionContext.created_at,
+      related_entity: callId,
+    }));
+    dispatchStepStartedAt = new Date().toISOString();
+    await db.updateCallState(callId, "execution_step", buildExecutionStep(executionContext, {
+      step_name: "provider_dispatch",
+      status: "started",
+      result: "pending",
+      started_at: dispatchStepStartedAt,
+      related_entity: callId,
+    }));
   } catch (error) {
     await outboundSafety.completeDispatch(outboundSafetyReservation, "released");
     await completeOutboundCallIdempotency(outboundIdempotencyContext, "failed", {
@@ -28926,6 +29060,25 @@ async function placeOutboundCall(payload, hostOverride = null) {
           error_code: String(error.code),
           error_message: "Call submission was rejected before a provider call was created.",
         }).catch(() => {});
+        executionContext = transitionExecutionContext(executionContext, "failed", {
+          current_stage: "dispatch_rejected",
+          error_classification: "non_retryable",
+        });
+        await db.updateCallState(callId, "outbound_submission_rejected", {
+          execution_context: executionContext,
+          provider,
+          error_code: String(error.code),
+          at: new Date().toISOString(),
+        }).catch(() => {});
+        await db.updateCallState(callId, "execution_step", buildExecutionStep(executionContext, {
+          step_name: "provider_dispatch",
+          status: "failed",
+          result: "rejected",
+          error_classification: "non_retryable",
+          retry_count: providerIndex,
+          started_at: dispatchStepStartedAt,
+          related_entity: callId,
+        })).catch(() => {});
         throw error;
       }
       const safeError = normalizeProviderOperationError(
@@ -28954,11 +29107,26 @@ async function placeOutboundCall(payload, hostOverride = null) {
           error_code: safeError.code,
           error_message: "Provider submission outcome is uncertain; verify provider state before retrying.",
         }).catch(() => {});
+        executionContext = transitionExecutionContext(executionContext, "requires_attention", {
+          provider,
+          current_stage: "reconciliation_required",
+          error_classification: classifyExecutionFailure(safeError).classification,
+        });
         await db.updateCallState(callId, "outbound_submission_uncertain", {
+          execution_context: executionContext,
           provider,
           error_code: safeError.code,
           at: new Date().toISOString(),
         }).catch(() => {});
+        await db.updateCallState(callId, "execution_step", buildExecutionStep(executionContext, {
+          step_name: "provider_dispatch",
+          status: "requires_attention",
+          result: "unknown",
+          error_classification: "ambiguous",
+          retry_count: providerIndex,
+          started_at: dispatchStepStartedAt,
+          related_entity: callId,
+        })).catch(() => {});
         await completeOutboundCallIdempotency(outboundIdempotencyContext, "pending", {
           provider,
           callSid: callId,
@@ -28982,13 +29150,29 @@ async function placeOutboundCall(payload, hostOverride = null) {
         error_code: "provider_call_correlation_mismatch",
         error_message: "Provider accepted a call but returned an unexpected local call identifier.",
       }).catch(() => {});
+      executionContext = transitionExecutionContext(executionContext, "requires_attention", {
+        provider,
+        provider_call_id: providerCall.providerCallId || null,
+        current_stage: "reconciliation_required",
+        error_classification: classifyExecutionFailure({ providerSubmissionState: "unknown" }).classification,
+      });
       await db.updateCallState(callId, "outbound_submission_uncertain", {
+        execution_context: executionContext,
         provider,
         provider_call_id: providerCall.providerCallId || null,
         outbound_idempotency_key: normalizedOutboundIdempotencyKey || null,
         ai_voice_engine: aiVoiceEngine,
         at: new Date().toISOString(),
       }).catch(() => {});
+      await db.updateCallState(callId, "execution_step", buildExecutionStep(executionContext, {
+        step_name: "provider_dispatch",
+        status: "requires_attention",
+        result: "unknown",
+        error_classification: "ambiguous",
+        retry_count: providerIndex,
+        started_at: dispatchStepStartedAt,
+        related_entity: providerCall.providerCallId || callId,
+      })).catch(() => {});
       await completeOutboundCallIdempotency(outboundIdempotencyContext, "pending", {
         provider,
         callSid: callId,
@@ -29008,7 +29192,13 @@ async function placeOutboundCall(payload, hostOverride = null) {
     selectedProvider = provider;
     try {
       await db.updateCallStatus(callId, callStatus);
+      executionContext = transitionExecutionContext(executionContext, "accepted", {
+        provider,
+        provider_call_id: providerCallId,
+        current_stage: "provider_accepted",
+      });
       await db.updateCallState(callId, "provider_submission_accepted", {
+        execution_context: executionContext,
         provider,
         provider_call_id: providerCallId,
         outbound_idempotency_key: normalizedOutboundIdempotencyKey || null,
@@ -29017,6 +29207,14 @@ async function placeOutboundCall(payload, hostOverride = null) {
         status: callStatus,
         at: new Date().toISOString(),
       });
+      await db.updateCallState(callId, "execution_step", buildExecutionStep(executionContext, {
+        step_name: "provider_dispatch",
+        status: "completed",
+        result: "accepted",
+        started_at: dispatchStepStartedAt,
+        retry_count: providerIndex,
+        related_entity: providerCallId,
+      }));
       await completeOutboundCallIdempotency(
         outboundIdempotencyContext,
         "completed",
@@ -29037,7 +29235,14 @@ async function placeOutboundCall(payload, hostOverride = null) {
         error_code: "outbound_persistence_failed",
         error_message: "Provider accepted the call, but local confirmation could not be persisted.",
       }).catch(() => {});
+      executionContext = transitionExecutionContext(executionContext, "requires_attention", {
+        provider,
+        provider_call_id: providerCallId,
+        current_stage: "reconciliation_required",
+        error_classification: classifyExecutionFailure({ providerSubmissionState: "accepted" }).classification,
+      });
       await db.updateCallState(callId, "outbound_submission_uncertain", {
+        execution_context: executionContext,
         provider,
         provider_call_id: providerCallId,
         provider_metadata: providerMetadata,
@@ -29045,6 +29250,15 @@ async function placeOutboundCall(payload, hostOverride = null) {
         error_code: "outbound_persistence_failed",
         at: new Date().toISOString(),
       }).catch(() => {});
+      await db.updateCallState(callId, "execution_step", buildExecutionStep(executionContext, {
+        step_name: "provider_dispatch",
+        status: "requires_attention",
+        result: "unknown",
+        error_classification: "ambiguous",
+        retry_count: providerIndex,
+        started_at: dispatchStepStartedAt,
+        related_entity: providerCallId,
+      })).catch(() => {});
       await completeOutboundCallIdempotency(
         outboundIdempotencyContext,
         "pending",
@@ -29082,11 +29296,25 @@ async function placeOutboundCall(payload, hostOverride = null) {
       error_code: lastError?.code || "outbound_call_provider_attempts_exhausted",
       error_message: "All provider attempts were rejected before a call was created.",
     }).catch(() => {});
+    executionContext = transitionExecutionContext(executionContext, "failed", {
+      current_stage: "provider_attempts_exhausted",
+      error_classification: classifyExecutionFailure(lastError || { submissionState: "rejected" }).classification,
+    });
     await db.updateCallState(callId, "outbound_submission_rejected", {
+      execution_context: executionContext,
       provider: providerPlan.selected_provider || preferredProvider || currentProvider,
       error_code: lastError?.code || "outbound_call_provider_attempts_exhausted",
       at: new Date().toISOString(),
     }).catch(() => {});
+    await db.updateCallState(callId, "execution_step", buildExecutionStep(executionContext, {
+      step_name: "provider_dispatch",
+      status: "failed",
+      result: "rejected",
+      error_classification: classifyExecutionFailure(lastError || { submissionState: "rejected" }).classification,
+      retry_count: Math.max(0, attemptProviders.length - 1),
+      started_at: dispatchStepStartedAt,
+      related_entity: callId,
+    })).catch(() => {});
     await completeOutboundCallIdempotency(
       outboundIdempotencyContext,
       "failed",
@@ -29259,7 +29487,13 @@ async function placeOutboundCall(payload, hostOverride = null) {
   });
 
   try {
+    executionContext = transitionExecutionContext(executionContext, "accepted", {
+      provider: selectedProvider || currentProvider,
+      provider_call_id: providerCallId,
+      current_stage: "call_created",
+    });
     const callCreatedState = buildCallCreatedState({
+      execution_context: executionContext,
       customer_name: customer_name || null,
       business_id: business_id || null,
       script: script || null,
@@ -30220,6 +30454,20 @@ registerPostCallWorkflowDefinitionRoutes(app, {
   getService: () => postCallWorkflowDefinitionService,
   getExecutionService: () => postCallWorkflowExecutionService,
   requireAdminToken,
+  requireMiniAppSession,
+  sendApiError,
+});
+
+registerPostCallExtractionRoutes(app, {
+  db,
+  requireAdminToken,
+  requireMiniAppSession,
+  sendApiError,
+});
+
+registerOutgoingWebhookRoutes(app, {
+  db,
+  getService: () => outgoingWebhookService,
   requireMiniAppSession,
   sendApiError,
 });
@@ -33912,9 +34160,13 @@ registerCallRoutes(app, {
       error.code = "provider_call_id_missing";
       throw error;
     }
+    if (call.business_id && provider !== "cartesia") {
+      await createOutboundCallSafetyService().authorizeActor({
+        business_id: call.business_id,
+        actor_id: actorId,
+      });
+    }
     if (provider === "vapi") {
-      const safety = createOutboundCallSafetyService();
-      if (call.business_id) await safety.authorizeActor({ business_id: call.business_id, actor_id: actorId });
       const remote = await createVapiClientFromEnv().getCall(providerCallId);
       return { status: remote?.status, endedReason: remote?.endedReason || remote?.ended_reason };
     }
@@ -33948,11 +34200,18 @@ registerCallRoutes(app, {
         actor_id: actorId,
       });
     }
-    return new VapiCallReconciliationService({
+    const reconciliationService = new VapiCallReconciliationService({
       client: createVapiClientFromEnv(),
       getLocalCall: (id) => db.getVapiOutboundCallByProviderId(id),
       recordEvent: (event) => db.recordVapiCallEvent(event),
-    }).reconcile(providerCallId);
+    });
+    try {
+      return await reconciliationService.reconcile(providerCallId);
+    } catch (error) {
+      if (error?.code !== "vapi_call_not_found") throw error;
+      const remote = await createVapiClientFromEnv().getCall(providerCallId);
+      return { status: remote?.status, endedReason: remote?.endedReason || remote?.ended_reason };
+    }
   },
   isSafeId,
   normalizeCallRecordForApi,
@@ -34254,8 +34513,10 @@ registerStatusRoutes(app, {
   getProviderCompatibilityReport,
   callConfigurations,
   config,
+  getApiAuthFailureMetrics: (windowMinutes) => apiAuthFailureMetrics.get(windowMinutes),
   verifyHmacSignature,
   hasAdminToken,
+  requireAdminToken,
   requireOutboundAuthorization,
   refreshInboundDefaultScript,
   getInboundHealthContext,
@@ -34268,6 +34529,25 @@ registerStatusRoutes(app, {
   keypadProviderOverrides,
   functionEngine,
   callFunctionSystems,
+  getProviderRecommendation: ({ operation, preferredProvider, requiredCapabilities }) => {
+    const descriptors = getVoiceProviderRegistry().listDescriptors();
+    return recommendVoiceProvider({
+      operation,
+      preferredProvider,
+      requiredCapabilities,
+      descriptors,
+      readiness: getProviderReadiness(),
+      configuredOrder: getProviderOrder(null),
+      health: Object.fromEntries(descriptors.map(({ provider }) => {
+        const entry = getProviderHealthEntry(provider);
+        return [provider, {
+          circuit_state: entry.circuitState,
+          degraded: isProviderDegraded(provider),
+          observation_scope: "api_process_memory",
+        }];
+      })),
+    });
+  },
 });
 
 registerWebhookRoutes(app, {
@@ -34766,6 +35046,7 @@ async function gracefulShutdown(options = {}) {
     }
 
     webhookService.stop();
+    await outgoingWebhookService?.stop?.();
     await callECampaignMissionWorker?.stop?.();
     await callECampaignRetentionWorker?.stop?.();
     callConfigurations.clear();

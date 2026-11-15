@@ -56,12 +56,16 @@ describe("CartesiaOutboundCallService", () => {
       async createCall(row) { writes.push(["common", row]); },
       async updateCallState(...args) { writes.push(["state", ...args]); },
     } });
-    await service.recordAcceptedCall({ actorId: "7001", businessId: "biz-1", destination: "+14155550123", agentId: "agent_1", fromNumberId: "ap_number_1" }, "agent_call_1");
+    await service.recordAcceptedCall({ actorId: "7001", businessId: "biz-1", destination: "+14155550123", agentId: "agent_1", fromNumberId: "ap_number_1", idempotencyKey: "cartesia-request-001", requestId: "cartesia-request-1" }, "agent_call_1", "2026-11-14T12:00:00.000Z");
     assert.equal(writes[0][1].local_call_id, "cartesia_agent_call_1");
     assert.equal(writes[1][1].call_sid, "cartesia_agent_call_1");
     assert.equal(writes[1][1].user_chat_id, "7001");
     assert.equal(writes[1][1].business_id, "biz-1");
     assert.equal(writes[2][3].provider_call_id, "agent_call_1");
+    assert.equal(writes[2][3].execution_context.request_id, "cartesia-request-1");
+    assert.equal(writes[2][3].execution_context.internal_call_id, "cartesia_agent_call_1");
+    assert.equal(writes[3][2], "execution_step");
+    assert.equal(writes[3][3].started_at, "2026-11-14T12:00:00.000Z");
   });
 
   it("keeps Managed Agent dispatch closed when its feature gate is off", async () => {

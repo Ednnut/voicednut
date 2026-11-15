@@ -37,6 +37,7 @@ describe('outbound call confirmation response', () => {
       },
       headers: {},
       callEActorId: '7001',
+      requestId: 'request-7001',
     }, {
       json(body) {
         responseBody = body;
@@ -45,11 +46,48 @@ describe('outbound call confirmation response', () => {
     });
 
     assert.equal(submittedPayload.number, '+15555550123');
+    assert.equal(submittedPayload.execution_context.request_id, 'request-7001');
+    assert.equal(submittedPayload.execution_context.actor_id, '7001');
+    assert.equal(submittedPayload.execution_context.execution_type, 'outbound_call');
+    assert.equal(submittedPayload.execution_context.status, 'created');
     assert.equal(responseBody.success, true);
     assert.equal(responseBody.call_sid, 'CA1234567890');
     assert.equal(responseBody.status, 'queued');
     assert.equal(responseBody.provider, 'twilio');
     assert.equal(responseBody.ai_voice_engine, 'cartesia');
+  });
+
+  it('passes request correlation into direct Cartesia and Vapi call services', async () => {
+    const cartesiaInputs = [];
+    const vapiInputs = [];
+    const makeResponse = () => ({
+      json(value) { return value; },
+      status() { return this; },
+    });
+    const cartesia = __testables.createOutboundCallHandler({
+      placeCartesiaOutboundCall: async (input) => { cartesiaInputs.push(input); return { providerCallId: 'cartesia-call-1', status: 'queued' }; },
+      sendApiError: (_res, status, code, message) => ({ status, code, message }),
+    });
+    const vapi = __testables.createOutboundCallHandler({
+      placeVapiOutboundCall: async (input) => { vapiInputs.push(input); return { providerCallId: 'vapi-call-1', status: 'queued' }; },
+      sendApiError: (_res, status, code, message) => ({ status, code, message }),
+    });
+
+    await cartesia({
+      requestId: 'request-cartesia-1',
+      callEActorId: '7001',
+      headers: {},
+      body: { provider: 'cartesia', number: '+14155550123', business_id: 'biz-1', agent_id: 'agent-1', from_number_id: 'number-1', idempotency_key: 'cartesia-request-1' },
+    }, makeResponse());
+    await vapi({
+      requestId: 'request-vapi-1',
+      callEActorId: '7001',
+      headers: {},
+      body: { provider: 'vapi', number: '+14155550123', script_id: 1, mapping_id: 2, phone_number_id: 'phone-1', idempotency_key: 'vapi-request-1' },
+    }, makeResponse());
+
+    assert.equal(cartesiaInputs[0].request_id, 'request-cartesia-1');
+    assert.equal(vapiInputs[0].requestId, 'request-vapi-1');
   });
 });
 
@@ -126,6 +164,7 @@ describe('unified call history and operations', () => {
     });
     assert.deepEqual(lifecycleScope, { callSid: 'local-1', actorId: '7008', options: { limit: 20 } });
     assert.equal(body.call.provider_call_id, 'provider-1');
+    assert.equal(body.call.refresh_available, true);
     assert.equal(body.lifecycle_events[0].status, 'completed');
     assert.equal(body.lifecycle_events[0].source, 'call_record_status');
   });

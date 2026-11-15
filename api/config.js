@@ -777,6 +777,7 @@ const postCallQaMinTurns = Number(readEnv("POST_CALL_QA_MIN_TURNS") || "4");
 const postCallQaMinScore = Number(readEnv("POST_CALL_QA_MIN_SCORE") || "70");
 const postCallQaVersion = String(readEnv("POST_CALL_QA_VERSION") || "post_call_qa_v1").trim();
 const postCallWorkflowsEnabled = readBooleanEnv("POST_CALL_WORKFLOWS_ENABLED", false);
+const outgoingWebhooksEnabled = readBooleanEnv("OUTGOING_WEBHOOKS_ENABLED", false);
 const postCallQaProfileThresholds = parseNumericMap(
   readEnv("POST_CALL_QA_PROFILE_THRESHOLDS"),
   { min: 0, max: 100 },
@@ -785,6 +786,11 @@ const postCallQaRubricWeights = parseJsonObject(
   readEnv("POST_CALL_QA_RUBRIC_WEIGHTS"),
   "POST_CALL_QA_RUBRIC_WEIGHTS",
 );
+const postCallExtractionEnabled = readBooleanEnv("POST_CALL_EXTRACTION_ENABLED", false);
+const postCallExtractionShadowMode = readBooleanEnv("POST_CALL_EXTRACTION_SHADOW_MODE", true);
+const postCallExtractionKillSwitch = readBooleanEnv("POST_CALL_EXTRACTION_KILL_SWITCH", false);
+const postCallExtractionRolloutPercent = Number(readEnv("POST_CALL_EXTRACTION_ROLLOUT_PERCENT") || "0");
+const postCallExtractionAllowlist = parseList(readEnv("POST_CALL_EXTRACTION_ALLOWLIST") || "");
 const domainFlowsEnabled = readBooleanEnv("FEATURE_DOMAIN_FLOWS_ENABLED", false);
 const domainFlowsShadowMode = readBooleanEnv(
   "FEATURE_DOMAIN_FLOWS_SHADOW_MODE",
@@ -1720,6 +1726,19 @@ module.exports = {
         : Math.max(1000, Math.floor(apiHmacMaxSkewMs || 300000)),
     replayValidation: apiHmacReplayValidation,
   },
+  anomalyDetection: {
+    callVolumeMinCurrent: Number(readEnv("ANOMALY_CALL_VOLUME_MIN_CURRENT") || "25"),
+    callVolumeGrowthFactor: Number(readEnv("ANOMALY_CALL_VOLUME_GROWTH_FACTOR") || "3"),
+    providerOpenCount: Number(readEnv("ANOMALY_PROVIDER_OPEN_COUNT") || "1"),
+    providerFailureCount: Number(readEnv("ANOMALY_PROVIDER_FAILURE_COUNT") || "5"),
+    dispatchRetryCount: Number(readEnv("ANOMALY_DISPATCH_RETRY_COUNT") || "5"),
+    campaignDispatchCount: Number(readEnv("ANOMALY_CAMPAIGN_DISPATCH_COUNT") || "100"),
+    webhookFailureCount: Number(readEnv("ANOMALY_WEBHOOK_FAILURE_COUNT") || "5"),
+    workflowFailureCount: Number(readEnv("ANOMALY_WORKFLOW_FAILURE_COUNT") || "3"),
+    workflowRetryCount: Number(readEnv("ANOMALY_WORKFLOW_RETRY_COUNT") || "10"),
+    authAlertCount: Number(readEnv("ANOMALY_AUTH_ALERT_COUNT") || "3"),
+    apiAuthFailureCount: Number(readEnv("ANOMALY_API_AUTH_FAILURE_COUNT") || "10"),
+  },
   streamAuth: {
     secret: streamAuthSecret,
     maxSkewMs: streamAuthMaxSkewMs,
@@ -1849,9 +1868,25 @@ module.exports = {
     profileThresholds: postCallQaProfileThresholds,
     rubricWeights: postCallQaRubricWeights,
   },
+  postCallExtraction: {
+    enabled: postCallExtractionEnabled,
+    shadowMode: postCallExtractionShadowMode,
+    killSwitch: postCallExtractionKillSwitch,
+    rolloutPercent: Number.isFinite(postCallExtractionRolloutPercent)
+      ? Math.max(0, Math.min(100, Math.floor(postCallExtractionRolloutPercent)))
+      : 0,
+    allowlist: postCallExtractionAllowlist.map((value) => String(value || "").trim().toLowerCase()).filter(Boolean),
+    minConfidence: Number(readEnv("POST_CALL_EXTRACTION_MIN_CONFIDENCE") || "0.8"),
+    timeoutMs: Number(readEnv("POST_CALL_EXTRACTION_TIMEOUT_MS") || "15000"),
+    model: String(readEnv("POST_CALL_EXTRACTION_MODEL") || "").trim() || null,
+  },
   postCallWorkflows: {
     enabled: postCallWorkflowsEnabled,
     pollIntervalMs: Number(readEnv("POST_CALL_WORKFLOWS_POLL_INTERVAL_MS") || "1500"),
+  },
+  outgoingWebhooks: {
+    enabled: outgoingWebhooksEnabled,
+    pollIntervalMs: Number(readEnv("OUTGOING_WEBHOOKS_POLL_INTERVAL_MS") || "3000"),
   },
   domainFlows: {
     enabled: domainFlowsEnabled,

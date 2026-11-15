@@ -114,6 +114,8 @@ docs/*
 !docs/phase18-vapi-web-call-operations.md
 !docs/phase19-vapi-tool-call-webhook-safety.md
 !docs/phase20-vapi-call-campaign-drafts.md
+!docs/voicednut-phases-11-16.md
+!docs/voicednut-phases-11-16-implementation-report.md
 !docs/call-e-integration-plan.md
 !docs/call-e-api-bot-implementation-map.md
 !docs/call-e-pilot-runbook.md

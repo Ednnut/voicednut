@@ -12,6 +12,8 @@ function createHarness(options = {}) {
   };
   const executionService = {
     async listRuns(filters) { calls.push(["runs", filters]); return []; },
+    async listEvents(filters) { calls.push(["events", filters]); return [{ event_id: "event_1", status: "dead_letter" }]; },
+    async retryEvent(eventId) { calls.push(["retryEvent", eventId]); return { event_id: eventId, status: "pending" }; },
     async getRun(runId, businessId) { calls.push(["getRun", runId, businessId]); return { run_id: runId, business_id: businessId, status: "waiting_approval", steps: [] }; },
     async approveRun(runId, actor) { calls.push(["approveRun", runId, actor]); return { run_id: runId, status: "queued" }; },
     async cancelRun(runId, actor) { calls.push(["cancelRun", runId, actor]); return { run_id: runId, status: "canceled" }; },
@@ -110,6 +112,35 @@ describe("Post-call workflow definition routes", () => {
     response = await dispatch("POST", "/post-call/workflows/runs/:run_id/cancel", { headers, params: { run_id: "run_1" } });
     assert.equal(response.body.run.status, "canceled");
     assert.deepEqual(calls.slice(2), [["approveRun", "run_1", "admin_token"], ["cancelRun", "run_1", "admin_token"]]);
+  });
+
+  it("restricts workflow event visibility and dead-letter retries to admins", async () => {
+    const { dispatch, calls } = createHarness();
+    let response = await dispatch("GET", "/post-call/workflows/events");
+    assert.equal(response.status, 403);
+    response = await dispatch("POST", "/post-call/workflows/events/:event_id/retry", { params: { event_id: "event_1" } });
+    assert.equal(response.status, 403);
+    assert.equal(calls.length, 0);
+
+    const headers = { "x-admin": "authorized" };
+    response = await dispatch("GET", "/post-call/workflows/events", {
+      headers,
+      query: { status: "dead_letter", business_id: "biz-42", limit: "10" },
+    });
+    assert.equal(response.body.events[0].status, "dead_letter");
+    assert.deepEqual(calls[0], ["events", {
+      status: "dead_letter",
+      trigger_event: undefined,
+      business_id: "biz-42",
+      limit: "10",
+    }]);
+
+    response = await dispatch("POST", "/post-call/workflows/events/:event_id/retry", {
+      headers,
+      params: { event_id: "event_1" },
+    });
+    assert.equal(response.body.event.status, "pending");
+    assert.deepEqual(calls[1], ["retryEvent", "event_1"]);
   });
 
   it("passes a requested workflow filter to the global version list", async () => {

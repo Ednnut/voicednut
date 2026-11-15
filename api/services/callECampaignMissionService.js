@@ -464,7 +464,9 @@ class CallECampaignMissionService {
     const reserved = Number(mission.budget_reserved_minor) || 0;
     const usage = await this.db.getCallEMissionUsageReport?.(businessId, missionId);
     const actual = Number(usage?.actual_by_currency?.[budgetCurrency] || 0);
-    const budgetReady = budgetCap == null || actual + reserved + Number(mission.per_call_cost_ceiling_minor || 0) <= budgetCap;
+    const estimated = Number(usage?.estimated_by_currency?.[budgetCurrency] || 0);
+    const committed = actual + estimated;
+    const budgetReady = budgetCap == null || committed + reserved + Number(mission.per_call_cost_ceiling_minor || 0) <= budgetCap;
     check('budget', budgetReady, budgetReady ? null : 'budget_reservation_would_exceed_cap');
     let routing = null;
     try {
@@ -474,7 +476,7 @@ class CallECampaignMissionService {
     const canAdvance = checks.every((item) => item.ready);
     return { mission_id: missionId, business_id: businessId, status: mission.status, checks,
       budget: { currency: /^[A-Z]{3}$/.test(budgetCurrency) ? budgetCurrency : null, cap_minor: budgetCap,
-        actual_minor: actual, reserved_minor: reserved,
+        actual_minor: actual, estimated_minor: estimated, committed_minor: committed, reserved_minor: reserved,
         per_call_ceiling_minor: mission.per_call_cost_ceiling_minor == null ? null : Number(mission.per_call_cost_ceiling_minor) },
       safety: safetyPolicy ? { timezone: safetyPolicy.timezone, quiet_hours_start: safetyPolicy.quiet_hours_start,
         quiet_hours_end: safetyPolicy.quiet_hours_end, emergency_stop: safetyPolicy.emergency_stop } : null,
