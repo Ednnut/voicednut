@@ -50,7 +50,9 @@ describe("Vapi webhook route authentication policy", () => {
 
   it("does not handle Vapi events after the verifier rejects a request", () => {
     let called = false;
+    let authRejections = 0;
     const guard = __testables.createWebhookAuthGuard({
+      onAuthRejected() { authRejections += 1; },
       requireValidVapiWebhook(_req, res) {
         res.status(401).json({ success: false });
         return false;
@@ -61,5 +63,6 @@ describe("Vapi webhook route authentication policy", () => {
     handler({ path: "/webhook/vapi", requestId: "req-test" }, res);
     assert.equal(called, false);
     assert.equal(res.statusCode, 401);
+    assert.equal(authRejections, 1);
   });
 });

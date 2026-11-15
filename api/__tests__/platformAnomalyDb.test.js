@@ -61,4 +61,57 @@ describe('platform anomaly metrics', function () {
       }
     }
   });
+
+  it('aggregates retry-safe HMAC failure buckets across process instances without exposing process IDs', async () => {
+    const dbPath = path.join(os.tmpdir(), `voicednut-auth-failure-metrics-${Date.now()}-${Math.random()}.sqlite`);
+    const db = new Database();
+    db.dbPath = dbPath;
+    try {
+      await db.initialize();
+      const bucket = Math.floor(Date.now() / 60000);
+      const entries = [
+        { bucket_minute: bucket, process_instance_id: 'process-one', reason: 'invalid_signature', count: 4 },
+        { bucket_minute: bucket, process_instance_id: 'process-two', reason: 'invalid_signature', count: 3 },
+        { bucket_minute: bucket, process_instance_id: 'process-one', reason: 'replay_detected', count: 2 },
+        { bucket_minute: bucket, process_instance_id: 'process-one', reason: 'miniapp_missing_session', count: 5 },
+        { bucket_minute: bucket, process_instance_id: 'process-two', reason: 'miniapp_access_denied', count: 2 },
+        { bucket_minute: bucket, process_instance_id: 'process-one', reason: 'admin_token_missing', count: 4 },
+        { bucket_minute: bucket, process_instance_id: 'process-two', reason: 'admin_token_invalid', count: 1 },
+        { bucket_minute: bucket, process_instance_id: 'process-one', reason: 'webhook_auth_rejected', count: 6 },
+      ];
+      await db.recordApiAuthFailureBuckets(entries);
+      // Replaying a process snapshot keeps the same aggregate rather than adding it twice.
+      await db.recordApiAuthFailureBuckets(entries);
+      const result = await db.getApiAuthFailureMetrics(60);
+      assert.equal(result.scope, 'shared_sqlite');
+      assert.equal(result.retention_minutes, 1440);
+      assert.equal(result.total, 9);
+      assert.equal(result.by_reason.invalid_signature, 7);
+      assert.equal(result.by_reason.replay_detected, 2);
+      assert.equal(result.miniapp_session.total, 7);
+      assert.equal(result.miniapp_session.by_reason.miniapp_missing_session, 5);
+      assert.equal(result.miniapp_session.by_reason.miniapp_access_denied, 2);
+      assert.equal(result.admin_token.total, 5);
+      assert.equal(result.admin_token.by_reason.admin_token_missing, 4);
+      assert.equal(result.admin_token.by_reason.admin_token_invalid, 1);
+      assert.equal(result.webhook_auth.total, 6);
+      assert.deepEqual(Object.keys(result.by_reason).sort(), [
+        'invalid_signature', 'invalid_timestamp', 'missing_headers', 'other', 'replay_detected', 'timestamp_out_of_range',
+      ]);
+      assert.equal(JSON.stringify(result).includes('process-one'), false);
+      assert.equal(JSON.stringify(result).includes('admin-token-secret'), false);
+      const largeBatch = Array.from({ length: 8641 }, () => ({
+        bucket_minute: bucket, process_instance_id: 'process-three', reason: 'miniapp_invalid_session', count: 1,
+      }));
+      assert.deepEqual(await db.recordApiAuthFailureBuckets(largeBatch), { recorded: 8641 });
+      await assert.rejects(() => db.recordApiAuthFailureBuckets([
+        { bucket_minute: bucket, process_instance_id: 'process-one', reason: 'invalid_signature', count: -1 },
+      ]), { code: 'api_auth_metrics_invalid' });
+    } finally {
+      if (db.db) await new Promise((resolve) => db.db.close(resolve));
+      for (const suffix of ['', '-wal', '-shm']) {
+        try { fs.unlinkSync(`${dbPath}${suffix}`); } catch {}
+      }
+    }
+  });
 });

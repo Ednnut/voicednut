@@ -8,6 +8,7 @@ describe('call status ownership', () => {
     let capturedWindow;
     let body;
     let responseStatus = 200;
+    const authMetricSteps = [];
     const handler = __testables.createAnomalyObservabilityHandler({
       config: {
         apiAuth: { hmacSecret: 'configured' },
@@ -15,12 +16,20 @@ describe('call status ownership', () => {
           callVolumeMinCurrent: 10, callVolumeGrowthFactor: 2,
           providerOpenCount: 1, providerFailureCount: 2, dispatchRetryCount: 3, campaignDispatchCount: 10,
           webhookFailureCount: 2, workflowFailureCount: 2, workflowRetryCount: 4, authAlertCount: 1, apiAuthFailureCount: 2,
+          miniAppAuthFailureCount: 2, adminAuthFailureCount: 2, webhookAuthFailureCount: 2,
         },
       },
       verifyHmacSignature: () => ({ ok: true }),
       hasAdminToken: () => false,
-      getApiAuthFailureMetrics: (window) => ({ window_minutes: window, total: 2,
-        by_reason: { invalid_signature: 2 }, scope: 'api_process_memory' }),
+      flushApiAuthFailureMetrics: async () => { authMetricSteps.push('flush'); },
+      getApiAuthFailureMetrics: async (window) => {
+        authMetricSteps.push('read');
+        return { window_minutes: window, total: 2, by_reason: { invalid_signature: 2 },
+          miniapp_session: { total: 2, by_reason: { miniapp_missing_session: 2 } },
+          admin_token: { total: 2, by_reason: { admin_token_missing: 1, admin_token_invalid: 1 } },
+          webhook_auth: { total: 2, by_reason: { webhook_auth_rejected: 2 } },
+          scope: 'shared_sqlite', retention_minutes: 1440 };
+      },
       getDb: () => ({
         getPlatformAnomalyMetrics: async (window) => {
           capturedWindow = window;
@@ -43,7 +52,7 @@ describe('call status ownership', () => {
     assert.equal(capturedWindow, 30);
     assert.equal(body.informational_only, true);
     assert.deepEqual(body.alerts.map((alert) => alert.code), [
-      'call_volume_surge', 'provider_circuit_open', 'provider_call_failures', 'api_authentication_failures', 'call_dispatch_retries',
+      'call_volume_surge', 'provider_circuit_open', 'provider_call_failures', 'api_authentication_failures', 'miniapp_authentication_failures', 'admin_token_authentication_failures', 'webhook_authentication_failures', 'call_dispatch_retries',
       'campaign_consumption_high', 'outgoing_webhook_failures', 'workflow_failures_high', 'workflow_retries_high',
       'authorization_failure_alerts',
     ]);
@@ -52,7 +61,14 @@ describe('call status ownership', () => {
     assert.equal(JSON.stringify(body).includes('provider_timeout'), false);
     assert.deepEqual(body.alerts.find((alert) => alert.code === 'api_authentication_failures').by_reason,
       { invalid_signature: 2 });
-    assert.equal(body.summary.api_hmac_auth_failures.scope, 'api_process_memory');
+    assert.equal(body.summary.api_hmac_auth_failures.scope, 'shared_sqlite');
+    assert.equal(body.summary.miniapp_session_auth_failures.total, 2);
+    assert.equal(body.summary.admin_token_auth_failures.total, 2);
+    assert.deepEqual(body.alerts.find((alert) => alert.code === 'admin_token_authentication_failures').by_reason,
+      { admin_token_missing: 1, admin_token_invalid: 1 });
+    assert.deepEqual(body.alerts.find((alert) => alert.code === 'webhook_authentication_failures').by_reason,
+      { webhook_auth_rejected: 2 });
+    assert.deepEqual(authMetricSteps, ['flush', 'read']);
     assert.equal(body.alerts.find((alert) => alert.code === 'workflow_retries_high').current, 4);
   });
 
@@ -70,6 +86,24 @@ describe('call status ownership', () => {
     });
     assert.equal(status, 401);
     assert.equal(metricsRead, false);
+  });
+
+  it('falls back to process-local HMAC counts when shared metrics storage is unavailable', async () => {
+    let body;
+    const handler = __testables.createAnomalyObservabilityHandler({
+      config: { apiAuth: { hmacSecret: 'configured' } },
+      hasAdminToken: () => false,
+      flushApiAuthFailureMetrics: async () => { throw new Error('database unavailable'); },
+      getApiAuthFailureMetrics: async () => { throw new Error('database unavailable'); },
+      getLocalApiAuthFailureMetrics: () => ({ window_minutes: 60, total: 3, by_reason: { invalid_signature: 3 }, scope: 'api_process_memory' }),
+      getDb: () => ({ getPlatformAnomalyMetrics: async () => ({}) }),
+    });
+    await handler({ query: {} }, {
+      status() { return this; },
+      json(value) { body = value; return value; },
+    });
+    assert.equal(body.summary.api_hmac_auth_failures.total, 3);
+    assert.equal(body.summary.api_hmac_auth_failures.scope, 'api_process_memory');
   });
 
   it('denies a Telegram user access to another user call status', async () => {

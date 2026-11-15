@@ -101,6 +101,25 @@ function registerPostCallExtractionRoutes(app, options = {}) {
         sendError(res, sendApiError, req, 500, "post_call_extractions_failed", "Business extractions could not be listed");
       }
     });
+    app.get("/miniapp/businesses/:business_id/post-call/extraction-usage", requireMiniAppSession, async (req, res) => {
+      try {
+        const scope = await authorizeBusiness(req, res, ["policy_manager", "call_operator"]);
+        if (!scope) return;
+        const rawDays = req.query?.days;
+        const days = rawDays === undefined ? 30
+          : typeof rawDays === "string" && /^\d{1,2}$/.test(rawDays) ? Number(rawDays) : Number.NaN;
+        if (!Number.isSafeInteger(days) || days < 1 || days > 90) {
+          return sendError(res, sendApiError, req, 400, "post_call_extraction_usage_invalid", "Usage period must be from 1 to 90 days");
+        }
+        if (typeof db?.getCallStructuredExtractionUsageReport !== "function") {
+          return sendError(res, sendApiError, req, 503, "post_call_extraction_usage_unavailable", "Structured extraction usage is unavailable");
+        }
+        const usage = await db.getCallStructuredExtractionUsageReport(scope.businessId, { days });
+        res.json({ success: true, request_id: req.requestId || null, business_id: scope.businessId, usage });
+      } catch (_) {
+        sendError(res, sendApiError, req, 500, "post_call_extraction_usage_failed", "Structured extraction usage could not be loaded");
+      }
+    });
     app.post(`${businessPath}/:call_sid/review`, requireMiniAppSession, async (req, res) => {
       try {
         const scope = await authorizeBusiness(req, res, ["policy_manager"]);

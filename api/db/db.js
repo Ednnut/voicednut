@@ -672,6 +672,39 @@ class EnhancedDatabase {
                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
             )`,
 
+            `CREATE TABLE IF NOT EXISTS api_auth_failure_minute_buckets (
+                bucket_minute INTEGER NOT NULL,
+                process_instance_id TEXT NOT NULL,
+                reason TEXT NOT NULL CHECK(reason IN ('missing_headers', 'invalid_timestamp', 'timestamp_out_of_range', 'invalid_signature', 'replay_detected', 'other')),
+                count INTEGER NOT NULL CHECK(count >= 0),
+                updated_at DATETIME NOT NULL,
+                PRIMARY KEY(bucket_minute, process_instance_id, reason)
+            )`,
+            `CREATE TABLE IF NOT EXISTS miniapp_auth_failure_minute_buckets (
+                bucket_minute INTEGER NOT NULL,
+                process_instance_id TEXT NOT NULL,
+                reason TEXT NOT NULL CHECK(reason IN ('miniapp_missing_session', 'miniapp_invalid_session', 'miniapp_access_denied', 'miniapp_revoked_session', 'miniapp_missing_init_data', 'miniapp_invalid_init_data', 'miniapp_invalid_init_signature', 'miniapp_replayed_init_data')),
+                count INTEGER NOT NULL CHECK(count >= 0),
+                updated_at DATETIME NOT NULL,
+                PRIMARY KEY(bucket_minute, process_instance_id, reason)
+            )`,
+            `CREATE TABLE IF NOT EXISTS admin_auth_failure_minute_buckets (
+                bucket_minute INTEGER NOT NULL,
+                process_instance_id TEXT NOT NULL,
+                reason TEXT NOT NULL CHECK(reason IN ('admin_token_missing', 'admin_token_invalid')),
+                count INTEGER NOT NULL CHECK(count >= 0),
+                updated_at DATETIME NOT NULL,
+                PRIMARY KEY(bucket_minute, process_instance_id, reason)
+            )`,
+            `CREATE TABLE IF NOT EXISTS webhook_auth_failure_minute_buckets (
+                bucket_minute INTEGER NOT NULL,
+                process_instance_id TEXT NOT NULL,
+                reason TEXT NOT NULL CHECK(reason IN ('webhook_auth_rejected')),
+                count INTEGER NOT NULL CHECK(count >= 0),
+                updated_at DATETIME NOT NULL,
+                PRIMARY KEY(bucket_minute, process_instance_id, reason)
+            )`,
+
             // Application settings
             `CREATE TABLE IF NOT EXISTS app_settings (
                 key TEXT PRIMARY KEY,
@@ -13622,6 +13655,61 @@ class EnhancedDatabase {
         });
     }
 
+    async getCallStructuredExtractionUsageReport(businessId, options = {}) {
+        const normalizedBusinessId = String(businessId || '').trim();
+        const days = Number(options.days ?? 30);
+        if (!/^[A-Za-z0-9._:-]{1,120}$/.test(normalizedBusinessId) ||
+            !Number.isSafeInteger(days) || days < 1 || days > 90) {
+            throw Object.assign(new Error('Structured extraction usage scope is invalid'), { code: 'validation_error' });
+        }
+        const since = new Date(Date.now() - (days * 24 * 60 * 60 * 1000)).toISOString();
+        const aggregate = (row = {}) => ({
+            request_count: Number(row.request_count) || 0,
+            prompt_tokens: {
+                reported_requests: Number(row.prompt_reported_requests) || 0,
+                total: row.prompt_reported_requests ? Number(row.prompt_token_total) : null,
+            },
+            completion_tokens: {
+                reported_requests: Number(row.completion_reported_requests) || 0,
+                total: row.completion_reported_requests ? Number(row.completion_token_total) : null,
+            },
+            total_tokens: {
+                reported_requests: Number(row.total_reported_requests) || 0,
+                total: row.total_reported_requests ? Number(row.total_token_total) : null,
+            },
+        });
+        const summarizeSql = `SELECT COUNT(*) AS request_count,
+            COUNT(prompt_tokens) AS prompt_reported_requests, SUM(prompt_tokens) AS prompt_token_total,
+            COUNT(completion_tokens) AS completion_reported_requests, SUM(completion_tokens) AS completion_token_total,
+            COUNT(total_tokens) AS total_reported_requests, SUM(total_tokens) AS total_token_total
+            FROM call_structured_extraction_usage WHERE business_id = ? AND recorded_at >= ?`;
+        const all = (sql, params) => new Promise((resolve, reject) => this.db.all(sql, params, (error, rows) => error ? reject(error) : resolve(rows || [])));
+        const get = (sql, params) => new Promise((resolve, reject) => this.db.get(sql, params, (error, row) => error ? reject(error) : resolve(row || {})));
+        const [totalsRow, modelRows, modelCountRow] = await Promise.all([
+            get(summarizeSql, [normalizedBusinessId, since]),
+            all(`SELECT model_id, COUNT(*) AS request_count,
+                    COUNT(prompt_tokens) AS prompt_reported_requests, SUM(prompt_tokens) AS prompt_token_total,
+                    COUNT(completion_tokens) AS completion_reported_requests, SUM(completion_tokens) AS completion_token_total,
+                    COUNT(total_tokens) AS total_reported_requests, SUM(total_tokens) AS total_token_total
+                FROM call_structured_extraction_usage WHERE business_id = ? AND recorded_at >= ?
+                GROUP BY model_id ORDER BY request_count DESC, model_id ASC LIMIT 50`, [normalizedBusinessId, since]),
+            get(`SELECT COUNT(DISTINCT model_id) AS model_count FROM call_structured_extraction_usage
+                WHERE business_id = ? AND recorded_at >= ?`, [normalizedBusinessId, since]),
+        ]);
+        const modelGroupCount = Number(modelCountRow.model_count) || 0;
+        return {
+            business_id: normalizedBusinessId,
+            period_days: days,
+            usage_source: 'openrouter_chat_completion_response',
+            provenance: 'provider_reported',
+            cost_status: 'unknown',
+            totals: aggregate(totalsRow),
+            by_model: modelRows.map((row) => ({ model_id: String(row.model_id || 'unknown'), ...aggregate(row) })),
+            model_group_count: modelGroupCount,
+            model_groups_truncated: modelGroupCount > modelRows.length,
+        };
+    }
+
     async upsertCallStructuredExtraction(record = {}) {
         const callSid = String(record.call_sid || '').trim();
         const schemaJson = JSON.stringify(record.schema || {});
@@ -14134,6 +14222,111 @@ class EnhancedDatabase {
                }
            });
        });
+   }
+
+   async recordApiAuthFailureBuckets(entries = []) {
+       const hmacReasons = new Set(['missing_headers', 'invalid_timestamp', 'timestamp_out_of_range', 'invalid_signature', 'replay_detected', 'other']);
+       const miniappReasons = new Set(['miniapp_missing_session', 'miniapp_invalid_session', 'miniapp_access_denied', 'miniapp_revoked_session', 'miniapp_missing_init_data', 'miniapp_invalid_init_data', 'miniapp_invalid_init_signature', 'miniapp_replayed_init_data']);
+       const adminReasons = new Set(['admin_token_missing', 'admin_token_invalid']);
+       const webhookReasons = new Set(['webhook_auth_rejected']);
+       const currentBucket = Math.floor(Date.now() / 60000);
+       const oldestBucket = currentBucket - 1440 + 1;
+       if (!Array.isArray(entries) || entries.length > 24480) {
+           throw Object.assign(new Error('API authentication metric batch is invalid'), { code: 'api_auth_metrics_invalid' });
+       }
+       const rows = entries.map((entry) => {
+           const bucket = Number(entry?.bucket_minute);
+           const processId = String(entry?.process_instance_id || '');
+           const reason = String(entry?.reason || '');
+           const count = Number(entry?.count);
+           if (!Number.isSafeInteger(bucket) || bucket < oldestBucket || bucket > currentBucket ||
+               !/^[A-Za-z0-9-]{1,80}$/.test(processId) || (!hmacReasons.has(reason) && !miniappReasons.has(reason) && !adminReasons.has(reason) && !webhookReasons.has(reason)) ||
+               !Number.isSafeInteger(count) || count < 1) {
+               throw Object.assign(new Error('API authentication metric entry is invalid'), { code: 'api_auth_metrics_invalid' });
+           }
+           const table = miniappReasons.has(reason) ? 'miniapp_auth_failure_minute_buckets'
+               : adminReasons.has(reason) ? 'admin_auth_failure_minute_buckets'
+                   : webhookReasons.has(reason) ? 'webhook_auth_failure_minute_buckets' : 'api_auth_failure_minute_buckets';
+           return { bucket, processId, reason, count: Math.min(count, 1_000_000_000), table };
+       });
+       const run = (sql, params = []) => new Promise((resolve, reject) =>
+           this.db.run(sql, params, (error) => error ? reject(error) : resolve()));
+       for (const table of ['api_auth_failure_minute_buckets', 'miniapp_auth_failure_minute_buckets', 'admin_auth_failure_minute_buckets', 'webhook_auth_failure_minute_buckets']) {
+           const tableRows = rows.filter((row) => row.table === table);
+           for (let offset = 0; offset < tableRows.length; offset += 100) {
+               const chunk = tableRows.slice(offset, offset + 100);
+               const tuples = chunk.map(() => '(?, ?, ?, ?, CURRENT_TIMESTAMP)').join(', ');
+               const params = chunk.flatMap((row) => [row.bucket, row.processId, row.reason, row.count]);
+               await run(`INSERT INTO ${table}
+                   (bucket_minute, process_instance_id, reason, count, updated_at) VALUES ${tuples}
+                   ON CONFLICT(bucket_minute, process_instance_id, reason) DO UPDATE SET
+                       count = MAX(${table}.count, excluded.count), updated_at = CURRENT_TIMESTAMP`, params);
+           }
+       }
+       await run('DELETE FROM api_auth_failure_minute_buckets WHERE bucket_minute < ?', [oldestBucket]);
+       await run('DELETE FROM miniapp_auth_failure_minute_buckets WHERE bucket_minute < ?', [oldestBucket]);
+       await run('DELETE FROM admin_auth_failure_minute_buckets WHERE bucket_minute < ?', [oldestBucket]);
+       await run('DELETE FROM webhook_auth_failure_minute_buckets WHERE bucket_minute < ?', [oldestBucket]);
+       return { recorded: rows.length };
+   }
+
+   async getApiAuthFailureMetrics(windowMinutes = 60) {
+       const hmacReasons = ['missing_headers', 'invalid_timestamp', 'timestamp_out_of_range', 'invalid_signature', 'replay_detected', 'other'];
+       const miniappReasons = ['miniapp_missing_session', 'miniapp_invalid_session', 'miniapp_access_denied', 'miniapp_revoked_session', 'miniapp_missing_init_data', 'miniapp_invalid_init_data', 'miniapp_invalid_init_signature', 'miniapp_replayed_init_data'];
+       const adminReasons = ['admin_token_missing', 'admin_token_invalid'];
+       const webhookReasons = ['webhook_auth_rejected'];
+       const parsedWindow = Number(windowMinutes);
+       const window = Number.isFinite(parsedWindow) ? Math.max(1, Math.min(1440, Math.floor(parsedWindow))) : 60;
+       const currentBucket = Math.floor(Date.now() / 60000);
+       const firstBucket = currentBucket - window + 1;
+       await new Promise((resolve, reject) => this.db.run(
+           'DELETE FROM api_auth_failure_minute_buckets WHERE bucket_minute < ?',
+           [currentBucket - 1440 + 1], (error) => error ? reject(error) : resolve(),
+       ));
+       await new Promise((resolve, reject) => this.db.run(
+           'DELETE FROM miniapp_auth_failure_minute_buckets WHERE bucket_minute < ?',
+           [currentBucket - 1440 + 1], (error) => error ? reject(error) : resolve(),
+       ));
+       await new Promise((resolve, reject) => this.db.run(
+           'DELETE FROM admin_auth_failure_minute_buckets WHERE bucket_minute < ?',
+           [currentBucket - 1440 + 1], (error) => error ? reject(error) : resolve(),
+       ));
+       await new Promise((resolve, reject) => this.db.run(
+           'DELETE FROM webhook_auth_failure_minute_buckets WHERE bucket_minute < ?',
+           [currentBucket - 1440 + 1], (error) => error ? reject(error) : resolve(),
+       ));
+       const read = (table) => new Promise((resolve, reject) => this.db.all(
+           `SELECT reason, SUM(count) AS count FROM ${table}
+            WHERE bucket_minute >= ? AND bucket_minute <= ? GROUP BY reason`,
+           [firstBucket, currentBucket], (error, result) => error ? reject(error) : resolve(result || []),
+       ));
+       const [hmacRows, miniappRows, adminRows, webhookRows] = await Promise.all([
+           read('api_auth_failure_minute_buckets'), read('miniapp_auth_failure_minute_buckets'), read('admin_auth_failure_minute_buckets'),
+           read('webhook_auth_failure_minute_buckets'),
+       ]);
+       const aggregate = (reasons, rows) => {
+           const byReason = Object.fromEntries(reasons.map((reason) => [reason, 0]));
+           for (const row of rows) {
+               if (Object.hasOwn(byReason, row.reason)) byReason[row.reason] = Number(row.count) || 0;
+           }
+           return {
+               total: reasons.reduce((sum, reason) => Math.min(Number.MAX_SAFE_INTEGER, sum + byReason[reason]), 0),
+               by_reason: byReason,
+           };
+       };
+       const hmac = aggregate(hmacReasons, hmacRows);
+       const miniappSession = aggregate(miniappReasons, miniappRows);
+       const adminToken = aggregate(adminReasons, adminRows);
+       const webhookAuth = aggregate(webhookReasons, webhookRows);
+       return {
+           window_minutes: window,
+           ...hmac,
+           miniapp_session: miniappSession,
+           admin_token: adminToken,
+           webhook_auth: webhookAuth,
+           scope: 'shared_sqlite',
+           retention_minutes: 1440,
+       };
    }
 
    async getPlatformAnomalyMetrics(windowMinutes = 60) {
@@ -16597,7 +16790,7 @@ class EnhancedDatabase {
    }
 
    async listApprovedPostCallWorkflowDefinitions(triggerEvent, businessId = null) {
-       const requiresBusinessScope = triggerEvent === 'call_e_result_ready';
+       const requiresBusinessScope = ['call_e_result_ready', 'post_call_automation_failed'].includes(triggerEvent);
        if ((requiresBusinessScope && !businessId) || (businessId && !/^[A-Za-z0-9._:-]{1,120}$/.test(String(businessId)))) return [];
        const scoped = Boolean(businessId);
        const scopeClause = scoped ? 'business_id = ?' : 'business_id IS NULL';

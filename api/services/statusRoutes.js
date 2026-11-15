@@ -632,9 +632,15 @@ function createAnomalyObservabilityHandler(ctx = {}) {
 
       const windowMinutes = parseWindowMinutes(req.query?.window_minutes, 60);
       const metrics = await db.getPlatformAnomalyMetrics(windowMinutes);
-      const apiAuthFailures = typeof ctx.getApiAuthFailureMetrics === "function"
-        ? ctx.getApiAuthFailureMetrics(windowMinutes)
-        : { window_minutes: windowMinutes, total: 0, by_reason: {}, scope: "unavailable" };
+      let apiAuthFailures = { window_minutes: windowMinutes, total: 0, by_reason: {}, scope: "unavailable" };
+      try {
+        if (typeof ctx.flushApiAuthFailureMetrics === "function") await ctx.flushApiAuthFailureMetrics();
+        if (typeof ctx.getApiAuthFailureMetrics === "function") apiAuthFailures = await ctx.getApiAuthFailureMetrics(windowMinutes);
+      } catch (_) {
+        apiAuthFailures = typeof ctx.getLocalApiAuthFailureMetrics === "function"
+          ? ctx.getLocalApiAuthFailureMetrics(windowMinutes)
+          : apiAuthFailures;
+      }
       const configured = config.anomalyDetection || {};
       const threshold = (value, fallback, min = 1, max = 1000000) => {
         const parsed = Number(value);
@@ -652,6 +658,9 @@ function createAnomalyObservabilityHandler(ctx = {}) {
         workflow_retry_count: threshold(configured.workflowRetryCount, 10, 1, 100000),
         authorization_alert_count: threshold(configured.authAlertCount, 3, 1, 100000),
         api_authentication_failures: threshold(configured.apiAuthFailureCount, 10, 1, 100000),
+        miniapp_authentication_failures: threshold(configured.miniAppAuthFailureCount, 10, 1, 100000),
+        admin_token_authentication_failures: threshold(configured.adminAuthFailureCount, 10, 1, 100000),
+        webhook_authentication_failures: threshold(configured.webhookAuthFailureCount, 10, 1, 100000),
       };
       const alerts = [];
       const currentCalls = Number(metrics.calls?.current_window) || 0;
@@ -675,6 +684,24 @@ function createAnomalyObservabilityHandler(ctx = {}) {
         alerts.push({ code: "api_authentication_failures", severity: "high", current: apiAuthFailureCount,
           threshold: thresholds.api_authentication_failures, by_reason: apiAuthFailures.by_reason || {} });
       }
+      const miniAppAuthFailures = apiAuthFailures?.miniapp_session || { total: 0, by_reason: {} };
+      const miniAppAuthFailureCount = Number(miniAppAuthFailures.total) || 0;
+      if (miniAppAuthFailureCount >= thresholds.miniapp_authentication_failures) {
+        alerts.push({ code: "miniapp_authentication_failures", severity: "high", current: miniAppAuthFailureCount,
+          threshold: thresholds.miniapp_authentication_failures, by_reason: miniAppAuthFailures.by_reason || {} });
+      }
+      const adminTokenFailures = apiAuthFailures?.admin_token || { total: 0, by_reason: {} };
+      const adminTokenFailureCount = Number(adminTokenFailures.total) || 0;
+      if (adminTokenFailureCount >= thresholds.admin_token_authentication_failures) {
+        alerts.push({ code: "admin_token_authentication_failures", severity: "high", current: adminTokenFailureCount,
+          threshold: thresholds.admin_token_authentication_failures, by_reason: adminTokenFailures.by_reason || {} });
+      }
+      const webhookAuthFailures = apiAuthFailures?.webhook_auth || { total: 0, by_reason: {} };
+      const webhookAuthFailureCount = Number(webhookAuthFailures.total) || 0;
+      if (webhookAuthFailureCount >= thresholds.webhook_authentication_failures) {
+        alerts.push({ code: "webhook_authentication_failures", severity: "high", current: webhookAuthFailureCount,
+          threshold: thresholds.webhook_authentication_failures, by_reason: webhookAuthFailures.by_reason || {} });
+      }
       const countRules = [
         ["call_dispatch_retries", "dispatch_retry_count", "dispatch_retry_count", "high"],
         ["campaign_consumption_high", "campaign_dispatches_today", "campaign_dispatches_today", "medium"],
@@ -694,12 +721,17 @@ function createAnomalyObservabilityHandler(ctx = {}) {
         informational_only: true,
         thresholds,
         alerts,
-        summary: { ...metrics, api_hmac_auth_failures: apiAuthFailures },
+        summary: { ...metrics, api_hmac_auth_failures: apiAuthFailures,
+          miniapp_session_auth_failures: miniAppAuthFailures, admin_token_auth_failures: adminTokenFailures,
+          webhook_auth_failures: webhookAuthFailures },
         data_notes: {
           provider_failures: "Includes latest provider diagnostic circuit snapshots and failed/error call rows with a persisted error code grouped by selected provider. It excludes failures without a local call error record.",
           campaign_consumption: "Counts CALL-E recipients with a local call ID dispatched during the current UTC day; active reservations are reported separately.",
-          authorization_failures: "Mini App authorization counts are threshold-alert events. Raw HMAC rejection counts are reason-bucketed in bounded API-process memory, omit request/network identifiers, and reset on process restart.",
-          api_authentication_failures: "Counts global HMAC middleware rejections only; bypass webhook routes and route-specific admin-token/session failures are excluded. Counters are API-process local and reset on restart.",
+          authorization_failures: "The authorization_failure_alerts metric counts configured Mini App threshold-alert events. Mini App session denials are separately reason-bucketed without user, route, token, or request identifiers.",
+          api_authentication_failures: "Counts global HMAC middleware rejections only; bypass webhook routes and webhook signature failures are excluded. Counts are batched from each API process into shared SQLite buckets; at most the latest flush interval can be missing after abrupt process termination.",
+          miniapp_authentication_failures: "Counts missing, invalid, revoked, replayed, or unauthorized Mini App sessions/init data across processes sharing the SQLite file. Counts are reason-bucketed, omit user, route, token, and request identifiers, and are retained up to 24 hours.",
+          admin_token_authentication_failures: "Counts missing or invalid admin-token attempts at centrally guarded routes across processes sharing SQLite. Token values, route names, and request identifiers are omitted; counts are retained up to 24 hours.",
+          webhook_authentication_failures: "Counts rejected webhook authentication verifiers across guarded webhook routes as a single fixed reason. Provider, route, signature, request, and payload values are omitted; counts are retained up to 24 hours.",
           workflow_retries: "Counts durable post-call workflow event rows with more than one processing attempt in the selected window. It does not count action-level retries performed by external systems.",
         },
       });

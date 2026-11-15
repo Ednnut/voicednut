@@ -75,4 +75,46 @@ describe("Post-call structured extraction persistence", () => {
       { ...usage, provider_request_id: "gen-openrouter-456", provider: "openrouter" },
     ]);
   });
+
+  it("reports bounded business-scoped provider token totals without exposing request or call IDs", async () => {
+    await new Promise((resolve, reject) => db.db.run(
+      "INSERT INTO calls (call_sid, phone_number, business_id) VALUES (?, ?, ?), (?, ?, ?)",
+      ["extract-call-2", "+15555550124", "biz-1", "extract-call-other", "+15555550125", "biz-2"],
+      (error) => error ? reject(error) : resolve(),
+    ));
+    const recent = new Date().toISOString();
+    const old = new Date(Date.now() - 91 * 24 * 60 * 60 * 1000).toISOString();
+    const row = (callSid, businessId, requestId, modelId, recordedAt, counts) => db.recordCallStructuredExtractionUsage({
+      call_sid: callSid, business_id: businessId, provider_request_id: requestId, model_id: modelId,
+      usage_source: "openrouter_chat_completion_response", recorded_at: recordedAt, ...counts,
+    });
+    await row("extract-call-1", "biz-1", "gen-report-1", "model/a", recent,
+      { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 });
+    await row("extract-call-2", "biz-1", "gen-report-2", "model/a", recent,
+      { prompt_tokens: null, completion_tokens: 7, total_tokens: null });
+    await row("extract-call-2", "biz-1", "gen-report-3", "model/b", recent,
+      { prompt_tokens: 100, completion_tokens: 20, total_tokens: 120 });
+    await row("extract-call-2", "biz-1", "gen-report-old", "model/old", old,
+      { prompt_tokens: 999, completion_tokens: 999, total_tokens: 1998 });
+    await row("extract-call-other", "biz-2", "gen-report-other", "model/other", recent,
+      { prompt_tokens: 500, completion_tokens: 500, total_tokens: 1000 });
+
+    const report = await db.getCallStructuredExtractionUsageReport("biz-1", { days: 30 });
+    assert.equal(report.business_id, "biz-1");
+    assert.equal(report.period_days, 30);
+    assert.equal(report.provenance, "provider_reported");
+    assert.equal(report.cost_status, "unknown");
+    assert.deepEqual(report.totals, {
+      request_count: 3,
+      prompt_tokens: { reported_requests: 2, total: 110 },
+      completion_tokens: { reported_requests: 3, total: 32 },
+      total_tokens: { reported_requests: 2, total: 135 },
+    });
+    assert.deepEqual(report.by_model.map(({ model_id, request_count }) => ({ model_id, request_count })), [
+      { model_id: "model/a", request_count: 2 }, { model_id: "model/b", request_count: 1 },
+    ]);
+    assert.equal(JSON.stringify(report).includes("gen-report"), false);
+    assert.equal(JSON.stringify(report).includes("extract-call"), false);
+    await assert.rejects(() => db.getCallStructuredExtractionUsageReport("biz-1", { days: 91 }), { code: "validation_error" });
+  });
 });

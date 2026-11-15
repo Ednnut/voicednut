@@ -1738,6 +1738,9 @@ module.exports = {
     workflowRetryCount: Number(readEnv("ANOMALY_WORKFLOW_RETRY_COUNT") || "10"),
     authAlertCount: Number(readEnv("ANOMALY_AUTH_ALERT_COUNT") || "3"),
     apiAuthFailureCount: Number(readEnv("ANOMALY_API_AUTH_FAILURE_COUNT") || "10"),
+    miniAppAuthFailureCount: Number(readEnv("ANOMALY_MINIAPP_AUTH_FAILURE_COUNT") || "10"),
+    adminAuthFailureCount: Number(readEnv("ANOMALY_ADMIN_AUTH_FAILURE_COUNT") || "10"),
+    webhookAuthFailureCount: Number(readEnv("ANOMALY_WEBHOOK_AUTH_FAILURE_COUNT") || "10"),
   },
   streamAuth: {
     secret: streamAuthSecret,

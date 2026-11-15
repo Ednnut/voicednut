@@ -130,6 +130,7 @@ function createWebhookAuthGuard(ctx = {}) {
       const label = req?.path || req?.originalUrl || policy.label;
       const ok = verifier(req, res, label, policy.options || {});
       if (!ok) {
+        if (typeof ctx.onAuthRejected === "function") ctx.onAuthRejected();
         console.warn("webhook_auth_rejected", {
           policy: policy.id,
           request_id: req?.requestId || null,

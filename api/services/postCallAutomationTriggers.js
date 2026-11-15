@@ -286,6 +286,23 @@ async function triggerPostCallAutomationFailureWebhook({ outgoingWebhookService,
   }
 }
 
+async function triggerPostCallAutomationFailureWorkflow({ workflowService, payload, logger = console }) {
+  if (!workflowService || (!workflowService.enqueueEvent && !workflowService.trigger) || !payload) {
+    return { skipped: true, reason: "workflow_service_unavailable" };
+  }
+  try {
+    const enqueue = workflowService.enqueueEvent || workflowService.trigger;
+    return { queued: await enqueue.call(workflowService, payload) };
+  } catch (error) {
+    const code = normalizeStatus(error?.code || "workflow_failure_event_enqueue_failed");
+    logger?.error?.("post_call_automation_failure_workflow_enqueue_failed", {
+      call_sid: payload.call_sid || null,
+      error_code: /^[a-z][a-z0-9_.-]{0,79}$/.test(code) ? code : "workflow_failure_event_enqueue_failed",
+    });
+    return { skipped: true, reason: "workflow_failure_event_enqueue_failed" };
+  }
+}
+
 async function triggerPostCallOutcomeWorkflow({ workflowService, payload, logger = console }) {
   if (!workflowService || (!workflowService.enqueueEvent && !workflowService.trigger) || !payload) {
     return { skipped: true, reason: "workflow_service_unavailable" };
@@ -417,6 +434,9 @@ async function runPostCallAutomationTrigger({
         failureStage: "workflow_trigger",
         errorCode: workflowErrorCode,
       });
+      if (triggerPayload.trigger_event !== "post_call_automation_failed") {
+        await triggerPostCallAutomationFailureWorkflow({ workflowService, payload: failurePayload, logger });
+      }
       await triggerPostCallAutomationFailureWebhook({ outgoingWebhookService, payload: failurePayload, logger });
     }
     if (effectiveCallSid && webhookService && typeof webhookService.addLiveEvent === "function") {
@@ -469,6 +489,9 @@ async function runPostCallAutomationTrigger({
       failureStage: "automation_execution",
       errorCode: "post_call_automation_failed",
     });
+    if (triggerPayload.trigger_event !== "post_call_automation_failed") {
+      await triggerPostCallAutomationFailureWorkflow({ workflowService, payload: failurePayload, logger });
+    }
     await triggerPostCallAutomationFailureWebhook({ outgoingWebhookService, payload: failurePayload, logger });
     if (effectiveCallSid && webhookService && typeof webhookService.addLiveEvent === "function") {
       webhookService.addLiveEvent(effectiveCallSid, "Automation failed", { force: true });

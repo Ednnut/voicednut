@@ -116,6 +116,23 @@ describe("PostCallWorkflowDefinitionService", () => {
     );
   });
 
+  it("accepts automation-failure workflows only with a business scope", () => {
+    const definition = normalizeWorkflowDefinition(validDefinition({
+      trigger_event: "post_call_automation_failed",
+      business_id: "biz-42",
+    }));
+    assert.equal(definition.trigger_event, "post_call_automation_failed");
+    assert.throws(() => normalizeWorkflowDefinition(validDefinition({
+      trigger_event: "post_call_automation_failed",
+    })), /business_id is required/);
+    assert.throws(() => normalizeWorkflowDefinition(validDefinition({
+      trigger_event: "post_call_automation_failed",
+      business_id: "biz-42",
+      template_id: 19,
+      template_version: 3,
+    })), /only supported for CALL-E result-ready/);
+  });
+
   it("accepts bounded enum-index classifications only on a business and template-version scope", () => {
     const definition = normalizeWorkflowDefinition(validDefinition({
       workflow_id: "result_classifier",

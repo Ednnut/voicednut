@@ -12,6 +12,10 @@ function harness() {
   const calls = [];
   const db = {
     async listCallStructuredExtractions(filter) { calls.push(["list", filter]); return [record]; },
+    async getCallStructuredExtractionUsageReport(businessId, options) {
+      calls.push(["usage", businessId, options]);
+      return { business_id: businessId, period_days: options.days, provenance: "provider_reported", cost_status: "unknown" };
+    },
     async getCallStructuredExtraction(callSid) { calls.push(["get", callSid]); return record; },
     async reviewCallStructuredExtraction(input) { calls.push(["review", input]); return { ...record, status: input.decision }; },
     async getCallEBusinessOperator(businessId, actor) { return businessId === "biz-1" && actor === "12345" ? { role: "policy_manager" } : null; },
@@ -75,5 +79,33 @@ describe("Post-call extraction review routes", () => {
     assert.equal(reviewed.statusCode, 200);
     assert.equal(calls.find(([kind]) => kind === "review")[1].reviewed_by, "12345");
     assert.equal(calls.find(([kind]) => kind === "review")[1].business_id, "biz-1");
+  });
+
+  it("returns bounded business-scoped usage summaries and rejects unauthorized or invalid queries", async () => {
+    const { dispatch, calls } = harness();
+    const route = "/miniapp/businesses/:business_id/post-call/extraction-usage";
+    const session = { telegram_id: "12345" };
+    const report = await dispatch("GET", route, { params: { business_id: "biz-1" }, miniAppSession: session });
+    assert.equal(report.statusCode, 200);
+    assert.equal(report.body.usage.cost_status, "unknown");
+    assert.deepEqual(calls.find(([kind]) => kind === "usage").slice(1), ["biz-1", { days: 30 }]);
+
+    const invalid = await dispatch("GET", route, {
+      params: { business_id: "biz-1" }, query: { days: "91" }, miniAppSession: session,
+    });
+    assert.equal(invalid.statusCode, 400);
+    assert.equal(calls.filter(([kind]) => kind === "usage").length, 1);
+
+    const repeatedParameter = await dispatch("GET", route, {
+      params: { business_id: "biz-1" }, query: { days: ["30", "60"] }, miniAppSession: session,
+    });
+    assert.equal(repeatedParameter.statusCode, 400);
+    assert.equal(calls.filter(([kind]) => kind === "usage").length, 1);
+
+    const denied = await dispatch("GET", route, {
+      params: { business_id: "biz-2" }, miniAppSession: session,
+    });
+    assert.equal(denied.statusCode, 403);
+    assert.equal(calls.filter(([kind]) => kind === "usage").length, 1);
   });
 });

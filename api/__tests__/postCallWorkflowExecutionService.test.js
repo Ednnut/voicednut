@@ -354,7 +354,12 @@ describe("PostCallWorkflowExecutionService", () => {
       enabled: true,
       db: {
         async listApprovedPostCallWorkflowDefinitions(...args) { scopeArgs = args; return [row]; },
-        async createPostCallWorkflowRun(input) { runs.push(input); return { row: input, created: true }; },
+        async createPostCallWorkflowRun(input) {
+          const prior = runs.find((run) => run.idempotency_key === input.idempotency_key);
+          if (prior) return { row: prior, created: false };
+          runs.push(input);
+          return { row: input, created: true };
+        },
       },
     });
     service.drain = async () => ({ processed: 0 });
@@ -372,6 +377,42 @@ describe("PostCallWorkflowExecutionService", () => {
     assert.equal(runs[0].idempotency_key, `workflow:${row.workflow_id}:call_e_result_ready:biz-42:${require("crypto").createHash("sha256").update("call_provider_123").digest("hex")}`);
     assert.equal(runs[0].payload_json.includes("private result"), false);
     assert.equal(runs[0].payload_json.includes("private transcript"), false);
+  });
+
+  it("routes automation-failure events to business-scoped workflows with idempotency", async () => {
+    const definition = makeDefinition([{ id: "done", type: "end" }], undefined, "post_call_automation_failed");
+    definition.business_id = "biz-42";
+    const row = { workflow_id: definition.workflow_id, version: 1, business_id: "biz-42", status: "approved", definition_json: JSON.stringify(definition) };
+    let scopeArgs;
+    const runs = [];
+    const service = new PostCallWorkflowExecutionService({
+      enabled: true,
+      db: {
+        async listApprovedPostCallWorkflowDefinitions(...args) { scopeArgs = args; return [row]; },
+        async createPostCallWorkflowRun(input) {
+          const prior = runs.find((run) => run.idempotency_key === input.idempotency_key);
+          if (prior) return { row: prior, created: false };
+          runs.push(input);
+          return { row: input, created: true };
+        },
+      },
+    });
+    service.drain = async () => ({ processed: 0 });
+    const event = {
+      trigger_event: "post_call_automation_failed", business_id: "biz-42", call_sid: "CA-42",
+      idempotency_key: "post-call-automation-failed:CA-42:automation_execution",
+      payload: { failure_stage: "automation_execution", error_code: "post_call_automation_failed" },
+    };
+    const first = await service.trigger(event);
+    const firstIdempotencyKey = runs[0].idempotency_key;
+    const second = await service.trigger(event);
+    assert.deepEqual(scopeArgs, ["post_call_automation_failed", "biz-42"]);
+    assert.equal(first.matched, 1);
+    assert.equal(runs.length, 1);
+    assert.equal(runs[0].business_id, "biz-42");
+    assert.equal(runs[0].trigger_event, "post_call_automation_failed");
+    assert.equal(runs[0].idempotency_key, firstIdempotencyKey);
+    assert.equal(second.runs[0].deduped, true);
   });
 
   it("does not query or enqueue result-ready workflows without a valid business scope", async () => {

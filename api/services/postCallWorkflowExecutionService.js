@@ -1,6 +1,6 @@
 const crypto = require("crypto");
 const { buildContext, matchesConditionSpec } = require("./postCallAutomationService");
-const { normalizeWorkflowDefinition, SUPPORTED_TRIGGER_EVENTS } = require("./postCallWorkflowDefinitionService");
+const { normalizeWorkflowDefinition, SUPPORTED_TRIGGER_EVENTS, BUSINESS_SCOPED_TRIGGER_EVENTS } = require("./postCallWorkflowDefinitionService");
 const { validateCallEResult } = require("../adapters/callETemplateAdapter");
 const { safeExecutionReference } = require("./executionContext");
 
@@ -107,7 +107,7 @@ class PostCallWorkflowExecutionService {
       ? null
       : String(safe.business_id).trim();
     if (businessId && !/^[A-Za-z0-9._:-]{1,120}$/.test(businessId)) fail("business_id is invalid");
-    if (triggerEvent === "call_e_result_ready" && !businessId) {
+    if (BUSINESS_SCOPED_TRIGGER_EVENTS.has(triggerEvent) && !businessId) {
       return { skipped: true, reason: "missing_business_scope", runs: [] };
     }
     const definitions = await this.db.listApprovedPostCallWorkflowDefinitions(triggerEvent, businessId);
@@ -390,7 +390,7 @@ class PostCallWorkflowExecutionService {
       const businessId = event.business_id == null ? null : String(event.business_id);
       if ((businessId && !/^[A-Za-z0-9._:-]{1,120}$/.test(businessId)) ||
           (payload.business_id || null) !== businessId ||
-          (triggerEvent === "call_e_result_ready" && !businessId)) {
+          (BUSINESS_SCOPED_TRIGGER_EVENTS.has(triggerEvent) && !businessId)) {
         fail("Stored workflow event scope is invalid");
       }
       const eventKey = String(payload.idempotency_key || payload.call_sid || payload.call?.call_sid || "").trim();

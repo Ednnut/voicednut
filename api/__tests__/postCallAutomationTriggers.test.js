@@ -145,7 +145,10 @@ describe("PostCallAutomationTriggers", () => {
     });
 
     assert.equal(result.ok, false);
-    assert.equal(workflowEvents.length, 1);
+    assert.equal(workflowEvents.length, 2);
+    assert.equal(workflowEvents[1].trigger_event, "post_call_automation_failed");
+    assert.deepEqual(workflowEvents[1].payload, { failure_stage: "automation_execution",
+      error_code: "post_call_automation_failed" });
     assert.equal(outgoingEvents.length, 2);
     assert.equal(outgoingEvents[1].trigger_event, "post_call_automation_failed");
     assert.deepEqual(outgoingEvents[1].payload, { failure_stage: "automation_execution",

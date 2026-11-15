@@ -372,6 +372,13 @@ const HMAC_BYPASS_PATH_PREFIXES = [
 let db;
 let digitService;
 const apiAuthFailureMetrics = new ApiAuthFailureMetrics();
+let apiAuthFailureFlushTimer = null;
+const persistApiAuthFailureMetrics = (entries) => {
+  if (typeof db?.recordApiAuthFailureBuckets !== "function") {
+    throw Object.assign(new Error("API authentication metrics storage is unavailable"), { code: "api_auth_metrics_unavailable" });
+  }
+  return db.recordApiAuthFailureBuckets(entries);
+};
 const functionEngine = new DynamicFunctionEngine();
 let smsService = new EnhancedSmsService({
   getActiveProvider: () => getActiveSmsProvider(),
@@ -7806,6 +7813,10 @@ function noteMiniAppAlertSignal(signal, details = {}, nowMs = Date.now()) {
   db?.logServiceHealth?.("miniapp_alert", `${signal}_threshold`, payload).catch(() => {});
 }
 
+function recordMiniAppAuthFailure(reason) {
+  apiAuthFailureMetrics.record(reason);
+}
+
 function getMiniAppActorKey(req) {
   const session = req?.miniAppSession || {};
   const telegramId = String(
@@ -8638,6 +8649,7 @@ function parseMiniAppAuthorization(req) {
 async function requireMiniAppSession(req, res, next) {
   const token = parseMiniAppAuthorization(req);
   if (!token) {
+    recordMiniAppAuthFailure("miniapp_missing_session");
     noteMiniAppAlertSignal("auth_failures", {
       route: req.path || req.originalUrl || "/miniapp",
       code: "miniapp_auth_required",
@@ -8657,6 +8669,7 @@ async function requireMiniAppSession(req, res, next) {
     });
     const telegramId = String(session.telegram_id || "").trim();
     if (!telegramId) {
+      recordMiniAppAuthFailure("miniapp_invalid_session");
       noteMiniAppAlertSignal("auth_failures", {
         route: req.path || req.originalUrl || "/miniapp",
         code: "miniapp_session_missing_telegram_id",
@@ -8671,6 +8684,7 @@ async function requireMiniAppSession(req, res, next) {
       );
     }
     if (!isMiniAppUserAllowed(telegramId)) {
+      recordMiniAppAuthFailure("miniapp_access_denied");
       noteMiniAppAlertSignal("auth_failures", {
         route: req.path || req.originalUrl || "/miniapp",
         code: "miniapp_admin_required",
@@ -8688,6 +8702,7 @@ async function requireMiniAppSession(req, res, next) {
       requestId: req.requestId || null,
     });
     if (isRevoked) {
+      recordMiniAppAuthFailure("miniapp_revoked_session");
       noteMiniAppAlertSignal("auth_failures", {
         route: req.path || req.originalUrl || "/miniapp",
         code: "miniapp_token_revoked",
@@ -8716,6 +8731,7 @@ async function requireMiniAppSession(req, res, next) {
     });
     return next();
   } catch (error) {
+    if (error instanceof MiniAppAuthError) recordMiniAppAuthFailure("miniapp_invalid_session");
     noteMiniAppAlertSignal("auth_failures", {
       route: req.path || req.originalUrl || "/miniapp",
       code: error?.code || "miniapp_auth_invalid",
@@ -13559,6 +13575,8 @@ function requireAdminToken(req, res, next) {
   }
   const provided = req.headers[ADMIN_HEADER_NAME];
   if (!safeCompareSecret(provided, token)) {
+    apiAuthFailureMetrics.record(typeof provided === "string" && provided.length > 0
+      ? "admin_token_invalid" : "admin_token_missing");
     return res
       .status(403)
       .json({ success: false, error: "Admin token required" });
@@ -15453,6 +15471,12 @@ async function startServer(options = {}) {
     console.log("Initializing enhanced database...");
     db = new Database();
     await db.initialize();
+    if (apiAuthFailureFlushTimer) clearInterval(apiAuthFailureFlushTimer);
+    apiAuthFailureFlushTimer = setInterval(() => {
+      void apiAuthFailureMetrics.flush(persistApiAuthFailureMetrics)
+        .catch((error) => console.warn("api_auth_failure_metrics_flush_failed", { code: String(error?.code || "database_error").slice(0, 80) }));
+    }, 10_000);
+    apiAuthFailureFlushTimer.unref?.();
     await cartesiaSpeechSettingsStore.load();
     const schemaGuard = await db.ensureSchemaGuardrails({
       expectedVersion: Number(config.database?.schemaVersion) || 2,
@@ -22685,6 +22709,7 @@ app.post("/miniapp/session", async (req, res) => {
     init_data_source: initDataSource,
   });
   if (!initDataRaw) {
+    recordMiniAppAuthFailure("miniapp_missing_init_data");
     return sendApiError(
       res,
       400,
@@ -22765,6 +22790,7 @@ app.post("/miniapp/session", async (req, res) => {
     const userId =
       validation.user?.id || validation.chat?.id || validation.receiver?.id || null;
     if (!userId) {
+      recordMiniAppAuthFailure("miniapp_invalid_init_data");
       return sendApiError(
         res,
         401,
@@ -22775,6 +22801,7 @@ app.post("/miniapp/session", async (req, res) => {
     }
     const normalizedUserId = String(userId);
     if (!isMiniAppUserAllowed(normalizedUserId)) {
+      recordMiniAppAuthFailure("miniapp_access_denied");
       return sendApiError(
         res,
         403,
@@ -22801,6 +22828,7 @@ app.post("/miniapp/session", async (req, res) => {
         { requestId: req.requestId || null },
       );
       if (replayDetected) {
+        recordMiniAppAuthFailure("miniapp_replayed_init_data");
         console.warn("miniapp_replay_detected", {
           route: "session",
           request_id: req.requestId || null,
@@ -22880,6 +22908,8 @@ app.post("/miniapp/session", async (req, res) => {
     });
   } catch (error) {
     if (error instanceof MiniAppAuthError) {
+      recordMiniAppAuthFailure(error.code === "miniapp_invalid_signature"
+        ? "miniapp_invalid_init_signature" : "miniapp_invalid_init_data");
       if (error.code === "miniapp_invalid_signature") {
         const initDataDiagnostics = readMiniAppInitDataDiagnostics(initDataRaw);
         const hashDiagnostics = computeMiniAppHashDiagnostics(initDataRaw, botTokenCandidates);
@@ -34513,7 +34543,12 @@ registerStatusRoutes(app, {
   getProviderCompatibilityReport,
   callConfigurations,
   config,
-  getApiAuthFailureMetrics: (windowMinutes) => apiAuthFailureMetrics.get(windowMinutes),
+  flushApiAuthFailureMetrics: () => apiAuthFailureMetrics.flush(persistApiAuthFailureMetrics),
+  getApiAuthFailureMetrics: async (windowMinutes) => {
+    if (typeof db?.getApiAuthFailureMetrics === "function") return db.getApiAuthFailureMetrics(windowMinutes);
+    return apiAuthFailureMetrics.get(windowMinutes);
+  },
+  getLocalApiAuthFailureMetrics: (windowMinutes) => apiAuthFailureMetrics.get(windowMinutes),
   verifyHmacSignature,
   hasAdminToken,
   requireAdminToken,
@@ -34552,6 +34587,7 @@ registerStatusRoutes(app, {
 
 registerWebhookRoutes(app, {
   config,
+  onAuthRejected: () => apiAuthFailureMetrics.record("webhook_auth_rejected"),
   fetchFn: fetch,
   handleTwilioGatherWebhook,
   requireValidTwilioSignature,
@@ -34946,6 +34982,9 @@ module.exports = {
   __testables: {
     setDbForTests,
     getDb: () => db,
+    requireMiniAppSession,
+    requireAdminToken,
+    getLocalApiAuthFailureMetrics: (windowMinutes) => apiAuthFailureMetrics.get(windowMinutes),
     setCallTestConfigForTests: (patch = {}) => {
       const previous = {
         twilio: structuredClone(config.twilio),
@@ -35037,6 +35076,13 @@ async function gracefulShutdown(options = {}) {
   console.log(`\n${startMessage}`);
 
   try {
+    if (apiAuthFailureFlushTimer) {
+      clearInterval(apiAuthFailureFlushTimer);
+      apiAuthFailureFlushTimer = null;
+    }
+    await apiAuthFailureMetrics.flush(persistApiAuthFailureMetrics).catch((error) => {
+      console.warn("api_auth_failure_metrics_final_flush_failed", { code: String(error?.code || "database_error").slice(0, 80) });
+    });
     if (db?.logServiceHealth) {
       await db.logServiceHealth("system", "shutdown_initiated", {
         active_calls: callConfigurations.size,
