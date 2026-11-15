@@ -105,7 +105,9 @@ function normalizeCallDetails(payload, expectedCallId = null) {
   const telephony = payload.telephony_params && typeof payload.telephony_params === 'object' && !Array.isArray(payload.telephony_params)
     ? payload.telephony_params
     : {};
-  const transcript = Array.isArray(payload.transcript)
+  const redactedAt = typeof payload.redacted_at === 'string' ? payload.redacted_at.slice(0, 40) : null;
+  const contentUnavailable = payload.zdr_enabled === true || Boolean(redactedAt);
+  const transcript = !contentUnavailable && Array.isArray(payload.transcript)
     ? payload.transcript.slice(0, 1000).map((turn) => ({
       role: ['assistant', 'user'].includes(String(turn?.role || '').toLowerCase()) ? String(turn.role).toLowerCase() : 'unknown',
       text: typeof turn?.text === 'string' ? turn.text.slice(0, 10000) : '',
@@ -128,10 +130,11 @@ function normalizeCallDetails(payload, expectedCallId = null) {
     telephonyAccountType: ['cartesia', 'twilio', 'sip_trunk'].includes(String(payload.telephony_account_type || '').toLowerCase())
       ? String(payload.telephony_account_type).toLowerCase()
       : null,
-    summary: typeof payload.summary === 'string' ? payload.summary.slice(0, 4000) : null,
+    summary: !contentUnavailable && typeof payload.summary === 'string' ? payload.summary.slice(0, 4000) : null,
     transcript,
     endReason: typeof payload.end_reason === 'string' ? payload.end_reason.slice(0, 100) : null,
     zdrEnabled: payload.zdr_enabled === true,
+    redactedAt,
   });
 }
 

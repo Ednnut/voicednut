@@ -6,6 +6,11 @@ const { CartesiaOutboundCallService, buildCartesiaConfirmationPhrase, buildCorre
 function makeHarness(overrides = {}) {
   const state = { calls: 0, safety: [], completions: [], idempotency: null, providerInput: null };
   const db = {
+    async getCall() { return state.commonCall || null; },
+    async createCall(record) { state.commonCall = record; },
+    async getLatestCallState() { return state.createdState || null; },
+    async updateCallState(_id, _type, record) { state.createdState = record; },
+    async upsertCartesiaCallRecord(record) { state.callRecord = record; },
     async getOutboundCallIdempotency() { return state.idempotency; },
     async reserveOutboundCallIdempotency(input) {
       if (state.idempotency) return { reserved: false };
@@ -29,6 +34,7 @@ function makeHarness(overrides = {}) {
       ...overrides.client,
     },
     db,
+    postCallService: overrides.postCallService,
     outboundSafety: {
       async authorizeActor(input) { state.safety.push({ type: "authorize", ...input }); },
       async reserveDispatch(input) { state.safety.push({ type: "reserve", ...input }); return { reservationKey: "cartesia:reservation" }; },
@@ -47,6 +53,37 @@ const input = {
 };
 
 describe("CartesiaOutboundCallService", () => {
+  it("validates ringing timeout before issuing approval or submitting a call", async () => {
+    const { service, state } = makeHarness();
+    for (const timeout of [4, 81, 5.5, "30", NaN, Infinity]) {
+      await assert.rejects(service.createApproval({ ...input, ringing_timeout_seconds: timeout }), {
+        code: "cartesia_ringing_timeout_invalid",
+      });
+    }
+    assert.equal(state.calls, 0);
+    assert.equal(state.safety.length, 0);
+  });
+
+  it("binds ringing timeout to approval and forwards it without changing defaults", async () => {
+    for (const timeout of [5, 30, 80]) {
+      const { service, state } = makeHarness();
+      const request = { ...input, ringing_timeout_seconds: timeout };
+      const approval = await service.createApproval({ ...request, confirmation_phrase: buildCartesiaConfirmationPhrase(request) });
+      await assert.rejects(service.createOutboundCall({ ...request, ringing_timeout_seconds: timeout === 80 ? 5 : 80, approval_token: approval.approvalToken }), {
+        code: "cartesia_approval_invalid",
+      });
+      await service.createOutboundCall({ ...request, approval_token: approval.approvalToken });
+      assert.equal(state.providerInput.ringingTimeoutSeconds, timeout);
+      assert.equal(state.calls, 1);
+    }
+  });
+
+  it("rejects provider-reserved variable prefixes and non-finite numbers", () => {
+    for (const variables of [{ system__name: "value" }, { secret__key: "value" }, { score: NaN }, { score: Infinity }, { score: -Infinity }]) {
+      assert.throws(() => normalizeDynamicVariables(variables), { code: "cartesia_dynamic_variables_invalid" });
+    }
+  });
+
   it("requires exact typed confirmation and issues an actor- and request-bound approval", async () => {
     const { service, state } = makeHarness();
     await assert.rejects(service.createApproval({ ...input, confirmation_phrase: "yes" }), { code: "cartesia_confirmation_required" });
@@ -144,7 +181,7 @@ describe("CartesiaOutboundCallService", () => {
     const { service, state } = makeHarness();
     const approval = await service.createApproval({ ...input, confirmation_phrase: buildCartesiaConfirmationPhrase(input) });
     const result = await service.createOutboundCall({ ...input, approval_token: approval.approvalToken });
-    assert.deepEqual(result, { providerCallId: "agent_call_1", status: "queued", idempotentReplay: false });
+    assert.deepEqual(result, { localCallId: "cartesia_agent_call_1", providerCallId: "agent_call_1", status: "queued", idempotentReplay: false });
     assert.equal(state.calls, 1);
     assert.equal(state.safety.find((item) => item.type === "reserve").provider, "cartesia");
     assert.deepEqual(state.providerInput.dynamicVariables, { voicednut_request_id: buildCorrelationId(input.idempotency_key) });
@@ -174,7 +211,138 @@ describe("CartesiaOutboundCallService", () => {
     const replay = await service.createOutboundCall({ ...input, approval_token: approval.approvalToken });
     assert.equal(replay.idempotentReplay, true);
     assert.equal(state.calls, 1);
+    assert.equal(replay.localCallId, "cartesia_agent_call_1");
+    assert.equal(state.commonCall.call_sid, replay.localCallId);
+    assert.equal(state.commonCall.business_id, input.business_id);
+    assert.equal(state.createdState.provider_call_id, replay.providerCallId);
+    assert.equal(state.callRecord.business_id, input.business_id);
+    assert.equal(state.callRecord.status, "created");
     assert.ok(state.safety.some((item) => item.type === "authorize"));
+  });
+
+  it("repairs a failed accepted-call record write on replay without resubmitting", async () => {
+    let writes = 0;
+    const { service, state } = makeHarness({ db: { async upsertCartesiaCallRecord() {
+      writes += 1;
+      if (writes === 1) throw new Error("storage unavailable");
+    } } });
+    const approval = await service.createApproval({ ...input, confirmation_phrase: buildCartesiaConfirmationPhrase(input) });
+    const request = { ...input, approval_token: approval.approvalToken };
+    await assert.rejects(service.createOutboundCall(request), /storage unavailable/);
+    assert.equal(state.idempotency.status, "completed");
+    const replay = await service.createOutboundCall(request);
+    assert.equal(replay.localCallId, "cartesia_agent_call_1");
+    assert.equal(state.calls, 1);
+    assert.equal(writes, 2);
+  });
+
+  it("requires call storage before provider submission", async () => {
+    const { service, state } = makeHarness({ db: { upsertCartesiaCallRecord: undefined } });
+    const approval = await service.createApproval({ ...input, confirmation_phrase: buildCartesiaConfirmationPhrase(input) });
+    await assert.rejects(service.createOutboundCall({ ...input, approval_token: approval.approvalToken }), {
+      code: "cartesia_call_dependencies_missing",
+    });
+    assert.equal(state.calls, 0);
+  });
+
+  it("recovers webhook-first completion and deduplicates notifications on replay", async () => {
+    const notifications = new Set();
+    const workflowKeys = new Set();
+    let handoffs = 0;
+    const persisted = {
+      local_call_id: "cartesia_agent_call_1", provider_call_id: "agent_call_1",
+      business_id: "biz-1", direction: "outbound", status: "completed",
+      start_time: "2026-11-01T10:00:00Z", end_time: "2026-11-01T10:01:00Z",
+    };
+    const { service, state } = makeHarness({ postCallService: {
+      async process(id) {
+        handoffs += 1;
+        assert.equal(state.commonCall.status, "completed");
+        assert.equal(state.details.duration, 60);
+        workflowKeys.add(`call-completed:${id}`);
+      },
+    }, db: {
+      async getCartesiaCallRecordByProviderId() { return persisted; },
+      async getLatestCallState(_id, type) { return type === "call_created" ? state.createdState : null; },
+      async updateCallState(_id, type, record) { if (type === "call_created") state.createdState = record; },
+      async updateCallStatus(_id, status, details) { state.commonCall.status = status; state.details = details; },
+      async createEnhancedWebhookNotificationOnce(id, type, actor) { notifications.add(`${id}:${type}:${actor}`); },
+    } });
+    const approval = await service.createApproval({ ...input, confirmation_phrase: buildCartesiaConfirmationPhrase(input) });
+    const request = { ...input, approval_token: approval.approvalToken };
+    await service.createOutboundCall(request);
+    await service.createOutboundCall(request);
+    assert.equal(state.commonCall.status, "completed");
+    assert.equal(state.details.duration, 60);
+    assert.equal(state.calls, 1);
+    assert.equal(handoffs, 2);
+    assert.equal(workflowKeys.size, 1);
+    assert.deepEqual([...notifications], ["cartesia_agent_call_1:call_completed:7001"]);
+  });
+
+  it("retries a failed workflow handoff without another provider submission", async () => {
+    let attempts = 0;
+    const { service, state } = makeHarness({ postCallService: {
+      async process() { if (++attempts === 1) throw new Error('workflow storage unavailable'); },
+    } });
+    const approval = await service.createApproval({ ...input, confirmation_phrase: buildCartesiaConfirmationPhrase(input) });
+    const request = { ...input, approval_token: approval.approvalToken };
+    await assert.rejects(service.createOutboundCall(request));
+    await service.createOutboundCall(request);
+    assert.equal(attempts, 2);
+    assert.equal(state.calls, 1);
+  });
+
+  it("repairs shared metadata after a partial write without resubmission", async () => {
+    let writes = 0;
+    let creates = 0;
+    const { service, state } = makeHarness({ db: {
+      async createCall(record) { creates += 1; state.commonCall = record; },
+      async updateCallState(_id, _type, record) {
+        writes += 1;
+        if (writes === 1) throw new Error("state write unavailable");
+        state.createdState = record;
+      },
+    } });
+    const approval = await service.createApproval({ ...input, confirmation_phrase: buildCartesiaConfirmationPhrase(input) });
+    const request = { ...input, approval_token: approval.approvalToken };
+    await assert.rejects(service.createOutboundCall(request), /state write unavailable/);
+    await service.createOutboundCall(request);
+    assert.equal(state.calls, 1);
+    assert.equal(creates, 1);
+    assert.equal(state.createdState.provider, "cartesia");
+  });
+
+  it("rejects an existing shared call from another business", async () => {
+    const { service } = makeHarness({ db: {
+      async getCall() { return { business_id: "other-business", phone_number: input.destination, direction: "outbound" }; },
+    } });
+    const approval = await service.createApproval({ ...input, confirmation_phrase: buildCartesiaConfirmationPhrase(input) });
+    await assert.rejects(service.createOutboundCall({ ...input, approval_token: approval.approvalToken }), {
+      code: "cartesia_call_record_mismatch",
+    });
+  });
+
+  it("preserves a webhook-first identity and started state when replaying queued acceptance", async () => {
+    const { service, state } = makeHarness({ db: {
+      async getCartesiaCallRecordByProviderId() {
+        return { business_id: "biz-1", local_call_id: "cartesia_existing", status: "started" };
+      },
+    } });
+    const approval = await service.createApproval({ ...input, confirmation_phrase: buildCartesiaConfirmationPhrase(input) });
+    const result = await service.createOutboundCall({ ...input, approval_token: approval.approvalToken });
+    assert.equal(result.localCallId, "cartesia_existing");
+    assert.equal(state.callRecord.status, "started");
+  });
+
+  it("refuses to associate a provider call already scoped to another business", async () => {
+    const { service } = makeHarness({ db: {
+      async getCartesiaCallRecordByProviderId() { return { business_id: "biz-2" }; },
+    } });
+    const approval = await service.createApproval({ ...input, confirmation_phrase: buildCartesiaConfirmationPhrase(input) });
+    await assert.rejects(service.createOutboundCall({ ...input, approval_token: approval.approvalToken }), {
+      code: "cartesia_call_record_mismatch",
+    });
   });
 
   it("rejects approval reuse for another destination or actor", async () => {

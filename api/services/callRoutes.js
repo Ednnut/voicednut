@@ -1969,9 +1969,40 @@ function registerCallRoutes(app, ctx = {}) {
       return sendRouteError(ctx, req, res, status, code, status >= 500 ? "Cartesia call defaults could not be saved" : error.message);
     }
   });
+  app.post("/api/cartesia/outbound-call", cartesiaApprovalLimiter, requireOutboundAuthorization, requireCallEActorAssertion, async (req, res) => {
+    if (!req.callEActorId) {
+      return sendRouteError(ctx, req, res, 403, "cartesia_actor_required", "A verified operator is required");
+    }
+    if (typeof ctx.placeCartesiaOutboundCall !== "function") {
+      return sendRouteError(ctx, req, res, 503, "cartesia_not_configured", "Cartesia outbound calling is unavailable");
+    }
+    try {
+      const result = await ctx.placeCartesiaOutboundCall({
+        ...req.body, actorId: req.callEActorId, actor_id: req.callEActorId,
+      });
+      return res.json({ success: true, call: result });
+    } catch (error) {
+      const status = [400, 403, 409, 429, 502, 503, 504].includes(Number(error?.status)) ? Number(error.status) : 503;
+      return sendRouteError(ctx, req, res, status, "cartesia_submission_failed",
+        "Cartesia submission could not be confirmed. Keep the same request key and reconcile before retrying.");
+    }
+  });
   app.post("/api/cartesia/call-approval", cartesiaApprovalLimiter, requireOutboundAuthorization, requireCallEActorAssertion, async (req, res) => {
-    return sendRouteError(ctx, req, res, 409, "cartesia_is_ai_capability",
-      "Direct Cartesia dialing is retired. Start calls through /call using the selected telephony provider.");
+    try {
+      if (!req.callEActorId) {
+        return sendRouteError(ctx, req, res, 403, "cartesia_actor_required", "A verified operator is required");
+      }
+      if (typeof ctx.createCartesiaCallApproval !== "function") {
+        return sendRouteError(ctx, req, res, 503, "cartesia_approval_unavailable", "Cartesia call approval is unavailable");
+      }
+      const approval = await ctx.createCartesiaCallApproval({
+        ...req.body, actorId: req.callEActorId, actor_id: req.callEActorId,
+      });
+      return res.json({ success: true, approval });
+    } catch (error) {
+      const status = [400, 403, 409, 503].includes(Number(error?.status)) ? Number(error.status) : 503;
+      return sendRouteError(ctx, req, res, status, "cartesia_approval_failed", "Cartesia call approval could not be issued");
+    }
   });
   app.get("/api/cartesia/agents", cartesiaApprovalLimiter, requireOutboundAuthorization, requireCallEActorAssertion, async (req, res) => {
     try {

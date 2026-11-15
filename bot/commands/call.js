@@ -713,6 +713,23 @@ async function buildCustomCallConfig(conversation, ctx, ensureActive, businessOp
   };
 }
 
+async function offerManagedAgentCall(conversation, ctx, access, ensureActive, options = {}) {
+  if (!access?.isAdmin || ctx.chat?.type !== 'private') return false;
+  const choose = options.choose || askOptionWithButtons;
+  const selection = await choose(conversation, ctx, 'Choose how to place this call:', [
+    { id: 'carrier', label: 'Current telephony provider' },
+    { id: 'cartesia', label: 'Cartesia Managed Agent' },
+    { id: 'cancel', label: 'Cancel' },
+  ], { prefix: 'call-config', columns: 1, ensureActive });
+  ensureActive();
+  if (selection?.id === 'carrier') return false;
+  if (selection?.id === 'cartesia') {
+    const run = options.run || require('./cartesiaOperations').runCartesiaSingleCall;
+    await run(conversation, ctx, ensureActive);
+  }
+  return true;
+}
+
 async function callFlow(conversation, ctx) {
   const opId = startOperation(ctx, 'call');
   const flow = ensureFlow(ctx, 'call', { step: 'start' });
@@ -737,6 +754,8 @@ async function callFlow(conversation, ctx) {
       return;
     }
     flow.touch('authorized');
+
+    if (await offerManagedAgentCall(conversation, ctx, access, ensureActive)) return;
 
     const activeProvider = await getActiveCallProvider();
     ensureActive();
@@ -1181,5 +1200,6 @@ function registerCallCommand(bot) {
 
 module.exports = {
   callFlow,
-  registerCallCommand
+  registerCallCommand,
+  __testables: { offerManagedAgentCall },
 };

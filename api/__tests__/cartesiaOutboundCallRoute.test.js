@@ -28,6 +28,45 @@ function makeHandler(overrides = {}) {
 }
 
 describe("Cartesia outbound call API contract", () => {
+  it("guards dedicated submission and binds both actor aliases to the assertion", async () => {
+    const routes = new Map();
+    const inputs = [];
+    const limiter = () => {};
+    const authorization = () => {};
+    const actor = () => {};
+    const call = { localCallId: "local-test", providerCallId: "provider-test", status: "created", idempotentReplay: true };
+    registerCallRoutes({ post(path, ...handlers) { routes.set(path, handlers); }, get() {}, patch() {} }, {
+      cartesiaApprovalLimiter: limiter, requireOutboundAuthorization: authorization, requireCallEActorAssertion: actor,
+      placeCartesiaOutboundCall: async (input) => { inputs.push(input); return call; },
+      sendApiError(res, status, code, message) { return res.status(status).json({ code, error: message }); },
+    });
+    const handlers = routes.get("/api/cartesia/outbound-call");
+    assert.deepEqual(handlers.slice(0, 3), [limiter, authorization, actor]);
+    const denied = makeResponse();
+    await handlers[3]({ body: { actorId: "spoofed" } }, denied);
+    assert.equal(denied.statusCode, 403);
+    assert.equal(inputs.length, 0);
+    const accepted = makeResponse();
+    await handlers[3]({ callEActorId: "verified", body: { actorId: "spoofed", actor_id: "spoofed", approval_token: "signed-test" } }, accepted);
+    assert.deepEqual(inputs, [{ actorId: "verified", actor_id: "verified", approval_token: "signed-test" }]);
+    assert.deepEqual(accepted.body, { success: true, call });
+  });
+
+  it("does not retry uncertain submission or expose service error content", async () => {
+    const routes = new Map();
+    let submissions = 0;
+    registerCallRoutes({ post(path, ...handlers) { routes.set(path, handlers); }, get() {}, patch() {} }, {
+      placeCartesiaOutboundCall: async () => { submissions++; throw new Error("private-provider-detail"); },
+      sendApiError(res, status, code, message) { return res.status(status).json({ code, error: message }); },
+    });
+    const response = makeResponse();
+    await routes.get("/api/cartesia/outbound-call").at(-1)({ callEActorId: "verified", body: {} }, response);
+    assert.equal(submissions, 1);
+    assert.equal(response.statusCode, 503);
+    assert.match(response.body.error, /reconcile before retrying/);
+    assert.doesNotMatch(JSON.stringify(response.body), /private-provider-detail/);
+  });
+
   it("rejects Cartesia as a call provider without dispatching to any carrier", async () => {
     let dispatched = false;
     const handler = makeHandler({
@@ -68,6 +107,24 @@ describe("Cartesia outbound call API contract", () => {
     assert.equal(handlers[1], authorization);
     assert.equal(handlers[2], actor);
     assert.equal(typeof handlers[3], "function");
+  });
+
+  it("binds approvals to the verified actor and fails closed without one", async () => {
+    const routes = new Map();
+    const inputs = [];
+    registerCallRoutes({ post(path, ...handlers) { routes.set(path, handlers); }, get() {}, patch() {} }, {
+      createCartesiaCallApproval: async (input) => { inputs.push(input); return { approvalToken: "signed-test-approval" }; },
+      sendApiError(res, status, code, message) { return res.status(status).json({ code, error: message }); },
+    });
+    const handler = routes.get("/api/cartesia/call-approval").at(-1);
+    const denied = makeResponse();
+    await handler({ body: { actor_id: "spoofed" } }, denied);
+    assert.equal(denied.statusCode, 403);
+    assert.equal(inputs.length, 0);
+    const accepted = makeResponse();
+    await handler({ callEActorId: "verified", body: { actorId: "spoofed", actor_id: "spoofed", business_id: "biz-1" } }, accepted);
+    assert.deepEqual(inputs, [{ actorId: "verified", actor_id: "verified", business_id: "biz-1" }]);
+    assert.equal(accepted.body.approval.approvalToken, "signed-test-approval");
   });
 
   it("reads business-scoped provider defaults and permits writes only for Cartesia admins", async () => {

@@ -1,6 +1,7 @@
 "use strict";
 
 const crypto = require("node:crypto");
+const { syncCommonOutboundCall } = require("./cartesiaWebhookService");
 
 const ID_PATTERN = /^[A-Za-z0-9._:-]{1,200}$/;
 const IDEMPOTENCY_PATTERN = /^[A-Za-z0-9._:-]{8,180}$/;
@@ -21,10 +22,10 @@ function normalizeDynamicVariables(value) {
   const result = {};
   let totalLength = 0;
   for (const [key, rawValue] of entries) {
-    if (!DYNAMIC_VARIABLE_PATTERN.test(key) || key.toLowerCase() === "voicednut_request_id") {
+    if (!DYNAMIC_VARIABLE_PATTERN.test(key) || /^(system__|secret__)/.test(key) || key.toLowerCase() === "voicednut_request_id") {
       throw serviceError("cartesia_dynamic_variables_invalid", "Dynamic variable names must be simple identifiers; the VOICEDNUT correlation key is reserved", 400);
     }
-    if (!["string", "number", "boolean"].includes(typeof rawValue) || !String(rawValue).length || String(rawValue).length > 300) {
+    if (!["string", "number", "boolean"].includes(typeof rawValue) || (typeof rawValue === "number" && !Number.isFinite(rawValue)) || !String(rawValue).length || String(rawValue).length > 300) {
       throw serviceError("cartesia_dynamic_variables_invalid", "Dynamic variable values must be non-empty strings, numbers, or booleans up to 300 characters", 400);
     }
     const normalizedValue = typeof rawValue === "string" ? rawValue.trim() : rawValue;
@@ -50,7 +51,8 @@ function serviceError(code, message, status = 409) {
 }
 
 function buildCartesiaConfirmationPhrase(input = {}) {
-  const phrase = `PLACE CARTESIA CALL TO ${String(input.destination || "").trim()} FROM ${String(input.fromNumberId || input.from_number_id || "").trim()} WITH AGENT ${String(input.agentId || input.agent_id || "").trim()}`;
+  const timeout = input.ringingTimeoutSeconds ?? input.ringing_timeout_seconds ?? 30;
+  const phrase = `PLACE CARTESIA CALL TO ${String(input.destination || "").trim()} FROM ${String(input.fromNumberId || input.from_number_id || "").trim()} WITH AGENT ${String(input.agentId || input.agent_id || "").trim()}${timeout === 30 ? "" : ` WITH RINGING TIMEOUT ${timeout} SECONDS`}`;
   const variables = normalizeDynamicVariables(input.dynamicVariables || input.dynamic_variables);
   if (!Object.keys(variables).length) return phrase;
   const fingerprint = crypto.createHash("sha256").update(stableStringify(variables)).digest("hex").slice(0, 12);
@@ -58,7 +60,12 @@ function buildCartesiaConfirmationPhrase(input = {}) {
 }
 
 function normalizeCallInput(input = {}) {
+  const ringingTimeoutSeconds = input.ringingTimeoutSeconds ?? input.ringing_timeout_seconds ?? 30;
+  if (!Number.isInteger(ringingTimeoutSeconds) || ringingTimeoutSeconds < 5 || ringingTimeoutSeconds > 80) {
+    throw serviceError("cartesia_ringing_timeout_invalid", "Ringing timeout must be an integer between 5 and 80 seconds", 400);
+  }
   const normalized = {
+    ringingTimeoutSeconds,
     businessId: String(input.businessId || input.business_id || "").trim(),
     actorId: String(input.actorId || input.actor_id || "").trim(),
     destination: String(input.destination || input.number || "").trim(),
@@ -81,6 +88,9 @@ function hashRequest(input) {
     destination: input.destination,
     agentId: input.agentId,
     fromNumberId: input.fromNumberId,
+    // Preserve fingerprints for existing requests using the historical default.
+    ...(input.ringingTimeoutSeconds !== undefined && input.ringingTimeoutSeconds !== 30
+      ? { ringingTimeoutSeconds: input.ringingTimeoutSeconds } : {}),
     ...(Object.keys(input.dynamicVariables || {}).length ? { dynamicVariables: input.dynamicVariables } : {}),
   })).digest("hex");
 }
@@ -185,6 +195,7 @@ class CartesiaOutboundCallService {
   constructor(options = {}) {
     this.client = options.client;
     this.db = options.db;
+    this.postCallService = options.postCallService || null;
     this.outboundSafety = options.outboundSafety || null;
     this.approvalSecret = String(options.approvalSecret || "");
     this.approvalTtlMs = Math.min(5 * 60 * 1000, Math.max(30 * 1000, Number(options.approvalTtlMs) || 5 * 60 * 1000));
@@ -609,7 +620,88 @@ class CartesiaOutboundCallService {
     if (!matches) throw serviceError("cartesia_approval_invalid", "Call approval is invalid or expired", 403);
   }
 
-  resolveExisting(existing, normalized, requestHash) {
+  async persistAcceptedCall(result, normalized) {
+    if (typeof this.db?.upsertCartesiaCallRecord !== "function") {
+      throw serviceError("cartesia_call_dependencies_missing", "Cartesia call storage is unavailable", 503);
+    }
+    const providerCallId = String(result.providerCallId || "").trim();
+    if (!/^[A-Za-z0-9_-]{1,200}$/.test(providerCallId)) {
+      throw serviceError("cartesia_call_outcome_unknown", "Cartesia returned an unusable call ID; reconcile before retrying", 502);
+    }
+    // Match the webhook's stable identity, including when it arrives first.
+    const localCallId = `cartesia_${providerCallId}`;
+    const existing = typeof this.db.getCartesiaCallRecordByProviderId === "function"
+      ? await this.db.getCartesiaCallRecordByProviderId(providerCallId)
+      : null;
+    if (existing?.business_id && String(existing.business_id) !== normalized.businessId) {
+      throw serviceError("cartesia_call_record_mismatch", "Cartesia call belongs to a different business", 409);
+    }
+    await this.db.upsertCartesiaCallRecord({
+      local_call_id: localCallId,
+      provider_call_id: providerCallId,
+      business_id: normalized.businessId,
+      agent_id: normalized.agentId,
+      from_number_id: normalized.fromNumberId,
+      phone_number: normalized.destination,
+      direction: "outbound",
+      status: result.status === "queued" && existing?.status === "started"
+        ? "started"
+        : ["started", "completed", "failed"].includes(result.status) ? result.status : "created",
+      event_timestamp: new Date(this.now()).toISOString(),
+    });
+    const resolvedLocalId = existing?.local_call_id || localCallId;
+    await this.persistCommonCall(resolvedLocalId, providerCallId, normalized);
+    // A webhook may have persisted terminal state before the common row existed.
+    // Reread after creation so replay also repairs that partial lifecycle write.
+    if (typeof this.db.getCartesiaCallRecordByProviderId === "function") {
+      const persisted = await this.db.getCartesiaCallRecordByProviderId(providerCallId);
+      if (persisted) await syncCommonOutboundCall(this.db, persisted, { business_id: normalized.businessId });
+    }
+    if (this.postCallService) await this.postCallService.process(providerCallId);
+    return { ...result, localCallId: resolvedLocalId };
+  }
+
+  async persistCommonCall(localCallId, providerCallId, normalized) {
+    if (["getCall", "createCall", "getLatestCallState", "updateCallState"].some((key) => typeof this.db?.[key] !== "function")) {
+      throw serviceError("cartesia_call_dependencies_missing", "Common call storage is unavailable", 503);
+    }
+    let call = await this.db.getCall(localCallId);
+    if (!call) {
+      try {
+        await this.db.createCall({
+          call_sid: localCallId,
+          phone_number: normalized.destination,
+          prompt: "",
+          first_message: "",
+          user_chat_id: normalized.actorId,
+          business_id: normalized.businessId,
+          direction: "outbound",
+        });
+      } catch (error) {
+        // Concurrent replay may have inserted the same unique call key.
+        if (!String(error?.code || "").startsWith("SQLITE_CONSTRAINT")) throw error;
+      }
+      call = await this.db.getCall(localCallId);
+    }
+    if (!call || String(call.business_id || "") !== normalized.businessId ||
+        String(call.phone_number || "") !== normalized.destination || call.direction !== "outbound") {
+      throw serviceError("cartesia_call_record_mismatch", "Common call record does not match this request", 409);
+    }
+    const created = await this.db.getLatestCallState(localCallId, "call_created");
+    if (created && (created.provider !== "cartesia" || created.provider_call_id !== providerCallId ||
+        String(created.business_id || "") !== normalized.businessId)) {
+      throw serviceError("cartesia_call_record_mismatch", "Common call metadata does not match this request", 409);
+    }
+    if (!created) await this.db.updateCallState(localCallId, "call_created", {
+      provider: "cartesia",
+      provider_call_id: providerCallId,
+      business_id: normalized.businessId,
+      agent_id: normalized.agentId,
+      from_number_id: normalized.fromNumberId,
+    });
+  }
+
+  async resolveExisting(existing, normalized, requestHash) {
     if (!existing || existing.provider !== "cartesia" || existing.request_hash !== requestHash) {
       throw serviceError("cartesia_idempotency_conflict", "Idempotency key was already used for a different call", 409);
     }
@@ -617,7 +709,7 @@ class CartesiaOutboundCallService {
       let result = {};
       try { result = typeof existing.response_payload === "string" ? JSON.parse(existing.response_payload) : existing.response_payload; }
       catch {}
-      if (result.providerCallId) return { ...result, idempotentReplay: true };
+      if (result.providerCallId) return { ...await this.persistAcceptedCall(result, normalized), idempotentReplay: true };
     }
     if (existing.status === "failed") {
       throw serviceError("cartesia_previous_call_failed", "The prior Cartesia call was rejected; use a new request key only after reviewing the failure", 409);
@@ -633,7 +725,9 @@ class CartesiaOutboundCallService {
     const idempotencyKey = `cartesia:${normalized.idempotencyKey}`;
     if (typeof this.db?.getOutboundCallIdempotency !== "function" ||
         typeof this.db?.reserveOutboundCallIdempotency !== "function" ||
-        typeof this.db?.completeOutboundCallIdempotency !== "function") {
+        typeof this.db?.completeOutboundCallIdempotency !== "function" ||
+        typeof this.db?.upsertCartesiaCallRecord !== "function" ||
+        ["getCall", "createCall", "getLatestCallState", "updateCallState"].some((key) => typeof this.db?.[key] !== "function")) {
       throw serviceError("cartesia_call_dependencies_missing", "Cartesia idempotency storage is unavailable", 503);
     }
 
@@ -679,7 +773,7 @@ class CartesiaOutboundCallService {
         agentId: normalized.agentId,
         fromNumberId: normalized.fromNumberId,
         toNumber: normalized.destination,
-        ringingTimeoutSeconds: 30,
+        ringingTimeoutSeconds: normalized.ringingTimeoutSeconds,
         maxCallDurationMinutes: 30,
         dynamicVariables: { ...normalized.dynamicVariables, voicednut_request_id: buildCorrelationId(normalized.idempotencyKey) },
       });
@@ -700,7 +794,7 @@ class CartesiaOutboundCallService {
     }
 
     const providerCallId = String(result?.providerCallId || "").trim();
-    if (!providerCallId || providerCallId.length > 200) {
+    if (!/^[A-Za-z0-9_-]{1,200}$/.test(providerCallId)) {
       throw serviceError("cartesia_call_outcome_unknown", "Cartesia accepted a request without a usable call ID; reconcile before retrying", 502);
     }
     const response = { providerCallId, status: String(result.status || "queued").toLowerCase() };
@@ -714,7 +808,7 @@ class CartesiaOutboundCallService {
       response_payload: response,
     });
     await this.outboundSafety.completeDispatch(safetyReservation, "accepted");
-    return { ...response, idempotentReplay: false };
+    return { ...await this.persistAcceptedCall(response, normalized), idempotentReplay: false };
   }
 
   async reconcileOutboundCall(input = {}) {
@@ -759,6 +853,7 @@ class CartesiaOutboundCallService {
 
     if (existing.call_sid) {
       const call = await verifyCall(String(existing.call_sid));
+      await this.persistAcceptedCall({ providerCallId: call.callId, status: call.status }, normalized);
       return { outcome: "reconciled", status: call.status, call };
     }
     if (existing.status !== "pending") {
@@ -834,6 +929,7 @@ class CartesiaOutboundCallService {
     if (typeof this.outboundSafety?.completeDispatch === "function") {
       await this.outboundSafety.completeDispatch({ reservationKey: `cartesia:${crypto.createHash("sha256").update(normalized.idempotencyKey).digest("hex")}` }, "accepted");
     }
+    await this.persistAcceptedCall({ providerCallId: call.callId, status: call.status }, normalized);
     return { outcome: "reconciled", status: call.status, call };
   }
 }

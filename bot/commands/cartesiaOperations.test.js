@@ -10,6 +10,32 @@ process.env.BOT_TOKEN ||= 'test-token';
 process.env.API_SECRET ||= 'test-api-secret';
 
 const httpClient = require('../utils/httpClient');
+const { buildCartesiaConfirmationPhrase } = require('../../api/services/cartesiaOutboundCallService');
+
+test('single-call workflow confirms once and retains uncertain requests for reconciliation', async () => {
+  const { runCartesiaSingleCall } = require('./cartesiaOperations').__testables;
+  const original = httpClient.post;
+  const originalGet = httpClient.get;
+  httpClient.get = async () => ({ data: { agents: [{ id: 'agent-test', ready: true, phoneNumbers: [{ id: 'number-test', displayNumber: 'masked' }] }] } });
+  const input = { businessId: 'biz-test', destination: '+12025550123', agentId: 'agent-test', fromNumberId: 'number-test' };
+  const answers = [input.businessId, input.destination, '1', '1', buildCartesiaConfirmationPhrase(input)];
+  const ctx = { from: { id: 1 }, session: {}, reply: async () => {} };
+  const posts = [];
+  httpClient.post = async (_ctx, url, body, options) => {
+    posts.push({ url, body, options });
+    if (url.endsWith('/call-approval')) return { data: { approval: { approvalToken: 'signed-test' } } };
+    throw new Error('uncertain');
+  };
+  try {
+    await runCartesiaSingleCall({ external: async (operation) => operation(), wait: async () => ({ message: { text: answers.shift() } }) }, ctx, () => {});
+    assert.equal(posts.length, 2);
+    assert.ok(posts.every((post) => post.options.retry.retries === 0));
+    assert.equal(posts[1].body.idempotencyKey, ctx.session.cartesiaCallPending.idempotencyKey);
+    assert.equal(posts[1].body.approvalToken, 'signed-test');
+    await runCartesiaSingleCall({ wait() { throw new Error('must not prompt again'); } }, ctx, () => {});
+    assert.equal(posts.length, 2);
+  } finally { httpClient.post = original; httpClient.get = originalGet; }
+});
 
 const {
   ACTIONS,
@@ -23,6 +49,81 @@ const {
     runCartesiaBusinessScope,
   },
 } = require('./cartesiaOperations');
+
+test('accepted calls are not reported as uncertain when Telegram delivery fails', async () => {
+  const { runCartesiaSingleCall } = require('./cartesiaOperations').__testables;
+  const input = { businessId: 'biz-test', destination: '+12025550123', agentId: 'agent-test', fromNumberId: 'number-test' };
+  const answers = [input.businessId, input.destination, '1', '1', buildCartesiaConfirmationPhrase(input)];
+  const replies = [];
+  const ctx = { from: { id: 1 }, session: {}, async reply(text) {
+    replies.push(text);
+    if (text.startsWith('Cartesia call accepted.')) throw new Error('telegram-delivery-failed');
+  } };
+  const original = httpClient.post;
+  const originalGet = httpClient.get;
+  httpClient.get = async () => ({ data: { agents: [{ id: 'agent-test', ready: true, phoneNumbers: [{ id: 'number-test', displayNumber: 'masked' }] }] } });
+  httpClient.post = async (_ctx, url) => url.endsWith('/call-approval')
+    ? { data: { approval: { approvalToken: 'signed-test' } } }
+    : { data: { call: { localCallId: 'local-test', providerCallId: 'provider-test' } } };
+  try {
+    await assert.rejects(runCartesiaSingleCall({ external: async (operation) => operation(), wait: async () => ({ message: { text: answers.shift() } }) }, ctx, () => {}), /telegram-delivery-failed/);
+    assert.equal(ctx.session.cartesiaCallPending, null);
+    assert.ok(!replies.some((text) => text.includes('Submission could not be confirmed')));
+  } finally { httpClient.post = original; httpClient.get = originalGet; }
+});
+
+test('single-call workflow stops on empty inventory without requesting approval', async () => {
+  const { runCartesiaSingleCall } = require('./cartesiaOperations').__testables;
+  const originalGet = httpClient.get;
+  const originalPost = httpClient.post;
+  const replies = [];
+  const answers = ['biz-test', '+12025550123'];
+  httpClient.get = async () => ({ data: { agents: [] } });
+  httpClient.post = async () => { assert.fail('empty inventory must not dispatch'); };
+  try {
+    await runCartesiaSingleCall({ external: async (operation) => operation(), wait: async () => ({ message: { text: answers.shift() } }) },
+      { from: { id: 1 }, session: {}, reply: async (text) => replies.push(text) }, () => {});
+    assert.match(replies.at(-1), /No agents with attached numbers/);
+    assert.equal(answers.length, 0);
+  } finally { httpClient.get = originalGet; httpClient.post = originalPost; }
+});
+
+test('conversation replay preserves the request key and inventory snapshot', async () => {
+  const { runCartesiaSingleCall } = require('./cartesiaOperations').__testables;
+  const originalGet = httpClient.get;
+  const originalPost = httpClient.post;
+  const recorded = [];
+  const submissions = [];
+  let inventoryReads = 0;
+  httpClient.get = async () => {
+    inventoryReads++;
+    return { data: { agents: [{ id: 'agent-test', ready: true, phoneNumbers: [{ id: 'number-test' }] }] } };
+  };
+  httpClient.post = async (_ctx, url, body) => {
+    if (url.endsWith('/call-approval')) { submissions.push(body); throw new Error('approval unavailable'); }
+    assert.fail('approval failure must not dispatch');
+  };
+  try {
+    for (let replay = 0; replay < 2; replay++) {
+      let cursor = 0;
+      const input = { destination: '+12025550123', agentId: 'agent-test', fromNumberId: 'number-test' };
+      const answers = ['biz-test', input.destination, '1', '1', buildCartesiaConfirmationPhrase(input)];
+      await runCartesiaSingleCall({
+        async external(operation) {
+          const index = cursor++;
+          if (!(index in recorded)) recorded[index] = await operation();
+          return recorded[index];
+        },
+        wait: async () => ({ message: { text: answers.shift() } }),
+      }, { from: { id: 1 }, session: {}, reply: async () => {} }, () => {});
+    }
+    assert.equal(recorded.length, 2);
+    assert.equal(inventoryReads, 1);
+    assert.equal(submissions.length, 2);
+    assert.equal(submissions[0].idempotencyKey, submissions[1].idempotencyKey);
+    assert.equal(submissions[0].agentId, submissions[1].agentId);
+  } finally { httpClient.get = originalGet; httpClient.post = originalPost; }
+});
 
 test('Cartesia operations keep single calls outside the Cartesia action set', () => {
   assert.equal(ACTIONS.has('CARTESIA_CALL'), false);
@@ -42,11 +143,14 @@ test('Cartesia operations keep single calls outside the Cartesia action set', ()
   assert.equal(ACTIONS.has('CARTESIA_BUSINESS_SCOPE'), true);
 });
 
-test('Cartesia single-call action is not handled by the Cartesia operations flow', () => {
+test('Cartesia menu separates carrier calling from Managed Agent calling', () => {
   const keyboard = buildCartesiaKeyboard({ session: {} });
   const callback = keyboard.inline_keyboard.flat().find((button) => button.text.includes('Place a single call'));
   assert.ok(callback);
   assert.match(callback.callback_data, /CALL/);
+  const managedCall = keyboard.inline_keyboard.flat().find((button) => button.text.includes('Managed Agent call'));
+  assert.ok(managedCall);
+  assert.match(managedCall.callback_data, /CARTESIA_CALL/);
   const reconcile = keyboard.inline_keyboard.flat().find((button) => button.text.includes('Reconcile a call'));
   assert.ok(reconcile);
   assert.match(reconcile.callback_data, /CARTESIA_RECONCILE/);
@@ -610,11 +714,11 @@ test('agent selector shows only active agents with attached source numbers', () 
   assert.doesNotMatch(formatAgentChoices(choices), /No source|Invalid ID/);
 });
 
-test('legacy Cartesia single-call action cannot initiate a call from Cartesia operations', async () => {
+test('Cartesia single-call action rejects group chats before prompting or requests', async () => {
   const calls = [];
   const replies = [];
   const ctx = {
-    from: { id: 7001 }, chat: { type: 'private' },
+    from: { id: 7001 }, chat: { type: 'group' },
     session: { accessProfile: { isAdmin: true, checkedAt: Date.now() }, cartesiaOperationAction: 'CARTESIA_CALL' },
     async reply(message) { replies.push(String(message)); },
   };
@@ -630,7 +734,7 @@ test('legacy Cartesia single-call action cannot initiate a call from Cartesia op
   }
   assert.deepEqual(calls, []);
   assert.equal(ctx.session.cartesiaCallPending, undefined);
-  assert.match(replies.join('\n'), /Start a single call with \/call/i);
+  assert.match(replies.join('\n'), /private chat/i);
 });
 
 test('Cartesia operator summary masks the destination', () => {

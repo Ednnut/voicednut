@@ -1,5 +1,90 @@
 VOICEDNUT — Cartesia Advanced Integration Foundation & Unified Voice Orchestration Engine
 
+## Stage 1 implementation checkpoint (2026-11-15)
+
+This document's original sections below describe target capabilities, not a
+production-readiness assertion. Stage 1 is **incomplete / not approved for live
+traffic**.
+
+### Implemented locally
+
+- Outbound-only Cartesia registry adapter delegates to the guarded submission
+  service. Generic `/outbound-call` still rejects `provider=cartesia`.
+- `POST /api/cartesia/call-approval` returns `{ success: true, approval }`, where
+  approval contains `approvalToken`, `requestFingerprint`, and `expiresAt`.
+- `POST /api/cartesia/outbound-call` accepts the approved request plus
+  `approvalToken` and returns `{ success: true, call }`. Call contains
+  `localCallId`, `providerCallId`, `status`, and `idempotentReplay`.
+- Both routes retain rate limiting, outbound API authorization, and signed actor
+  assertion. Both actor aliases are overwritten with the verified operator.
+  Service checks retain business authorization, source/agent readiness,
+  consent/contact policy, signed approval, and request idempotency.
+- Request fields: `businessId`, `destination` (E.164), `agentId`, `fromNumberId`,
+  `idempotencyKey`; optional `dynamicVariables` and `ringingTimeoutSeconds`
+  (integer 5–80, default 30). Approval additionally requires the exact
+  `confirmationPhrase` produced by `buildCartesiaConfirmationPhrase`.
+- Accepted calls persist provider/local identity, a shared call row, and
+  `call_created` metadata. Replay repairs partial persistence without submitting
+  again. Lifecycle synchronization supports early webhooks and legacy IDs.
+- Private-chat administrators can select Managed Agent calling from `/call` or
+  `/cartesia`. Inventory is admin-wide, not business-filtered; server checks must
+  authorize the selected source. The bot records its request key and inventory
+  through `conversation.external` and disables HTTP retries for approval and
+  submission. An uncertain submission remains pending for reconciliation.
+
+### Recovery and rollout boundaries
+
+Keep `CARTESIA_DISPATCH_ENABLED=false` until remaining acceptance gaps are closed.
+`CARTESIA_MANAGED_AGENTS_ENABLED` and configured credentials alone are not live
+traffic approval. Approval signing requires `CARTESIA_APPROVAL_SECRET` of at least
+32 characters; credentials must remain in the secret store/environment.
+
+On an uncertain submission, retain the original request fields and request key;
+use the existing `POST /api/cartesia/call-reconcile` operator flow. Do not generate
+a replacement key or fail over to another provider while outcome is unresolved.
+Telegram pending state is session-local; restart-durable operator recovery still
+requires review. Rollback is to disable dispatch, retain webhook/reconciliation
+reads for existing calls, and revert the integration changes if needed. No schema
+migration was introduced by this increment.
+
+### Metadata-only post-call policy and remaining acceptance gaps
+
+Stage 1 uses metadata-only shared processing: summaries, transcripts, recordings,
+and contact details are not copied into workflow events. Authorized artifact reads
+remain on demand; ZDR and redacted call responses suppress summary/transcript
+content. Analysis events require a non-empty summary of at most 4,000 characters
+and a serialized analysis object of at most 16 KiB. Receipt hashes bind analysis
+content without retaining its text.
+
+Terminal and analysis webhook deliveries invoke `CartesiaPostCallService`, which
+requires a terminal outbound record and matching local-call, business, and provider
+metadata before calling the existing durable workflow engine. Events use the
+shared `call-completed:<local-id>` key. The engine's execution gate and published
+workflow selection remain unchanged; no workflows are enabled by this integration.
+
+The accepted-call persistence repair path also invokes this metadata handoff after
+lifecycle synchronization, recovering terminal webhooks that arrived before the
+common row existed. Replay retries failed handoffs without provider resubmission.
+
+SQLite-backed coverage now verifies concurrent duplicate metadata handoffs and
+workflow-service recreation produce one durable workflow run, without executing
+actions. This exercises the real workflow trigger and database insertion method;
+it is not a full bot-to-provider end-to-end test.
+
+Remaining gaps: restart-durable Telegram recovery and the final acceptance/security
+review remain open. Bot sessions use the default in-memory grammY store. After a
+restart, server idempotency protects the original key but the pending guard cannot
+prevent an operator from creating a new request with a new key. Until durable
+pending recovery is implemented, keep live dispatch disabled and reconcile any
+uncertain request before starting another. Metadata-only processing
+does not satisfy transcript-based QA or summary-driven automation requirements.
+Do not declare the full Stage 1 definition of done satisfied.
+
+Latest local checks: API `npm test -- --reporter dot`: 987 passing; bot `npm test`
+with synthetic local configuration: 111 passing, 5 skipped. These are mocked local
+checks, not provider connectivity or live-call verification. No Mini App changes,
+live calls, provider writes, schema changes, or deployments were performed.
+
 ROLE
 
 Act as a principal software architect, senior TypeScript/backend engineer, senior frontend engineer, AI voice infrastructure engineer, and enterprise platform engineer.

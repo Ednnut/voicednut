@@ -131,6 +131,7 @@ const {
   canFailoverAfterProviderError,
 } = require("./adapters/voiceProviderRegistry");
 const CallEVoiceAdapter = require("./adapters/CallEVoiceAdapter");
+const CartesiaVoiceAdapter = require("./adapters/CartesiaVoiceAdapter");
 const { buildTwilioOutboundCallPayload } = require("./adapters/twilioVoiceCallPayload");
 const { previewCallETemplate } = require("./adapters/callETemplateAdapter");
 const { buildCallEDeploymentStatus, createCallEClientFromEnv, getCallEProviderHealth } = require("./services/callEClient");
@@ -14732,6 +14733,10 @@ function getVoiceProviderRegistry() {
     listCallEvents: ({ providerCallId, ...options }) => createCallEClientFromEnv().listCallEvents(providerCallId, options),
   }));
 
+  registry.register("cartesia", new CartesiaVoiceAdapter({
+    createOutboundCall: (request) => createCartesiaOutboundCallService().createOutboundCall(request),
+  }));
+
   voiceProviderRegistry = registry;
   return registry;
 }
@@ -25065,6 +25070,9 @@ function createCartesiaOutboundCallService() {
     db,
     outboundSafety: createOutboundCallSafetyService(),
     approvalSecret: config.cartesia?.approvalSecret,
+    postCallService: new (require('./services/cartesiaPostCallService'))({
+      db, workflowService: postCallWorkflowExecutionService,
+    }),
   });
 }
 
@@ -25831,6 +25839,7 @@ const cartesiaWebhookConfigService = new CartesiaWebhookConfigService({
 });
 const cartesiaWebhookHandler = createCartesiaWebhookHandler({
   db,
+  postCallService: new (require('./services/cartesiaPostCallService'))({ db, workflowService: postCallWorkflowExecutionService }),
   webhookSecret: config.cartesia?.webhookSecret,
   enabled: cartesiaManagedAgentsEnabled,
 });
@@ -33570,7 +33579,15 @@ registerCallRoutes(app, {
     getTemplate: (templateId) => db.getCallTemplateById(templateId),
   }).createOutboundCall(input),
   createCartesiaCallApproval: (input) => createCartesiaOutboundCallService().createApproval(input),
-  placeCartesiaOutboundCall: (input) => createCartesiaOutboundCallService().createOutboundCall(input),
+  placeCartesiaOutboundCall: async (input) => {
+    const result = await getVoiceProviderRegistry().createOutboundCall("cartesia", input);
+    return {
+      localCallId: result.localCallId,
+      providerCallId: result.providerCallId,
+      status: result.status,
+      idempotentReplay: result.metadata.idempotentReplay === true,
+    };
+  },
   reconcileCartesiaOutboundCall: (input) => createCartesiaOutboundCallService().reconcileOutboundCall(input),
   listCartesiaAgents: () => createCartesiaOutboundCallService().listAgentInventory(),
   getCartesiaCallDefaults: (input) => createCartesiaOutboundCallService().getCallDefaults(input),

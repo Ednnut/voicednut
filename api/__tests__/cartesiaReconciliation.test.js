@@ -29,6 +29,11 @@ function makeHarness({ row = {}, pages, getCall, authorizeActor, completeDispatc
       },
     },
     db: {
+      async getCall() { return state.commonCall || null; },
+      async createCall(record) { state.commonCall = record; },
+      async getLatestCallState() { return state.createdState || null; },
+      async updateCallState(_id, _type, record) { state.createdState = record; },
+      async upsertCartesiaCallRecord(record) { state.callRecord = record; },
       async getOutboundCallIdempotency() { return state.row; },
       async completeOutboundCallIdempotency(payload) { state.writes.push(payload); state.row = { ...state.row, ...payload }; return 1; },
     },
@@ -53,6 +58,8 @@ describe("Cartesia call reconciliation", () => {
     assert.equal(result.outcome, "reconciled");
     assert.equal(result.call.callId, "call_1");
     assert.equal(result.call.status, "started");
+    assert.equal(state.callRecord.local_call_id, "cartesia_call_1");
+    assert.equal(state.callRecord.business_id, "biz-1");
     assert.equal("transcript" in result.call, false);
     assert.equal(state.writes.length, 1);
     assert.equal(state.writes[0].call_sid, "call_1");

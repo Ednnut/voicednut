@@ -48,6 +48,28 @@ function responseRecorder() {
 }
 
 describe('Cartesia call lifecycle webhook', () => {
+  it('rejects malformed and oversized analysis before recording a receipt', () => {
+    for (const analysis of [{}, { summary: null }, { summary: 1 }, { summary: '  ' },
+      { summary: 'x'.repeat(4001) }, { summary: 'ok', extra: 'x'.repeat(16384) }]) {
+      assert.throws(() => normalizeCartesiaWebhookEvent(callEvent({ type: 'post_call_analysis', analysis })), {
+        code: 'cartesia_webhook_invalid',
+      });
+    }
+    assert.doesNotThrow(() => normalizeCartesiaWebhookEvent(callEvent({
+      type: 'post_call_analysis', analysis: { summary: 'x'.repeat(4000) },
+    })));
+  });
+
+  it('binds analysis receipts to their content without retaining summary text', () => {
+    const body = callEvent({ type: 'post_call_analysis', analysis: { summary: 'Synthetic summary A' } });
+    const first = normalizeCartesiaWebhookEvent(body);
+    const duplicate = normalizeCartesiaWebhookEvent(JSON.parse(JSON.stringify(body)));
+    const changed = normalizeCartesiaWebhookEvent({ ...body, analysis: { summary: 'Synthetic summary B' } });
+    assert.equal(first.payloadHash, duplicate.payloadHash);
+    assert.notEqual(first.payloadHash, changed.payloadHash);
+    assert.equal(JSON.stringify(first).includes('Synthetic summary'), false);
+  });
+
   it('validates Cartesia event envelope and produces metadata without transcript or summary content', () => {
     const event = normalizeCartesiaWebhookEvent(callEvent());
     assert.equal(event.type, 'call_completed');
@@ -179,7 +201,11 @@ describe('Cartesia call lifecycle webhook', () => {
       },
       async getCartesiaCallBusinessScope() { return 'business-1'; },
       async upsertCartesiaCallRecord() {},
-      async getCall() {
+      async getCartesiaCallRecordByProviderId() {
+        return { local_call_id: 'cartesia_local_01', business_id: 'business-1' };
+      },
+      async getCall(callId) {
+        assert.equal(callId, 'cartesia_local_01');
         return { call_id: 'ac_outbound_01', status, user_chat_id: '7001', business_id: 'business-1' };
       },
       async getLatestCallState() {
@@ -189,7 +215,10 @@ describe('Cartesia call lifecycle webhook', () => {
         status = nextStatus;
         statusUpdates.push({ status: nextStatus, additionalData });
       },
-      async updateCallState() {},
+      async updateCallState(callId, _state, metadata) {
+        assert.equal(callId, 'cartesia_local_01');
+        assert.equal(metadata.provider_call_id, 'ac_outbound_01');
+      },
       async createEnhancedWebhookNotificationOnce(callId, type, chatId) {
         notifications.add(`${callId}:${type}:${chatId}`);
       },
@@ -224,11 +253,46 @@ describe('Cartesia call lifecycle webhook', () => {
     assert.deepEqual(statusUpdates.map(({ status: nextStatus }) => nextStatus), ['in-progress', 'completed', 'completed']);
     assert.equal(statusUpdates[1].additionalData.duration, 60);
     assert.deepEqual([...notifications].sort(), [
-      'ac_outbound_01:call_completed:7001',
-      'ac_outbound_01:call_in_progress:7001',
+      'cartesia_local_01:call_completed:7001',
+      'cartesia_local_01:call_in_progress:7001',
     ]);
     assert.deepEqual(getCommonCallStatusUpdate({ status: 'failed' }).additionalData.error_code, 'cartesia_call_failed');
   });
+
+  for (const scenario of ['legacy', 'tenant_mismatch', 'provider_mismatch']) {
+    it(`handles common lifecycle identity scenario: ${scenario}`, async () => {
+      const updates = [];
+      const lookups = [];
+      const db = {
+        async recordCartesiaWebhookReceipt() { return { inserted: true }; },
+        async upsertCartesiaCallRecord() {},
+        async getCartesiaCallBusinessScope() { return 'business-1'; },
+        async getCartesiaCallRecordByProviderId() {
+          return { local_call_id: 'cartesia_local', business_id: 'business-1' };
+        },
+        async getCall(id) {
+          lookups.push(id);
+          if (id === 'cartesia_local' && scenario === 'legacy') return null;
+          return { business_id: scenario === 'tenant_mismatch' ? 'business-2' : 'business-1' };
+        },
+        async getLatestCallState() {
+          return { provider: 'cartesia', business_id: 'business-1',
+            provider_call_id: scenario === 'provider_mismatch' ? 'different_call' : 'ac_test_01' };
+        },
+        async updateCallStatus(id) { updates.push(id); },
+        async updateCallState() {},
+      };
+      const event = callEvent();
+      event.call.telephony_params.direction = 'outbound';
+      const res = responseRecorder();
+      await createCartesiaWebhookHandler({ webhookSecret: WEBHOOK_SECRET, db })(
+        { headers: { 'x-webhook-secret': WEBHOOK_SECRET }, body: event }, res,
+      );
+      assert.equal(res.statusCode, 204);
+      assert.deepEqual(updates, scenario === 'legacy' ? ['ac_test_01'] : []);
+      if (scenario === 'legacy') assert.deepEqual(lookups.slice(0, 2), ['cartesia_local', 'ac_test_01']);
+    });
+  }
 
   it('rejects reuse of a webhook request ID with a different event payload', async () => {
     const receipts = new Map();

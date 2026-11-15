@@ -1,5 +1,22 @@
 const assert = require('node:assert/strict');
-const { CartesiaCallService, normalizeOutboundCallInput } = require('../services/cartesiaCallService');
+const { CartesiaCallService, normalizeOutboundCallInput, normalizeCallDetails } = require('../services/cartesiaCallService');
+
+describe('Cartesia artifact retention normalization', () => {
+  it('suppresses artifacts for ZDR and redacted calls even when the response includes content', () => {
+    const payload = { id: 'ac_test', agent_id: 'agent_test', status: 'completed',
+      summary: 'Synthetic summary', transcript: [{ role: 'user', text: 'Synthetic turn' }] };
+    for (const retention of [{ zdr_enabled: true }, { redacted_at: '2026-11-01T00:00:00Z' }]) {
+      const result = normalizeCallDetails({ ...payload, ...retention });
+      assert.equal(result.summary, null);
+      assert.equal(result.transcript, null);
+      assert.equal(JSON.stringify(result).includes('Synthetic'), false);
+    }
+    const available = normalizeCallDetails(payload);
+    assert.equal(available.summary, payload.summary);
+    assert.equal(available.transcript.length, 1);
+    assert.equal(available.redactedAt, null);
+  });
+});
 
 const outboundInput = {
   businessId: 'business_test',

@@ -8,6 +8,7 @@ const { getAccessProfile } = require('../utils/capabilities');
 const { buildCallbackData } = require('../utils/actions');
 const { escapeHtml, renderMenu } = require('../utils/ui');
 const { startOperation, ensureOperationActive } = require('../utils/sessionState');
+const { buildCartesiaConfirmationPhrase, normalizeCallInput } = require('../../api/services/cartesiaOutboundCallService');
 
 const ACTIONS = new Set(['CARTESIA_RECONCILE', 'CARTESIA_CALLS', 'CARTESIA_REVIEW_QUEUE', 'CARTESIA_REVIEW_RULES', 'CARTESIA_CAMPAIGN_STATUS', 'CARTESIA_CAMPAIGN_RECONCILE', 'CARTESIA_BATCH_RECONCILE', 'CARTESIA_BATCH_CANCEL', 'CARTESIA_AGENT_HEALTH', 'CARTESIA_AGENT_RUNTIME', 'CARTESIA_BUSINESS_SCOPE']);
 const BUSINESS_ID_PATTERN = /^[A-Za-z0-9._:-]{1,120}$/;
@@ -23,6 +24,7 @@ function apiRoot() {
 function buildCartesiaKeyboard(ctx) {
   return new InlineKeyboard()
     .text('📞 Place a single call via /call', buildCallbackData(ctx, 'CALL')).row()
+    .text('📞 Cartesia Managed Agent call', buildCallbackData(ctx, 'CARTESIA_CALL')).row()
     .text('🔎 Check campaign status', buildCallbackData(ctx, 'CARTESIA_CAMPAIGN_STATUS')).row()
     .text('🔄 Refresh provider progress', buildCallbackData(ctx, 'CARTESIA_CAMPAIGN_RECONCILE')).row()
     .text('🔄 Reconcile batch progress', buildCallbackData(ctx, 'CARTESIA_BATCH_RECONCILE')).row()
@@ -45,7 +47,7 @@ async function renderCartesiaCenter(ctx) {
     return;
   }
   await renderMenu(ctx,
-    '<b>Cartesia Operations</b>\nManage Cartesia voice capabilities, review Cartesia call records, and manage existing Cartesia batches. Start every new single call with /call; the selected telephony provider carries the call, while a compatible script may select Cartesia speech.',
+    '<b>Cartesia Operations</b>\nPlace a confirmed Managed Agent call, review Cartesia call records, or manage existing batches. Carrier-based calls remain available through /call. Managed Agent calls require server enablement and business authorization.',
     buildCartesiaKeyboard(ctx), { parseMode: 'HTML' });
 }
 
@@ -625,6 +627,82 @@ async function runCartesiaBusinessScope(conversation, ctx, ensureActive) {
   await ctx.reply(`Inbound number ••••${lastFour || '????'} is now scoped to business ${businessId}. ${scope.idempotentReplay ? 'The saved operation was confirmed.' : 'The mapping was saved.'}`);
 }
 
+async function runCartesiaSingleCall(conversation, ctx, ensureActive) {
+  if (ctx.session.cartesiaCallPending) {
+    await ctx.reply('A saved Cartesia request needs reconciliation first. Reopen /cartesia and reconcile it before starting another call.');
+    return;
+  }
+  const idempotencyKey = await conversation.external(() => `bot-cartesia:${crypto.randomUUID()}`);
+  const input = { actorId: String(ctx.from.id), idempotencyKey };
+  for (const [key, prompt] of [
+    ['businessId', 'Enter the business ID.'],
+    ['destination', 'Enter the destination in E.164 format.'],
+  ]) {
+    const value = await askInput(conversation, ctx, prompt, ensureActive);
+    if (value === null) return;
+    input[key] = value;
+  }
+  if (!BUSINESS_ID_PATTERN.test(input.businessId) || !DESTINATION_PATTERN.test(input.destination)) {
+    await ctx.reply('Invalid business or destination. No call was submitted.');
+    return;
+  }
+  try {
+    const agents = await conversation.external(async () => {
+      const inventory = await httpClient.get(ctx, `${apiRoot()}/api/cartesia/agents`, { timeout: 15000 });
+      return buildAgentChoices(inventory?.data?.agents);
+    });
+    ensureActive();
+    if (!agents.length) { await ctx.reply('No agents with attached numbers are available. No call was submitted.'); return; }
+    const choice = await askChoice(conversation, ctx,
+      'Choose a Managed Agent. Deployment readiness and business authorization will be checked before submission:',
+      formatAgentChoices(agents), ensureActive);
+    if (choice === null) return;
+    if (!agents[choice]) { await ctx.reply('Invalid agent selection. No call was submitted.'); return; }
+    const agent = agents[choice];
+    const numbers = agent.phoneNumbers.filter((phone) => IDENTIFIER_PATTERN.test(String(phone?.id || ''))).slice(0, 50);
+    const source = await askChoice(conversation, ctx,
+      'Choose an attached source number. The server must authorize it for this business:',
+      formatPhoneNumberChoices(numbers), ensureActive);
+    if (source === null) return;
+    if (!numbers[source]) { await ctx.reply('Invalid source selection. No call was submitted.'); return; }
+    input.agentId = agent.id;
+    input.fromNumberId = numbers[source].id;
+  } catch {
+    await ctx.reply('Agent inventory is unavailable. No call was submitted.');
+    return;
+  }
+  try { normalizeCallInput(input); }
+  catch { await ctx.reply('Invalid call details. No call was submitted.'); return; }
+  const phrase = buildCartesiaConfirmationPhrase(input);
+  const confirmation = await askInput(conversation, ctx,
+    `This may place a billable call. Confirm recipient consent and business authorization, then type exactly:\n${phrase}`, ensureActive);
+  if (confirmation !== phrase) { await ctx.reply('Confirmation did not match. No call was submitted.'); return; }
+  let submitting = false;
+  let acceptedCall;
+  try {
+    const approved = await httpClient.post(ctx, `${apiRoot()}/api/cartesia/call-approval`,
+      { ...input, confirmationPhrase: confirmation }, { timeout: 15000, retry: { retries: 0 } });
+    ensureActive();
+    const approvalToken = approved?.data?.approval?.approvalToken;
+    if (typeof approvalToken !== 'string' || !approvalToken) throw new Error('Approval unavailable');
+    ctx.session.cartesiaCallPending = { ...input };
+    submitting = true;
+    const response = await httpClient.post(ctx, `${apiRoot()}/api/cartesia/outbound-call`,
+      { ...input, approvalToken }, { timeout: 30000, retry: { retries: 0 } });
+    ensureActive();
+    const call = response?.data?.call;
+    if (!IDENTIFIER_PATTERN.test(call?.localCallId || '') || !IDENTIFIER_PATTERN.test(call?.providerCallId || '')) throw new Error('Invalid call reference');
+    ctx.session.cartesiaCallPending = null;
+    acceptedCall = call;
+  } catch {
+    await ctx.reply(submitting
+      ? 'Submission could not be confirmed. The request was saved; reconcile it from /cartesia before trying another call.'
+      : 'Approval could not be issued. No call was submitted.');
+    return;
+  }
+  await ctx.reply(`Cartesia call accepted. Local call: ${acceptedCall.localCallId}. Use call history to follow progress.`);
+}
+
 async function cartesiaOperationFlow(conversation, ctx) {
   const access = await getAccessProfile(ctx);
   if (!access?.isAdmin) {
@@ -632,15 +710,11 @@ async function cartesiaOperationFlow(conversation, ctx) {
     return;
   }
   const action = String(ctx.session?.cartesiaOperationAction || '');
-  if (action === 'CARTESIA_CALL') {
-    await ctx.reply('Start a single call with /call. The selected telephony provider carries it; Cartesia speech is selected through a compatible script profile.');
-    return;
-  }
   if (action === 'CARTESIA_CAMPAIGN' || action === 'CARTESIA_BATCH_RETRY') {
     await ctx.reply('Cartesia-managed dialing and batch retries are disabled. Start new calls with /call using the selected telephony provider; existing batches remain available for status, reconciliation, and cancellation.');
     return;
   }
-  if (!ACTIONS.has(action)) {
+  if (action !== 'CARTESIA_CALL' && !ACTIONS.has(action)) {
     await ctx.reply('That Cartesia action expired. Reopen /cartesia and choose the action again.');
     return;
   }
@@ -653,6 +727,10 @@ async function cartesiaOperationFlow(conversation, ctx) {
   const token = startOperation(ctx, operationId);
   const ensureActive = () => ensureOperationActive(ctx, token);
 
+  if (action === 'CARTESIA_CALL') {
+    await runCartesiaSingleCall(conversation, ctx, ensureActive);
+    return;
+  }
   if (action === 'CARTESIA_RECONCILE') {
     await runCartesiaReconciliation(conversation, ctx, ensureActive);
     return;
@@ -714,7 +792,9 @@ module.exports = {
   renderCartesiaCenter,
   registerCartesiaCommand,
   cartesiaOperationFlow,
+  runCartesiaSingleCall,
   __testables: {
+    runCartesiaSingleCall,
     buildReconciliationPayload,
     buildAgentChoices,
     formatAgentChoices,
