@@ -86,6 +86,12 @@ function createAppWithSquareWebhook() {
   return app;
 }
 
+function createAppWithSpekoWebhook() {
+  const app = express();
+  app.post("/webhook/speko", (_req, res) => res.sendStatus(204));
+  return app;
+}
+
 function findCheck(report, id) {
   return report.checks.find((check) => check.id === id);
 }
@@ -248,6 +254,70 @@ describe("Square provider preflight", () => {
     assert.equal(isProviderSupported("payment", "square"), true);
     assert.equal(isProviderSupported("call", "square"), false);
     assert.equal(isProviderSupported("sms", "square"), false);
+  });
+
+  describe("Speko provider preflight", () => {
+    const config = {
+      server: { hostname: "api.example.com" },
+      speko: {
+        enabled: true,
+        apiKey: "speko-test-key",
+        agentId: "agent_test",
+        phoneNumber: "+12015550199",
+        webhookSecret: `whsec_${Buffer.from("secret").toString("base64")}`,
+        maxDurationSeconds: 300,
+        ringTimeoutSeconds: 45,
+      },
+    };
+
+    it("supports Speko on calls only and builds the workspace webhook URL", () => {
+      assert.equal(isProviderSupported("call", "speko"), true);
+      assert.equal(isProviderSupported("sms", "speko"), false);
+      assert.deepEqual(
+        buildProviderCallbackUrls("speko", "call", config).urls,
+        ["https://api.example.com/webhook/speko"],
+      );
+    });
+
+    it("validates offline configuration without making a provider request", async () => {
+      const report = await runProviderPreflight({
+        provider: "speko",
+        channel: "call",
+        mode: "manual",
+        config,
+        app: createAppWithSpekoWebhook(),
+        allowNetwork: false,
+        requireReachability: false,
+        guards: { speko: true },
+      });
+
+      assert.equal(report.ok, true);
+      assert.equal(findCheck(report, "credentials_auth").status, CHECK_STATUS.WARN);
+      assert.equal(findCheck(report, "webhook_auth").status, CHECK_STATUS.PASS);
+      assert.equal(findCheck(report, "callback_urls").status, CHECK_STATUS.PASS);
+      assert.equal(findCheck(report, "required_routes").status, CHECK_STATUS.PASS);
+    });
+
+    it("fails closed when the feature flag or signed webhook secret is absent", async () => {
+      const report = await runProviderPreflight({
+        provider: "speko",
+        channel: "call",
+        mode: "manual",
+        config: {
+          ...config,
+          speko: { ...config.speko, enabled: false, webhookSecret: "" },
+        },
+        app: express(),
+        allowNetwork: false,
+        requireReachability: false,
+        guards: { speko: false },
+      });
+
+      assert.equal(report.ok, false);
+      assert.equal(findCheck(report, "credentials_auth").status, CHECK_STATUS.FAIL);
+      assert.equal(findCheck(report, "webhook_auth").status, CHECK_STATUS.FAIL);
+      assert.equal(findCheck(report, "required_routes").status, CHECK_STATUS.FAIL);
+    });
   });
 
   it("builds the Square webhook callback URL from SQUARE_WEBHOOK_URL", () => {

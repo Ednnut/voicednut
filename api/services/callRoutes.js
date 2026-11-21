@@ -101,6 +101,7 @@ function createOutboundCallHandler(ctx = {}) {
         payment_failure_message: req.body?.payment_failure_message,
         payment_retry_message: req.body?.payment_retry_message,
         payment_policy: req.body?.payment_policy,
+        speko_options: req.body?.speko_options,
       };
 
       const host = resolveHost(req) || config.server?.hostname;
@@ -136,6 +137,10 @@ function createOutboundCallHandler(ctx = {}) {
         error?.code === "outbound_persistence_failed";
       const idempotencyConflict = error?.code === "idempotency_conflict";
       const idempotencyInProgress = error?.code === "idempotency_in_progress";
+      const spekoOutcomeUnknown =
+        error?.uncertain === true || error?.code === "speko_outcome_unknown";
+      const spekoIdempotencyRequired =
+        error?.code === "speko_idempotency_key_required";
       const isValidation =
         paymentRequiresScript ||
         paymentPolicyRequiresScript ||
@@ -145,9 +150,12 @@ function createOutboundCallHandler(ctx = {}) {
         message.includes("Invalid phone number format");
       const status = idempotencyConflict || idempotencyInProgress
         ? 409
-        : outboundPersistenceFailed
+        : outboundPersistenceFailed || spekoOutcomeUnknown
           ? 503
-          : paymentRequiresScript || paymentPolicyRequiresScript || isValidation
+          : spekoIdempotencyRequired ||
+              paymentRequiresScript ||
+              paymentPolicyRequiresScript ||
+              isValidation
             ? 400
             : 500;
       let code = "outbound_call_failed";
@@ -163,6 +171,10 @@ function createOutboundCallHandler(ctx = {}) {
         code = "idempotency_conflict";
       } else if (idempotencyInProgress) {
         code = "idempotency_in_progress";
+      } else if (spekoOutcomeUnknown) {
+        code = "speko_outcome_unknown";
+      } else if (spekoIdempotencyRequired) {
+        code = "speko_idempotency_key_required";
       } else if (outboundPersistenceFailed) {
         code = "outbound_persistence_failed";
       } else if (isValidation) {
@@ -184,6 +196,10 @@ function createOutboundCallHandler(ctx = {}) {
               ? message || "Invalid payment configuration."
           : outboundPersistenceFailed
             ? "Call provider accepted the request but persistence failed; retry with the same idempotency key."
+            : spekoOutcomeUnknown
+              ? "Speko may have created the call. Retry the identical request with the same idempotency key; do not submit a new call."
+              : spekoIdempotencyRequired
+                ? "Speko calls require an idempotency_key or Idempotency-Key header."
           : "Failed to create outbound call",
         req.requestId || null,
         { details: buildErrorDetails(error) },
@@ -455,6 +471,57 @@ function createGetCallDetailsHandler(ctx = {}) {
     } catch (error) {
       console.error("Error fetching enhanced adaptive call details:", error);
       return res.status(500).json({ error: "Failed to fetch call details" });
+    }
+  };
+}
+
+function createGetSpekoRecordingHandler(ctx = {}) {
+  const { isSafeId } = ctx;
+  return async function handleGetSpekoRecording(req, res) {
+    const callSid = String(req.params?.callSid || "").trim();
+    if (!isSafeId(callSid, { max: 128 })) {
+      return res.status(400).json({ error: "invalid_call_id" });
+    }
+    try {
+      const db = typeof ctx.getDb === "function" ? ctx.getDb() : ctx.db;
+      if (!db?.getCall || !db?.getLatestCallState) {
+        return res.status(503).json({ error: "call_store_unavailable" });
+      }
+      const call = await db.getCall(callSid);
+      if (!call) return res.status(404).json({ error: "call_not_found" });
+      const requesterChatId = getRequesterChatId(req);
+      if (
+        call?.user_chat_id &&
+        (!requesterChatId || isOwnedByDifferentChat(call, requesterChatId))
+      ) {
+        return res.status(403).json({ error: "not_authorized" });
+      }
+      const createdState = await db
+        .getLatestCallState(callSid, "call_created")
+        .catch(() => null);
+      const provider =
+        String(createdState?.provider || call?.provider || "").toLowerCase();
+      const sessionId = String(
+        createdState?.provider_metadata?.speko_session_id || "",
+      ).trim();
+      if (provider !== "speko" || !sessionId) {
+        return res.status(404).json({ error: "recording_not_available" });
+      }
+      if (typeof ctx.getSpekoRecording !== "function") {
+        return res.status(503).json({ error: "speko_recording_unavailable" });
+      }
+      const recording = await ctx.getSpekoRecording(sessionId);
+      const url = String(recording?.url || "").trim();
+      if (!url || !/^https:\/\//i.test(url)) {
+        return res.status(404).json({ error: "recording_not_ready" });
+      }
+      res.set("Cache-Control", "no-store");
+      return res.json({ recording_url: url, expires_in: "short-lived" });
+    } catch (error) {
+      console.error("Speko recording retrieval failed:", {
+        code: error?.code || "speko_recording_failed",
+      });
+      return res.status(502).json({ error: "speko_recording_failed" });
     }
   };
 }
@@ -1776,6 +1843,7 @@ function registerCallRoutes(app, ctx = {}) {
       : (_req, _res, next) => next();
   const handleOutboundCall = createOutboundCallHandler(ctx);
   const handleGetCallDetails = createGetCallDetailsHandler(ctx);
+  const handleGetSpekoRecording = createGetSpekoRecordingHandler(ctx);
   const handleGetTranscriptAudio = createGetTranscriptAudioHandler(ctx);
   const handleListCalls = createListCallsHandler(ctx);
   const handleListCallsFiltered = createListCallsFilteredHandler(ctx);
@@ -1798,6 +1866,11 @@ function registerCallRoutes(app, ctx = {}) {
     handleOutboundCall,
   );
   app.get("/api/calls/:callSid", requireOutboundAuthorization, handleGetCallDetails);
+  app.get(
+    "/api/calls/:callSid/recording",
+    requireOutboundAuthorization,
+    handleGetSpekoRecording,
+  );
   app.get(
     "/api/calls/:callSid/transcript/audio",
     requireOutboundAuthorization,
@@ -1849,5 +1922,6 @@ module.exports = {
   registerCallRoutes,
   __testables: {
     createOutboundCallHandler,
+    createGetSpekoRecordingHandler,
   },
 };

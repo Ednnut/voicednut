@@ -1,4 +1,5 @@
 const config = require("../config");
+const { listSupportedProviders } = require("./providerFlowPolicy");
 
 const PROVIDER_CHANNELS = Object.freeze({
   CALL: "call",
@@ -6,11 +7,14 @@ const PROVIDER_CHANNELS = Object.freeze({
   EMAIL: "email",
 });
 
-const SUPPORTED_PROVIDERS = Object.freeze({
-  [PROVIDER_CHANNELS.CALL]: Object.freeze(["twilio", "plivo", "vonage"]),
-  [PROVIDER_CHANNELS.SMS]: Object.freeze(["twilio", "plivo", "vonage"]),
-  [PROVIDER_CHANNELS.EMAIL]: Object.freeze(["sendgrid", "mailgun"]),
-});
+const SUPPORTED_PROVIDERS = Object.freeze(
+  Object.fromEntries(
+    Object.values(PROVIDER_CHANNELS).map((channel) => [
+      channel,
+      Object.freeze(listSupportedProviders(channel)),
+    ]),
+  ),
+);
 
 function normalizeChannel(channel) {
   const normalized = String(channel || "")

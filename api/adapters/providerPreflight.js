@@ -16,6 +16,9 @@ const {
   createSquarePaymentService,
 } = require("../services/squarePaymentService");
 const { runWithTimeout } = require("../utils/asyncControl");
+const { SpekoVoiceAdapter } = require("./spekoVoiceAdapter");
+const { isSpekoWebhookSecret } = require("./spekoWebhookSecurity");
+const { listSupportedProviders } = require("./providerFlowPolicy");
 
 const CHECK_STATUS = Object.freeze({
   PASS: "pass",
@@ -25,8 +28,8 @@ const CHECK_STATUS = Object.freeze({
 });
 
 const SUPPORTED_PROVIDER_PREFLIGHT_CHANNELS = Object.freeze({
-  call: Object.freeze(["twilio", "plivo", "vonage"]),
-  sms: Object.freeze(["twilio", "plivo", "vonage"]),
+  call: Object.freeze(listSupportedProviders("call")),
+  sms: Object.freeze(listSupportedProviders("sms")),
   payment: Object.freeze(["paypal", "stripe", "square"]),
 });
 
@@ -102,6 +105,15 @@ const REQUIRED_ROUTE_GROUPS = Object.freeze({
         label: "Plivo media websocket route",
         anyOf: Object.freeze([
           Object.freeze({ method: "GET", path: "/plivo/stream" }),
+        ]),
+      }),
+    ]),
+    speko: Object.freeze([
+      Object.freeze({
+        id: "speko_webhook",
+        label: "Speko call webhook route",
+        anyOf: Object.freeze([
+          Object.freeze({ method: "POST", path: "/webhook/speko" }),
         ]),
       }),
     ]),
@@ -535,6 +547,24 @@ function buildProviderCallbackUrls(provider, channel, config, options = {}) {
   }
   if (normalizedProvider === "vonage") {
     return buildVonageCallbackUrls(channel, config, options);
+  }
+  if (normalizedProvider === "speko") {
+    const host = normalizeHost(options.hostOverride || config?.server?.hostname);
+    if (!host) {
+      return {
+        host: "",
+        base_url: "",
+        urls: [],
+        reason: "SERVER is required to receive Speko workspace webhooks",
+      };
+    }
+    const baseUrl = `https://${host}`;
+    return {
+      host,
+      base_url: baseUrl,
+      urls: [`${baseUrl}/webhook/speko`],
+      reason: null,
+    };
   }
   if (normalizedProvider === "paypal") {
     return buildPaypalCallbackUrls(channel, config, options);
@@ -982,6 +1012,26 @@ async function runSquareCredentialCheck(channel, config, options = {}) {
 function runWebhookAuthCheck(provider, channel, config, options = {}) {
   const normalizedProvider = normalizeProvider(provider);
   const normalizedChannel = normalizeChannel(channel);
+  if (normalizedProvider === "speko") {
+    if (!isSpekoWebhookSecret(config?.speko?.webhookSecret)) {
+      return {
+        status: CHECK_STATUS.FAIL,
+        reason: "SPEKO_WEBHOOK_SECRET is required for signed webhook processing",
+        suggestedFix: "Configure the workspace Standard Webhooks signing secret.",
+      };
+    }
+    if (options?.guards?.speko !== true) {
+      return {
+        status: CHECK_STATUS.FAIL,
+        reason: "Speko webhook signature verification is not wired",
+        suggestedFix: "Ensure /webhook/speko verifies Standard Webhooks signatures.",
+      };
+    }
+    return {
+      status: CHECK_STATUS.PASS,
+      details: { validation_mode: "standard_webhooks", channel: normalizedChannel },
+    };
+  }
   if (normalizedProvider === "twilio") {
     const mode = String(config?.twilio?.webhookValidation || "warn").toLowerCase();
     if (mode === "off") {
@@ -1377,6 +1427,49 @@ async function runProviderPreflight(options = {}) {
           allowNetwork: options.allowNetwork,
           timeoutMs: options.timeoutMs,
         });
+      }
+      if (provider === "speko") {
+        if (channel !== "call") {
+          return {
+            status: CHECK_STATUS.FAIL,
+            reason: "Speko is supported for calls only",
+          };
+        }
+        const spekoConfig = config?.speko || {};
+        if (spekoConfig.enabled !== true) {
+          return {
+            status: CHECK_STATUS.FAIL,
+            reason: "SPEKO_ENABLED is not true",
+            suggestedFix: "Set SPEKO_ENABLED=true after configuring Speko.",
+          };
+        }
+        try {
+          const adapter = new SpekoVoiceAdapter({ config: spekoConfig });
+          adapter.validateConfig();
+          if (options.allowNetwork === false) {
+            return {
+              status: CHECK_STATUS.WARN,
+              reason: "Network authentication and agent checks were skipped",
+              details: { configuration: "valid" },
+            };
+          }
+          const result = await runWithTimeout(
+            adapter.preflight(),
+            {
+              timeoutMs: Number(options.timeoutMs) || 7000,
+              label: "speko_preflight",
+              timeoutCode: "speko_preflight_timeout",
+            },
+          );
+          return { status: CHECK_STATUS.PASS, details: result };
+        } catch (error) {
+          return {
+            status: CHECK_STATUS.FAIL,
+            reason: redactError(error),
+            suggestedFix:
+              "Verify the Speko API key, agent ID, caller number, and workspace access.",
+          };
+        }
       }
       if (provider === "paypal") {
         return runPaypalCredentialCheck(channel, config, {

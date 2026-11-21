@@ -36,6 +36,10 @@ const PROVIDER_FLOW_REGISTRY = Object.freeze({
         "voice_stream",
       ]),
     }),
+    speko: Object.freeze({
+      label: "Speko Voice",
+      flows: Object.freeze(["outbound_voice", "status_webhooks"]),
+    }),
   }),
   [PROVIDER_CHANNELS.SMS]: Object.freeze({
     twilio: Object.freeze({
@@ -73,6 +77,25 @@ const PROVIDER_FLOW_REGISTRY = Object.freeze({
     }),
   }),
 });
+
+const PROVIDER_CAPABILITY_REGISTRY = Object.freeze(
+  Object.fromEntries(
+    Object.entries(PROVIDER_FLOW_REGISTRY).map(([channel, providers]) => [
+      channel,
+      Object.freeze(
+        Object.fromEntries(
+          Object.entries(providers).map(([provider, entry]) => [
+            provider,
+            Object.freeze({
+              label: entry.label,
+              capabilities: Object.freeze([...(entry.flows || [])]),
+            }),
+          ]),
+        ),
+      ),
+    ]),
+  ),
+);
 
 const CALL_STATUS_MAP = Object.freeze({
   twilio: Object.freeze({
@@ -124,6 +147,28 @@ const CALL_STATUS_MAP = Object.freeze({
     canceled: "canceled",
     cancelled: "canceled",
     rejected: "canceled",
+  }),
+  speko: Object.freeze({
+    dialing: "initiated",
+    initiated: "initiated",
+    ringing: "ringing",
+    active: "in-progress",
+    answered: "in-progress",
+    bridged: "in-progress",
+    ended: "completed",
+    completed: "completed",
+    busy: "busy",
+    sip_busy: "busy",
+    no_answer: "no-answer",
+    "no-answer": "no-answer",
+    sip_no_answer: "no-answer",
+    sip_declined: "canceled",
+    sip_invalid_number: "failed",
+    sip_carrier_rejected: "failed",
+    sip_dial_rejected: "failed",
+    failed: "failed",
+    canceled: "canceled",
+    cancelled: "canceled",
   }),
 });
 
@@ -200,6 +245,28 @@ function listProviderFlows(channel, provider, context = {}) {
   return flows;
 }
 
+function listProviderCapabilities(channel, provider, context = {}) {
+  const entry = PROVIDER_CAPABILITY_REGISTRY[normalizeChannel(channel)]?.[
+    normalizeProviderName(provider)
+  ];
+  if (!entry) return [];
+  const capabilities = [...entry.capabilities];
+  if (
+    normalizeChannel(channel) === PROVIDER_CHANNELS.CALL &&
+    normalizeProviderName(provider) === "vonage" &&
+    context.vonageDtmfWebhookEnabled !== true
+  ) {
+    return capabilities.filter((capability) => capability !== "digit_capture");
+  }
+  return capabilities;
+}
+
+function providerSupportsCapability(channel, provider, capability, context = {}) {
+  return listProviderCapabilities(channel, provider, context).includes(
+    normalizeFlowName(capability),
+  );
+}
+
 function providerSupportsFlow(channel, provider, flow, context = {}) {
   const targetFlow = normalizeFlowName(flow);
   if (!targetFlow) return true;
@@ -230,6 +297,7 @@ function resolveProviderExecutionOrder(options = {}) {
     providers = [],
     readiness = {},
     requestedFlow = null,
+    requiredCapabilities = [],
     context = {},
     failoverEnabled = true,
     isProviderDegraded = () => false,
@@ -264,6 +332,29 @@ function resolveProviderExecutionOrder(options = {}) {
         provider,
         reason: "flow_unsupported",
         flow,
+        score,
+      });
+      return;
+    }
+    const missingCapability = (Array.isArray(requiredCapabilities)
+      ? requiredCapabilities
+      : [])
+      .map(normalizeFlowName)
+      .find(
+        (capability) =>
+          capability &&
+          !providerSupportsCapability(
+            normalizedChannel,
+            provider,
+            capability,
+            context,
+          ),
+      );
+    if (missingCapability) {
+      blocked.push({
+        provider,
+        reason: "capability_unsupported",
+        capability: missingCapability,
         score,
       });
       return;
@@ -648,6 +739,11 @@ function buildProviderCompatibilityReport(options = {}) {
       ready: callReadiness[provider] === true,
       degraded: isProviderDegraded(provider) === true,
       flows,
+      capabilities: listProviderCapabilities(
+        PROVIDER_CHANNELS.CALL,
+        provider,
+        callFlowContext,
+      ),
       payment_mode: resolvePaymentExecutionMode({
         provider,
         featureConfig: paymentFeatureConfig,
@@ -663,6 +759,7 @@ function buildProviderCompatibilityReport(options = {}) {
     smsMatrix[provider] = {
       ready: smsReadiness[provider] === true,
       flows: listProviderFlows(PROVIDER_CHANNELS.SMS, provider),
+      capabilities: listProviderCapabilities(PROVIDER_CHANNELS.SMS, provider),
     };
   });
 
@@ -671,6 +768,7 @@ function buildProviderCompatibilityReport(options = {}) {
     emailMatrix[provider] = {
       ready: emailReadiness[provider] === true,
       flows: listProviderFlows(PROVIDER_CHANNELS.EMAIL, provider),
+      capabilities: listProviderCapabilities(PROVIDER_CHANNELS.EMAIL, provider),
     };
   });
 
@@ -735,10 +833,13 @@ function buildProviderCompatibilityReport(options = {}) {
 module.exports = {
   PROVIDER_CHANNELS,
   PROVIDER_FLOW_REGISTRY,
+  PROVIDER_CAPABILITY_REGISTRY,
   normalizeProviderName,
   listSupportedProviders,
   listProviderFlows,
+  listProviderCapabilities,
   providerSupportsFlow,
+  providerSupportsCapability,
   resolveProviderExecutionOrder,
   resolvePaymentExecutionMode,
   toCanonicalCallStatus,

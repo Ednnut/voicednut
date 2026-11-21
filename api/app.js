@@ -92,6 +92,9 @@ const {
   resolvePaymentExecutionMode,
   buildProviderCompatibilityReport,
   buildCanonicalCallStatusEvent,
+  providerSupportsCapability,
+  toCanonicalCallStatus,
+  notificationTypeForCallStatus,
 } = require("./adapters/providerFlowPolicy");
 const {
   runProviderPreflight,
@@ -110,6 +113,11 @@ const {
   PlivoVoiceAdapter,
   VonageVoiceAdapter,
 } = require("./adapters");
+const { SpekoVoiceAdapter, isE164 } = require("./adapters/spekoVoiceAdapter");
+const {
+  isSpekoWebhookSecret,
+  verifySpekoWebhook,
+} = require("./adapters/spekoWebhookSecurity");
 const { v4: uuidv4 } = require("uuid");
 const { WaveFile } = require("wavefile");
 const { runWithTimeout: runOperationWithTimeout } = require("./utils/asyncControl");
@@ -3270,6 +3278,13 @@ async function shouldProcessProviderEventAsync(
   }
 }
 
+async function releaseProviderEventAsync(source, dedupePayload = {}) {
+  const fingerprint = buildProviderEventFingerprint(source, dedupePayload);
+  providerEventDedupe.delete(fingerprint.key);
+  if (!db?.releaseProviderEventIdempotency) return;
+  await db.releaseProviderEventIdempotency({ event_key: fingerprint.key });
+}
+
 function recordCallLifecycle(callSid, status, meta = {}) {
   if (!callSid || !status) return false;
   const normalized = normalizeCallStatus(status);
@@ -3788,7 +3803,7 @@ function buildInboundCallConfig(callSid, payload = {}, options = {}) {
     user_chat_id: config.telegram?.adminChatId || route.user_chat_id || null,
     customer_name: route.customer_name || null,
     provider,
-    provider_metadata: null,
+    provider_metadata: options.provider_metadata || null,
     business_context: route.business_context || functionSystem.context,
     function_count: functionSystem.functions.length,
     call_profile: route.call_profile || route.conversation_profile || null,
@@ -3979,7 +3994,7 @@ async function ensureCallRecord(
   try {
     await db.createCall({
       call_sid: callSid,
-      phone_number: from || null,
+      phone_number: from || "",
       prompt: callConfig.prompt,
       first_message: callConfig.first_message,
       user_chat_id: callConfig.user_chat_id || null,
@@ -4057,6 +4072,8 @@ async function ensureCallRecord(
     await db.recordCallOutcomeFromCallCreated(callSid, callCreatedState);
     return await db.getCall(callSid);
   } catch (error) {
+    const racedCall = await db.getCall(callSid).catch(() => null);
+    if (racedCall) return racedCall;
     console.error("Failed to create inbound call record:", error);
     return null;
   }
@@ -12396,7 +12413,19 @@ const vonageCallMap = new Map();
 
 let plivoVoiceAdapter = null;
 let vonageVoiceAdapter = null;
+let spekoVoiceAdapter = null;
 let vonageMappingReconcileTimer = null;
+
+function getSpekoVoiceAdapter() {
+  if (!spekoVoiceAdapter) {
+    spekoVoiceAdapter = new SpekoVoiceAdapter({ config: config.speko });
+  }
+  return spekoVoiceAdapter;
+}
+
+function setSpekoVoiceAdapterForTests(adapter) {
+  spekoVoiceAdapter = adapter || null;
+}
 
 function rememberPlivoCallMapping(callSid, plivoUuid, source = "unknown") {
   if (!callSid || !plivoUuid) return;
@@ -12877,11 +12906,12 @@ function supportsKeypadCaptureProvider(provider) {
     .trim()
     .toLowerCase();
   if (!normalized) return false;
-  if (normalized === "twilio") return true;
-  if (normalized === "vonage") {
-    return config.vonage?.dtmfWebhookEnabled === true;
-  }
-  return false;
+  return providerSupportsCapability(
+    PROVIDER_CHANNELS.CALL,
+    normalized,
+    "digit_capture",
+    { vonageDtmfWebhookEnabled: config.vonage?.dtmfWebhookEnabled === true },
+  );
 }
 
 function normalizeDigitProfile(value) {
@@ -13033,6 +13063,12 @@ function shouldRunProviderPreflightForSelection(channel, provider) {
   ) {
     return true;
   }
+  if (
+    normalizedChannel === PROVIDER_CHANNELS.CALL &&
+    normalizedProvider === "speko"
+  ) {
+    return true;
+  }
   return false;
 }
 
@@ -13078,6 +13114,7 @@ async function evaluateProviderPreflightReport(options = {}) {
       twilio: typeof requireValidTwilioSignature === "function",
       plivo: typeof requireValidPlivoWebhook === "function",
       vonage: typeof requireValidVonageWebhook === "function",
+      speko: typeof verifySpekoWebhook === "function",
       paypal: true,
       stripe: true,
     },
@@ -13471,6 +13508,20 @@ function getProviderReadiness() {
   const vonageWebhookReady =
     vonageWebhookMode !== "strict" ||
     Boolean(config.vonage?.webhookSignatureSecret);
+  const spekoConfig = config.speko || {};
+  const spekoReady =
+    spekoConfig.enabled === true &&
+    Boolean(spekoConfig.apiKey) &&
+    Boolean(String(spekoConfig.agentId || "").trim()) &&
+    (!spekoConfig.phoneNumber || isE164(spekoConfig.phoneNumber)) &&
+    isSpekoWebhookSecret(spekoConfig.webhookSecret) &&
+    Number(spekoConfig.maxDurationSeconds) >= 30 &&
+    Number(spekoConfig.maxDurationSeconds) <= 14400 &&
+    Number(spekoConfig.ringTimeoutSeconds) >= 20 &&
+    Number(spekoConfig.ringTimeoutSeconds) <= 45 &&
+    (spekoConfig.inboundEnabled !== true ||
+      (isE164(spekoConfig.inboundPhoneNumber) &&
+        Boolean(resolveInboundRoute(spekoConfig.inboundPhoneNumber))));
   if (
     vonageHasCredentials &&
     vonageHasRouting &&
@@ -13490,6 +13541,7 @@ function getProviderReadiness() {
     ),
     plivo: plivoHasCredentials && plivoHasRouting && plivoWebhookReady,
     vonage: vonageHasCredentials && vonageHasRouting && vonageWebhookReady,
+    speko: spekoReady,
   };
 }
 
@@ -13848,7 +13900,9 @@ function getPlivoVoiceAdapter() {
 }
 
 async function endCallForProvider(callSid) {
-  const callConfig = callConfigurations.get(callSid);
+  const callConfig =
+    callConfigurations.get(callSid) ||
+    (await hydrateCallConfigFromDb(callSid).catch(() => null));
   const provider = callConfig?.provider || currentProvider;
 
   if (provider === "twilio") {
@@ -13883,6 +13937,15 @@ async function endCallForProvider(callSid) {
     }
     const plivoAdapter = getPlivoVoiceAdapter();
     await plivoAdapter.hangupCall(callUuid);
+    return;
+  }
+
+  if (provider === "speko") {
+    const sessionId = callConfig?.provider_metadata?.speko_session_id;
+    if (!sessionId) {
+      throw new Error("Speko session ID is not available for hangup");
+    }
+    await getSpekoVoiceAdapter().endCall(sessionId);
     return;
   }
 
@@ -14401,6 +14464,9 @@ async function startServer(options = {}) {
         "gpt_tool_audit",
         "gpt_tool_idempotency",
         "provider_event_idempotency",
+        "speko_call_sequences",
+        "speko_call_sequence_claims",
+        "outbound_call_attempt_leases",
         "call_runtime_state",
       ],
       requiredIndexes: [
@@ -24455,6 +24521,39 @@ async function reserveOutboundCallIdempotency(payload = {}, preferredProvider = 
       } catch {
         responsePayload = null;
       }
+      const replayProvider = String(
+        responsePayload?.provider || existing.provider || provider,
+      )
+        .trim()
+        .toLowerCase();
+      const replayMetadata =
+        responsePayload?.provider_metadata &&
+        typeof responsePayload.provider_metadata === "object"
+          ? responsePayload.provider_metadata
+          : {};
+      if (replayProvider === "speko") {
+        const persistedCall = await db.getCall(String(existing.call_sid)).catch(
+          () => null,
+        );
+        const callCreatedState = persistedCall
+          ? await db
+              .getLatestCallState(String(existing.call_sid), "call_created")
+              .catch(() => null)
+          : null;
+        if (
+          !callCreatedState?.provider_metadata?.speko_session_id ||
+          callCreatedState.provider_metadata.speko_session_id !==
+            replayMetadata.speko_session_id
+        ) {
+          return {
+            enabled: true,
+            idempotencyKey,
+            requestHash,
+            provider: "speko",
+            retryPending: true,
+          };
+        }
+      }
       return {
         enabled: true,
         idempotencyKey,
@@ -24464,16 +24563,18 @@ async function reserveOutboundCallIdempotency(payload = {}, preferredProvider = 
           callId: String(existing.call_sid),
           callStatus:
             String(responsePayload?.call_status || "").trim() || "queued",
-          provider:
-            String(responsePayload?.provider || existing.provider || provider)
-              .trim()
-              .toLowerCase() || "twilio",
-          providerMetadata:
-            responsePayload?.provider_metadata &&
-            typeof responsePayload.provider_metadata === "object"
-              ? responsePayload.provider_metadata
-              : {},
+          provider: replayProvider || "twilio",
+          providerMetadata: replayMetadata,
         },
+      };
+    }
+    if (existingStatus === "pending" && existing.provider === "speko") {
+      return {
+        enabled: true,
+        idempotencyKey,
+        requestHash,
+        provider: "speko",
+        retryPending: true,
       };
     }
   }
@@ -24693,10 +24794,34 @@ async function placeOutboundCall(payload, hostOverride = null) {
   const readiness = getProviderReadiness();
   const preferredProvider =
     keypadOverride?.provider || requestedProvider || currentProvider;
+  const paymentRequested = normalizeBooleanFlag(
+    hasPayloadField("payment_enabled")
+      ? payment_enabled
+      : scriptPaymentDefaults.payment_enabled,
+    false,
+  );
+  if (
+    preferredProvider === "speko" &&
+    (keypadRequired || paymentRequested)
+  ) {
+    throw new Error(
+      "Speko supports outbound voice only; keypad collection and Voicednut payment flows require a compatible carrier.",
+    );
+  }
+  if (preferredProvider === "speko" && !readiness.speko) {
+    throw new Error(
+      "Speko is not ready. Enable it and configure its API key, agent, and signed webhook.",
+    );
+  }
   const orderedProviders = getProviderOrder(preferredProvider);
   let availableProviders = orderedProviders.filter(
     (provider) => readiness[provider],
   );
+  if (preferredProvider !== "speko") {
+    availableProviders = availableProviders.filter(
+      (provider) => provider !== "speko",
+    );
+  }
   if (keypadOverride && !availableProviders.includes(preferredProvider)) {
     console.warn(
       `Provider guard override for ${keypadOverride.scopeKey} requested ${preferredProvider}, but provider is unavailable. Falling back to available keypad-capable providers.`,
@@ -24728,6 +24853,11 @@ async function placeOutboundCall(payload, hostOverride = null) {
     }
     availableProviders = keypadProviders;
   }
+  if (paymentRequested) {
+    availableProviders = availableProviders.filter(
+      (provider) => provider !== "speko",
+    );
+  }
   if (!availableProviders.length) {
     throw new Error("No outbound provider configured");
   }
@@ -24738,6 +24868,7 @@ async function placeOutboundCall(payload, hostOverride = null) {
     providers: availableProviders,
     readiness,
     requestedFlow: keypadRequired ? "digit_capture" : "outbound_voice",
+    requiredCapabilities: [keypadRequired ? "digit_capture" : "outbound_voice"],
     context: {
       vonageDtmfWebhookEnabled: config.vonage?.dtmfWebhookEnabled === true,
     },
@@ -24745,7 +24876,7 @@ async function placeOutboundCall(payload, hostOverride = null) {
     isProviderDegraded,
     getProviderHealthScore,
   });
-  const attemptProviders = providerPlan.attempt_order;
+  let attemptProviders = providerPlan.attempt_order;
   recordProviderFlowMetric("provider_selection_plan", {
     channel: "call",
     flow: keypadRequired ? "digit_capture" : "outbound_voice",
@@ -24760,6 +24891,20 @@ async function placeOutboundCall(payload, hostOverride = null) {
   if (!attemptProviders.length) {
     throw new Error("No eligible outbound call providers are currently available");
   }
+  if (
+    providerPlan.selected_provider === "speko" &&
+    !normalizedOutboundIdempotencyKey
+  ) {
+    const error = new Error(
+      "Speko calls require an idempotency_key (or Idempotency-Key header)",
+    );
+    error.code = "speko_idempotency_key_required";
+    error.status = 400;
+    throw error;
+  }
+  if (preferredProvider === "speko") {
+    attemptProviders = ["speko"];
+  }
   const outboundIdempotencyContext = await reserveOutboundCallIdempotency(
     {
       ...payloadObject,
@@ -24767,6 +24912,50 @@ async function placeOutboundCall(payload, hostOverride = null) {
     },
     providerPlan.selected_provider || preferredProvider || currentProvider,
   );
+  if (outboundIdempotencyContext?.retryPending) {
+    if (!readiness.speko) {
+      const error = new Error(
+        "A Speko call with this idempotency key has an uncertain outcome; restore Speko readiness and retry the same request.",
+      );
+      error.code = "speko_outcome_unknown";
+      error.status = 503;
+      error.uncertain = true;
+      throw error;
+    }
+    attemptProviders = ["speko"];
+  }
+  let spekoAttemptLeaseClaimed = false;
+  const releaseSpekoAttemptLease = async () => {
+    if (!spekoAttemptLeaseClaimed || !outboundIdempotencyContext?.idempotencyKey) {
+      return;
+    }
+    spekoAttemptLeaseClaimed = false;
+    await db
+      ?.releaseOutboundCallAttempt?.({
+        idempotency_key: outboundIdempotencyContext.idempotencyKey,
+      })
+      .catch(() => {});
+  };
+  if (
+    outboundIdempotencyContext?.enabled &&
+    outboundIdempotencyContext?.provider === "speko" &&
+    !outboundIdempotencyContext?.replay &&
+    typeof db?.claimOutboundCallAttempt === "function"
+  ) {
+    const lease = await db.claimOutboundCallAttempt({
+      idempotency_key: outboundIdempotencyContext.idempotencyKey,
+      lease_seconds: Math.ceil(
+        (Number(config.speko?.requestTimeoutMs) || 30000) / 1000 + 30,
+      ),
+    });
+    if (!lease?.claimed) {
+      const pendingError = new Error("Idempotency key is currently processing");
+      pendingError.code = "idempotency_in_progress";
+      pendingError.status = 409;
+      throw pendingError;
+    }
+    spekoAttemptLeaseClaimed = true;
+  }
   if (outboundIdempotencyContext?.replay) {
     callId = outboundIdempotencyContext.replay.callId;
     callStatus = outboundIdempotencyContext.replay.callStatus || "queued";
@@ -24930,22 +25119,59 @@ async function placeOutboundCall(payload, hostOverride = null) {
           rememberVonageCallMapping(callId, vonageUuid, "outbound_create");
         }
         callStatus = response?.status || "queued";
+      } else if (provider === "speko") {
+        callId = `speko_${crypto
+          .createHash("sha256")
+          .update(normalizedOutboundIdempotencyKey)
+          .digest("hex")
+          .slice(0, 32)}`;
+        const response = await getSpekoVoiceAdapter().createOrRecoverCall({
+          callId,
+          to: number,
+          systemPrompt: effectivePrompt,
+          firstMessage: effectiveFirstMessage,
+          spekoOptions: payloadObject.speko_options,
+          idempotencyKey: normalizedOutboundIdempotencyKey,
+          reconcile: outboundIdempotencyContext?.retryPending === true,
+        });
+        callStatus = toCanonicalCallStatus("speko", response.status) || "initiated";
+        providerMetadata = {
+          speko_session_id: response.sessionId,
+          speko_call_control_id: response.raw?.callControlId || null,
+          speko_provider_status: response.status,
+          idempotency_key: normalizedOutboundIdempotencyKey,
+          reconciled_after_uncertain_outcome: response.recovered === true,
+        };
       } else {
         throw new Error(`Unsupported provider ${provider}`);
       }
-      await completeOutboundCallIdempotency(
-        outboundIdempotencyContext,
-        "completed",
-        {
-          provider,
-          callSid: callId,
-          responsePayload: {
-            call_status: callStatus,
+      try {
+        await completeOutboundCallIdempotency(
+          outboundIdempotencyContext,
+          "completed",
+          {
             provider,
-            provider_metadata: providerMetadata,
+            callSid: callId,
+            responsePayload: {
+              call_status: callStatus,
+              provider,
+              provider_metadata: providerMetadata,
+            },
           },
-        },
-      );
+        );
+      } catch (error) {
+        if (provider === "speko") {
+          const uncertainError = new Error(
+            "Speko accepted the call but the result could not be persisted; retry with the same idempotency key",
+          );
+          uncertainError.code = "speko_outcome_unknown";
+          uncertainError.status = 503;
+          uncertainError.uncertain = true;
+          uncertainError.cause = error;
+          throw uncertainError;
+        }
+        throw error;
+      }
       recordProviderSuccess(provider);
       recordProviderFlowMetric("outbound_call_success", {
         channel: "call",
@@ -24975,6 +25201,10 @@ async function placeOutboundCall(payload, hostOverride = null) {
         `Outbound call failed for provider ${provider}:`,
         error.message || error,
       );
+      if (provider === "speko" && error?.uncertain === true) {
+        await releaseSpekoAttemptLease();
+        throw error;
+      }
     }
   }
 
@@ -24989,6 +25219,7 @@ async function placeOutboundCall(payload, hostOverride = null) {
           lastError?.message || "outbound_call_provider_attempts_exhausted",
       },
     ).catch(() => {});
+    await releaseSpekoAttemptLease();
     throw lastError || new Error("Failed to place outbound call");
   }
   if (keypadOverride) {
@@ -25214,18 +25445,24 @@ async function placeOutboundCall(payload, hostOverride = null) {
   });
 
   try {
-    await db.createCall({
-      call_sid: callId,
-      phone_number: number,
-      prompt: effectivePrompt,
-      first_message: effectiveFirstMessage,
-      user_chat_id: user_chat_id,
-      business_context: JSON.stringify(functionSystem.context),
-      generated_functions: JSON.stringify(
-        functionSystem.functions.map((f) => f.function.name),
-      ),
-      direction: "outbound",
-    });
+    const persistedCall =
+      selectedProvider === "speko"
+        ? await db.getCall(callId).catch(() => null)
+        : null;
+    if (!persistedCall) {
+      await db.createCall({
+        call_sid: callId,
+        phone_number: number,
+        prompt: effectivePrompt,
+        first_message: effectiveFirstMessage,
+        user_chat_id: user_chat_id,
+        business_context: JSON.stringify(functionSystem.context),
+        generated_functions: JSON.stringify(
+          functionSystem.functions.map((f) => f.function.name),
+        ),
+        direction: "outbound",
+      });
+    }
     const callCreatedState = buildCallCreatedState({
       customer_name: customer_name || null,
       business_id: business_id || null,
@@ -25266,7 +25503,9 @@ async function placeOutboundCall(payload, hostOverride = null) {
       from:
         (selectedProvider || currentProvider) === "twilio"
           ? config.twilio?.fromNumber
-          : null,
+          : (selectedProvider || currentProvider) === "speko"
+            ? config.speko?.phoneNumber || null
+            : null,
       to: number || null,
       inbound: false,
       collection_profile: collection_profile || null,
@@ -25323,6 +25562,7 @@ async function placeOutboundCall(payload, hostOverride = null) {
       `Business context: ${functionSystem.context.industry} - ${functionSystem.context.businessType}`,
     );
   } catch (dbError) {
+    await releaseSpekoAttemptLease();
     console.error("Database error:", dbError);
     const persistenceError = new Error(
       "Outbound call was created but persistence failed",
@@ -25332,6 +25572,8 @@ async function placeOutboundCall(payload, hostOverride = null) {
     persistenceError.retryable = true;
     throw persistenceError;
   }
+
+  await releaseSpekoAttemptLease();
 
   return {
     callId,
@@ -29767,6 +30009,8 @@ registerCallRoutes(app, {
   buildErrorDetails,
   getCurrentProvider: () => currentProvider,
   getDb: () => db,
+  getSpekoRecording: (sessionId) =>
+    getSpekoVoiceAdapter().getRecording(sessionId),
   isSafeId,
   normalizeCallRecordForApi,
   buildCallbackPayload,
@@ -29821,6 +30065,247 @@ registerStatusRoutes(app, {
   callFunctionSystems,
 });
 
+async function handleSpekoCallReport(callSid, sessionId, report = {}) {
+  const dbInstance = db;
+  const entries = Array.isArray(report?.transcript?.entries)
+    ? report.transcript.entries
+    : [];
+  const existing = (await dbInstance.getCallTranscripts(callSid).catch(() => []))
+    .map((entry) => ({
+      speaker: String(entry?.speaker || "").toLowerCase(),
+      message: String(entry?.message || "").trim(),
+    }));
+  const knownEntries = new Set(
+    existing.map((entry) => `${entry.speaker}\u0000${entry.message}`),
+  );
+  let interactionCount = existing.length;
+  for (const entry of entries) {
+    const message = String(entry?.text || "").trim();
+    if (!message) continue;
+    const source = String(entry?.source || "").toLowerCase();
+    const speaker = source === "agent" ? "ai" : source === "user" ? "user" : "system";
+    const key = `${speaker}\u0000${message}`;
+    if (knownEntries.has(key)) continue;
+    await dbInstance.addTranscript({
+      call_sid: callSid,
+      speaker,
+      message,
+      interaction_count: ++interactionCount,
+    });
+    knownEntries.add(key);
+  }
+
+  const contact = String(report?.contact || "").toLowerCase();
+  const finalStatus =
+    contact === "no_answer" || contact === "no_response"
+      ? "no-answer"
+      : contact === "not_connected"
+        ? "failed"
+        : "completed";
+  await recordCallStatus(
+    callSid,
+    finalStatus,
+    notificationTypeForCallStatus(finalStatus),
+    {
+      provider: "speko",
+      speko_session_id: sessionId,
+      speko_sequence: Number.isSafeInteger(Number(report?.sequence))
+        ? Number(report.sequence)
+        : null,
+    },
+  );
+  await dbInstance.updateCallState(callSid, "speko_call_report", {
+    provider: "speko",
+    speko_session_id: sessionId,
+    sequence: Number.isSafeInteger(Number(report?.sequence))
+      ? Number(report.sequence)
+      : null,
+    outcome: String(report?.outcome || "").slice(0, 500) || null,
+    contact: contact || null,
+    summary: String(report?.summary || "").slice(0, 4000) || null,
+    transcript_count: entries.length,
+    recording_status: String(report?.artifacts?.recording?.status || "").slice(0, 40) || null,
+    recording_url_available: Boolean(report?.recording_url),
+    recording_url_expires_at: report?.recording_url_expires_at || null,
+    received_at: new Date().toISOString(),
+  });
+
+  const call = (await dbInstance.getCall(callSid).catch(() => null)) || {};
+  const transcripts = await dbInstance.getCallTranscripts(callSid).catch(() => []);
+  const duration = Number(report?.duration_seconds) || null;
+  void runPostCallQaEvaluation({
+    callSid,
+    call,
+    transcripts,
+    durationSeconds: duration,
+    config,
+    db: dbInstance,
+    logger: console,
+  }).catch((error) => {
+    console.error("speko_post_call_qa_failed", {
+      call_sid: callSid,
+      error: error?.code || "post_call_qa_failed",
+    });
+  });
+  void runPostCallAutomationTrigger({
+    service: postCallAutomationService,
+    webhookService,
+    db: dbInstance,
+    logger: console,
+    callSid,
+    payload: buildCallCompletionAutomationPayload({
+      callSid,
+      call,
+      transcripts,
+      summary: { summary: report?.summary || "" },
+      finalStatus,
+      notificationType: notificationTypeForCallStatus(finalStatus),
+      duration,
+    }),
+  });
+}
+
+async function handleSpekoPreCall(event = {}) {
+  const deny = (code, message) => {
+    const error = new Error(message || code);
+    error.code = code;
+    error.status = 403;
+    return error;
+  };
+  const spekoConfig = config.speko || {};
+  if (spekoConfig.inboundEnabled !== true) {
+    throw deny("speko_inbound_disabled", "Speko inbound calling is disabled");
+  }
+  if (spekoConfig.enabled !== true || !String(spekoConfig.agentId || "").trim()) {
+    throw deny("speko_inbound_not_ready", "Speko inbound configuration is incomplete");
+  }
+
+  const direction = String(event.direction || "").trim().toLowerCase();
+  const sessionId = String(event.session_id || event.call_id || "").trim();
+  const to = String(event.to || event.dialed_number || "").trim();
+  const from = String(event.from || "").trim();
+  if (direction !== "inbound" || !sessionId || sessionId.length > 256) {
+    throw deny("speko_inbound_event_invalid", "Speko inbound event is invalid");
+  }
+  if (!isE164(spekoConfig.inboundPhoneNumber) || !isE164(to)) {
+    throw deny("speko_inbound_number_invalid", "Speko inbound number is not configured");
+  }
+  if (normalizePhoneDigits(to) !== normalizePhoneDigits(spekoConfig.inboundPhoneNumber)) {
+    throw deny("speko_inbound_number_unassigned", "Speko destination number is not assigned to Voicednut");
+  }
+  const route = resolveInboundRoute(to);
+  if (!route || typeof route !== "object") {
+    throw deny("speko_inbound_route_missing", "No Voicednut inbound route is configured");
+  }
+  const eventAgentId = String(event.agent_id || event.agentId || "").trim();
+  if (eventAgentId && eventAgentId !== String(spekoConfig.agentId).trim()) {
+    throw deny("speko_inbound_agent_mismatch", "Speko inbound agent does not match configuration");
+  }
+  if (!db) {
+    const error = new Error("Speko inbound call persistence is unavailable");
+    error.code = "speko_inbound_persistence_unavailable";
+    error.status = 503;
+    throw error;
+  }
+
+  const callSid = `speko_in_${crypto
+    .createHash("sha256")
+    .update(sessionId)
+    .digest("hex")
+    .slice(0, 32)}`;
+  const call = await ensureCallRecord(
+    callSid,
+    { from, to },
+    "speko_inbound_pre_call",
+    {
+      provider: "speko",
+      inbound: true,
+      provider_metadata: {
+        provider: "speko",
+        direction: "inbound",
+        speko_session_id: sessionId,
+        speko_phone_number_id: String(event.phone_number_id || "").slice(0, 128) || null,
+      },
+    },
+  );
+  if (!call) {
+    const error = new Error("Speko inbound call could not be recorded");
+    error.code = "speko_inbound_persistence_failed";
+    error.status = 503;
+    throw error;
+  }
+  callDirections.set(sessionId, "inbound");
+  return { metadata: { voicednut_call_id: callSid } };
+}
+
+async function handleSpekoCallAnalysis(callSid, sessionId, analysis = {}) {
+  const analysisDetails =
+    analysis.analysis && typeof analysis.analysis === "object"
+      ? analysis.analysis
+      : {};
+  await db.updateCallState(callSid, "speko_call_analysis", {
+    provider: "speko",
+    speko_session_id: sessionId,
+    sequence: Number.isSafeInteger(Number(analysis.sequence))
+      ? Number(analysis.sequence)
+      : null,
+    summary: String(analysis.summary || "").slice(0, 4000) || null,
+    outcome: String(analysis.outcome || "").slice(0, 500) || null,
+    contact: String(analysis.contact || "").slice(0, 40) || null,
+    structured_data:
+      analysis.structured_data && typeof analysis.structured_data === "object"
+        ? analysis.structured_data
+        : null,
+    custom_data:
+      analysis.custom_data && typeof analysis.custom_data === "object"
+        ? analysis.custom_data
+        : null,
+    analysis_status: String(analysisDetails.status || "").slice(0, 40) || null,
+    analysis_provider: String(analysisDetails.provider || "").slice(0, 80) || null,
+    analysis_model: String(analysisDetails.model || "").slice(0, 120) || null,
+    completed_at: analysisDetails.completed_at || null,
+    received_at: new Date().toISOString(),
+  });
+}
+
+async function handleSpekoCallRecording(callSid, sessionId, recordingEvent = {}) {
+  const recording =
+    recordingEvent.recording && typeof recordingEvent.recording === "object"
+      ? recordingEvent.recording
+      : {};
+  await db.updateCallState(callSid, "speko_call_recording", {
+    provider: "speko",
+    speko_session_id: sessionId,
+    sequence: Number.isSafeInteger(Number(recordingEvent.sequence))
+      ? Number(recordingEvent.sequence)
+      : null,
+    status: String(recording.status || "").slice(0, 40) || null,
+    duration_ms: Number.isFinite(Number(recording.duration_ms))
+      ? Number(recording.duration_ms)
+      : null,
+    recording_url_available: Boolean(recordingEvent.recording_url),
+    occurred_at: recordingEvent.occurred_at || null,
+    received_at: new Date().toISOString(),
+  });
+}
+
+async function handleSpekoCallTransfer(callSid, sessionId, eventType, transferEvent = {}) {
+  await db.updateCallState(callSid, "speko_call_transfer", {
+    provider: "speko",
+    speko_session_id: sessionId,
+    event_type: eventType,
+    sequence: Number.isSafeInteger(Number(transferEvent.sequence))
+      ? Number(transferEvent.sequence)
+      : null,
+    transfer_id: String(transferEvent.transfer_id || "").slice(0, 128) || null,
+    mode: String(transferEvent.mode || "").slice(0, 20) || null,
+    destination: String(transferEvent.to || "").slice(0, 32) || null,
+    failure_cause: String(transferEvent.failureCause || "").slice(0, 160) || null,
+    occurred_at: transferEvent.occurred_at || null,
+    received_at: new Date().toISOString(),
+  });
+}
+
 registerWebhookRoutes(app, {
   config,
   fetchFn: fetch,
@@ -29836,7 +30321,17 @@ registerWebhookRoutes(app, {
   activeStreamConnections,
   shouldProcessProviderEvent,
   shouldProcessProviderEventAsync,
+  releaseProviderEventAsync,
+  claimSpekoCallSequence: (payload) => db.claimSpekoCallSequence(payload),
+  finishSpekoCallSequence: (payload) => db.finishSpekoCallSequence(payload),
+  releaseSpekoCallSequenceClaim: (payload) =>
+    db.releaseSpekoCallSequenceClaim(payload),
+  handleSpekoPreCall,
   recordCallStatus,
+  handleSpekoCallReport,
+  handleSpekoCallAnalysis,
+  handleSpekoCallRecording,
+  handleSpekoCallTransfer,
   getPlivoCallUuid,
   resolvePlivoCallSid,
   rememberPlivoCallMapping,
@@ -30211,6 +30706,10 @@ module.exports = {
   startServer,
   __testables: {
     setDbForTests,
+    setSpekoVoiceAdapterForTests,
+    syncRuntimeProviderMirrors,
+    placeOutboundCall,
+    handleSpekoPreCall,
     verifyHmacSignature,
     resolveApiHmacReplayValidationMode,
     resetHmacReplayCacheForTests,

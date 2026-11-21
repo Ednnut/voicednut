@@ -3,6 +3,7 @@ const {
   buildCanonicalSmsInboundEvent,
   buildCanonicalSmsDeliveryEvent,
 } = require("../adapters/providerFlowPolicy");
+const { verifySpekoWebhook } = require("../adapters/spekoWebhookSecurity");
 const { createPaypalPaymentService } = require("./paypalPaymentService");
 const { createSquarePaymentService } = require("./squarePaymentService");
 const { createStripePaymentService } = require("./stripePaymentService");
@@ -2868,10 +2869,13 @@ function registerWebhookRoutes(app, ctx = {}) {
     ctx.handleStripeWebhook || createStripeWebhookHandler(ctx);
   const handleSquareWebhook =
     ctx.handleSquareWebhook || createSquareWebhookHandler(ctx);
+  const handleSpekoWebhook =
+    ctx.handleSpekoWebhook || createSpekoWebhookHandler(ctx);
 
   app.get("/capture/secure", handleSecureCaptureView);
   app.post("/capture/secure", handleSecureCaptureSubmit);
   app.post("/webhook/telegram", withWebhookAuth("telegram", handleTelegramWebhook));
+  app.post("/webhook/speko", handleSpekoWebhook);
   app.get("/plivo/answer", withWebhookAuth("plivo_answer", handlePlivoAnswer));
   app.post("/plivo/answer", withWebhookAuth("plivo_answer", handlePlivoAnswer));
   app.post("/plivo/events", withWebhookAuth("plivo_event", handlePlivoEvent));
@@ -2923,8 +2927,252 @@ function registerWebhookRoutes(app, ctx = {}) {
   );
 }
 
+function normalizeSpekoCallStatus(data = {}) {
+  const eventType = String(data.event_type || "").trim().toLowerCase();
+  const status = String(data.status || "").trim().toLowerCase();
+  const endReason = String(data.end_reason || "").trim().toLowerCase();
+
+  if (["sip_busy", "busy", "line_busy"].includes(endReason)) return "busy";
+  if (
+    ["sip_no_answer", "no_answer", "no-answer", "timeout"].includes(endReason)
+  ) {
+    return "no-answer";
+  }
+  if (["sip_declined", "caller_abandoned"].includes(endReason)) {
+    return "canceled";
+  }
+  if (
+    [
+      "sip_invalid_number",
+      "sip_carrier_rejected",
+      "sip_dial_rejected",
+      "originate_failed",
+      "provider_failed",
+      "credits_exhausted",
+    ].includes(endReason)
+  ) {
+    return "failed";
+  }
+  if (eventType === "call.initiated") return "initiated";
+  if (eventType === "call.ringing") return "ringing";
+  if (["call.answered", "call.bridged"].includes(eventType)) return "in-progress";
+  if (status === "active") return "in-progress";
+  if (status === "ringing") return "ringing";
+  if (status === "failed" || status === "failure") return "failed";
+  if (status === "ended" || status === "completed") {
+    return "completed";
+  }
+  return null;
+}
+
+function createSpekoWebhookHandler(ctx = {}) {
+  return async function handleSpekoWebhook(req, res) {
+    const secret = String(ctx.config?.speko?.webhookSecret || "");
+    const rawBody =
+      typeof req.rawBody === "string"
+        ? req.rawBody
+        : Buffer.isBuffer(req.rawBody)
+          ? req.rawBody.toString("utf8")
+          : "";
+    if (
+      !verifySpekoWebhook({
+        secret,
+        headers: req.headers,
+        rawBody,
+        toleranceSeconds: ctx.config?.speko?.webhookToleranceSeconds,
+      })
+    ) {
+      return res.status(401).json({ error: "invalid_speko_signature" });
+    }
+
+    const payload =
+      req.body && typeof req.body === "object" && !Array.isArray(req.body)
+        ? req.body
+        : {};
+    const data =
+      payload.data && typeof payload.data === "object" && !Array.isArray(payload.data)
+        ? payload.data
+        : payload;
+    const eventType = String(
+      payload.type || payload.event || payload.event_type || data.event_type || "",
+    )
+      .trim()
+      .toLowerCase();
+    const eventId = String(
+      req.headers["webhook-id"] || payload.webhook_id || payload.event_id || "",
+    ).trim();
+    if (!eventType) {
+      return res.status(400).json({ error: "invalid_speko_event" });
+    }
+
+    // Pre-call decisions must stay on the request path. Voicednut currently has
+    // no external caller-enrichment provider configured. An enabled inbound
+    // handler may create a local call record and return its correlation ID.
+    if (eventType === "call.pre_call") {
+      try {
+        const override =
+          typeof ctx.handleSpekoPreCall === "function"
+            ? await ctx.handleSpekoPreCall(payload)
+            : {};
+        res.set?.("Cache-Control", "no-store");
+        return res.status(200).json(
+          override && typeof override === "object" && !Array.isArray(override)
+            ? override
+            : {},
+        );
+      } catch (error) {
+        const status = [403, 503].includes(Number(error?.status))
+          ? Number(error.status)
+          : 503;
+        console.error("Speko pre-call decision failed:", {
+          code: error?.code || "speko_pre_call_rejected",
+        });
+        return res.status(status).json({
+          error: error?.code || "speko_pre_call_rejected",
+        });
+      }
+    }
+    if (!eventId) return res.status(400).json({ error: "invalid_speko_event" });
+
+    if (typeof ctx.shouldProcessProviderEventAsync !== "function") {
+      return res.status(503).json({ error: "speko_webhook_dedupe_unavailable" });
+    }
+    const dedupePayload = { webhook_id: eventId };
+    let sequenceClaim = null;
+    try {
+      const shouldProcess = await ctx.shouldProcessProviderEventAsync(
+        "speko",
+        dedupePayload,
+      );
+      if (shouldProcess === false) {
+        return res.status(200).json({ status: "ok", duplicate: true });
+      }
+
+      const sessionId = String(
+        data.session_id || payload.session_id || data.call_id || payload.call_id || "",
+      ).trim();
+      const metadata =
+        data.metadata && typeof data.metadata === "object"
+          ? data.metadata
+          : payload.metadata && typeof payload.metadata === "object"
+            ? payload.metadata
+            : {};
+      const callId = String(metadata.voicednut_call_id || "").trim();
+      if (!callId || !sessionId) {
+        return res.status(200).json({ status: "ok", ignored: true });
+      }
+
+      const sequence = Number(data.sequence);
+      const hasSequence = Number.isSafeInteger(sequence) && sequence > 0;
+      if (
+        hasSequence &&
+        typeof ctx.claimSpekoCallSequence === "function" &&
+        typeof ctx.finishSpekoCallSequence === "function"
+      ) {
+        sequenceClaim = {
+          call_sid: sessionId,
+          sequence_number: sequence,
+          event_key: eventId,
+        };
+        const claimResult = await ctx.claimSpekoCallSequence(sequenceClaim);
+        if (claimResult?.stale) {
+          sequenceClaim = null;
+          return res.status(200).json({ status: "ok", stale: true });
+        }
+        if (!claimResult?.claimed) {
+          const busyError = new Error("Speko event sequence is being processed");
+          busyError.code = "speko_sequence_busy";
+          throw busyError;
+        }
+      } else if (hasSequence && typeof ctx.getSpekoCallSequence === "function") {
+        const lastSequence = await ctx.getSpekoCallSequence({ call_sid: sessionId });
+        if (Number(lastSequence) >= sequence) {
+          return res.status(200).json({ status: "ok", stale: true });
+        }
+      }
+
+      if (eventType === "call.status") {
+        const status = normalizeSpekoCallStatus(data);
+        if (status && typeof ctx.recordCallStatus === "function") {
+          const notificationTypes = {
+            initiated: "call_initiated",
+            ringing: "call_ringing",
+            "in-progress": "call_in_progress",
+            completed: "call_completed",
+            busy: "call_busy",
+            "no-answer": "call_no_answer",
+            failed: "call_failed",
+            canceled: "call_canceled",
+          };
+          await ctx.recordCallStatus(
+            callId,
+            status,
+            notificationTypes[status],
+            {
+              provider: "speko",
+              provider_status: data.status || null,
+              speko_session_id: sessionId,
+              speko_event_type: data.event_type || null,
+              speko_sequence: Number.isSafeInteger(Number(data.sequence))
+                ? Number(data.sequence)
+                : null,
+              end_reason: data.end_reason || null,
+            },
+          );
+        }
+      } else if (
+        eventType === "call.report" &&
+        typeof ctx.handleSpekoCallReport === "function"
+      ) {
+        await ctx.handleSpekoCallReport(callId, sessionId, data);
+      } else if (
+        eventType === "call.analysis" &&
+        typeof ctx.handleSpekoCallAnalysis === "function"
+      ) {
+        await ctx.handleSpekoCallAnalysis(callId, sessionId, data);
+      } else if (
+        eventType === "call.recording" &&
+        typeof ctx.handleSpekoCallRecording === "function"
+      ) {
+        await ctx.handleSpekoCallRecording(callId, sessionId, data);
+      } else if (
+        eventType.startsWith("call.transfer.") &&
+        typeof ctx.handleSpekoCallTransfer === "function"
+      ) {
+        await ctx.handleSpekoCallTransfer(callId, sessionId, eventType, data);
+      }
+
+      if (sequenceClaim && typeof ctx.finishSpekoCallSequence === "function") {
+        const finishResult = await ctx.finishSpekoCallSequence(sequenceClaim);
+        if (finishResult?.advanced === false) {
+          const finishError = new Error("Speko event sequence claim was lost");
+          finishError.code = "speko_sequence_claim_lost";
+          throw finishError;
+        }
+        sequenceClaim = null;
+      } else if (hasSequence && typeof ctx.advanceSpekoCallSequence === "function") {
+        await ctx.advanceSpekoCallSequence({ call_sid: sessionId, sequence_number: sequence });
+      }
+
+      return res.status(200).json({ status: "ok" });
+    } catch (error) {
+      if (sequenceClaim && typeof ctx.releaseSpekoCallSequenceClaim === "function") {
+        await ctx.releaseSpekoCallSequenceClaim(sequenceClaim).catch(() => {});
+      }
+      await ctx
+        .releaseProviderEventAsync?.("speko", dedupePayload)
+        .catch(() => {});
+      console.error("Speko webhook processing failed:", {
+        code: error?.code || "speko_webhook_processing_failed",
+      });
+      return res.status(503).json({ error: "speko_webhook_processing_failed" });
+    }
+  };
+}
+
 module.exports = {
   registerWebhookRoutes,
+  createSpekoWebhookHandler,
   createVonageEventWebhookHandler,
   createPlivoEventWebhookHandler,
   createPlivoAnswerWebhookHandler,
@@ -2933,6 +3181,7 @@ module.exports = {
   createSquareWebhookHandler,
   __testables: {
     WEBHOOK_AUTH_POLICIES,
+    normalizeSpekoCallStatus,
     createWebhookAuthGuard,
   },
 };

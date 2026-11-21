@@ -66,11 +66,32 @@ npm run smoke:plivo --prefix api
 
 Production webhook validation should use `PLIVO_WEBHOOK_VALIDATION=strict` with either API HMAC headers through ingress or `PLIVO_WEBHOOK_SECRET` passed as `x-plivo-webhook-secret`.
 
+## Speko Voice (opt-in)
+
+Speko is an independent voice provider. Twilio, Plivo, and Vonage remain available, and SMS selection is unchanged. Set `SPEKO_ENABLED=true` only after configuring the workspace, then select it with `CALL_PROVIDER=speko` or the existing per-call provider field. Inbound Speko call handling is separately disabled by default.
+
+Configure `SPEKO_API_KEY`, `SPEKO_AGENT_ID`, and `SPEKO_WEBHOOK_SECRET`. `SPEKO_PHONE_NUMBER` is optional; when set it must be an E.164 number owned by the Speko workspace. `SPEKO_BASE_URL` defaults to `https://api.speko.dev`; request timeout, call duration, and ring timeout use `SPEKO_REQUEST_TIMEOUT_MS`, `SPEKO_MAX_DURATION_SECONDS`, and `SPEKO_RING_TIMEOUT_SECONDS`. Speko is disabled by default and missing credentials do not affect other providers.
+
+The API creates an agent-backed phone session at `POST /v1/sessions/phone`, preserving Voicednut's internal call ID separately from Speko's session ID. A supplied `idempotency_key` (or `Idempotency-Key` header) is required for Speko calls. An ambiguous timeout or server error returns `503`; retry the exact request with the same key. The API holds a durable per-key attempt lease to block concurrent retries. If the outcome is still pending, it first searches Speko sessions using the stored `metadata[voicednut_call_id]`; a unique match is recovered into Voicednut, while multiple matches remain uncertain for manual review. When no session is found, any retry still uses the same provider idempotency key. The API never fails over to another carrier after an uncertain submission. Speko voice-session webhooks are received at `POST /webhook/speko`; register that HTTPS URL in Speko's workspace settings for `call.status`, `call.report`, `call.analysis`, `call.recording`, and transfer lifecycle events, using Standard Webhooks signing. Sequence ordering is tracked per Speko session. Reports are treated as updates, including the later recording-ready delivery; short-lived recording URLs are not persisted. There is no per-call webhook URL. An optional `speko_options` object on the outbound call request passes through the documented per-call `voice`, `llm`, `ttsOptions`, `sttOptions`, `telephony`, `timezone`, `variables`, and `webhookTags` fields. Unknown option names are rejected; credentials and caller metadata remain server-side.
+
+To opt into inbound calls, set `SPEKO_INBOUND_ENABLED=true`, set `SPEKO_INBOUND_PHONE_NUMBER` to the E.164 Speko number, and add that number to the existing `INBOUND_NUMBER_ROUTES` map. Manually assign that number to the configured Speko agent in the Speko workspace and subscribe `/webhook/speko` to `call.pre_call` as well as the lifecycle events above. Voicednut only accepts pre-call events for that configured number and an existing inbound route; disabled, unassigned, or mismatched calls are rejected before the agent starts. The verified pre-call request creates an idempotent Voicednut inbound record and returns its internal call ID as session metadata for later event correlation. This does not buy, import, or route phone numbers in Speko.
+
+Read-only preflight authenticates to Speko and verifies the configured agent and optional caller number. It does not create calls or change workspace settings:
+
+```bash
+npm run preflight:provider --prefix api -- --channel call --provider speko --network 1 --reachability 1
+```
+
+The shared provider capability registry is derived from the supported provider flow declarations and drives provider selection, keypad capability checks, compatibility reporting, and call/SMS provider lists. Speko currently supports outbound voice, opt-in inbound handling for an explicitly mapped number, signed lifecycle webhooks, post-call transcript/report/analysis/recording state ingestion, and on-demand recording-link retrieval via `GET /api/calls/:callSid/recording`. Calls associated with a Telegram chat require the matching `x-telegram-chat-id` (or the existing `chat_id` query parameter) before a short-lived recording link is issued. Speko agent management is not wired into Voicednut; inbound number-to-agent assignment remains a manual Speko workspace step. It does not expose Speko call transfer controls, programmable human-call control, or Voicednut keypad collection and native payment flows. To roll back, change `CALL_PROVIDER` to `twilio`, `plivo`, or `vonage` and disable Speko; keep the other providers' credentials and webhook routes configured.
+
 Reference docs:
 
 - Plivo Voice Call API: https://www.plivo.com/docs/voice/api/call/overview
 - Plivo Message API: https://www.plivo.com/docs/messaging/api/message/send-a-message
 - Plivo Audio Stream protocol: https://www.plivo.com/docs/voice/audio-streaming/audio-streaming
+- Speko phone agents: https://docs.speko.ai/guides/phone-agents
+- Speko SDK voice calls: https://docs.speko.ai/sdk/voice
+- Speko workspace webhooks: https://docs.speko.ai/guides/webhooks
 
 ## PayPal Payment Connector
 

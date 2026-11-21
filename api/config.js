@@ -462,6 +462,19 @@ const telegramWebhookValidation = telegramWebhookValidationModes.has(
     ? "strict"
     : "warn";
 const callProvider = ensure("CALL_PROVIDER", "twilio").toLowerCase();
+const spekoEnabled =
+  String(readEnv("SPEKO_ENABLED") || "false").toLowerCase() === "true";
+const spekoInboundEnabled =
+  String(readEnv("SPEKO_INBOUND_ENABLED") || "false").toLowerCase() === "true";
+const spekoMaxDurationSeconds = Number(
+  readEnv("SPEKO_MAX_DURATION_SECONDS") || "300",
+);
+const spekoRingTimeoutSeconds = Number(
+  readEnv("SPEKO_RING_TIMEOUT_SECONDS") || "45",
+);
+const spekoRequestTimeoutMs = Number(
+  readEnv("SPEKO_REQUEST_TIMEOUT_MS") || "30000",
+);
 const apiSecret = readEnv("API_SECRET");
 const adminApiToken = apiSecret || readEnv("ADMIN_API_TOKEN");
 const complianceModeRaw = (
@@ -1104,6 +1117,28 @@ const salesforceInstanceUrl = readEnv("SALESFORCE_INSTANCE_URL");
 module.exports = {
   platform: {
     provider: callProvider,
+  },
+  speko: {
+    enabled: spekoEnabled,
+    inboundEnabled: spekoInboundEnabled,
+    apiKey: readEnv("SPEKO_API_KEY"),
+    baseUrl: readEnv("SPEKO_BASE_URL") || "https://api.speko.dev",
+    agentId: readEnv("SPEKO_AGENT_ID"),
+    phoneNumber: readEnv("SPEKO_PHONE_NUMBER"),
+    inboundPhoneNumber: readEnv("SPEKO_INBOUND_PHONE_NUMBER"),
+    webhookSecret: readEnv("SPEKO_WEBHOOK_SECRET"),
+    requestTimeoutMs:
+      Number.isFinite(spekoRequestTimeoutMs) && spekoRequestTimeoutMs > 0
+        ? Math.floor(spekoRequestTimeoutMs)
+        : 30000,
+    maxDurationSeconds:
+      Number.isFinite(spekoMaxDurationSeconds)
+        ? Math.floor(spekoMaxDurationSeconds)
+        : 300,
+    ringTimeoutSeconds:
+      Number.isFinite(spekoRingTimeoutSeconds)
+        ? Math.floor(spekoRingTimeoutSeconds)
+        : 45,
   },
   twilio: {
     accountSid: ensure("TWILIO_ACCOUNT_SID"),

@@ -652,6 +652,20 @@ class EnhancedDatabase {
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )`,
 
+            `CREATE TABLE IF NOT EXISTS speko_call_sequences (
+                call_sid TEXT PRIMARY KEY,
+                sequence_number INTEGER NOT NULL,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )`,
+
+            `CREATE TABLE IF NOT EXISTS speko_call_sequence_claims (
+                call_sid TEXT PRIMARY KEY,
+                sequence_number INTEGER NOT NULL,
+                event_key TEXT NOT NULL,
+                lease_until DATETIME NOT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )`,
+
             // Outbound call idempotency guard (provider-agnostic)
             `CREATE TABLE IF NOT EXISTS outbound_call_idempotency (
                 idempotency_key TEXT PRIMARY KEY,
@@ -663,6 +677,12 @@ class EnhancedDatabase {
                 error_message TEXT,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )`,
+
+            `CREATE TABLE IF NOT EXISTS outbound_call_attempt_leases (
+                idempotency_key TEXT PRIMARY KEY,
+                lease_until DATETIME NOT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )`,
 
             // Durable idempotency lock/result store for call-script mutations
@@ -3341,6 +3361,153 @@ class EnhancedDatabase {
         });
     }
 
+    async releaseProviderEventIdempotency(payload = {}) {
+        const eventKey = String(payload.event_key || '').trim();
+        if (!eventKey) return 0;
+        return new Promise((resolve, reject) => {
+            this.db.run(
+                'DELETE FROM provider_event_idempotency WHERE event_key = ?',
+                [eventKey],
+                function(err) {
+                    if (err) {
+                        reject(err);
+                    } else {
+                        resolve(this.changes || 0);
+                    }
+                }
+            );
+        });
+    }
+
+    async advanceSpekoCallSequence(payload = {}) {
+        const callSid = String(payload.call_sid || '').trim();
+        const sequence = Number(payload.sequence_number);
+        if (!callSid || !Number.isSafeInteger(sequence) || sequence < 1) {
+            return { advanced: false };
+        }
+        return new Promise((resolve, reject) => {
+            const sql = `
+                INSERT INTO speko_call_sequences (call_sid, sequence_number, updated_at)
+                VALUES (?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(call_sid) DO UPDATE SET
+                    sequence_number = excluded.sequence_number,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE excluded.sequence_number > speko_call_sequences.sequence_number
+            `;
+            this.db.run(sql, [callSid, sequence], function(err) {
+                if (err) {
+                    reject(err);
+                } else {
+                    resolve({ advanced: (this.changes || 0) > 0 });
+                }
+            });
+        });
+    }
+
+    async getSpekoCallSequence(payload = {}) {
+        const callSid = String(payload.call_sid || '').trim();
+        if (!callSid) return 0;
+        return new Promise((resolve, reject) => {
+            this.db.get(
+                'SELECT sequence_number FROM speko_call_sequences WHERE call_sid = ?',
+                [callSid],
+                (err, row) => {
+                    if (err) reject(err);
+                    else resolve(Number(row?.sequence_number) || 0);
+                }
+            );
+        });
+    }
+
+    async claimSpekoCallSequence(payload = {}) {
+        const callSid = String(payload.call_sid || '').trim();
+        const sequence = Number(payload.sequence_number);
+        const eventKey = String(payload.event_key || '').trim();
+        const leaseSeconds = Math.max(10, Math.min(300, Number(payload.lease_seconds) || 60));
+        if (!callSid || !eventKey || !Number.isSafeInteger(sequence) || sequence < 1) {
+            return { claimed: false, stale: false, invalid: true };
+        }
+        const sql = `
+            INSERT INTO speko_call_sequence_claims (
+                call_sid, sequence_number, event_key, lease_until
+            )
+            SELECT ?, ?, ?, datetime('now', ?)
+            WHERE ? > COALESCE((
+                SELECT sequence_number FROM speko_call_sequences WHERE call_sid = ?
+            ), 0)
+            ON CONFLICT(call_sid) DO UPDATE SET
+                sequence_number = excluded.sequence_number,
+                event_key = excluded.event_key,
+                lease_until = excluded.lease_until,
+                created_at = CURRENT_TIMESTAMP
+            WHERE speko_call_sequence_claims.lease_until <= CURRENT_TIMESTAMP
+              AND excluded.sequence_number > COALESCE((
+                  SELECT sequence_number FROM speko_call_sequences WHERE call_sid = excluded.call_sid
+              ), 0)
+        `;
+        const changed = await new Promise((resolve, reject) => {
+            this.db.run(
+                sql,
+                [callSid, sequence, eventKey, `+${leaseSeconds} seconds`, sequence, callSid],
+                function(err) {
+                    if (err) reject(err);
+                    else resolve((this.changes || 0) > 0);
+                }
+            );
+        });
+        if (changed) return { claimed: true, stale: false };
+        const lastSequence = await this.getSpekoCallSequence({ call_sid: callSid });
+        return { claimed: false, stale: lastSequence >= sequence, busy: lastSequence < sequence };
+    }
+
+    async finishSpekoCallSequence(payload = {}) {
+        const callSid = String(payload.call_sid || '').trim();
+        const sequence = Number(payload.sequence_number);
+        const eventKey = String(payload.event_key || '').trim();
+        if (!callSid || !eventKey || !Number.isSafeInteger(sequence) || sequence < 1) {
+            return { advanced: false };
+        }
+        const run = (sql, params = []) => new Promise((resolve, reject) => {
+            this.db.run(sql, params, function(err) {
+                if (err) reject(err);
+                else resolve(this.changes || 0);
+            });
+        });
+        const changed = await run(`
+            INSERT INTO speko_call_sequences (call_sid, sequence_number, updated_at)
+            SELECT call_sid, sequence_number, CURRENT_TIMESTAMP
+            FROM speko_call_sequence_claims
+            WHERE call_sid = ? AND sequence_number = ? AND event_key = ?
+            ON CONFLICT(call_sid) DO UPDATE SET
+                sequence_number = excluded.sequence_number,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE excluded.sequence_number > speko_call_sequences.sequence_number
+        `, [callSid, sequence, eventKey]);
+        if (!changed) return { advanced: false };
+        await run(
+            'DELETE FROM speko_call_sequence_claims WHERE call_sid = ? AND sequence_number = ? AND event_key = ?',
+            [callSid, sequence, eventKey],
+        );
+        return { advanced: true };
+    }
+
+    async releaseSpekoCallSequenceClaim(payload = {}) {
+        const callSid = String(payload.call_sid || '').trim();
+        const eventKey = String(payload.event_key || '').trim();
+        const sequence = Number(payload.sequence_number);
+        if (!callSid || !eventKey) return 0;
+        return new Promise((resolve, reject) => {
+            const sql = sequence
+                ? 'DELETE FROM speko_call_sequence_claims WHERE call_sid = ? AND event_key = ? AND sequence_number = ?'
+                : 'DELETE FROM speko_call_sequence_claims WHERE call_sid = ? AND event_key = ?';
+            const params = sequence ? [callSid, eventKey, sequence] : [callSid, eventKey];
+            this.db.run(sql, params, function(err) {
+                if (err) reject(err);
+                else resolve(this.changes || 0);
+            });
+        });
+    }
+
     async isProviderEventIdempotencyActive(payload = {}) {
         const source = String(payload.source || '').trim();
         const payloadHash = String(payload.payload_hash || '').trim();
@@ -3426,6 +3593,44 @@ class EnhancedDatabase {
                     resolve({ reserved: (this.changes || 0) > 0 });
                 }
             });
+        });
+    }
+
+    async claimOutboundCallAttempt(payload = {}) {
+        const idempotencyKey = String(payload.idempotency_key || '').trim();
+        const leaseSeconds = Math.max(10, Math.min(300, Number(payload.lease_seconds) || 90));
+        if (!idempotencyKey) return { claimed: false };
+        return new Promise((resolve, reject) => {
+            this.db.run(
+                'DELETE FROM outbound_call_attempt_leases WHERE lease_until <= CURRENT_TIMESTAMP',
+                (cleanupError) => {
+                    if (cleanupError) return reject(cleanupError);
+                    this.db.run(
+                        `INSERT OR IGNORE INTO outbound_call_attempt_leases (idempotency_key, lease_until)
+                         VALUES (?, datetime('now', ?))`,
+                        [idempotencyKey, `+${leaseSeconds} seconds`],
+                        function(err) {
+                            if (err) reject(err);
+                            else resolve({ claimed: (this.changes || 0) > 0 });
+                        },
+                    );
+                },
+            );
+        });
+    }
+
+    async releaseOutboundCallAttempt(payload = {}) {
+        const idempotencyKey = String(payload.idempotency_key || '').trim();
+        if (!idempotencyKey) return 0;
+        return new Promise((resolve, reject) => {
+            this.db.run(
+                'DELETE FROM outbound_call_attempt_leases WHERE idempotency_key = ?',
+                [idempotencyKey],
+                function(err) {
+                    if (err) reject(err);
+                    else resolve(this.changes || 0);
+                },
+            );
         });
     }
 
