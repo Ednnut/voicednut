@@ -44,6 +44,45 @@ function createHandler() {
   return { handler, get recordingRequests() { return recordingRequests; } };
 }
 
+describe("outbound Speko agent selection", () => {
+  it("forwards the selected agent ID and version to the call service", async () => {
+    let receivedPayload;
+    const handler = __testables.createOutboundCallHandler({
+      sendApiError: (res, status, code, message) => res.status(status).json({ error: code, message }),
+      resolveHost: () => "api.example.test",
+      config: { server: { hostname: "api.example.test" } },
+      placeOutboundCall: async (payload, host) => {
+        receivedPayload = { payload, host };
+        return {
+          callId: "call_selected_agent",
+          callStatus: "initiated",
+          provider: "speko",
+          functionSystem: { context: {}, functions: [] },
+        };
+      },
+      buildErrorDetails: () => ({}),
+      getCurrentProvider: () => "speko",
+    });
+    const res = response();
+    await handler({
+      body: {
+        number: "+12015550123",
+        prompt: "Test prompt",
+        first_message: "Hello",
+        speko_agent_id: "agent_selected_in_telegram",
+        speko_agent_version: 3,
+      },
+      headers: {},
+      requestId: "request-selected-agent",
+    }, res);
+
+    assert.equal(res.statusCode, 200);
+    assert.equal(receivedPayload.payload.speko_agent_id, "agent_selected_in_telegram");
+    assert.equal(receivedPayload.payload.speko_agent_version, 3);
+    assert.equal(receivedPayload.host, "api.example.test");
+  });
+});
+
 describe("Speko recording authorization", () => {
   it("requires an owner identity for calls attached to a chat", async () => {
     const fixture = createHandler();
