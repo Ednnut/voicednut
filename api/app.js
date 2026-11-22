@@ -6567,11 +6567,13 @@ function normalizeHostValue(value) {
 }
 
 function resolveHost(req) {
+  // SERVER is the canonical public callback host. Do not let an arbitrary
+  // inbound Host/X-Forwarded-Host header redirect provider callbacks.
+  const configuredHost = normalizeHostValue(config.server?.hostname);
+  if (configuredHost) return configuredHost;
   const forwardedHost = normalizeHostValue(req?.headers?.["x-forwarded-host"]);
   if (forwardedHost) return forwardedHost;
-  const hostHeader = normalizeHostValue(req?.headers?.host);
-  if (hostHeader) return hostHeader;
-  return normalizeHostValue(config.server?.hostname);
+  return normalizeHostValue(req?.headers?.host);
 }
 
 function appendQueryParamsToUrl(rawUrl, params = {}) {
@@ -26902,6 +26904,8 @@ async function placeOutboundCall(payload, hostOverride = null) {
         const response = await getSpekoVoiceAdapter().createOrRecoverCall({
           callId,
           to: number,
+          agentId: payloadObject.speko_agent_id || payloadObject.agent_id || undefined,
+          agentVersion: payloadObject.speko_agent_version,
           systemPrompt: effectivePrompt,
           firstMessage: effectiveFirstMessage,
           spekoOptions: payloadObject.speko_options,
@@ -26912,10 +26916,11 @@ async function placeOutboundCall(payload, hostOverride = null) {
         callStatus = toCanonicalCallStatus("speko", response.status) || "initiated";
         providerMetadata = {
           speko_session_id: response.sessionId,
+          speko_agent_id: payloadObject.speko_agent_id || payloadObject.agent_id || config.speko.agentId || null,
           speko_call_control_id: response.raw?.callControlId || null,
           speko_provider_status: response.status,
           idempotency_key: normalizedOutboundIdempotencyKey,
-          agent_version: response.raw?.agentVersion || config.speko.agentVersion || null,
+          agent_version: response.raw?.agentVersion || payloadObject.speko_agent_version || config.speko.agentVersion || null,
           reconciled_after_uncertain_outcome: response.recovered === true,
         };
       } else {
