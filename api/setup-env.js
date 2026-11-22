@@ -21,7 +21,7 @@ const SECTIONS = [
     fields: [
       { key: 'API_SECRET', prompt: 'API Secret (press Enter to generate securely)' },
       { key: 'PORT', prompt: 'API Port', defaultValue: '3000' },
-      { key: 'SERVER', prompt: 'Public API hostname (optional)' },
+      { key: 'SERVER', prompt: 'Public HTTPS API hostname (domain only, no path; optional)' },
       { key: 'CORS_ORIGINS', prompt: 'Allowed web origins, comma-separated (optional)' },
     ],
   },
@@ -32,8 +32,10 @@ const SECTIONS = [
       { key: 'SPEKO_ENABLED', prompt: 'Enable Speko calls?', defaultValue: 'true' },
       { key: 'SPEKO_EXCLUSIVE_MODE', prompt: 'Lock all voice calls to Speko?', defaultValue: 'true' },
       { key: 'SPEKO_AGENT_RELEASE_GATE_REQUIRED', prompt: 'Require the agent release checklist?', defaultValue: 'true' },
+      { key: 'SPEKO_INBOUND_ENABLED', prompt: 'Enable Speko inbound calls?', defaultValue: 'false' },
+      { key: 'SPEKO_INBOUND_PHONE_NUMBER', prompt: 'Speko inbound phone number (E.164; optional)' },
+      { key: 'INBOUND_NUMBER_ROUTES', prompt: 'Inbound number routes (JSON object; optional)' },
       { key: 'SPEKO_API_KEY', prompt: 'Speko API Key' },
-      { key: 'SPEKO_AGENT_ID', prompt: 'Speko Agent ID' },
       { key: 'SPEKO_AGENT_VERSION', prompt: 'Speko Agent Version (optional)' },
       { key: 'SPEKO_WEBHOOK_SECRET', prompt: 'Speko Webhook Secret (whsec_...)' },
       { key: 'SPEKO_BASE_URL', prompt: 'Speko API URL', defaultValue: 'https://api.speko.dev' },
@@ -168,11 +170,6 @@ async function collectInputs() {
 
   rl.close();
   if (!answers.API_SECRET) answers.API_SECRET = crypto.randomBytes(32).toString('base64url');
-  if (String(answers.CALL_PROVIDER || '').toLowerCase() === 'speko') {
-    answers.SPEKO_INBOUND_ENABLED = 'false';
-    answers.SPEKO_CALL_CONTROL_ENABLED = 'false';
-    answers.SPEKO_AGENT_TOOLS_ENABLED = 'false';
-  }
   return answers;
 }
 
@@ -204,8 +201,8 @@ async function main() {
   const content = buildEnvContent(values);
   await fs.promises.writeFile(targetPath, content, 'utf8');
   console.log(`✅ Created ${targetPath}`);
-  if (!values.SPEKO_API_KEY || !values.SPEKO_AGENT_ID || !values.SPEKO_WEBHOOK_SECRET) {
-    console.log('   Add your Speko API key, agent ID, and webhook secret before placing calls.');
+  if (!values.SPEKO_API_KEY || !values.SPEKO_WEBHOOK_SECRET) {
+    console.log('   Add your Speko API key and webhook secret before using Speko. Select an agent in the Telegram call flow; SPEKO_AGENT_ID is only an optional legacy default.');
   }
   if (String(values.CALL_PROVIDER || '').toLowerCase() === 'speko') {
     console.log('   Speko exclusive mode locks voice provider switching and cross-provider failover.');
