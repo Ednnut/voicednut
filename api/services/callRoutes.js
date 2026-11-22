@@ -102,6 +102,8 @@ function createOutboundCallHandler(ctx = {}) {
         payment_retry_message: req.body?.payment_retry_message,
         payment_policy: req.body?.payment_policy,
         speko_options: req.body?.speko_options,
+        speko_agent_id: req.body?.speko_agent_id,
+        speko_agent_version: req.body?.speko_agent_version,
       };
 
       const host = resolveHost(req) || config.server?.hostname;
