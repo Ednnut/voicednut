@@ -169,6 +169,41 @@ describe("Speko voice adapter", () => {
     assert.equal(result.status, "dialing");
   });
 
+  it("uses a per-call agent ID when no SPEKO_AGENT_ID default is configured", async () => {
+    let requestBody;
+    const adapter = new SpekoVoiceAdapter({
+      config: { ...validConfig, agentId: "" },
+      fetch: async (_url, options) => {
+        requestBody = JSON.parse(options.body);
+        return createResponse(201, { sessionId: "session_dynamic", status: "dialing" });
+      },
+    });
+    await adapter.dial({
+      callId: "voicednut_dynamic",
+      to: "+12015550123",
+      agentId: "agent_selected_in_telegram",
+      idempotencyKey: "dynamic-agent-key",
+    });
+    assert.equal(requestBody.agentId, "agent_selected_in_telegram");
+  });
+
+  it("rejects a Speko dial without a selected agent or legacy default", async () => {
+    const adapter = new SpekoVoiceAdapter({
+      config: { ...validConfig, agentId: "" },
+      fetch: async () => {
+        throw new Error("A request must not be sent without an agent ID");
+      },
+    });
+    await assert.rejects(
+      adapter.dial({
+        callId: "voicednut_missing_agent",
+        to: "+12015550123",
+        idempotencyKey: "missing-agent-key",
+      }),
+      { code: "speko_missing_agent_id" },
+    );
+  });
+
   it("passes through documented per-call settings and rejects unsupported fields", async () => {
     let requestBody;
     const adapter = new SpekoVoiceAdapter({
@@ -447,6 +482,31 @@ describe("Speko voice adapter", () => {
     });
     assert.deepEqual(await adapter.preflight(), {
       agentId: "agent_test",
+      agentSelectionRequired: false,
+      availableAgentCount: null,
+      phoneNumberConfigured: true,
+    });
+  });
+
+  it("allows preflight without a static agent ID when the workspace has agents", async () => {
+    const adapter = new SpekoVoiceAdapter({
+      config: { ...validConfig, agentId: "" },
+      clientFactory: async () => ({
+        agents: {
+          list: async () => [{ id: "agent_dynamic" }, { id: "agent_backup" }],
+        },
+        phoneNumbers: {
+          list: async () => [{ e164: validConfig.phoneNumber }],
+        },
+      }),
+      fetch: async () => {
+        throw new Error("preflight must not make a raw HTTP request");
+      },
+    });
+    assert.deepEqual(await adapter.preflight(), {
+      agentId: null,
+      agentSelectionRequired: true,
+      availableAgentCount: 2,
       phoneNumberConfigured: true,
     });
   });

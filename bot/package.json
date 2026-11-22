@@ -7,7 +7,7 @@
     "start": "node .",
     "dev": "nodemon .",
     "setup": "node setup-env.js",
-    "test": "node tests/operationalStatus.test.js"
+    "test": "node tests/config.test.js"
   },
   "dependencies": {
     "@grammyjs/conversations": "^1.2.0",

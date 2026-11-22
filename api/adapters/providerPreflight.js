@@ -1466,7 +1466,7 @@ async function runProviderPreflight(options = {}) {
         }
         try {
           const adapter = new SpekoVoiceAdapter({ config: spekoConfig });
-          adapter.validateConfig();
+          adapter.validateConfig({ requireAgent: false });
           if (options.allowNetwork === false) {
             return {
               status: CHECK_STATUS.WARN,

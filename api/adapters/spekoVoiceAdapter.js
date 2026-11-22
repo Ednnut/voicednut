@@ -206,7 +206,7 @@ class SpekoVoiceAdapter {
     }
     if (
       options.requireAgent !== false &&
-      !String(this.config.agentId || "").trim()
+      !String(options.agentId || this.config.agentId || "").trim()
     ) {
       throw new SpekoAdapterError("Speko agent ID is not configured", {
         code: "speko_missing_agent_id",
@@ -264,7 +264,8 @@ class SpekoVoiceAdapter {
   }
 
   async dial(options = {}) {
-    this.validateConfig();
+    const agentId = String(options.agentId || this.config.agentId || "").trim();
+    this.validateConfig({ agentId });
     if (!isE164(options.to)) {
       throw new SpekoAdapterError("Destination must be a valid E.164 number", {
         code: "speko_invalid_destination",
@@ -281,11 +282,14 @@ class SpekoVoiceAdapter {
 
     const body = {
       to: String(options.to).trim(),
-      agentId: this.config.agentId,
+      agentId,
       metadata: { voicednut_call_id: String(options.callId || "") },
     };
-    if (this.config.agentVersion !== undefined && this.config.agentVersion !== null) {
-      body.agentVersion = normalizeOptionalNumber(this.config.agentVersion, {
+    const usesConfiguredAgent = agentId === String(this.config.agentId || "").trim();
+    const agentVersion = options.agentVersion ??
+      (usesConfiguredAgent ? this.config.agentVersion : null);
+    if (agentVersion !== undefined && agentVersion !== null) {
+      body.agentVersion = normalizeOptionalNumber(agentVersion, {
         label: "agent version",
         code: "speko_invalid_agent_version",
         integer: true,
@@ -440,7 +444,7 @@ class SpekoVoiceAdapter {
         uncertain: true,
       });
     }
-    this.validateConfig();
+    this.validateConfig({ requireAgent: false });
     const controller = new AbortController();
     const timeoutMs = getRequestTimeoutMs(this.config.requestTimeoutMs);
     const timeout = setTimeout(() => controller.abort(), timeoutMs);
@@ -564,14 +568,31 @@ class SpekoVoiceAdapter {
     return this.dial(options);
   }
 
-  async preflight() {
-    this.validateConfig();
+  async preflight(options = {}) {
+    const agentId = String(options.agentId || this.config.agentId || "").trim();
+    this.validateConfig({ requireAgent: Boolean(agentId), agentId });
     const client = await this.getClient();
-    const agent = await client.agents.get(this.config.agentId);
-    if (!agent || String(agent.id || "") !== String(this.config.agentId)) {
-      throw new SpekoAdapterError("Configured Speko agent was not found", {
-        code: "speko_agent_not_found",
-      });
+    let availableAgentCount = null;
+    if (agentId) {
+      const agent = await client.agents.get(agentId);
+      if (!agent || String(agent.id || "") !== agentId) {
+        throw new SpekoAdapterError("Selected Speko agent was not found", {
+          code: "speko_agent_not_found",
+        });
+      }
+    } else {
+      const listed = await client.agents.list();
+      const agents = Array.isArray(listed)
+        ? listed
+        : Array.isArray(listed?.agents)
+          ? listed.agents
+          : [];
+      availableAgentCount = agents.length;
+      if (availableAgentCount < 1) {
+        throw new SpekoAdapterError("No Speko agents are available in this workspace", {
+          code: "speko_no_agents_available",
+        });
+      }
     }
     const configuredNumber = this.config.phoneNumber;
     if (configuredNumber) {
@@ -587,7 +608,9 @@ class SpekoVoiceAdapter {
       }
     }
     return {
-      agentId: this.config.agentId,
+      agentId: agentId || null,
+      agentSelectionRequired: !agentId,
+      availableAgentCount,
       phoneNumberConfigured: Boolean(configuredNumber),
     };
   }

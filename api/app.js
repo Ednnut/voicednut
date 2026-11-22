@@ -6567,11 +6567,13 @@ function normalizeHostValue(value) {
 }
 
 function resolveHost(req) {
+  // SERVER is the canonical public callback host. Do not let an arbitrary
+  // inbound Host/X-Forwarded-Host header redirect provider callbacks.
+  const configuredHost = normalizeHostValue(config.server?.hostname);
+  if (configuredHost) return configuredHost;
   const forwardedHost = normalizeHostValue(req?.headers?.["x-forwarded-host"]);
   if (forwardedHost) return forwardedHost;
-  const hostHeader = normalizeHostValue(req?.headers?.host);
-  if (hostHeader) return hostHeader;
-  return normalizeHostValue(config.server?.hostname);
+  return normalizeHostValue(req?.headers?.host);
 }
 
 function appendQueryParamsToUrl(rawUrl, params = {}) {
@@ -26902,6 +26904,8 @@ async function placeOutboundCall(payload, hostOverride = null) {
         const response = await getSpekoVoiceAdapter().createOrRecoverCall({
           callId,
           to: number,
+          agentId: payloadObject.speko_agent_id || payloadObject.agent_id || undefined,
+          agentVersion: payloadObject.speko_agent_version,
           systemPrompt: effectivePrompt,
           firstMessage: effectiveFirstMessage,
           spekoOptions: payloadObject.speko_options,
@@ -26912,10 +26916,12 @@ async function placeOutboundCall(payload, hostOverride = null) {
         callStatus = toCanonicalCallStatus("speko", response.status) || "initiated";
         providerMetadata = {
           speko_session_id: response.sessionId,
+          speko_agent_id: payloadObject.speko_agent_id || payloadObject.agent_id || config.speko.agentId || null,
           speko_call_control_id: response.raw?.callControlId || null,
           speko_provider_status: response.status,
           idempotency_key: normalizedOutboundIdempotencyKey,
-          agent_version: response.raw?.agentVersion || config.speko.agentVersion || null,
+          agent_version: response.raw?.agentVersion || payloadObject.speko_agent_version ||
+            (!payloadObject.speko_agent_id && !payloadObject.agent_id ? config.speko.agentVersion : null) || null,
           reconciled_after_uncertain_outcome: response.recovered === true,
         };
       } else {
@@ -32296,7 +32302,7 @@ async function handleSpekoPreCall(event = {}) {
   if (spekoConfig.inboundEnabled !== true) {
     throw deny("speko_inbound_disabled", "Speko inbound calling is disabled");
   }
-  if (spekoConfig.enabled !== true || !String(spekoConfig.agentId || "").trim()) {
+  if (spekoConfig.enabled !== true) {
     throw deny("speko_inbound_not_ready", "Speko inbound configuration is incomplete");
   }
 
@@ -32318,8 +32324,12 @@ async function handleSpekoPreCall(event = {}) {
     throw deny("speko_inbound_route_missing", "No Voicednut inbound route is configured");
   }
   const eventAgentId = String(event.agent_id || event.agentId || "").trim();
-  if (eventAgentId && eventAgentId !== String(spekoConfig.agentId).trim()) {
-    throw deny("speko_inbound_agent_mismatch", "Speko inbound agent does not match configuration");
+  const routeAgentId = String(
+    route.speko_agent_id || route.agent_id || route.agentId || "",
+  ).trim();
+  const expectedAgentId = routeAgentId || String(spekoConfig.agentId || "").trim();
+  if (expectedAgentId && eventAgentId && eventAgentId !== expectedAgentId) {
+    throw deny("speko_inbound_agent_mismatch", "Speko inbound agent does not match the configured route");
   }
   if (!db) {
     const error = new Error("Speko inbound call persistence is unavailable");
@@ -32344,6 +32354,7 @@ async function handleSpekoPreCall(event = {}) {
         provider: "speko",
         direction: "inbound",
         speko_session_id: sessionId,
+        speko_agent_id: eventAgentId || expectedAgentId || null,
         speko_phone_number_id: String(event.phone_number_id || "").slice(0, 128) || null,
       },
     },
@@ -32913,6 +32924,7 @@ module.exports = {
     setMiniAppTelemetryContext,
     recordMiniAppRouteTelemetry,
     runDeepgramVoiceAgentStartupPreflight,
+    resolveHost,
   },
 };
 
