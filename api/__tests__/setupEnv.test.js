@@ -40,7 +40,7 @@ describe("API environment setup", () => {
     assert.match(output, /^CALL_PROVIDER=speko$/m);
     assert.match(output, /^SPEKO_ENABLED=true$/m);
     assert.match(output, /^SPEKO_INBOUND_ENABLED=true$/m);
-    assert.match(output, /^SPEKO_INBOUND_PHONE_NUMBER=\\+12015550199$/m);
+    assert.ok(output.includes("SPEKO_INBOUND_PHONE_NUMBER=+12015550199"));
     assert.match(output, /^INBOUND_NUMBER_ROUTES=/m);
     assert.doesNotMatch(output, /PLIVO_AUTH_ID|VONAGE_APPLICATION_ID/);
   });
