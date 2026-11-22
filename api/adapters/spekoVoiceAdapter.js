@@ -285,7 +285,9 @@ class SpekoVoiceAdapter {
       agentId,
       metadata: { voicednut_call_id: String(options.callId || "") },
     };
-    const agentVersion = options.agentVersion ?? this.config.agentVersion;
+    const usesConfiguredAgent = agentId === String(this.config.agentId || "").trim();
+    const agentVersion = options.agentVersion ??
+      (usesConfiguredAgent ? this.config.agentVersion : null);
     if (agentVersion !== undefined && agentVersion !== null) {
       body.agentVersion = normalizeOptionalNumber(agentVersion, {
         label: "agent version",
