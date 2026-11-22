@@ -36,7 +36,6 @@ const SECTIONS = [
       { key: 'SPEKO_INBOUND_PHONE_NUMBER', prompt: 'Speko inbound phone number (E.164; optional)' },
       { key: 'INBOUND_NUMBER_ROUTES', prompt: 'Inbound number routes (JSON object; optional)' },
       { key: 'SPEKO_API_KEY', prompt: 'Speko API Key' },
-      { key: 'SPEKO_AGENT_VERSION', prompt: 'Legacy default agent version (optional; used only with SPEKO_AGENT_ID)' },
       { key: 'SPEKO_WEBHOOK_SECRET', prompt: 'Speko Webhook Secret (whsec_...)' },
       { key: 'SPEKO_BASE_URL', prompt: 'Speko API URL', defaultValue: 'https://api.speko.dev' },
       { key: 'SPEKO_MONTHLY_SPEND_LIMIT_USD', prompt: 'Monthly spend limit in USD (0 disables)', defaultValue: '0' },
