@@ -4,6 +4,7 @@ process.env.ADMIN_TELEGRAM_ID = "123456";
 process.env.ADMIN_TELEGRAM_USERNAME = "voicednut_test";
 process.env.API_URL = "https://api.example.test/";
 process.env.TEMPLATES_API_URL = "https://api.example.test/";
+process.env.SCRIPTS_API_URL = "https://api.example.test/";
 process.env.BOT_TOKEN = "123456:testing-token";
 process.env.API_SECRET = "test-api-secret";
 
