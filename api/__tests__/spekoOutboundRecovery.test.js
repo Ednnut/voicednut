@@ -186,6 +186,32 @@ describe("Speko outbound call recovery", () => {
     assert.equal(createdState.provider_metadata.speko_phone_number_id, "pn_inbound_123");
   });
 
+  it("accepts a signed inbound agent identity without a global SPEKO_AGENT_ID", async () => {
+    Object.assign(config.speko, {
+      enabled: true,
+      inboundEnabled: true,
+      inboundPhoneNumber: "+12015550199",
+      agentId: "",
+    });
+    config.inbound.routes = {
+      "+12015550199": { user_chat_id: "chat-dynamic-agent" },
+    };
+    const result = await __testables.handleSpekoPreCall({
+      type: "call.pre_call",
+      call_id: "session_dynamic_inbound",
+      session_id: "session_dynamic_inbound",
+      direction: "inbound",
+      from: "+12015550123",
+      to: "+12015550199",
+      phone_number_id: "pn_inbound_dynamic",
+      agent_id: "agent_created_in_speko",
+    });
+    const call = await db.getCall(result.metadata.voicednut_call_id);
+    const state = await db.getLatestCallState(result.metadata.voicednut_call_id, "call_created");
+    assert.equal(call.direction, "inbound");
+    assert.equal(state.provider_metadata.speko_agent_id, "agent_created_in_speko");
+  });
+
   it("rejects disabled, unassigned, and mismatched-agent inbound sessions", async () => {
     Object.assign(config.speko, {
       enabled: true,
