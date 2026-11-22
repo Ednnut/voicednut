@@ -11,10 +11,10 @@
     "dev:https": "cross-env HTTPS=true vite",
     "build": "tsc --noEmit && vite build",
     "lint": "eslint src --ext ts,tsx --report-unused-disable-directives --max-warnings 0",
-    "test:softphone": "node --experimental-strip-types --test tests/spekoSoftphoneProtocol.test.mjs",
+    "test:softphone": "node tests/spekoSoftphoneProtocol.test.mjs",
     "lint:fix": "eslint src --ext ts,tsx --report-unused-disable-directives --max-warnings 0 --fix",
     "validate:contracts": "tsc -p tsconfig.contracts.json && node .tmp-contract-check/scripts/validate-miniapp-contracts.js",
-    "validate:prod": "npm run validate:contracts && npm run lint && npm run build",
+    "validate:prod": "npm run test:softphone && npm run validate:contracts && npm run lint && npm run build",
     "preview": "vite preview",
     "predeploy": "npm run build"
   },

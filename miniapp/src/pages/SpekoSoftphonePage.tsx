@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { Room, RoomEvent, Track } from 'livekit-client';
 import { useMiniAppCommandSession } from '@/hooks/useMiniAppCommandSession';
 import { Link } from '@/components/Link/Link';
-import { getDtmfCode, parseSpekoDataMessage } from '@/services/spekoSoftphoneProtocol';
+import { getDtmfCode, parseSpekoDataMessage } from '../../softphone/spekoSoftphoneProtocol.mjs';
 import './SpekoSoftphonePage.css';
 
 type JoinCredentials = { token: string; url: string };

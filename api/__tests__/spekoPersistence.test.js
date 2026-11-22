@@ -75,6 +75,7 @@ describe("Speko persistent lifecycle ordering", () => {
     assert.deepEqual(await db.recordSpekoHumanCallEvent(event), { inserted: true });
     assert.deepEqual(await db.recordSpekoHumanCallEvent(event), { inserted: false });
     await db.recordSpekoHumanCallEvent({ ...event, event_id: "human-event-old", event_type: "call.ringing", occurred_at: "2025-12-31T23:59:00.000Z" });
+    await db.recordSpekoHumanCallEvent({ ...event, event_id: "human-event-undated", event_type: "call.ringing", occurred_at: null });
     const row = await new Promise((resolve, reject) => db.db.get(
       "SELECT safe_details FROM speko_human_call_events WHERE event_id=?", [event.event_id], (err, result) => err ? reject(err) : resolve(result),
     ));
@@ -82,7 +83,22 @@ describe("Speko persistent lifecycle ordering", () => {
     const call = await db.getSpekoHumanCall({ call_id: "human-call-1" });
     assert.equal(call.status, "active");
     assert.equal(call.legs[0].status, "active");
+    assert.equal(call.latest_event_id, event.event_id);
+    assert.equal(call.latest_event_at, event.occurred_at);
+    assert.equal(call.legs[0].latest_event_at, event.occurred_at);
     assert.equal(JSON.stringify(call).includes("+15551234567"), false);
+
+    await db.saveSpekoHumanCall({ call: {
+      id: "human-call-undated-first", status: "initiating",
+      legs: [{ controlId: "undated-first-leg", kind: "browser", brokerId: "broker-1", status: "initiating" }],
+    } });
+    await db.recordSpekoHumanCallEvent({
+      event_id: "undated-first-event", call_id: "human-call-undated-first",
+      control_id: "undated-first-leg", event_type: "call.ringing",
+    });
+    const undatedFirst = await db.getSpekoHumanCall({ call_id: "human-call-undated-first" });
+    assert.equal(undatedFirst.status, "ringing");
+    assert.equal(undatedFirst.latest_event_id, "undated-first-event");
   });
 
   it("keeps an attributed, payload-free administrator control audit", async () => {

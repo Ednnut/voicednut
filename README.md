@@ -32,13 +32,13 @@ A comprehensive Telegram bot system for making AI-powered voice calls using Twil
 - Text-to-speech with Deepgram
 - Speech-to-text with real-time processing
 
-## 🔁 Provider Modes (Twilio, AWS Connect, Vonage)
+## 🔁 Provider Modes (Speko, Twilio, Plivo, Vonage)
 
-- Set the default voice backbone with `CALL_PROVIDER` in `api/.env` (`twilio`, `aws`, or `vonage`).
-- Admins can switch live traffic at any time via `/provider <name>|status` in Telegram (requires `ADMIN_API_TOKEN`).
-- Twilio mode keeps the original Media Streams flow; AWS mode routes through Connect/Kinesis per `aws-migration.md`; Vonage mode uses the Vonage Voice API and WebSocket streaming.
-- Each provider has matching SMS adapters (Twilio SMS, AWS Pinpoint, Vonage SMS) so outbound texts follow the active backbone.
-- When Twilio is selected but credentials are missing, the API now fails fast with a targeted message pointing to the relevant `.env` entries and the `npm run setup --prefix api` helper.
+- `api/.env.example` and `npm run setup --prefix api` use Speko for voice calls by default. Add your Speko API key, agent ID, and webhook secret before placing calls.
+- SMS uses its own provider setting and remains on Twilio by default; Speko currently provides voice calls, not SMS.
+- Set `CALL_PROVIDER` to `twilio`, `plivo`, or `vonage` to use another supported voice provider. Configure that provider's credentials in `api/.env`.
+- Admins can manage provider selection through the existing Telegram provider workflow (requires `ADMIN_API_TOKEN`). Provider capabilities and routing rules remain provider-specific.
+- The API setup wizard asks only for credentials used by the selected voice, SMS, and email providers. Advanced runtime, Mini App, payment, and CRM options are documented in `api/.env.advanced.example`.
 - Deepgram Voice Agent is now the default path (`USE_DEEPGRAM_VOICE_AGENT=true`) for Twilio and Vonage streams, and automatically falls back to the legacy STT+GPT+TTS pipeline when Voice Agent is unavailable, bypassed, or when keypad-required capture flows need the legacy digit path.
 - Voice Agent runtime guardrails (recommended):
   - `DEEPGRAM_VOICE_AGENT_TURN_TIMEOUT_MS=12000`

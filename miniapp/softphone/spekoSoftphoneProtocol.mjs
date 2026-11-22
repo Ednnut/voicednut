@@ -1,26 +1,20 @@
-const DTMF_CODES: Readonly<Record<string, number>> = Object.freeze({
+const DTMF_CODES = Object.freeze({
   '0': 0, '1': 1, '2': 2, '3': 3, '4': 4, '5': 5, '6': 6, '7': 7, '8': 8, '9': 9,
   '*': 10, '#': 11, A: 12, B: 13, C: 14, D: 15,
 });
 
-export type SpekoDataMessage =
-  | { type: 'incoming_call'; callId: string; controlId: string; caller?: { name?: string; phoneNumber?: string } }
-  | { type: 'call_event'; eventType: string; callId: string }
-  | { type: 'dtmf.press'; digits: string };
-
-export function parseSpekoDataMessage(topic: string, payload: Uint8Array): SpekoDataMessage | null {
+/** @param {string} topic @param {Uint8Array} payload */
+export function parseSpekoDataMessage(topic, payload) {
   if (topic !== 'speko.human_call' && topic !== 'speko.call_control') return null;
   try {
-    const message = JSON.parse(new TextDecoder().decode(payload)) as {
-      type?: string; callId?: string; controlId?: string; caller?: unknown;
-      event?: { type?: string; callId?: string }; digits?: string;
-    };
+    const message = JSON.parse(new TextDecoder().decode(payload));
     if (topic === 'speko.human_call') {
       if (message.type === 'incoming_call' && message.callId && message.controlId) {
-        const caller = message.caller as { name?: string; phoneNumber?: string } | undefined;
         return {
           type: 'incoming_call', callId: message.callId, controlId: message.controlId,
-          ...(caller && typeof caller === 'object' ? { caller } : {}),
+          ...(message.caller && typeof message.caller === 'object' && !Array.isArray(message.caller)
+            ? { caller: message.caller }
+            : {}),
         };
       }
       if (message.type === 'call_event' && message.event && typeof message.event === 'object') {
@@ -41,6 +35,7 @@ export function parseSpekoDataMessage(topic: string, payload: Uint8Array): Speko
   }
 }
 
-export function getDtmfCode(digit: string): number | undefined {
+/** @param {string} digit */
+export function getDtmfCode(digit) {
   return DTMF_CODES[digit.toUpperCase()];
 }

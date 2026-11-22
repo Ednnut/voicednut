@@ -40,6 +40,7 @@ const {
   finishActionMetric,
 } = require("./utils/actions");
 const { normalizeReply, logCommandError } = require("./utils/ui");
+const { formatSpekoMetricsMessage, formatSpekoUsageMessage } = require("./utils/spekoUsage");
 const {
   getAccessProfile,
   getCapabilityForCommand,
@@ -804,6 +805,72 @@ bot.on("callback_query:data", async (ctx) => {
       }
       await ctx.reply(detailsMessage);
       finishMetric("ok");
+      return;
+    }
+
+    if (action.startsWith("DLQ_RECONCILE:")) {
+      const dlqId = action.slice("DLQ_RECONCILE:".length);
+      if (!/^\d{1,10}$/.test(dlqId) || Number(dlqId) < 1) {
+        await ctx.reply("❌ That dead-letter item is invalid.");
+        finishMetric("invalid");
+        return;
+      }
+      try {
+        const headers = { "x-admin-token": config.admin?.apiToken };
+        const response = await httpClient.post(
+          ctx,
+          `${config.apiUrl}/admin/call-jobs/dlq/${Number(dlqId)}/reconcile/speko`,
+          {},
+          { timeout: 20000, headers },
+        );
+        const result = response?.data || {};
+        const message = result.outcome === "provider_operation_found"
+          ? `🔎 Speko session found for DLQ #${Number(dlqId)}.\nSession: ${String(result.session_id || "unknown")}\nProvider status: ${String(result.provider_status || "unknown")}\nThe job remains held for operator review. Do not replay it.`
+          : `🔎 Speko lookup did not find a matching session for DLQ #${Number(dlqId)}. The outcome remains uncertain. Do not retry or replay the call.`;
+        await ctx.reply(message);
+        finishMetric("ok", { route: "speko_dlq_reconcile", outcome: result.outcome || "unknown" });
+      } catch (error) {
+        await ctx.reply(httpClient.getUserMessage(error, "Speko reconciliation is unavailable; the call outcome remains uncertain."));
+        finishMetric("error", { route: "speko_dlq_reconcile" });
+      }
+      return;
+    }
+
+    if (action === "SPEKO_USAGE") {
+      try {
+        const response = await httpClient.get(
+          ctx,
+          `${config.apiUrl}/admin/speko/usage`,
+          {
+            timeout: 15000,
+            headers: { "x-admin-token": config.admin?.apiToken },
+          },
+        );
+        await ctx.reply(formatSpekoUsageMessage(response?.data || {}));
+        finishMetric("ok", { route: "speko_usage" });
+      } catch (error) {
+        await ctx.reply(httpClient.getUserMessage(error, "Speko usage is unavailable right now."));
+        finishMetric("error", { route: "speko_usage" });
+      }
+      return;
+    }
+
+    if (action === "SPEKO_METRICS") {
+      try {
+        const response = await httpClient.get(
+          ctx,
+          `${config.apiUrl}/admin/speko/metrics?hours=24`,
+          {
+            timeout: 10000,
+            headers: { "x-admin-token": config.admin?.apiToken },
+          },
+        );
+        await ctx.reply(formatSpekoMetricsMessage(response?.data || {}));
+        finishMetric("ok", { route: "speko_metrics" });
+      } catch (error) {
+        await ctx.reply(httpClient.getUserMessage(error, "Speko activity is unavailable right now."));
+        finishMetric("error", { route: "speko_metrics" });
+      }
       return;
     }
 

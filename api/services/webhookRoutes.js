@@ -3105,7 +3105,25 @@ function createSpekoWebhookHandler(ctx = {}) {
             : {};
       const callId = String(metadata.voicednut_call_id || "").trim();
       if (!callId || !sessionId) {
+        await Promise.resolve(
+          ctx.recordSpekoWebhookFailure?.(eventType, "speko_webhook_correlation_missing"),
+        ).catch(() => {});
         return res.status(200).json({ status: "ok", ignored: true });
+      }
+
+      const lifecycleEvent = eventType === "call.status" || [
+        "call.report",
+        "call.analysis",
+        "call.recording",
+      ].includes(eventType) || eventType.startsWith("call.transfer.");
+      const db = getDb(ctx);
+      if (lifecycleEvent && typeof db?.getCall === "function") {
+        const callRecord = await db.getCall(callId);
+        if (!callRecord) {
+          const notReady = new Error("Speko call record is not ready for webhook processing");
+          notReady.code = "speko_call_record_not_ready";
+          throw notReady;
+        }
       }
 
       const sequence = Number(data.sequence);

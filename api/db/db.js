@@ -1,4 +1,5 @@
 const sqlite3 = require('sqlite3').verbose();
+const { randomUUID } = require('crypto');
 const path = require('path');
 const {
     buildObjectiveTagsForFlow,
@@ -188,6 +189,7 @@ class EnhancedDatabase {
                 console.log('Connected to enhanced SQLite database');
                 this.applyConnectionPragmas()
                     .then(() => this.createEnhancedTables())
+                    .then(() => this.ensureCallJobDlqResolvedStatus())
                     .then(() => this.ensureSpekoAuditColumns())
                     .then(() => this.initializeSMSTables())
                     .then(() => this.initializeEmailTables())
@@ -451,12 +453,13 @@ class EnhancedDatabase {
                 attempts INTEGER DEFAULT 0,
                 last_error TEXT,
                 dead_letter_reason TEXT,
-                status TEXT DEFAULT 'open' CHECK(status IN ('open', 'replayed')),
+                status TEXT DEFAULT 'open' CHECK(status IN ('open', 'replayed', 'resolved')),
                 replay_count INTEGER DEFAULT 0,
                 last_replay_job_id INTEGER,
                 replayed_at DATETIME,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                resolved_at DATETIME
             )`,
 
             // Operational review cases for non-transfer escalations
@@ -998,6 +1001,51 @@ class EnhancedDatabase {
             'ALTER TABLE speko_human_call_control_audit ADD COLUMN scope_id TEXT',
             (err) => err ? reject(err) : resolve(),
         ));
+    }
+
+    async ensureCallJobDlqResolvedStatus() {
+        const row = await new Promise((resolve, reject) => this.db.get(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'call_job_dlq'",
+            (err, result) => err ? reject(err) : resolve(result || null),
+        ));
+        if (!row?.sql || /'resolved'/.test(row.sql)) return;
+        const run = (sql) => new Promise((resolve, reject) => this.db.run(sql, (err) => err ? reject(err) : resolve()));
+        let started = false;
+        try {
+            await run('BEGIN IMMEDIATE');
+            started = true;
+            await run('ALTER TABLE call_job_dlq RENAME TO call_job_dlq_legacy');
+            await run(`CREATE TABLE call_job_dlq (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id INTEGER NOT NULL UNIQUE,
+                job_type TEXT NOT NULL,
+                payload TEXT,
+                attempts INTEGER DEFAULT 0,
+                last_error TEXT,
+                dead_letter_reason TEXT,
+                status TEXT DEFAULT 'open' CHECK(status IN ('open', 'replayed', 'resolved')),
+                replay_count INTEGER DEFAULT 0,
+                last_replay_job_id INTEGER,
+                replayed_at DATETIME,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                resolved_at DATETIME
+            )`);
+            await run(`INSERT INTO call_job_dlq (
+                id, job_id, job_type, payload, attempts, last_error, dead_letter_reason,
+                status, replay_count, last_replay_job_id, replayed_at, created_at, updated_at
+            ) SELECT id, job_id, job_type, payload, attempts, last_error, dead_letter_reason,
+                     status, replay_count, last_replay_job_id, replayed_at, created_at, updated_at
+              FROM call_job_dlq_legacy`);
+            await run('DROP TABLE call_job_dlq_legacy');
+            await run('CREATE INDEX IF NOT EXISTS idx_call_job_dlq_status ON call_job_dlq(status)');
+            await run('CREATE INDEX IF NOT EXISTS idx_call_job_dlq_created_at ON call_job_dlq(created_at)');
+            await run('COMMIT');
+            started = false;
+        } catch (error) {
+            if (started) await run('ROLLBACK').catch(() => {});
+            throw error;
+        }
     }
 
     async ensureCallColumns(columns = []) {
@@ -3644,13 +3692,13 @@ class EnhancedDatabase {
             if (status) {
                 await new Promise((resolve, reject) => this.db.run(
                     `UPDATE speko_human_calls SET status=?,latest_event_at=?,latest_event_id=?,updated_at=CURRENT_TIMESTAMP
-                     WHERE call_id=? AND (latest_event_at IS NULL OR ? IS NULL OR latest_event_at<=?)`,
+                     WHERE call_id=? AND (latest_event_at IS NULL OR (? IS NOT NULL AND latest_event_at<=?))`,
                     [status, occurredAt, eventId, callId, occurredAt, occurredAt], (err) => err ? reject(err) : resolve(),
                 ));
                 if (payload.control_id || payload.controlId) {
                     await new Promise((resolve, reject) => this.db.run(
                         `UPDATE speko_human_call_legs SET status=?,latest_event_at=?,updated_at=CURRENT_TIMESTAMP
-                         WHERE control_id=? AND (latest_event_at IS NULL OR ? IS NULL OR latest_event_at<=?)`,
+                         WHERE control_id=? AND (latest_event_at IS NULL OR (? IS NOT NULL AND latest_event_at<=?))`,
                         [status, occurredAt, payload.control_id || payload.controlId, occurredAt, occurredAt],
                         (err) => err ? reject(err) : resolve(),
                     ));
@@ -4924,6 +4972,18 @@ class EnhancedDatabase {
         });
     }
 
+    async getCallJobDlqEntryByJobId(job_id) {
+        const id = Number(job_id);
+        if (!Number.isInteger(id) || id < 1) return null;
+        return new Promise((resolve, reject) => {
+            this.db.get(
+                'SELECT * FROM call_job_dlq WHERE job_id = ? LIMIT 1',
+                [id],
+                (err, row) => err ? reject(err) : resolve(row || null),
+            );
+        });
+    }
+
     async listCallJobs({ job_type = null, status = null, limit = 20 } = {}) {
         const clauses = [];
         const params = [];
@@ -4954,6 +5014,31 @@ class EnhancedDatabase {
         });
     }
 
+    async getCallJobStatusSummary() {
+        const [statusRows, deadLetterCount] = await Promise.all([
+            new Promise((resolve, reject) => {
+                this.db.all(
+                    'SELECT status, COUNT(*) AS count FROM call_jobs GROUP BY status',
+                    (err, rows) => err ? reject(err) : resolve(rows || []),
+                );
+            }),
+            this.countOpenCallJobDlq(),
+        ]);
+        const summary = {
+            pending: 0,
+            running: 0,
+            completed: 0,
+            failed: 0,
+            open_dead_letters: Number(deadLetterCount) || 0,
+        };
+        for (const row of statusRows) {
+            if (Object.prototype.hasOwnProperty.call(summary, row.status)) {
+                summary[row.status] = Number(row.count) || 0;
+            }
+        }
+        return summary;
+    }
+
     async claimDueCallJobs(limit = 10) {
         const now = new Date().toISOString();
         const rows = await new Promise((resolve, reject) => {
@@ -4971,25 +5056,127 @@ class EnhancedDatabase {
 
         const claimed = [];
         for (const row of rows) {
+            const lockToken = `${now}#${randomUUID()}`;
             const updated = await new Promise((resolve, reject) => {
                 const sql = `
                     UPDATE call_jobs
                     SET status = 'running', attempts = attempts + 1, locked_at = ?, updated_at = ?
                     WHERE id = ? AND status = 'pending'
                 `;
-                this.db.run(sql, [now, now, row.id], function(err) {
+                this.db.run(sql, [lockToken, now, row.id], function(err) {
                     if (err) reject(err);
                     else resolve(this.changes);
                 });
             });
             if (updated) {
-                claimed.push({ ...row, attempts: (row.attempts || 0) + 1 });
+                claimed.push({
+                    ...row,
+                    attempts: (row.attempts || 0) + 1,
+                    locked_at: lockToken,
+                });
             }
         }
         return claimed;
     }
 
-    async rescheduleCallJob(job_id, run_at, error = null) {
+    async quarantineStaleRunningCallJobs(staleBefore) {
+        const cutoff = String(staleBefore || '').trim();
+        if (!cutoff || Number.isNaN(Date.parse(cutoff))) {
+            throw new Error('A valid stale call-job cutoff is required');
+        }
+        const marker = 'worker_interrupted_requires_review';
+        const reviewMessage = 'Worker stopped before recording the operation outcome; inspect before taking further action.';
+        const usesDedicatedConnection = this.dbPath !== ':memory:';
+        const connection = usesDedicatedConnection
+            ? await new Promise((resolve, reject) => {
+                const handle = new sqlite3.Database(this.dbPath, (err) => {
+                    if (err) reject(err);
+                    else resolve(handle);
+                });
+            })
+            : this.db;
+        const run = (sql, params = []) => new Promise((resolve, reject) => {
+            connection.run(sql, params, function(err) {
+                if (err) reject(err);
+                else resolve(this.changes || 0);
+            });
+        });
+        const all = (sql, params = []) => new Promise((resolve, reject) => {
+            connection.all(sql, params, (err, rows) => err ? reject(err) : resolve(rows || []));
+        });
+        let transactionStarted = false;
+        try {
+            await run('PRAGMA busy_timeout = 5000');
+            await run('BEGIN IMMEDIATE');
+            transactionStarted = true;
+            const staleJobs = await all(
+                `SELECT * FROM call_jobs
+                 WHERE status = 'running'
+                   AND locked_at IS NOT NULL
+                   AND locked_at <= ?
+                 ORDER BY locked_at ASC LIMIT 100`,
+                [cutoff],
+            );
+            let quarantined = 0;
+            for (const job of staleJobs) {
+                const updatedAt = new Date().toISOString();
+                const updated = await run(
+                    `UPDATE call_jobs
+                     SET status = 'failed', last_error = ?, updated_at = ?,
+                         completed_at = COALESCE(completed_at, ?), locked_at = NULL
+                     WHERE id = ? AND status = 'running' AND locked_at = ? AND locked_at <= ?`,
+                    [marker, updatedAt, updatedAt, job.id, job.locked_at, cutoff],
+                );
+                if (!updated) continue;
+                await run(
+                    `INSERT INTO call_job_dlq (
+                        job_id, job_type, payload, attempts, last_error,
+                        dead_letter_reason, status, updated_at
+                     ) VALUES (?, ?, ?, ?, ?, ?, 'open', ?)
+                     ON CONFLICT(job_id) DO UPDATE SET
+                        job_type = excluded.job_type,
+                        payload = excluded.payload,
+                        attempts = excluded.attempts,
+                        last_error = CASE
+                            WHEN call_job_dlq.dead_letter_reason IN (
+                                'ambiguous_outbound_outcome', 'worker_interrupted_requires_review'
+                            ) THEN call_job_dlq.last_error
+                            ELSE excluded.last_error
+                        END,
+                        dead_letter_reason = CASE
+                            WHEN call_job_dlq.dead_letter_reason IN (
+                                'ambiguous_outbound_outcome', 'worker_interrupted_requires_review'
+                            ) THEN call_job_dlq.dead_letter_reason
+                            ELSE excluded.dead_letter_reason
+                        END,
+                        status = 'open', updated_at = excluded.updated_at`,
+                    [
+                        job.id,
+                        String(job.job_type || 'unknown'),
+                        typeof job.payload === 'string' ? job.payload : JSON.stringify(job.payload || {}),
+                        Math.max(0, Number(job.attempts) || 0),
+                        reviewMessage,
+                        marker,
+                        updatedAt,
+                    ],
+                );
+                quarantined += 1;
+            }
+            await run('COMMIT');
+            transactionStarted = false;
+            return quarantined;
+        } catch (error) {
+            if (transactionStarted) await run('ROLLBACK').catch(() => {});
+            throw error;
+        } finally {
+            if (usesDedicatedConnection) {
+                await new Promise((resolve) => connection.close(() => resolve()));
+            }
+        }
+    }
+
+    async rescheduleCallJob(job_id, run_at, error = null, expectedLockAt = null) {
+        if (!expectedLockAt) return 0;
         const updatedAt = new Date().toISOString();
         return new Promise((resolve, reject) => {
             const sql = `
@@ -4999,9 +5186,9 @@ class EnhancedDatabase {
                     last_error = ?,
                     updated_at = ?,
                     locked_at = NULL
-                WHERE id = ?
+                WHERE id = ? AND status = 'running' AND locked_at = ?
             `;
-            this.db.run(sql, [run_at, error, updatedAt, job_id], function(err) {
+            this.db.run(sql, [run_at, error, updatedAt, job_id, expectedLockAt], function(err) {
                 if (err) {
                     reject(err);
                 } else {
@@ -5011,7 +5198,8 @@ class EnhancedDatabase {
         });
     }
 
-    async completeCallJob(job_id, status = 'completed', error = null) {
+    async completeCallJob(job_id, status = 'completed', error = null, expectedLockAt = null) {
+        if (!expectedLockAt) return 0;
         const updatedAt = new Date().toISOString();
         const completedAt = (status === 'completed' || status === 'failed') ? updatedAt : null;
         return new Promise((resolve, reject) => {
@@ -5022,15 +5210,127 @@ class EnhancedDatabase {
                     updated_at = ?,
                     completed_at = COALESCE(?, completed_at),
                     locked_at = NULL
-                WHERE id = ?
+                WHERE id = ? AND status = 'running' AND locked_at = ?
             `;
-            this.db.run(sql, [status, error, updatedAt, completedAt, job_id], function(err) {
+            this.db.run(sql, [status, error, updatedAt, completedAt, job_id, expectedLockAt], function(err) {
                 if (err) {
                     reject(err);
                 } else {
                     resolve(this.changes);
                 }
             });
+        });
+    }
+
+    async failCallJobToDlq(job = {}, reason = 'non_retryable_error', error = null, expectedLockAt = null) {
+        const jobId = Number(job?.id);
+        if (!Number.isInteger(jobId) || jobId < 1 || !expectedLockAt) return false;
+        const now = new Date().toISOString();
+        const payload = typeof job?.payload === 'string'
+            ? job.payload
+            : JSON.stringify(job?.payload || {});
+        const attempts = Math.max(0, Number(job?.attempts) || 0);
+        const usesDedicatedConnection = this.dbPath !== ':memory:';
+        const connection = usesDedicatedConnection
+            ? await new Promise((resolve, reject) => {
+                const handle = new sqlite3.Database(this.dbPath, (err) => {
+                    if (err) reject(err);
+                    else resolve(handle);
+                });
+            })
+            : this.db;
+        const run = (sql, params = []) => new Promise((resolve, reject) => {
+            connection.run(sql, params, function(err) {
+                if (err) reject(err);
+                else resolve(this.changes || 0);
+            });
+        });
+        let transactionStarted = false;
+        try {
+            await run('PRAGMA busy_timeout = 5000');
+            await run('BEGIN IMMEDIATE');
+            transactionStarted = true;
+            const updated = await run(
+                `UPDATE call_jobs
+                 SET status = 'failed', last_error = ?, updated_at = ?,
+                     completed_at = ?, locked_at = NULL
+                 WHERE id = ? AND status = 'running' AND locked_at = ?`,
+                [error || job?.last_error || null, now, now, jobId, expectedLockAt],
+            );
+            if (!updated) {
+                await run('ROLLBACK');
+                transactionStarted = false;
+                return false;
+            }
+            await run(
+                `INSERT INTO call_job_dlq (
+                    job_id, job_type, payload, attempts, last_error,
+                    dead_letter_reason, status, updated_at
+                 ) VALUES (?, ?, ?, ?, ?, ?, 'open', ?)
+                 ON CONFLICT(job_id) DO UPDATE SET
+                    job_type = excluded.job_type,
+                    payload = excluded.payload,
+                    attempts = excluded.attempts,
+                    last_error = CASE
+                        WHEN call_job_dlq.dead_letter_reason IN (
+                            'ambiguous_outbound_outcome', 'worker_interrupted_requires_review'
+                        ) THEN call_job_dlq.last_error
+                        ELSE excluded.last_error
+                    END,
+                    dead_letter_reason = CASE
+                        WHEN call_job_dlq.dead_letter_reason IN (
+                            'ambiguous_outbound_outcome', 'worker_interrupted_requires_review'
+                        ) THEN call_job_dlq.dead_letter_reason
+                        ELSE excluded.dead_letter_reason
+                    END,
+                    status = 'open', updated_at = excluded.updated_at`,
+                [
+                    jobId,
+                    String(job?.job_type || 'unknown'),
+                    payload,
+                    attempts,
+                    error || job?.last_error || null,
+                    reason || null,
+                    now,
+                ],
+            );
+            await run('COMMIT');
+            transactionStarted = false;
+            return true;
+        } catch (failure) {
+            if (transactionStarted) await run('ROLLBACK').catch(() => {});
+            throw failure;
+        } finally {
+            if (usesDedicatedConnection) {
+                await new Promise((resolve) => connection.close(() => resolve()));
+            }
+        }
+    }
+
+    async updatePendingCallbackJob(job_id, status, run_at = null, error = null) {
+        const id = Number(job_id);
+        const normalizedStatus = String(status || '').trim().toLowerCase();
+        if (!Number.isInteger(id) || id < 1 || !['pending', 'completed', 'failed'].includes(normalizedStatus)) {
+            return 0;
+        }
+        if (normalizedStatus === 'pending' && !run_at) return 0;
+        const updatedAt = new Date().toISOString();
+        const completedAt = normalizedStatus === 'pending' ? null : updatedAt;
+        return new Promise((resolve, reject) => {
+            this.db.run(
+                `UPDATE call_jobs
+                 SET status = ?, run_at = COALESCE(?, run_at), last_error = ?,
+                     updated_at = ?, completed_at = ?, locked_at = NULL
+                 WHERE id = ? AND job_type = 'callback_call' AND status = 'pending'
+                   AND NOT EXISTS (
+                     SELECT 1 FROM call_job_dlq WHERE call_job_dlq.job_id = call_jobs.id
+                   )`,
+                [normalizedStatus, run_at, error, updatedAt, completedAt, id],
+                function(err) {
+                    if (err) reject(err);
+                    else resolve(this.changes || 0);
+                },
+            );
         });
     }
 
@@ -5193,8 +5493,18 @@ class EnhancedDatabase {
                 job_type = excluded.job_type,
                 payload = excluded.payload,
                 attempts = excluded.attempts,
-                last_error = excluded.last_error,
-                dead_letter_reason = excluded.dead_letter_reason,
+                last_error = CASE
+                    WHEN call_job_dlq.dead_letter_reason IN (
+                        'ambiguous_outbound_outcome', 'worker_interrupted_requires_review'
+                    ) THEN call_job_dlq.last_error
+                    ELSE excluded.last_error
+                END,
+                dead_letter_reason = CASE
+                    WHEN call_job_dlq.dead_letter_reason IN (
+                        'ambiguous_outbound_outcome', 'worker_interrupted_requires_review'
+                    ) THEN call_job_dlq.dead_letter_reason
+                    ELSE excluded.dead_letter_reason
+                END,
                 status = 'open',
                 updated_at = excluded.updated_at
         `;
@@ -5245,6 +5555,32 @@ class EnhancedDatabase {
         });
     }
 
+    async listCallJobDlqSummaries({ status = null, limit = 20, offset = 0 } = {}) {
+        const params = [];
+        const clauses = [];
+        if (status && String(status).toLowerCase() !== 'all') {
+            clauses.push('status = ?');
+            params.push(String(status).toLowerCase());
+        }
+        const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+        const sql = `
+            SELECT id, job_id, job_type, attempts, dead_letter_reason, status,
+                   created_at, updated_at
+            FROM call_job_dlq
+            ${where}
+            ORDER BY created_at DESC
+            LIMIT ? OFFSET ?
+        `;
+        params.push(Math.min(100, Math.max(1, Number(limit) || 20)));
+        params.push(Math.max(0, Number(offset) || 0));
+        return new Promise((resolve, reject) => {
+            this.db.all(sql, params, (err, rows) => {
+                if (err) reject(err);
+                else resolve(rows || []);
+            });
+        });
+    }
+
     async getCallJobDlqEntry(dlqId) {
         return new Promise((resolve, reject) => {
             const sql = 'SELECT * FROM call_job_dlq WHERE id = ?';
@@ -5256,6 +5592,66 @@ class EnhancedDatabase {
                 }
             });
         });
+    }
+
+    async resolveSpekoCallDlqEntry(dlqId, resolution = {}) {
+        const id = Number(dlqId);
+        const sessionId = String(resolution.sessionId || '').trim().slice(0, 128);
+        const reason = String(resolution.reason || '').trim().slice(0, 500);
+        const actor = resolution.actor == null ? null : String(resolution.actor).slice(0, 128);
+        if (!Number.isInteger(id) || id < 1 || !sessionId || reason.length < 10) {
+            throw new Error('A DLQ id, provider session id, and resolution reason are required');
+        }
+        const run = (sql, params = []) => new Promise((resolve, reject) => this.db.run(sql, params, function(err) {
+            if (err) reject(err);
+            else resolve({ changes: this.changes || 0 });
+        }));
+        const get = (sql, params = []) => new Promise((resolve, reject) => this.db.get(sql, params, (err, row) => err ? reject(err) : resolve(row || null)));
+        let started = false;
+        try {
+            await run('BEGIN IMMEDIATE');
+            started = true;
+            const entry = await get('SELECT id, job_id, job_type, status FROM call_job_dlq WHERE id = ?', [id]);
+            if (!entry) {
+                await run('ROLLBACK');
+                started = false;
+                return { status: 'not_found' };
+            }
+            if (entry.status !== 'open') {
+                await run('ROLLBACK');
+                started = false;
+                return { status: 'not_open' };
+            }
+            if (!['outbound_call', 'callback_call'].includes(String(entry.job_type || ''))) {
+                await run('ROLLBACK');
+                started = false;
+                return { status: 'unsupported_job' };
+            }
+            const now = new Date().toISOString();
+            const updated = await run(
+                `UPDATE call_job_dlq SET status = 'resolved', resolved_at = ?, updated_at = ?
+                 WHERE id = ? AND status = 'open'`,
+                [now, now, id],
+            );
+            if (!updated.changes) throw new Error('DLQ entry changed during resolution');
+            await run(
+                `INSERT INTO service_health_logs (service_name, status, details) VALUES (?, ?, ?)`,
+                ['call_jobs', 'dlq_speko_resolved', JSON.stringify({
+                    dlq_id: id,
+                    job_id: Number(entry.job_id) || null,
+                    session_id: sessionId,
+                    reason,
+                    actor,
+                    at: now,
+                })],
+            );
+            await run('COMMIT');
+            started = false;
+            return { status: 'resolved', dlqId: id, sessionId };
+        } catch (error) {
+            if (started) await run('ROLLBACK').catch(() => {});
+            throw error;
+        }
     }
 
     async countOpenCallJobDlq() {
@@ -5291,6 +5687,103 @@ class EnhancedDatabase {
                 }
             });
         });
+    }
+
+    async replayCallJobDlqEntry(dlqId, { runAt, maxReplays = 2 } = {}) {
+        const id = Number(dlqId);
+        const limit = Math.max(1, Number(maxReplays) || 2);
+        const replayAt = runAt || new Date().toISOString();
+        const run = (sql, params = []) => new Promise((resolve, reject) => {
+            this.db.run(sql, params, function(err) {
+                if (err) reject(err);
+                else resolve({ changes: this.changes || 0, lastID: this.lastID || 0 });
+            });
+        });
+        const get = (sql, params = []) => new Promise((resolve, reject) => {
+            this.db.get(sql, params, (err, row) => err ? reject(err) : resolve(row || null));
+        });
+
+        let transactionStarted = false;
+        try {
+            await run('BEGIN IMMEDIATE');
+            transactionStarted = true;
+            const entry = await get('SELECT * FROM call_job_dlq WHERE id = ?', [id]);
+            if (!entry) {
+                await run('ROLLBACK');
+                transactionStarted = false;
+                return { status: 'not_found' };
+            }
+            if (entry.status !== 'open') {
+                await run('ROLLBACK');
+                transactionStarted = false;
+                return { status: 'already_replayed' };
+            }
+            const reviewOnlyReason = [
+                'ambiguous_outbound_outcome',
+                'worker_interrupted_requires_review',
+            ].includes(entry.dead_letter_reason);
+            const sideEffectingCallJob = ['outbound_call', 'callback_call'].includes(
+                String(entry.job_type || '').toLowerCase(),
+            );
+            if (reviewOnlyReason || sideEffectingCallJob) {
+                await run('ROLLBACK');
+                transactionStarted = false;
+                return {
+                    status: 'requires_review',
+                    deadLetterReason: reviewOnlyReason
+                        ? entry.dead_letter_reason
+                        : 'side_effecting_call_requires_review',
+                };
+            }
+            if (Number(entry.replay_count) >= limit) {
+                await run('ROLLBACK');
+                transactionStarted = false;
+                return {
+                    status: 'replay_limit_reached',
+                    replayCount: Number(entry.replay_count) || 0,
+                };
+            }
+
+            let payload;
+            try {
+                payload = entry.payload ? JSON.parse(entry.payload) : {};
+            } catch {
+                await run('ROLLBACK');
+                transactionStarted = false;
+                return { status: 'invalid_payload' };
+            }
+            const created = await run(
+                `INSERT INTO call_jobs (job_type, payload, status, run_at, attempts, created_at, updated_at)
+                 VALUES (?, ?, 'pending', ?, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+                [String(entry.job_type || 'unknown'), JSON.stringify(payload), replayAt],
+            );
+            const replayJobId = created.lastID;
+            const updated = await run(
+                `UPDATE call_job_dlq
+                 SET replay_count = replay_count + 1,
+                     status = 'replayed',
+                     last_replay_job_id = ?,
+                     replayed_at = ?,
+                     updated_at = ?
+                 WHERE id = ? AND status = 'open' AND replay_count < ?`,
+                [replayJobId, replayAt, replayAt, id, limit],
+            );
+            if (!updated.changes) {
+                throw new Error('DLQ entry changed during replay transaction');
+            }
+            await run('COMMIT');
+            transactionStarted = false;
+            return {
+                status: 'replayed',
+                dlqId: id,
+                originalJobId: entry.job_id,
+                replayJobId,
+                replayCount: (Number(entry.replay_count) || 0) + 1,
+            };
+        } catch (error) {
+            if (transactionStarted) await run('ROLLBACK').catch(() => {});
+            throw error;
+        }
     }
 
     // FIXED: User session tracking - Using INSERT OR REPLACE instead of ON CONFLICT

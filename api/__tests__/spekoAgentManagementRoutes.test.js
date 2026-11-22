@@ -46,6 +46,109 @@ describe("Speko agent management routes", () => {
     assert.equal(response.status, 403);
   });
 
+  it("prevents caching authenticated Speko administration responses", async () => {
+    const response = await request(app)
+      .get("/admin/speko/agents/agent_1/draft")
+      .set("x-admin-token", adminToken);
+    assert.equal(response.status, 200);
+    assert.equal(response.headers["cache-control"], "no-store");
+  });
+
+  it("authenticates and delegates Speko draft and version operations", async () => {
+    const calls = [];
+    adapter.updateAgentDraft = async (agentId, body) => {
+      calls.push(["update", agentId, body]);
+      return { has_draft: true, draft_version_number: 5, changed_fields: Object.keys(body) };
+    };
+    adapter.discardAgentDraft = async (agentId) => {
+      calls.push(["discard", agentId]);
+      return { has_draft: false };
+    };
+    adapter.listAgentVersions = async (agentId) => {
+      calls.push(["versions", agentId]);
+      return [{ version_number: 3 }];
+    };
+
+    const deniedUpdate = await request(app)
+      .put("/admin/speko/agents/agent_1/draft")
+      .send({ systemPrompt: "Draft only" });
+    const deniedDiscard = await request(app)
+      .delete("/admin/speko/agents/agent_1/draft");
+    const deniedVersions = await request(app)
+      .get("/admin/speko/agents/agent_1/versions");
+    assert.equal(deniedUpdate.status, 403);
+    assert.equal(deniedDiscard.status, 403);
+    assert.equal(deniedVersions.status, 403);
+    assert.deepEqual(calls, []);
+
+    const updated = await request(app)
+      .put("/admin/speko/agents/agent_1/draft")
+      .set("x-admin-token", adminToken)
+      .send({ systemPrompt: "Draft only" });
+    const discarded = await request(app)
+      .delete("/admin/speko/agents/agent_1/draft")
+      .set("x-admin-token", adminToken);
+    const versions = await request(app)
+      .get("/admin/speko/agents/agent_1/versions")
+      .set("x-admin-token", adminToken);
+
+    assert.equal(updated.status, 200);
+    assert.equal(updated.headers["cache-control"], "no-store");
+    assert.equal(discarded.status, 200);
+    assert.equal(discarded.headers["cache-control"], "no-store");
+    assert.equal(versions.status, 200);
+    assert.equal(versions.headers["cache-control"], "no-store");
+    assert.deepEqual(calls, [
+      ["update", "agent_1", { systemPrompt: "Draft only" }],
+      ["discard", "agent_1"],
+      ["versions", "agent_1"],
+    ]);
+  });
+
+  it("blocks Speko admin mutations without authentication and explicit confirmation", async () => {
+    const calls = [];
+    adapter.cancelCallback = async (id) => (calls.push(["cancel", id]), { id });
+    adapter.dispatchCallback = async (id) => (calls.push(["dispatch", id]), { id });
+    adapter.redeliverWebhook = async (id) => (calls.push(["redeliver", id]), { id });
+    adapter.createKnowledgeBase = async (body) => (calls.push(["create-kb", body.name]), { id: "kb_test" });
+    adapter.deleteKnowledgeBase = async (id) => (calls.push(["delete-kb", id]), { id });
+
+    const denied = await request(app)
+      .post("/admin/speko/callbacks/callback_test/dispatch")
+      .send({ confirm: "callback_test" });
+    const cancelUnconfirmed = await request(app)
+      .post("/admin/speko/callbacks/callback_test/cancel")
+      .set("x-admin-token", adminToken);
+    const dispatchUnconfirmed = await request(app)
+      .post("/admin/speko/callbacks/callback_test/dispatch")
+      .set("x-admin-token", adminToken);
+    const redeliveryUnconfirmed = await request(app)
+      .post("/admin/speko/webhook-deliveries/delivery_test/redeliver")
+      .set("x-admin-token", adminToken);
+    const createUnconfirmed = await request(app)
+      .post("/admin/speko/knowledge-bases")
+      .set("x-admin-token", adminToken)
+      .send({ name: "kb-test", agentId: "agent_test" });
+    const deleteUnconfirmed = await request(app)
+      .delete("/admin/speko/knowledge-bases/kb_test")
+      .set("x-admin-token", adminToken);
+
+    assert.equal(denied.status, 403);
+    assert.equal(cancelUnconfirmed.status, 400);
+    assert.equal(dispatchUnconfirmed.status, 400);
+    assert.equal(redeliveryUnconfirmed.status, 400);
+    assert.equal(createUnconfirmed.status, 400);
+    assert.equal(deleteUnconfirmed.status, 400);
+    assert.deepEqual(calls, []);
+
+    const dispatched = await request(app)
+      .post("/admin/speko/callbacks/callback_test/dispatch")
+      .set("x-admin-token", adminToken)
+      .send({ confirm: "callback_test" });
+    assert.equal(dispatched.status, 200);
+    assert.deepEqual(calls, [["dispatch", "callback_test"]]);
+  });
+
   it("requires admin authentication for call transfers and human call control", async () => {
     const transfer = await request(app)
       .post("/admin/speko/calls/call_1/transfers/blind")
@@ -77,6 +180,84 @@ describe("Speko agent management routes", () => {
     assert.equal(audit.status, 403);
     assert.equal(ownerAssignment.status, 403);
     assert.equal(metrics.status, 403);
+  });
+
+  it("requires explicit destination confirmation before global human dialing", async () => {
+    const calls = [];
+    __testables.setSpekoCallControlServiceForTests({
+      dial: async (params, context) => {
+        calls.push({ params, context });
+        return { call: { id: "human-call-1" } };
+      },
+    });
+
+    try {
+      const unconfirmed = await request(app)
+        .post("/admin/speko/call-control/dial")
+        .set("x-admin-token", adminToken)
+        .send({ to: "+12015550123" });
+      const mismatched = await request(app)
+        .post("/admin/speko/call-control/dial")
+        .set("x-admin-token", adminToken)
+        .send({ to: "+12015550123", confirm_to: "+12015550124" });
+
+      assert.equal(unconfirmed.status, 400);
+      assert.equal(mismatched.status, 400);
+      assert.equal(unconfirmed.body.error, "explicit_speko_human_dial_confirmation_required");
+      assert.deepEqual(calls, []);
+
+      const confirmed = await request(app)
+        .post("/admin/speko/call-control/dial")
+        .set("x-admin-token", adminToken)
+        .send({ to: " +12015550123 ", confirm_to: "+12015550123" });
+      assert.equal(confirmed.status, 200);
+      assert.equal(confirmed.body.call.call.id, "human-call-1");
+      assert.equal(calls.length, 1);
+      assert.equal(calls[0].params.to, "+12015550123");
+      assert.equal(Object.hasOwn(calls[0].params, "confirm_to"), false);
+    } finally {
+      __testables.setSpekoCallControlServiceForTests(null);
+    }
+  });
+
+  it("requires command and target confirmation for global human-call controls", async () => {
+    const calls = [];
+    __testables.setSpekoCallControlServiceForTests({
+      command: async (...args) => (calls.push(args), { accepted: true }),
+    });
+
+    try {
+      const unconfirmed = await request(app)
+        .post("/admin/speko/call-control/controls/control_1/hangup")
+        .set("x-admin-token", adminToken);
+      const wrongCommand = await request(app)
+        .post("/admin/speko/call-control/controls/control_1/hangup")
+        .set("x-admin-token", adminToken)
+        .send({ confirm_command: "answer:control_1" });
+      const wrongTarget = await request(app)
+        .post("/admin/speko/call-control/controls/control_1/transfer")
+        .set("x-admin-token", adminToken)
+        .send({ to: "+12015550123", mode: "blind", confirm_command: "transfer:control_1:+12015550124" });
+
+      assert.equal(unconfirmed.status, 400);
+      assert.equal(wrongCommand.status, 400);
+      assert.equal(wrongTarget.status, 400);
+      assert.deepEqual(calls, []);
+
+      const confirmed = await request(app)
+        .post("/admin/speko/call-control/controls/control_1/transfer")
+        .set("x-admin-token", adminToken)
+        .send({ to: "+12015550123", mode: "blind", confirm_command: "transfer:control_1:+12015550123" });
+      assert.equal(confirmed.status, 200);
+      assert.equal(calls.length, 1);
+      assert.deepEqual(calls[0].slice(0, 3), [
+        "transfer",
+        "control_1",
+        { to: "+12015550123", mode: "blind" },
+      ]);
+    } finally {
+      __testables.setSpekoCallControlServiceForTests(null);
+    }
   });
 
   it("returns no-store broker presence and join credentials only to admins", async () => {
@@ -112,7 +293,8 @@ describe("Speko agent management routes", () => {
       const response = await request(app)
         .post("/admin/speko/call-control/controls/control_1/hangup")
         .set("x-admin-token", config.admin.userTokens["ops-alice"])
-        .set("x-admin-user", "spoofed-name");
+        .set("x-admin-user", "spoofed-name")
+        .send({ confirm_command: "hangup:control_1" });
       assert.equal(response.status, 200);
       assert.equal(auditContext.actorId, "ops-alice");
       assert.equal(auditContext.actorSource, "named_admin_token");

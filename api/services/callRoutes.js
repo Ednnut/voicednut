@@ -136,9 +136,20 @@ function createOutboundCallHandler(ctx = {}) {
       const outboundPersistenceFailed =
         error?.code === "outbound_persistence_failed";
       const idempotencyConflict = error?.code === "idempotency_conflict";
-      const idempotencyInProgress = error?.code === "idempotency_in_progress";
+      const idempotencyInProgress = [
+        "idempotency_in_progress",
+        "idempotency_key_in_progress",
+      ].includes(error?.code);
+      const retryAfterSeconds = error?.retryAfterSeconds !== null &&
+        error?.retryAfterSeconds !== undefined &&
+        Number.isFinite(Number(error.retryAfterSeconds))
+        ? Math.max(0, Number(error.retryAfterSeconds))
+        : null;
       const spekoOutcomeUnknown =
-        error?.uncertain === true || error?.code === "speko_outcome_unknown";
+        error?.code === "speko_outcome_unknown" ||
+        (error?.uncertain === true && String(error?.code || "").startsWith("speko_"));
+      const outboundOutcomeUnknown =
+        error?.uncertain === true || error?.code === "outbound_call_outcome_unknown";
       const spekoIdempotencyRequired =
         error?.code === "speko_idempotency_key_required";
       const isValidation =
@@ -150,7 +161,9 @@ function createOutboundCallHandler(ctx = {}) {
         message.includes("Invalid phone number format");
       const status = idempotencyConflict || idempotencyInProgress
         ? 409
-        : outboundPersistenceFailed || spekoOutcomeUnknown
+        : Number(error?.status) === 429
+          ? 429
+          : outboundPersistenceFailed || outboundOutcomeUnknown
           ? 503
           : spekoIdempotencyRequired ||
               paymentRequiresScript ||
@@ -173,10 +186,14 @@ function createOutboundCallHandler(ctx = {}) {
         code = "idempotency_in_progress";
       } else if (spekoOutcomeUnknown) {
         code = "speko_outcome_unknown";
+      } else if (outboundOutcomeUnknown) {
+        code = "outbound_call_outcome_unknown";
       } else if (spekoIdempotencyRequired) {
         code = "speko_idempotency_key_required";
       } else if (outboundPersistenceFailed) {
         code = "outbound_persistence_failed";
+      } else if (Number(error?.status) === 429 && /^[a-z0-9_.-]{1,80}$/i.test(String(error?.code || ""))) {
+        code = String(error.code).toLowerCase();
       } else if (isValidation) {
         code = "validation_error";
       }
@@ -196,13 +213,23 @@ function createOutboundCallHandler(ctx = {}) {
               ? message || "Invalid payment configuration."
           : outboundPersistenceFailed
             ? "Call provider accepted the request but persistence failed; retry with the same idempotency key."
-            : spekoOutcomeUnknown
-              ? "Speko may have created the call. Retry the identical request with the same idempotency key; do not submit a new call."
+              : outboundOutcomeUnknown
+              ? spekoOutcomeUnknown
+                ? "Speko may have created the call. Retry the identical request with the same idempotency key; do not submit a new call."
+                : "The provider may have created the call. Do not retry or submit through another provider until the outcome is reconciled."
               : spekoIdempotencyRequired
                 ? "Speko calls require an idempotency_key or Idempotency-Key header."
           : "Failed to create outbound call",
         req.requestId || null,
-        { details: buildErrorDetails(error) },
+        {
+          details: buildErrorDetails(error),
+          ...(typeof error?.retryable === "boolean"
+            ? { retryable: error.retryable }
+            : {}),
+          ...(retryAfterSeconds !== null
+            ? { retry_after_seconds: retryAfterSeconds }
+            : {}),
+        },
       );
     }
   };
@@ -336,6 +363,104 @@ function maskSensitiveExternalText(text, digitService = null) {
     );
 }
 
+function sanitizeCallQualityReport(report) {
+  if (!report || typeof report !== "object" || Array.isArray(report)) return null;
+
+  const normalizeCodeList = (value) =>
+    Array.isArray(value)
+     ? value
+         .slice(0, 10)
+         .map((entry) => String(entry || "").trim().toLowerCase())
+         .filter((entry) => /^[a-z0-9_]{1,64}$/.test(entry))
+     : [];
+  const normalizeScore = (value) => {
+    if (value === null || value === undefined || value === "") return null;
+    const score = Number(value);
+    return Number.isFinite(score) && score >= 0 && score <= 100
+     ? Number(score.toFixed(2))
+     : null;
+  };
+  const sourceMetrics =
+    report.metrics && typeof report.metrics === "object" && !Array.isArray(report.metrics)
+     ? report.metrics
+     : {};
+  const metrics = {};
+  const numericMetrics = [
+    "total_turns",
+    "user_turns",
+    "ai_turns",
+    "avg_ai_words_per_turn",
+    "unanswered_user_questions",
+    "courtesy_signals",
+    "duration_seconds",
+    "threshold_score",
+  ];
+  for (const key of numericMetrics) {
+    if (sourceMetrics[key] === null || sourceMetrics[key] === undefined || sourceMetrics[key] === "") {
+      continue;
+    }
+    const value = Number(sourceMetrics[key]);
+    if (Number.isFinite(value) && value >= 0 && value <= 14400) {
+     metrics[key] = Number(value.toFixed(2));
+    }
+  }
+  if (typeof sourceMetrics.closing_present === "boolean") {
+    metrics.closing_present = sourceMetrics.closing_present;
+  }
+  const sourceComponentScores = sourceMetrics.component_scores;
+  if (
+    sourceComponentScores &&
+    typeof sourceComponentScores === "object" &&
+    !Array.isArray(sourceComponentScores)
+  ) {
+    const componentScores = {};
+    for (const key of ["compliance", "resolution", "empathy", "clarity"]) {
+     const score = normalizeScore(sourceComponentScores[key]);
+     if (score !== null) componentScores[key] = score;
+    }
+    if (Object.keys(componentScores).length > 0) {
+     metrics.component_scores = componentScores;
+    }
+  }
+
+  const status = String(report.status || "").trim().toLowerCase();
+  const profile = String(report.profile || "").trim().toLowerCase();
+  const modelVersion = String(report.model_version || "").trim();
+  const evaluatedAt = String(report.evaluated_at || "").trim();
+  return {
+    status: ["scored", "insufficient_transcript"].includes(status)
+     ? status
+     : "unknown",
+    score: normalizeScore(report.score),
+    passed: report.passed === true,
+    shadow_mode: report.shadow_mode === true,
+    profile: /^[a-z0-9_-]{1,64}$/.test(profile) ? profile : null,
+    model_version: /^[a-zA-Z0-9_.-]{1,80}$/.test(modelVersion)
+     ? modelVersion
+     : null,
+    evaluated_at:
+     evaluatedAt.length <= 40 && !/[\r\n]/.test(evaluatedAt)
+       ? evaluatedAt || null
+       : null,
+    findings: normalizeCodeList(report.findings),
+    recommendations: normalizeCodeList(report.recommendations),
+    metrics,
+  };
+}
+
+function buildTranscriptMatchSnippet(text, query, digitService = null) {
+  const safeText = maskSensitiveExternalText(text, digitService)
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!safeText) return null;
+
+  const needle = String(query || "").trim().toLowerCase();
+  const matchAt = needle ? safeText.toLowerCase().indexOf(needle) : -1;
+  const start = matchAt >= 0 ? Math.max(0, matchAt - 60) : 0;
+  const end = Math.min(safeText.length, start + 200);
+  return `${start > 0 ? "…" : ""}${safeText.slice(start, end)}${end < safeText.length ? "…" : ""}`;
+}
+
 const DIGIT_TOKEN_REF_REGEX = /(vault:\/\/digits\/[^\s/]+\/tok_[A-Za-z0-9_]+|tok_[A-Za-z0-9_]+)/g;
 
 function resolveDigitReference(value, callSid, digitService = null) {
@@ -380,7 +505,10 @@ function createGetCallDetailsHandler(ctx = {}) {
         return res.status(404).json({ error: "Call not found" });
       }
       const requesterChatId = getRequesterChatId(req);
-      if (isOwnedByDifferentChat(call, requesterChatId)) {
+      if (
+        call?.user_chat_id &&
+        (!requesterChatId || isOwnedByDifferentChat(call, requesterChatId))
+      ) {
         return res.status(403).json({ error: "Not authorized for this call" });
       }
       let callState = null;
@@ -388,6 +516,42 @@ function createGetCallDetailsHandler(ctx = {}) {
         callState = await db.getLatestCallState(callSid, "call_created");
       } catch (_) {
         callState = null;
+      }
+      let spekoReport = null;
+      try {
+        const report = await db.getLatestCallState(callSid, "speko_call_report");
+        if (report && String(report.provider || "").toLowerCase() === "speko") {
+          const reportDuration = Number(report.duration_seconds);
+          const digitService =
+            typeof ctx.getDigitService === "function"
+              ? ctx.getDigitService()
+              : ctx.digitService;
+          spekoReport = {
+            outcome: maskSensitiveExternalText(String(report.outcome || "").slice(0, 500), digitService) || null,
+            contact: maskSensitiveExternalText(String(report.contact || "").slice(0, 80), digitService) || null,
+            summary: maskSensitiveExternalText(String(report.summary || "").slice(0, 4000), digitService),
+            duration_seconds: Number.isFinite(reportDuration) && reportDuration >= 0 && reportDuration <= 14400
+              ? reportDuration
+              : null,
+            recording_status: String(report.recording_status || "").slice(0, 40) || null,
+            recording_available: report.recording_url_available === true,
+          };
+        }
+      } catch (_) {
+        spekoReport = null;
+      }
+      let qaReport = null;
+      if (typeof db.getCallQualityReport === "function") {
+        try {
+          qaReport = sanitizeCallQualityReport(
+            await db.getCallQualityReport(callSid),
+          );
+        } catch (error) {
+          console.error("Call quality report lookup failed:", {
+            call_sid: callSid,
+            code: error?.code || "call_quality_report_lookup_failed",
+          });
+        }
       }
       const enrichedCall =
         callState?.customer_name || callState?.victim_name
@@ -463,6 +627,8 @@ function createGetCallDetailsHandler(ctx = {}) {
         call: normalizedCall,
         transcripts: responseTranscripts,
         transcript_count: responseTranscripts.length,
+        speko_report: spekoReport,
+        qa: qaReport,
         adaptation_analytics: adaptationData,
         business_context: normalizedCall.business_context,
         webhook_notifications: webhookNotifications,
@@ -1120,27 +1286,36 @@ function createSearchCallsHandler(ctx = {}) {
         });
       }
 
+      const searchValue = query.replace(/[!%_]/g, (character) => `!${character}`);
+      const searchTerm = `%${searchValue}%`;
       const searchResults = await new Promise((resolve, reject) => {
         const searchQuery = `
           SELECT DISTINCT
             c.*,
-            COUNT(t.id) as transcript_count,
-            GROUP_CONCAT(t.message, ' ') as conversation_text
+            (SELECT COUNT(*) FROM transcripts transcript_count
+             WHERE transcript_count.call_sid = c.call_sid) as transcript_count,
+            (SELECT matched.message FROM transcripts matched
+             WHERE matched.call_sid = c.call_sid
+               AND matched.message LIKE ? ESCAPE '!'
+             ORDER BY matched.timestamp DESC, matched.id DESC
+             LIMIT 1) as matching_transcript
           FROM calls c
-          LEFT JOIN transcripts t ON c.call_sid = t.call_sid
           WHERE 
-            c.phone_number LIKE ? OR
-            c.call_summary LIKE ? OR
-            c.prompt LIKE ? OR
-            c.first_message LIKE ? OR
-            t.message LIKE ?
-          GROUP BY c.call_sid
+            c.phone_number LIKE ? ESCAPE '!' OR
+            c.call_summary LIKE ? ESCAPE '!' OR
+            c.prompt LIKE ? ESCAPE '!' OR
+            c.first_message LIKE ? ESCAPE '!' OR
+            EXISTS (
+              SELECT 1 FROM transcripts transcript_match
+              WHERE transcript_match.call_sid = c.call_sid
+                AND transcript_match.message LIKE ? ESCAPE '!'
+            )
           ORDER BY c.created_at DESC
           LIMIT ?
         `;
 
-        const searchTerm = `%${query}%`;
         const params = [
+          searchTerm,
           searchTerm,
           searchTerm,
           searchTerm,
@@ -1169,15 +1344,15 @@ function createSearchCallsHandler(ctx = {}) {
           : ctx.digitService;
       const formattedResults = searchResultsWithDispositions.map((call) => {
         const normalized = normalizeCallRecordForApi(call);
+        delete normalized.matching_transcript;
         return {
           ...normalized,
           transcript_count: call.transcript_count || 0,
-          matching_text: call.conversation_text
-            ? `${digitService ? digitService.maskOtpForExternal(call.conversation_text) : call.conversation_text}`.substring(
-                0,
-                200,
-              ) + "..."
-            : null,
+          matching_text: buildTranscriptMatchSnippet(
+            call.matching_transcript,
+            query,
+            digitService,
+          ),
           created_date: new Date(call.created_at).toLocaleDateString(),
           duration_formatted: call.duration
             ? `${Math.floor(call.duration / 60)}:${String(call.duration % 60).padStart(2, "0")}`
@@ -1543,6 +1718,17 @@ function createUpdateCallbackTaskStatusHandler(ctx = {}) {
           "Callback task not found",
         );
       }
+      const dlqEntry = await db.getCallJobDlqEntryByJobId?.(taskId);
+      if (dlqEntry) {
+        return sendRouteError(
+          ctx,
+          req,
+          res,
+          409,
+          "callback_task_requires_review",
+          "Callback task is in the dead-letter queue and must be reviewed before further action",
+        );
+      }
       const status = String(req.body?.status || "")
         .trim()
         .toLowerCase();
@@ -1556,6 +1742,7 @@ function createUpdateCallbackTaskStatusHandler(ctx = {}) {
           "status must be pending, completed, or failed",
         );
       }
+      let runAt = null;
       if (status === "pending") {
         const runAtInputProvided =
           req.body?.run_at !== undefined || req.body?.delay_minutes !== undefined;
@@ -1569,7 +1756,7 @@ function createUpdateCallbackTaskStatusHandler(ctx = {}) {
             "run_at or delay_minutes is required when setting status to pending",
           );
         }
-        const runAt = resolveScheduledRunAt(
+        runAt = resolveScheduledRunAt(
           req.body?.run_at,
           req.body?.delay_minutes,
           0,
@@ -1584,9 +1771,22 @@ function createUpdateCallbackTaskStatusHandler(ctx = {}) {
             "run_at must be a valid timestamp",
           );
         }
-        await db.rescheduleCallJob(taskId, runAt, req.body?.error || null);
-      } else {
-        await db.completeCallJob(taskId, status, req.body?.error || null);
+      }
+      const updatedCount = await db.updatePendingCallbackJob?.(
+        taskId,
+        status,
+        status === "pending" ? runAt : null,
+        req.body?.error || null,
+      );
+      if (!updatedCount) {
+        return sendRouteError(
+          ctx,
+          req,
+          res,
+          409,
+          "callback_task_state_changed",
+          "Callback task is no longer pending and cannot be changed",
+        );
       }
       const updated = await db.getCallJob(taskId);
       return res.json({
@@ -1965,7 +2165,10 @@ module.exports = {
   registerCallRoutes,
   __testables: {
     createOutboundCallHandler,
+    createUpdateCallbackTaskStatusHandler,
+    createGetCallDetailsHandler,
     createGetSpekoRecordingHandler,
     createReconcileSpekoCallHandler,
+    createSearchCallsHandler,
   },
 };

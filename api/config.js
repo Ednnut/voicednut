@@ -461,9 +461,29 @@ const telegramWebhookValidation = telegramWebhookValidationModes.has(
   : isProduction
     ? "strict"
     : "warn";
-const callProvider = ensure("CALL_PROVIDER", "twilio").toLowerCase();
+const callProvider = ensure("CALL_PROVIDER", "speko").toLowerCase();
+const spekoExclusiveModeRaw = readEnv("SPEKO_EXCLUSIVE_MODE");
+const spekoExclusiveModeValid = !spekoExclusiveModeRaw ||
+  ["1", "true", "yes", "on", "0", "false", "no", "off"].includes(String(spekoExclusiveModeRaw).trim().toLowerCase());
+const spekoExclusiveMode = readBooleanEnv("SPEKO_EXCLUSIVE_MODE", false);
+const spekoAgentReleaseGateRaw = readEnv("SPEKO_AGENT_RELEASE_GATE_REQUIRED");
+const spekoAgentReleaseGateValid = !spekoAgentReleaseGateRaw ||
+  ["1", "true", "yes", "on", "0", "false", "no", "off"].includes(String(spekoAgentReleaseGateRaw).trim().toLowerCase());
+const spekoAgentReleaseGateRequired = readBooleanEnv(
+  "SPEKO_AGENT_RELEASE_GATE_REQUIRED",
+  spekoExclusiveMode,
+);
 const spekoEnabled =
-  String(readEnv("SPEKO_ENABLED") || "false").toLowerCase() === "true";
+  String(readEnv("SPEKO_ENABLED") || (callProvider === "speko" ? "true" : "false")).toLowerCase() === "true";
+const spekoMonthlySpendLimitUsdValue = readEnv("SPEKO_MONTHLY_SPEND_LIMIT_USD");
+const spekoLowBalanceAlertUsdValue = readEnv("SPEKO_LOW_BALANCE_ALERT_USD");
+const spekoMonthlySpendLimitUsdRaw = Number(spekoMonthlySpendLimitUsdValue || "0");
+const spekoLowBalanceAlertUsdRaw = Number(spekoLowBalanceAlertUsdValue || "0");
+const spekoBudgetConfigValid =
+  (!spekoMonthlySpendLimitUsdValue || (Number.isFinite(spekoMonthlySpendLimitUsdRaw) && spekoMonthlySpendLimitUsdRaw >= 0)) &&
+  (!spekoLowBalanceAlertUsdValue || (Number.isFinite(spekoLowBalanceAlertUsdRaw) && spekoLowBalanceAlertUsdRaw >= 0));
+const spekoReconcileIntervalMsRaw = Number(readEnv("SPEKO_RECONCILE_INTERVAL_MS") || "120000");
+const spekoReconcileStaleMinutesRaw = Number(readEnv("SPEKO_RECONCILE_STALE_MINUTES") || "5");
 const spekoInboundEnabled =
   String(readEnv("SPEKO_INBOUND_ENABLED") || "false").toLowerCase() === "true";
 const spekoCallControlEnabled =
@@ -484,6 +504,10 @@ const spekoRingTimeoutSeconds = Number(
 const spekoRequestTimeoutMs = Number(
   readEnv("SPEKO_REQUEST_TIMEOUT_MS") || "30000",
 );
+const spekoAgentVersionRaw = readEnv("SPEKO_AGENT_VERSION");
+const spekoAgentVersion = spekoAgentVersionRaw
+  ? Number(spekoAgentVersionRaw)
+  : null;
 const apiSecret = readEnv("API_SECRET");
 const adminApiToken = apiSecret || readEnv("ADMIN_API_TOKEN");
 function parseAdminUserTokens(rawValue) {
@@ -1046,7 +1070,9 @@ const emailCircuitBreakerCooldownMs = Number(
 const smsProviderTimeoutMs = Number(
   readEnv("SMS_PROVIDER_TIMEOUT_MS") || "15000",
 );
-const smsProvider = (readEnv("SMS_PROVIDER") || callProvider).toLowerCase();
+// Voice and SMS providers are configured independently. Speko only supports
+// voice, so keep the established Twilio SMS default when SMS_PROVIDER is unset.
+const smsProvider = (readEnv("SMS_PROVIDER") || "twilio").toLowerCase();
 const smsAiTimeoutMs = Number(readEnv("SMS_AI_TIMEOUT_MS") || "12000");
 const smsMaxMessageChars = Number(readEnv("SMS_MAX_MESSAGE_CHARS") || "1600");
 const smsMaxBulkRecipients = Number(readEnv("SMS_MAX_BULK_RECIPIENTS") || "100");
@@ -1144,6 +1170,27 @@ module.exports = {
   },
   speko: {
     enabled: spekoEnabled,
+    exclusiveMode: spekoExclusiveMode,
+    exclusiveModeValid: spekoExclusiveModeValid,
+    agentReleaseGateRequired: spekoAgentReleaseGateRequired,
+    agentReleaseGateValid: spekoAgentReleaseGateValid,
+    budgetConfigValid: spekoBudgetConfigValid,
+    monthlySpendLimitUsd:
+      Number.isFinite(spekoMonthlySpendLimitUsdRaw) && spekoMonthlySpendLimitUsdRaw > 0
+        ? spekoMonthlySpendLimitUsdRaw
+        : 0,
+    lowBalanceAlertUsd:
+      Number.isFinite(spekoLowBalanceAlertUsdRaw) && spekoLowBalanceAlertUsdRaw > 0
+        ? spekoLowBalanceAlertUsdRaw
+        : 0,
+    reconcileIntervalMs:
+      Number.isFinite(spekoReconcileIntervalMsRaw) && spekoReconcileIntervalMsRaw >= 30000
+        ? Math.floor(spekoReconcileIntervalMsRaw)
+        : 120000,
+    reconcileStaleMinutes:
+      Number.isFinite(spekoReconcileStaleMinutesRaw) && spekoReconcileStaleMinutesRaw >= 1
+        ? Math.floor(spekoReconcileStaleMinutesRaw)
+        : 5,
     inboundEnabled: spekoInboundEnabled,
     callControlEnabled: spekoCallControlEnabled,
     runMode: spekoRunMode,
@@ -1153,6 +1200,8 @@ module.exports = {
     apiKey: readEnv("SPEKO_API_KEY"),
     baseUrl: readEnv("SPEKO_BASE_URL") || "https://api.speko.dev",
     agentId: readEnv("SPEKO_AGENT_ID"),
+    agentVersion:
+      spekoAgentVersionRaw ? spekoAgentVersion : null,
     brokerId: readEnv("SPEKO_BROKER_ID"),
     phoneNumber: readEnv("SPEKO_PHONE_NUMBER"),
     inboundPhoneNumber: readEnv("SPEKO_INBOUND_PHONE_NUMBER"),
