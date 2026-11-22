@@ -32918,6 +32918,7 @@ module.exports = {
     setMiniAppTelemetryContext,
     recordMiniAppRouteTelemetry,
     runDeepgramVoiceAgentStartupPreflight,
+    resolveHost,
   },
 };
 
