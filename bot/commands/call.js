@@ -906,6 +906,57 @@ async function callFlow(conversation, ctx) {
       console.warn('Failed to fetch active provider for voice selection:', error?.message || error);
     }
 
+    let selectedSpekoAgent = null;
+    if (String(activeProviderForVoice || '').toLowerCase() === 'speko') {
+      try {
+        const response = await httpClient.get(null, `${scriptsApiBase}/admin/speko/agents`, {
+          timeout: 10000,
+          headers: { 'x-admin-token': config.admin.apiToken },
+        });
+        ensureActive();
+        const rawAgents = Array.isArray(response?.data?.agents)
+          ? response.data.agents
+          : Array.isArray(response?.data?.agents?.agents)
+            ? response.data.agents.agents
+            : [];
+        const agentOptions = rawAgents
+          .map((agent) => ({
+            id: String(agent?.id || '').trim(),
+            label: String(agent?.name || agent?.id || '').trim(),
+          }))
+          .filter((agent) => agent.id && agent.label)
+          .slice(0, 30);
+        if (!agentOptions.length) {
+          throw new Error('No Speko agents are available. Create an agent in the Speko workspace, then retry.');
+        }
+        const selected = await askOptionWithButtons(
+          conversation,
+          ctx,
+          '🤖 *Select Speko agent*\\nChoose the workspace agent that should handle this call.',
+          agentOptions,
+          { prefix: 'speko-agent', columns: 1, ensureActive },
+        );
+        ensureActive();
+        if (!selected?.id) {
+          await ctx.reply(cancelledMessage('Call setup', 'Use /call to start again.'));
+          return;
+        }
+        selectedSpekoAgent = agentOptions.find((agent) => agent.id === selected.id) || null;
+        if (!selectedSpekoAgent) {
+          throw new Error('The selected Speko agent is no longer available. Please start again.');
+        }
+        payload.speko_agent_id = selectedSpekoAgent.id;
+      } catch (error) {
+        console.error('Failed to load/select Speko agent:', error?.message || error);
+        await notifyCallError(ctx, escapeMarkdown(error?.message || 'Unable to load Speko agents.'));
+        await safeReset(ctx, 'speko_agent_selection_failed', {
+          message: '⚠️ Speko agent selection failed.',
+          menuHint: '📋 Check the Speko API connection and agent configuration, then use /call again.',
+        });
+        return;
+      }
+    }
+
     let availableVoiceModels = [];
     if (String(activeProviderForVoice || '').toLowerCase() === 'speko') {
       try {
@@ -1036,6 +1087,7 @@ async function callFlow(conversation, ctx) {
       buildLine('🎤', 'Voice', escapeMarkdown(payload.voice_model || 'Auto (best for flow)')),
       payload.purpose ? buildLine('🎯', 'Purpose', escapeMarkdown(payload.purpose)) : null,
       buildLine('📡', 'Provider', escapeMarkdown(providerLabel)),
+      selectedSpekoAgent ? buildLine('🤖', 'Speko agent', escapeMarkdown(selectedSpekoAgent.label)) : null,
       buildLine('🔒', 'Profile lock', escapeMarkdown(formatCallProfileLockState(payload.conversation_profile_lock))),
       buildLine('🧩', 'Placeholder values', escapeMarkdown(placeholderSummary)),
       buildLine('🪜', 'Follow-up mode', escapeMarkdown(expectedFollowUpMode))
