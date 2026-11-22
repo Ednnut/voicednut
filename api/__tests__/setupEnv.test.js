@@ -19,6 +19,10 @@ describe("API environment setup", () => {
     });
     const spekoKeys = spekoSections.flatMap((section) => section.fields.map(({ key }) => key));
     assert.ok(spekoKeys.includes("SPEKO_API_KEY"));
+    assert.equal(spekoKeys.includes("SPEKO_AGENT_ID"), false);
+    assert.ok(spekoKeys.includes("SPEKO_INBOUND_ENABLED"));
+    assert.ok(spekoKeys.includes("SPEKO_INBOUND_PHONE_NUMBER"));
+    assert.ok(spekoKeys.includes("INBOUND_NUMBER_ROUTES"));
     assert.ok(spekoKeys.includes("TWILIO_ACCOUNT_SID"));
     assert.ok(spekoKeys.includes("SENDGRID_API_KEY"));
     assert.equal(spekoKeys.includes("PLIVO_AUTH_ID"), false);
