@@ -898,8 +898,45 @@ async function callFlow(conversation, ctx) {
       : [];
 
     const defaultVoice = config.defaultVoiceModel;
-    const voiceCatalog = await fetchVoiceModelCatalog(ctx);
-    const availableVoiceModels = Array.isArray(voiceCatalog.models) ? voiceCatalog.models : [];
+    let activeProviderForVoice = null;
+    try {
+      activeProviderForVoice = await getActiveCallProvider();
+      ensureActive();
+    } catch (error) {
+      console.warn('Failed to fetch active provider for voice selection:', error?.message || error);
+    }
+
+    let availableVoiceModels = [];
+    if (String(activeProviderForVoice || '').toLowerCase() === 'speko') {
+      try {
+        const response = await httpClient.get(null, `${scriptsApiBase}/admin/speko/tts/voices`, {
+          timeout: 10000,
+          headers: {
+            'x-admin-token': config.admin.apiToken,
+          },
+        });
+        ensureActive();
+        const entries = Array.isArray(response?.data?.voices?.voices)
+          ? response.data.voices.voices
+          : [];
+        availableVoiceModels = entries
+          .map((entry) => ({
+            id: String(entry?.id || '').trim(),
+            label: String(entry?.name || entry?.id || '').trim(),
+            description: String(entry?.vendor || '').trim(),
+            gender: 'unknown',
+            style: 'balanced',
+          }))
+          .filter((entry) => entry.id);
+      } catch (error) {
+        console.warn('Failed to fetch Speko voice catalogue:', error?.message || error);
+        const voiceCatalog = await fetchVoiceModelCatalog(ctx);
+        availableVoiceModels = Array.isArray(voiceCatalog.models) ? voiceCatalog.models : [];
+      }
+    } else {
+      const voiceCatalog = await fetchVoiceModelCatalog(ctx);
+      availableVoiceModels = Array.isArray(voiceCatalog.models) ? voiceCatalog.models : [];
+    }
     if (availableVoiceModels.length > 8) {
       await ctx.reply('🔎 Tip: use Search in the voice picker to filter by model id quickly.');
     }

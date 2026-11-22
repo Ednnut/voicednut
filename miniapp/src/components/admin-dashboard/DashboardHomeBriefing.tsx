@@ -709,6 +709,18 @@ export function DashboardHomeBriefing({
         ))}
       </div>
 
+      {sessionRole.trim().toLowerCase() !== 'viewer' && (
+        <Link className="va-home-focus-card" to="/speko-softphone" data-module="speko-softphone">
+          <span className="va-home-focus-head">
+            <span className="va-home-focus-eyebrow">Human calls</span>
+            <span className="va-home-focus-meta">Assigned brokers</span>
+          </span>
+          <span className="va-home-focus-title-row"><strong>Open Speko softphone</strong></span>
+          <span className="va-home-focus-detail">Use a broker-assigned browser presence for PSTN calls.</span>
+          <span className="va-home-focus-action">Open softphone</span>
+        </Link>
+      )}
+
       <div className="va-grid va-home-grid">
         <UiSurfaceState
           className="va-home-panel"

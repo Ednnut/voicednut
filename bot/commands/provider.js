@@ -6,7 +6,7 @@ const { buildCallbackData } = require('../utils/actions');
 const { getAccessProfile } = require('../utils/capabilities');
 
 const ADMIN_HEADER_NAME = 'x-admin-token';
-const SUPPORTED_PROVIDERS = ['twilio', 'plivo', 'vonage'];
+const SUPPORTED_PROVIDERS = ['twilio', 'plivo', 'vonage', 'speko'];
 const STATUS_CACHE_TTL_MS = 8000;
 const statusCache = {
     value: null,

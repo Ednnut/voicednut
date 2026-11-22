@@ -50,6 +50,7 @@ function normalizeProvider(channel, value) {
 
 function resolveInitialProvider(channel) {
   if (channel === PROVIDER_CHANNELS.CALL) {
+    if (config.speko?.exclusiveMode === true) return "speko";
     return normalizeProvider(channel, config.platform?.provider || "twilio");
   }
   if (channel === PROVIDER_CHANNELS.SMS) {

@@ -1,10 +1,11 @@
 const assert = require("node:assert/strict");
-const { SpekoVoiceAdapter } = require("../adapters/spekoVoiceAdapter");
+const { SpekoVoiceAdapter, getRequestTimeoutMs } = require("../adapters/spekoVoiceAdapter");
 const { verifySpekoWebhook } = require("../adapters/spekoWebhookSecurity");
 const {
   createSpekoWebhookHandler,
-  __testables: { normalizeSpekoCallStatus },
+  __testables: webhookRouteTestables,
 } = require("../services/webhookRoutes");
+const { normalizeSpekoCallStatus } = webhookRouteTestables;
 
 const validConfig = {
   enabled: true,
@@ -12,6 +13,9 @@ const validConfig = {
   baseUrl: "https://api.speko.dev",
   agentId: "agent_test",
   brokerId: "broker_test",
+  callControlEnabled: true,
+  runMode: "s2s",
+  s2sModel: "openai:gpt-live-1.1",
   phoneNumber: "+12015550199",
   webhookSecret: `whsec_${Buffer.from("test-secret").toString("base64")}`,
   requestTimeoutMs: 30000,
@@ -65,6 +69,24 @@ function makeResponse() {
 }
 
 describe("Speko voice adapter", () => {
+  it("bounds every configured provider request timeout", async () => {
+    assert.equal(getRequestTimeoutMs(-10), 30000);
+    assert.equal(getRequestTimeoutMs(1), 1000);
+    assert.equal(getRequestTimeoutMs(999999), 120000);
+
+    let clientOptions;
+    const adapter = new SpekoVoiceAdapter({
+      config: { ...validConfig, requestTimeoutMs: 999999 },
+      sdkLoader: async () => ({
+        Speko: class {
+          constructor(options) { clientOptions = options; }
+        },
+      }),
+    });
+    await adapter.getClient();
+    assert.equal(clientOptions.timeout, 120000);
+  });
+
   it("is opt-in and rejects invalid caller and destination numbers", async () => {
     const disabled = new SpekoVoiceAdapter({
       config: { ...validConfig, enabled: false },
@@ -162,17 +184,28 @@ describe("Speko voice adapter", () => {
       systemPrompt: " ",
       firstMessage: "",
       idempotencyKey: "operation-456",
+      metadata: { campaign: "spring" },
       spekoOptions: {
         voice: "voice_123",
         llm: { temperature: 0.2, maxTokens: 128 },
-        telephony: { amd: { mode: "agent", timeoutSeconds: 8 } },
+        telephony: { amd: { mode: "agent", timeoutSeconds: 8 }, dtmf: "ww1w8" },
+        turnHandling: { onMachine: "leave_message", voicemailMessage: "Please call us back." },
         variables: { customer_name: "Sam" },
+        toolSecrets: { access_token: "not-logged-or-prompted" },
+        metadata: { campaign: "spring" },
       },
     });
     assert.equal("systemPrompt" in requestBody, false);
     assert.equal("firstMessage" in requestBody, false);
     assert.equal(requestBody.voice, "voice_123");
     assert.equal(requestBody.telephony.amd.mode, "agent");
+    assert.equal(requestBody.telephony.dtmf, "ww1w8");
+    assert.equal(requestBody.turnHandling.onMachine, "leave_message");
+    assert.equal(requestBody.toolSecrets.access_token, "not-logged-or-prompted");
+    assert.deepEqual(requestBody.metadata, {
+      campaign: "spring",
+      voicednut_call_id: "voicednut_456",
+    });
     assert.equal(requestBody.metadata.voicednut_call_id, "voicednut_456");
 
     await assert.rejects(
@@ -298,8 +331,103 @@ describe("Speko voice adapter", () => {
         firstMessage: "Hello",
         idempotencyKey: "operation-123",
       }),
-      { uncertain: true, code: "IDEMPOTENCY_KEY_IN_PROGRESS" },
+      { uncertain: true, code: "idempotency_in_progress", retryable: true },
     );
+  });
+
+  it("continues metadata reconciliation through every provider cursor", async () => {
+    const requestedCursors = [];
+    const adapter = new SpekoVoiceAdapter({
+      config: validConfig,
+      fetch: async (url) => {
+        const cursor = new URL(url).searchParams.get("cursor");
+        requestedCursors.push(cursor);
+        return cursor
+          ? createResponse(200, { sessions: [{ id: "session_page_2", metadata: { voicednut_call_id: "speko_pages" } }] })
+          : createResponse(200, { sessions: [], nextCursor: "next-page" });
+      },
+    });
+    const result = await adapter.findCallByInternalId("speko_pages");
+    assert.equal(result.sessionId, "session_page_2");
+    assert.deepEqual(requestedCursors, [null, "next-page"]);
+  });
+
+  it("does not redial when the provider reconciliation page cap is reached", async () => {
+    let posts = 0;
+    let pageNumber = 0;
+    const adapter = new SpekoVoiceAdapter({
+      config: validConfig,
+      fetch: async (_url, options) => {
+        if (options.method === "POST") posts += 1;
+        pageNumber += 1;
+        return createResponse(200, { sessions: [], nextCursor: `more-${pageNumber}` });
+      },
+    });
+    await assert.rejects(
+      adapter.createOrRecoverCall({
+        callId: "speko_page_cap",
+        to: "+12015550123",
+        idempotencyKey: "page-cap-key",
+        reconcile: true,
+      }),
+      { code: "speko_reconciliation_incomplete", uncertain: true },
+    );
+    assert.equal(posts, 0);
+  });
+
+  it("keeps expired idempotency outcomes read-only when no session is found", async () => {
+    let posts = 0;
+    const adapter = new SpekoVoiceAdapter({
+      config: validConfig,
+      fetch: async (_url, options) => {
+        if (options.method === "POST") posts += 1;
+        return options.method === "GET"
+          ? createResponse(200, { sessions: [] })
+          : createResponse(201, { sessionId: "unexpected" });
+      },
+    });
+    await assert.rejects(
+      adapter.createOrRecoverCall({
+        callId: "speko_expired",
+        to: "+12015550123",
+        idempotencyKey: "expired-key",
+        reconcile: true,
+        retryWindowStartedAt: new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString(),
+      }),
+      { code: "speko_idempotency_window_expired", uncertain: true },
+    );
+    assert.equal(posts, 0);
+  });
+
+  it("sends the configured agent version and maps retryable provider errors", async () => {
+    let sentBody;
+    const adapter = new SpekoVoiceAdapter({
+      config: { ...validConfig, agentVersion: 4 },
+      fetch: async (_url, options) => {
+        sentBody = JSON.parse(options.body);
+        return createResponse(201, { sessionId: "session_versioned" });
+      },
+    });
+    await adapter.dial({ to: "+12015550123", idempotencyKey: "versioned-key" });
+    assert.equal(sentBody.agentVersion, 4);
+
+    const rateLimited = new SpekoVoiceAdapter({
+      config: validConfig,
+      fetch: async () => createResponse(429, {
+        code: "RATE_LIMITED",
+        retryable: true,
+        retryAfterSeconds: 12,
+      }),
+    });
+    await assert.rejects(rateLimited.dial({
+      to: "+12015550123",
+      idempotencyKey: "rate-limited-key",
+    }), (error) => {
+      assert.equal(error.code, "rate_limited");
+      assert.equal(error.retryable, true);
+      assert.equal(error.retryAfterSeconds, 12);
+      return true;
+    });
   });
 
   it("checks agent and an explicitly configured number without dialing", async () => {
@@ -443,32 +571,6 @@ describe("Speko voice adapter", () => {
             },
           },
         },
-        callControl: {
-          dial: async (params) => {
-            calls.push(["callControl.dial", params]);
-            return { call: { id: "call_1" }, join: { token: "token" } };
-          },
-          get: async (callId) => {
-            calls.push(["callControl.get", callId]);
-            return { id: callId };
-          },
-          events: async (callId) => {
-            calls.push(["callControl.events", callId]);
-            return { events: [] };
-          },
-          dtmf: async (controlId, params) => {
-            calls.push(["callControl.dtmf", controlId, params]);
-            return { status: "active" };
-          },
-          transfer: async (controlId, params) => {
-            calls.push(["callControl.transfer", controlId, params]);
-            return { status: "initiated" };
-          },
-          hangup: async (controlId, params) => {
-            calls.push(["callControl.hangup", controlId, params]);
-            return { status: "ended" };
-          },
-        },
       }),
     });
 
@@ -490,34 +592,214 @@ describe("Speko voice adapter", () => {
     assert.equal((await adapter.updateAgentTool("agent_test", "tool_1", { description: "Updated" })).id, "tool_1");
     assert.equal((await adapter.deleteAgentTool("agent_test", "tool_1")).deleted, true);
 
-    assert.equal((await adapter.dialHumanCall({
-      to: "+12015550123",
-      from: "+12015550199",
-      metadata: { case_id: "case_1" },
-    })).call.id, "call_1");
-    assert.equal((await adapter.getHumanCall("call_1")).id, "call_1");
-    assert.equal((await adapter.getHumanCallEvents("call_1")).events.length, 0);
-    await adapter.humanCallCommand("dtmf", "control_pstn", { digits: "1w2" });
-    await adapter.humanCallCommand("transfer", "control_browser", {
-      to: "+12015550124",
-      mode: "blind",
-    });
-    await adapter.humanCallCommand("hangup", "control_browser", {
-      reason: "resolved",
+  });
+
+  it("supports verified callbacks, webhooks, sessions, phone inventory, and TTS catalogue reads", async () => {
+    const calls = [];
+    const adapter = new SpekoVoiceAdapter({
+      config: validConfig,
+      clientFactory: async () => ({
+        callbacks: {
+          list: async (params) => (calls.push(["callbacks.list", params]), { callbacks: [] }),
+          get: async (id) => (calls.push(["callbacks.get", id]), { id }),
+          cancel: async (id, params) => (calls.push(["callbacks.cancel", id, params]), { id, status: "cancelled" }),
+          dispatch: async (id) => (calls.push(["callbacks.dispatch", id]), { id, status: "dispatched" }),
+        },
+        webhooks: {
+          list: async () => (calls.push(["webhooks.list"]), []),
+          deliveries: {
+            list: async (params) => (calls.push(["webhook.deliveries.list", params]), { entries: [], nextCursor: null }),
+            get: async (id) => (calls.push(["webhook.deliveries.get", id]), { id }),
+            redeliver: async (id) => (calls.push(["webhook.deliveries.redeliver", id]), { delivered: true }),
+          },
+        },
+        phoneNumbers: {
+          list: async () => (calls.push(["phoneNumbers.list"]), [{ id: "pn_1", e164: "+12015550123" }]),
+          searchAvailable: async (params) => (calls.push(["phoneNumbers.search", params]), []),
+          get: async (id) => (calls.push(["phoneNumbers.get", id]), { id }),
+        },
+      }),
+      fetch: async (url) => {
+        calls.push(["fetch", String(url)]);
+        const parsed = new URL(String(url));
+        if (parsed.pathname === "/v1/sessions") {
+          return createResponse(200, { entries: [{ id: "session_1" }], nextCursor: null });
+        }
+        if (parsed.pathname === "/v1/sessions/session_1") {
+          return createResponse(200, { id: "session_1", status: "active" });
+        }
+        throw new Error(`unexpected URL ${url}`);
+      },
     });
 
-    assert.deepEqual(calls.slice(-3), [
-      ["callControl.dtmf", "control_pstn", { digits: "1w2" }],
-      ["callControl.transfer", "control_browser", {
+    assert.equal((await adapter.listCallbacks({ status: "scheduled" })).callbacks.length, 0);
+    assert.equal((await adapter.getCallback("cb_1")).id, "cb_1");
+    assert.equal((await adapter.cancelCallback("cb_1", { reason: "manual" })).status, "cancelled");
+    assert.equal((await adapter.dispatchCallback("cb_1")).status, "dispatched");
+    assert.equal((await adapter.listWebhooks()).length, 0);
+    assert.equal((await adapter.listWebhookDeliveries({ limit: 10 })).entries.length, 0);
+    assert.equal((await adapter.getWebhookDelivery("delivery_1")).id, "delivery_1");
+    assert.equal((await adapter.redeliverWebhook("delivery_1")).delivered, true);
+    assert.equal((await adapter.listPhoneNumbers())[0].id, "pn_1");
+    assert.equal((await adapter.searchAvailablePhoneNumbers({ areaCode: "202" })).length, 0);
+    assert.equal((await adapter.getPhoneNumber("pn_1")).id, "pn_1");
+    assert.equal((await adapter.listSessions({ limit: 20, status: "active" })).entries.length, 1);
+    assert.equal((await adapter.getSession("session_1")).id, "session_1");
+  });
+
+  it("supports voice, knowledge, credit, and one-shot SDK catalog operations", async () => {
+    const calls = [];
+    const adapter = new SpekoVoiceAdapter({
+      config: validConfig,
+      clientFactory: async () => ({
+        voices: {
+          list: async (params) => (calls.push(["voices.list", params]), {
+            voices: [{ id: "sophia", name: "Sophia", vendor: "cartesia" }],
+            providers: [],
+          }),
+        },
+        knowledgeBases: {
+          list: async (params) => (calls.push(["knowledge.list", params]), [{ id: "kb_1" }]),
+          create: async (params) => (calls.push(["knowledge.create", params]), { id: "kb_1" }),
+          get: async (kbId) => (calls.push(["knowledge.get", kbId]), { id: kbId }),
+          delete: async (kbId) => (calls.push(["knowledge.delete", kbId]), { deleted: true }),
+          listDocuments: async (kbId) => (calls.push(["knowledge.documents", kbId]), []),
+          getDocument: async (kbId, documentId) => (calls.push(["knowledge.document.get", kbId, documentId]), { id: documentId }),
+          createDocument: async (kbId, params) => (calls.push(["knowledge.document.create", kbId, params]), { document: { id: "doc_1" }, upload: { url: "https://upload.example" } }),
+          finalizeDocument: async (kbId, documentId) => (calls.push(["knowledge.document.finalize", kbId, documentId]), { id: documentId, status: "processing" }),
+          pollDocumentReady: async (kbId, documentId, params) => (calls.push(["knowledge.document.poll", kbId, documentId, params]), { id: documentId, status: "ready" }),
+          uploadDocument: async (kbId, params) => (calls.push(["knowledge.upload", kbId, params]), { id: "doc_1" }),
+          deleteDocument: async (kbId, documentId) => (calls.push(["knowledge.document.delete", kbId, documentId]), { deleted: true }),
+        },
+        credits: {
+          getBalance: async () => (calls.push(["credits.balance"]), { balanceUsd: 12.5, currency: "USD" }),
+          getLedger: async (params) => (calls.push(["credits.ledger", params]), { entries: [], nextCursor: null }),
+        },
+        transcribe: async (audio, params) => (calls.push(["transcribe", audio.byteLength, params]), { text: "hello", provider: "deepgram" }),
+        synthesize: async (text, params) => (calls.push(["synthesize", text, params]), { audio: new Uint8Array([1]), contentType: "audio/mpeg" }),
+        complete: async (params) => (calls.push(["complete", params]), { text: "ok", provider: "openai", model: "gpt" }),
+      }),
+    });
+
+    assert.equal((await adapter.listVoices({ provider: "cartesia" })).voices[0].id, "sophia");
+    assert.equal((await adapter.createKnowledgeBase({ agentId: "agent_test", name: "FAQ" })).id, "kb_1");
+    assert.equal((await adapter.getKnowledgeBase("kb_1")).id, "kb_1");
+    assert.equal((await adapter.listKnowledgeBaseDocuments("kb_1")).length, 0);
+    assert.equal((await adapter.getKnowledgeBaseDocument("kb_1", "doc_1")).id, "doc_1");
+    assert.equal((await adapter.createKnowledgeBaseDocument("kb_1", {
+      filename: "faq.md",
+      contentType: "text/markdown",
+      sizeBytes: 10,
+    })).document.id, "doc_1");
+    assert.equal((await adapter.finalizeKnowledgeBaseDocument("kb_1", "doc_1")).status, "processing");
+    assert.equal((await adapter.pollKnowledgeBaseDocument("kb_1", "doc_1", { timeoutMs: 1000 })).status, "ready");
+    assert.equal((await adapter.uploadKnowledgeBaseDocument("kb_1", {
+      filename: "faq.md",
+      contentType: "text/markdown",
+      data: "# FAQ",
+    })).id, "doc_1");
+    assert.equal((await adapter.deleteKnowledgeBaseDocument("kb_1", "doc_1")).deleted, true);
+    assert.equal((await adapter.deleteKnowledgeBase("kb_1")).deleted, true);
+    assert.equal((await adapter.getCreditBalance()).balanceUsd, 12.5);
+    assert.equal((await adapter.getCreditLedger({ limit: 10 })).entries.length, 0);
+    assert.equal((await adapter.transcribe(new Uint8Array([1, 2]), { language: "en" })).text, "hello");
+    assert.equal((await adapter.synthesize("Hello", { language: "en", voice: "sophia" })).contentType, "audio/mpeg");
+    assert.equal((await adapter.complete({
+      messages: [{ role: "user", content: "Hello" }],
+      intent: { language: "en" },
+    })).text, "ok");
+
+    await assert.rejects(
+      adapter.uploadKnowledgeBaseDocument("kb_1", {
+        filename: "secret.bin",
+        contentType: "application/octet-stream",
+        data: new Uint8Array([1]),
+      }),
+      { code: "speko_knowledge_document_content_type" },
+    );
+  });
+
+  it("supports blind and warm AI-call transfers and rejects disabled call control", async () => {
+    const calls = [];
+    const adapter = new SpekoVoiceAdapter({
+      config: validConfig,
+      clientFactory: async () => ({
+        calls: {
+          blindTransfer: async (sessionId, params) => {
+            calls.push(["blind", sessionId, params]);
+            return { transferId: "transfer_blind" };
+          },
+          warmTransfer: async (sessionId, params) => {
+            calls.push(["warm", sessionId, params]);
+            return { transferId: "transfer_warm" };
+          },
+          completeWarmTransfer: async (sessionId, transferId, params) => {
+            calls.push(["complete", sessionId, transferId, params]);
+            return { transferId };
+          },
+          cancelWarmTransfer: async (sessionId, transferId, params) => {
+            calls.push(["cancel", sessionId, transferId, params]);
+            return { transferId };
+          },
+        },
+      }),
+    });
+
+    await adapter.blindTransfer("session_1", {
+      to: "+12015550123",
+      ringingTimeout: 25,
+    });
+    await adapter.warmTransfer("session_1", {
+      to: "+12015550124",
+      screeningPrompt: "A caller needs assistance.",
+      ringingTimeout: 25,
+    });
+    await adapter.completeWarmTransfer("session_1", "transfer_warm", {
+      summary: "Caller verified.",
+    });
+    await adapter.cancelWarmTransfer("session_1", "transfer_warm", {
+      reason: "recipient unavailable",
+      tryNext: false,
+    });
+
+    assert.deepEqual(calls, [
+      ["blind", "session_1", { to: "+12015550123", ringingTimeout: 25 }],
+      ["warm", "session_1", {
         to: "+12015550124",
-        mode: "blind",
+        screeningPrompt: "A caller needs assistance.",
+        ringingTimeout: 25,
       }],
-      ["callControl.hangup", "control_browser", { reason: "resolved" }],
+      ["complete", "session_1", "transfer_warm", { summary: "Caller verified." }],
+      ["cancel", "session_1", "transfer_warm", {
+        reason: "recipient unavailable",
+        tryNext: false,
+      }],
     ]);
+
   });
 });
 
 describe("Speko webhook verification and lifecycle mapping", () => {
+  it("routes human call-control events through separate durable idempotency", async () => {
+    const reservations = [];
+    const recorded = [];
+    const handler = createSpekoWebhookHandler({
+      config: { speko: { webhookSecret: validConfig.webhookSecret } },
+      shouldProcessProviderEventAsync: async (source, event) => (reservations.push([source, event]), true),
+      recordSpekoHumanCallControlEvent: async (event) => recorded.push(event),
+    });
+    const body = JSON.stringify({ type: "call.answered", event_id: "human-event-1", data: {
+      call_id: "human-call-1", control_id: "opaque-leg", occurred_at: "2026-01-01T00:00:00Z",
+      payload: { status: "active", digits: "1234", phone_number: "+15551234567" },
+    } });
+    const response = makeResponse();
+    await handler(makeRequest(validConfig.webhookSecret, body, { webhookId: "webhook-delivery-1" }), response);
+    assert.equal(response.statusCode, 200);
+    assert.deepEqual(reservations, [["speko_human_call_control", { webhook_id: "webhook-delivery-1" }]]);
+    assert.equal(recorded[0].event_id, "human-event-1");
+    assert.deepEqual(recorded[0].details, { status: "active" });
+  });
+
   it("authenticates Standard Webhooks signatures and rejects stale timestamps", () => {
     const req = makeRequest(validConfig.webhookSecret, '{"type":"call.status"}');
     assert.equal(
@@ -550,11 +832,74 @@ describe("Speko webhook verification and lifecycle mapping", () => {
     );
   });
 
+  it("rejects a missing raw request body instead of signing a re-serialized body", async () => {
+    let processed = false;
+    const handler = createSpekoWebhookHandler({
+      config: { speko: { webhookSecret: validConfig.webhookSecret } },
+      handleSpekoPreCall: async () => {
+        processed = true;
+        return {};
+      },
+    });
+    const request = makeRequest(validConfig.webhookSecret, JSON.stringify({
+      type: "call.pre_call",
+      direction: "inbound",
+      to: validConfig.phoneNumber,
+    }));
+    delete request.rawBody;
+    const response = makeResponse();
+    await handler(request, response);
+    assert.equal(response.statusCode, 401);
+    assert.equal(processed, false);
+  });
+
+  it("fails closed when a shared webhook guard has no verifier", () => {
+    const guard = webhookRouteTestables.createWebhookAuthGuard({});
+    let processed = false;
+    const wrapped = guard("twilio_call_status", (_req, res) => {
+      processed = true;
+      res.status(200).send("OK");
+    });
+    const response = {
+      statusCode: 200,
+      status(code) {
+        this.statusCode = code;
+        return this;
+      },
+      json(body) {
+        this.body = body;
+        return this;
+      },
+    };
+    wrapped({ headers: {}, requestId: "guard-test" }, response);
+    assert.equal(response.statusCode, 503);
+    assert.deepEqual(response.body, { error: "webhook_verifier_unavailable" });
+    assert.equal(processed, false);
+  });
+
+  it("keeps shared webhook guards on the existing provider verification path", () => {
+    let verified = 0;
+    let processed = 0;
+    const guard = webhookRouteTestables.createWebhookAuthGuard({
+      requireValidTwilioSignature: () => {
+        verified += 1;
+        return true;
+      },
+    });
+    const wrapped = guard("twilio_call_status", () => {
+      processed += 1;
+    });
+    wrapped({ headers: {}, requestId: "twilio-regression" }, {});
+    assert.equal(verified, 1);
+    assert.equal(processed, 1);
+  });
+
   it("deduplicates verified events and releases reservations when processing fails", async () => {
     let processed = 0;
     let released = 0;
     let sequence = 0;
     let duplicate = false;
+    let recordedMetrics = 0;
     const handler = createSpekoWebhookHandler({
       config: { speko: { webhookSecret: validConfig.webhookSecret } },
       shouldProcessProviderEventAsync: async () => !duplicate,
@@ -570,6 +915,9 @@ describe("Speko webhook verification and lifecycle mapping", () => {
         return { advanced: true };
       },
       releaseSpekoCallSequenceClaim: async () => 1,
+      recordSpekoWebhookMetric: async () => {
+        recordedMetrics += 1;
+      },
       recordCallStatus: async () => {
         processed += 1;
         if (processed === 1) throw new Error("temporary DB failure");
@@ -597,12 +945,14 @@ describe("Speko webhook verification and lifecycle mapping", () => {
     assert.equal(second.statusCode, 200);
     assert.equal(sequence, 7);
     assert.equal(processed, 2);
+    assert.equal(recordedMetrics, 1);
 
     duplicate = true;
     const third = makeResponse();
     await handler(request, third);
     assert.equal(third.body.duplicate, true);
     assert.equal(processed, 2);
+    assert.equal(recordedMetrics, 1);
 
     const invalid = makeResponse();
     await handler(
@@ -610,6 +960,43 @@ describe("Speko webhook verification and lifecycle mapping", () => {
       invalid,
     );
     assert.equal(invalid.statusCode, 401);
+  });
+
+  it("releases an early lifecycle webhook until its correlated call record exists", async () => {
+    let callRecordReady = false;
+    let releases = 0;
+    let statusWrites = 0;
+    let failures = 0;
+    const handler = createSpekoWebhookHandler({
+      config: { speko: { webhookSecret: validConfig.webhookSecret } },
+      getDb: () => ({ getCall: async () => callRecordReady ? { call_sid: "speko_internal_early" } : null }),
+      shouldProcessProviderEventAsync: async () => true,
+      releaseProviderEventAsync: async () => { releases += 1; },
+      recordSpekoWebhookFailure: async (_type, code) => {
+        if (code === "speko_call_record_not_ready") failures += 1;
+      },
+      recordCallStatus: async () => { statusWrites += 1; },
+    });
+    const body = JSON.stringify({
+      type: "call.status",
+      data: {
+        session_id: "session_early",
+        status: "active",
+        metadata: { voicednut_call_id: "speko_internal_early" },
+      },
+    });
+    const request = makeRequest(validConfig.webhookSecret, body, { webhookId: "evt_early" });
+    const first = makeResponse();
+    await handler(request, first);
+    assert.equal(first.statusCode, 503);
+    assert.equal(releases, 1);
+    assert.equal(failures, 1);
+
+    callRecordReady = true;
+    const retry = makeResponse();
+    await handler(request, retry);
+    assert.equal(retry.statusCode, 200);
+    assert.equal(statusWrites, 1);
   });
 
   it("returns quickly for authenticated pre-call events without database work", async () => {

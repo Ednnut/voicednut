@@ -14,6 +14,7 @@ const {
 } = require('../utils/ui');
 const { buildCallbackData } = require('../utils/actions');
 const { getAccessProfile } = require('../utils/capabilities');
+const { formatCallQaLines } = require('../utils/callQa');
 
 const CANCEL_KEYWORDS = new Set(['cancel', 'exit', 'quit']);
 
@@ -183,11 +184,13 @@ async function calllogRecentFlow(conversation, ctx) {
             const status = call.status || 'unknown';
             const when = new Date(call.created_at).toLocaleString();
             const duration = call.duration ? `${Math.floor(call.duration / 60)}:${String(call.duration % 60).padStart(2, '0')}` : 'N/A';
+            const provider = String(call.provider || call.provider_name || '').trim();
             return [
                 `• ${escapeMarkdown(call.call_sid || 'unknown')} (${escapeMarkdown(status)})`,
                 `📞 ${escapeMarkdown(call.phone_number || 'N/A')}`,
+                provider ? `📡 ${escapeMarkdown(provider.toUpperCase())}` : null,
                 `⏱️ ${duration} | 🕒 ${escapeMarkdown(when)}`
-            ].join('\n');
+            ].filter(Boolean).join('\n');
         });
 
         const header = filter && !filtered
@@ -215,7 +218,7 @@ async function calllogSearchFlow(conversation, ctx) {
             return;
         }
         await ctx.reply(setupStepMessage('Call Log - Search', [
-            'Enter a search term (phone number, call SID, or status).',
+            'Enter a search term (phone number, call SID, status, or transcript words).',
             'Type `cancel` to stop.'
         ]), {
             parse_mode: 'Markdown'
@@ -250,8 +253,11 @@ async function calllogSearchFlow(conversation, ctx) {
         const lines = results.slice(0, 5).map((c) => {
             const status = c.status || 'unknown';
             const when = new Date(c.created_at).toLocaleString();
-            const summary = c.call_summary ? `\n📝 ${escapeMarkdown(c.call_summary.slice(0, 120))}${c.call_summary.length > 120 ? '…' : ''}` : '';
-            return `• ${escapeMarkdown(c.call_sid || 'unknown')} (${escapeMarkdown(status)})\n📞 ${escapeMarkdown(c.phone_number || 'N/A')}\n🕒 ${escapeMarkdown(when)}${summary}`;
+            const provider = c.provider ? `\n📡 ${escapeMarkdown(String(c.provider).toUpperCase())}` : '';
+            const matchingText = c.matching_text
+                ? `\n🔎 ${escapeMarkdown(String(c.matching_text).slice(0, 200))}`
+                : '';
+            return `• ${escapeMarkdown(c.call_sid || 'unknown')} (${escapeMarkdown(status)})\n📞 ${escapeMarkdown(c.phone_number || 'N/A')}${provider}\n🕒 ${escapeMarkdown(when)}${matchingText}`;
         });
         await ctx.reply(lines.join('\n\n'), {
             parse_mode: 'Markdown',
@@ -314,6 +320,32 @@ async function calllogDetailsFlow(conversation, ctx) {
         ];
         if (call.call_summary) {
             lines.push(`📝 ${escapeMarkdown(call.call_summary.slice(0, 300))}${call.call_summary.length > 300 ? '…' : ''}`);
+        }
+        const report = res.data?.speko_report;
+        if (report) {
+            if (report.summary && report.summary !== call.call_summary) {
+                lines.push(`🧾 ${escapeMarkdown(report.summary.slice(0, 300))}${report.summary.length > 300 ? '…' : ''}`);
+            }
+            if (report.outcome || report.contact) {
+                lines.push(buildLine('📋', 'Outcome', escapeMarkdown([report.outcome, report.contact].filter(Boolean).join(' · '))));
+            }
+            if (report.recording_available || report.recording_status) {
+                const recording = report.recording_available
+                    ? `Available${report.recording_status ? ` (${report.recording_status})` : ''}`
+                    : (report.recording_status || 'Not available');
+                lines.push(buildLine('🎙️', 'Recording', escapeMarkdown(recording)));
+            }
+        }
+        lines.push(...formatCallQaLines(res.data?.qa));
+        const transcripts = Array.isArray(res.data?.transcripts) ? res.data.transcripts : [];
+        if (transcripts.length) {
+            const preview = transcripts.slice(0, 4).map((entry) => {
+                const speaker = String(entry.speaker || '').toLowerCase() === 'ai' ? 'Agent' : 'Customer';
+                const message = String(entry.message || '').replace(/\s+/g, ' ').trim();
+                return message ? `• ${speaker}: ${escapeMarkdown(message.slice(0, 180))}${message.length > 180 ? '…' : ''}` : null;
+            }).filter(Boolean);
+            if (preview.length) lines.push(`🗣️ *Transcript*\n${preview.join('\n')}`);
+            if (transcripts.length > preview.length) lines.push(`Showing ${preview.length} of ${transcripts.length} transcript entries.`);
         }
         await ctx.reply(section('📄 Call Details', lines), {
             parse_mode: 'Markdown',

@@ -1,0 +1,1 @@
+Follow the repository guidance in [`AGENTS.md`](../AGENTS.md). Select a relevant workflow from `.agents/skills/` for substantial tasks; keep the loaded instructions focused on the request. Preserve existing behavior and user changes, verify external contracts, and run relevant project tests before reporting completion.

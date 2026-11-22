@@ -1,40 +1,60 @@
 #!/usr/bin/env node
-require('./utils/bootstrapLogger');
 const fs = require('fs');
 const path = require('path');
 const readline = require('readline');
+const crypto = require('crypto');
 
 const SECTIONS = [
   {
     comments: [
       '# --- API Environment --------------------------',
-      '# Primary call provider (twilio | plivo | vonage)',
+      '# Speko is the default voice provider; SMS remains separate.',
     ],
     fields: [
-      { key: 'CALL_PROVIDER', prompt: 'Primary call provider', defaultValue: 'twilio' },
-      { key: 'SMS_PROVIDER', prompt: 'Primary SMS provider', defaultValue: 'twilio' },
+      { key: 'CALL_PROVIDER', prompt: 'Voice provider (speko|twilio|plivo|vonage)', defaultValue: 'speko', choices: ['speko', 'twilio', 'plivo', 'vonage'] },
+      { key: 'SMS_PROVIDER', prompt: 'SMS provider (twilio|plivo|vonage)', defaultValue: 'twilio', choices: ['twilio', 'plivo', 'vonage'] },
       { key: 'EMAIL_PROVIDER', prompt: 'Primary email provider', defaultValue: 'sendgrid' },
     ],
   },
   {
-    comments: ['# API secret (shared for admin + HMAC signing)'],
+    comments: ['# API security and server'],
     fields: [
-      { key: 'API_SECRET', prompt: 'API Secret', defaultValue: 'change-me' },
-      { key: 'API_HMAC_MAX_SKEW_MS', prompt: 'API HMAC max skew (ms)', defaultValue: '300000' },
-      { key: 'API_HMAC_REPLAY_VALIDATION', prompt: 'API HMAC replay validation mode (warn|strict|off)', defaultValue: 'warn' },
-      { key: 'API_HMAC_REPLAY_WINDOW_MS', prompt: 'API HMAC replay window (ms)', defaultValue: '300000' },
+      { key: 'API_SECRET', prompt: 'API Secret (press Enter to generate securely)' },
+      { key: 'PORT', prompt: 'API Port', defaultValue: '3000' },
+      { key: 'SERVER', prompt: 'Public API hostname (optional)' },
+      { key: 'CORS_ORIGINS', prompt: 'Allowed web origins, comma-separated (optional)' },
     ],
   },
   {
-    comments: ['# Twilio credentials (required when CALL_PROVIDER=twilio)'],
+    comments: ['# Speko voice calls'],
+    includeWhen: (values) => String(values.CALL_PROVIDER || '').toLowerCase() === 'speko',
+    fields: [
+      { key: 'SPEKO_ENABLED', prompt: 'Enable Speko calls?', defaultValue: 'true' },
+      { key: 'SPEKO_EXCLUSIVE_MODE', prompt: 'Lock all voice calls to Speko?', defaultValue: 'true' },
+      { key: 'SPEKO_AGENT_RELEASE_GATE_REQUIRED', prompt: 'Require the agent release checklist?', defaultValue: 'true' },
+      { key: 'SPEKO_API_KEY', prompt: 'Speko API Key' },
+      { key: 'SPEKO_AGENT_ID', prompt: 'Speko Agent ID' },
+      { key: 'SPEKO_AGENT_VERSION', prompt: 'Speko Agent Version (optional)' },
+      { key: 'SPEKO_WEBHOOK_SECRET', prompt: 'Speko Webhook Secret (whsec_...)' },
+      { key: 'SPEKO_BASE_URL', prompt: 'Speko API URL', defaultValue: 'https://api.speko.dev' },
+      { key: 'SPEKO_MONTHLY_SPEND_LIMIT_USD', prompt: 'Monthly spend limit in USD (0 disables)', defaultValue: '0' },
+      { key: 'SPEKO_LOW_BALANCE_ALERT_USD', prompt: 'Low balance alert threshold in USD (0 disables)', defaultValue: '0' },
+      { key: 'SPEKO_RECONCILE_INTERVAL_MS', prompt: 'Stale call check interval in milliseconds', defaultValue: '120000' },
+      { key: 'SPEKO_RECONCILE_STALE_MINUTES', prompt: 'Reconcile calls older than minutes', defaultValue: '5' },
+    ],
+  },
+  {
+    comments: ['# Twilio credentials'],
+    includeWhen: (values) => [values.CALL_PROVIDER, values.SMS_PROVIDER].some((provider) => String(provider || '').toLowerCase() === 'twilio'),
     fields: [
       { key: 'TWILIO_ACCOUNT_SID', prompt: 'Twilio Account SID' },
       { key: 'TWILIO_AUTH_TOKEN', prompt: 'Twilio Auth Token' },
-      { key: 'FROM_NUMBER', prompt: 'Twilio From Number (E.164 format)' },
+      { key: 'FROM_NUMBER', prompt: 'Twilio From Number (E.164)' },
     ],
   },
   {
-    comments: ['# Plivo Voice/SMS (required when CALL_PROVIDER=plivo or SMS_PROVIDER=plivo)'],
+    comments: ['# Plivo credentials'],
+    includeWhen: (values) => [values.CALL_PROVIDER, values.SMS_PROVIDER].some((provider) => String(provider || '').toLowerCase() === 'plivo'),
     fields: [
       { key: 'PLIVO_AUTH_ID', prompt: 'Plivo Auth ID' },
       { key: 'PLIVO_AUTH_TOKEN', prompt: 'Plivo Auth Token' },
@@ -46,7 +66,8 @@ const SECTIONS = [
     ],
   },
   {
-    comments: ['# Vonage Voice/SMS (required when CALL_PROVIDER=vonage)', '# Provide either the PEM contents (use \\n escapes) or a path to the private key file'],
+    comments: ['# Vonage credentials', '# Provide either PEM contents (use \\n escapes) or a private-key file path.'],
+    includeWhen: (values) => [values.CALL_PROVIDER, values.SMS_PROVIDER].some((provider) => String(provider || '').toLowerCase() === 'vonage'),
     fields: [
       { key: 'VONAGE_API_KEY', prompt: 'Vonage API Key' },
       { key: 'VONAGE_API_SECRET', prompt: 'Vonage API Secret' },
@@ -59,27 +80,23 @@ const SECTIONS = [
     ],
   },
   {
-    comments: ['# Server configuration'],
+    comments: ['# SendGrid email credentials'],
+    includeWhen: (values) => String(values.EMAIL_PROVIDER || '').toLowerCase() === 'sendgrid',
     fields: [
-      { key: 'PORT', prompt: 'API Port', defaultValue: '3000' },
-      { key: 'SERVER', prompt: 'Public server hostname (optional)' },
-      { key: 'CORS_ORIGINS', prompt: 'Comma-separated CORS origins (optional)' },
+      { key: 'SENDGRID_API_KEY', prompt: 'SendGrid API Key (optional)' },
+      { key: 'EMAIL_DEFAULT_FROM', prompt: 'Verified sender email (optional)' },
     ],
   },
   {
     comments: ['# OpenRouter AI configuration'],
     fields: [
       { key: 'OPENROUTER_API_KEY', prompt: 'OpenRouter API Key' },
-      { key: 'OPENROUTER_MODEL', prompt: 'Default OpenRouter Model', defaultValue: 'meta-llama/llama-3.1-8b-instruct:free' },
-      { key: 'YOUR_SITE_URL', prompt: 'Your site URL', defaultValue: 'http://localhost:3000' },
-      { key: 'YOUR_SITE_NAME', prompt: 'Your site name', defaultValue: 'Voice Call Bot' },
     ],
   },
   {
     comments: ['# Deepgram configuration'],
     fields: [
       { key: 'DEEPGRAM_API_KEY', prompt: 'Deepgram API Key' },
-      { key: 'VOICE_MODEL', prompt: 'Deepgram Voice Model', defaultValue: 'aura-2-andromeda-en' },
     ],
   },
   {
@@ -88,25 +105,11 @@ const SECTIONS = [
       { key: 'TELEGRAM_BOT_TOKEN', prompt: 'Telegram Bot Token (optional fallback)' },
     ],
   },
-  {
-    comments: ['# Telegram Mini App security (required when Mini App admin dashboard is enabled)'],
-    fields: [
-      { key: 'MINI_APP_URL', prompt: 'Mini App URL (optional)' },
-      { key: 'MINI_APP_SESSION_SECRET', prompt: 'Mini App Session Secret' },
-      { key: 'MINI_APP_SESSION_TTL_SECONDS', prompt: 'Mini App Session TTL (seconds)', defaultValue: '900' },
-      { key: 'MINI_APP_INITDATA_MAX_AGE_SECONDS', prompt: 'Mini App Init Data max age (seconds)', defaultValue: '86400' },
-      { key: 'MINI_APP_INITDATA_EXPIRY_GRACE_SECONDS', prompt: 'Mini App Init Data expiry grace (seconds)', defaultValue: '604800' },
-      { key: 'MINI_APP_REPLAY_WINDOW_SECONDS', prompt: 'Mini App replay window (seconds)', defaultValue: '600' },
-      { key: 'MINI_APP_REPLAY_VALIDATION', prompt: 'Mini App replay validation mode (warn|strict|off)', defaultValue: 'warn' },
-    ],
-  },
-  {
-    comments: ['# Call recording'],
-    fields: [
-      { key: 'RECORDING_ENABLED', prompt: 'Enable call recording? (true/false)', defaultValue: 'false' },
-    ],
-  },
 ];
+
+function selectedSections(values) {
+  return SECTIONS.filter((section) => !section.includeWhen || section.includeWhen(values));
+}
 
 async function confirmOverwrite(targetPath) {
   if (!fs.existsSync(targetPath)) {
@@ -124,10 +127,10 @@ async function collectInputs() {
 
   console.log('Provide values for each variable. Press Enter to accept the default or leave blank.');
 
-  const ask = (field) => {
+  const ask = async (field) => {
     const defaultLabel = field.defaultValue ? ` [${field.defaultValue}]` : '';
     const question = `${field.prompt}${defaultLabel}: `;
-    return new Promise((resolve) => {
+    const answer = await new Promise((resolve) => {
       rl.question(question, (input) => {
         const value = input.trim();
         if (value) {
@@ -139,9 +142,24 @@ async function collectInputs() {
         }
       });
     });
+    const normalized = String(answer || '').toLowerCase();
+    if (field.choices && !field.choices.includes(normalized)) {
+      console.log(`Choose one of: ${field.choices.join(', ')}.`);
+      return ask(field);
+    }
+    return field.choices ? normalized : answer;
   };
 
   for (const section of SECTIONS) {
+    if (section.includeWhen) continue;
+    for (const field of section.fields) {
+      // eslint-disable-next-line no-await-in-loop
+      answers[field.key] = await ask(field);
+    }
+  }
+
+  for (const section of SECTIONS) {
+    if (!section.includeWhen || !section.includeWhen(answers)) continue;
     for (const field of section.fields) {
       // eslint-disable-next-line no-await-in-loop
       answers[field.key] = await ask(field);
@@ -149,12 +167,18 @@ async function collectInputs() {
   }
 
   rl.close();
+  if (!answers.API_SECRET) answers.API_SECRET = crypto.randomBytes(32).toString('base64url');
+  if (String(answers.CALL_PROVIDER || '').toLowerCase() === 'speko') {
+    answers.SPEKO_INBOUND_ENABLED = 'false';
+    answers.SPEKO_CALL_CONTROL_ENABLED = 'false';
+    answers.SPEKO_AGENT_TOOLS_ENABLED = 'false';
+  }
   return answers;
 }
 
 function buildEnvContent(values) {
   const lines = [];
-  SECTIONS.forEach((section, index) => {
+  selectedSections(values).forEach((section, index) => {
     if (index > 0) {
       lines.push('');
     }
@@ -180,11 +204,23 @@ async function main() {
   const content = buildEnvContent(values);
   await fs.promises.writeFile(targetPath, content, 'utf8');
   console.log(`✅ Created ${targetPath}`);
+  if (!values.SPEKO_API_KEY || !values.SPEKO_AGENT_ID || !values.SPEKO_WEBHOOK_SECRET) {
+    console.log('   Add your Speko API key, agent ID, and webhook secret before placing calls.');
+  }
+  if (String(values.CALL_PROVIDER || '').toLowerCase() === 'speko') {
+    console.log('   Speko exclusive mode locks voice provider switching and cross-provider failover.');
+    console.log('   After starting the API, run: npm run preflight:provider --prefix api -- --channel call --provider speko --network 1 --reachability 1');
+  }
   console.log('   Update any remaining blanks before starting the API.');
   console.log('   Optional advanced settings reference: api/.env.advanced.example');
 }
 
-main().catch((error) => {
-  console.error('❌ Failed to scaffold API .env file:', error.message);
-  process.exit(1);
-});
+if (require.main === module) {
+  require('./utils/bootstrapLogger');
+  main().catch((error) => {
+    console.error('❌ Failed to scaffold API .env file:', error.message);
+    process.exit(1);
+  });
+}
+
+module.exports = { SECTIONS, selectedSections, buildEnvContent };

@@ -112,12 +112,12 @@ function createWebhookAuthGuard(ctx = {}) {
       }
       const verifier = ctx[policy.verifier];
       if (typeof verifier !== "function") {
-        console.warn("webhook_auth_verifier_missing", {
+        console.error("webhook_auth_verifier_missing", {
           policy: policy.id,
           verifier: policy.verifier,
           request_id: req?.requestId || null,
         });
-        return handler(req, res, next);
+        return res.status(503).json({ error: "webhook_verifier_unavailable" });
       }
       const label = req?.path || req?.originalUrl || policy.label;
       const ok = verifier(req, res, label, policy.options || {});
@@ -3038,6 +3038,48 @@ function createSpekoWebhookHandler(ctx = {}) {
     }
     if (!eventId) return res.status(400).json({ error: "invalid_speko_event" });
 
+    const humanEventTypes = new Set([
+      "call.initiated", "call.ringing", "call.answered", "call.bridged", "call.hold",
+      "call.unhold", "call.mute", "call.unmute", "call.dtmf.received", "call.dtmf.sent",
+      "call.transfer.initiated", "call.transfer.completed", "call.transfer.failed",
+      "call.leg.hangup", "call.hangup",
+    ]);
+    // Transfer event names are shared by AI sessions and human call-control.
+    // session_id keeps AI transfers on the existing session webhook path.
+    const humanEvent = humanEventTypes.has(eventType) &&
+      !(eventType.startsWith("call.transfer.") && (data.session_id || payload.session_id));
+    if (humanEvent) {
+      const callId = String(data.call_id || data.callId || payload.call_id || payload.callId || "").trim();
+      const controlId = String(data.control_id || data.controlId || payload.control_id || payload.controlId || "").trim();
+      if (!callId || !controlId || typeof ctx.recordSpekoHumanCallControlEvent !== "function") {
+        return res.status(503).json({ error: "speko_human_event_storage_unavailable" });
+      }
+      const dedupe = { webhook_id: eventId };
+      try {
+        if (typeof ctx.shouldProcessProviderEventAsync !== "function") {
+          return res.status(503).json({ error: "speko_webhook_dedupe_unavailable" });
+        }
+        const shouldProcess = await ctx.shouldProcessProviderEventAsync("speko_human_call_control", dedupe);
+        if (shouldProcess === false) return res.status(200).json({ status: "ok", duplicate: true });
+        const payloadDetails = data.payload && typeof data.payload === "object" ? data.payload : {};
+        const details = {};
+        for (const key of ["status", "mode", "transfer_id", "failure_cause", "reason"]) {
+          if (payloadDetails[key] != null) details[key] = payloadDetails[key];
+        }
+        await ctx.recordSpekoHumanCallControlEvent({
+          event_id: String(data.event_id || data.id || payload.event_id || eventId),
+          call_id: callId, control_id: controlId, event_type: eventType,
+          occurred_at: data.occurred_at || data.occurredAt || payload.occurred_at || null,
+          source: "webhook", details,
+        });
+        return res.status(200).json({ status: "ok" });
+      } catch (error) {
+        await ctx.releaseProviderEventAsync?.("speko_human_call_control", dedupe).catch(() => {});
+        console.error("Speko human call-control event processing failed:", { code: error?.code || "speko_human_event_failed" });
+        return res.status(503).json({ error: "speko_human_event_processing_failed" });
+      }
+    }
+
     if (typeof ctx.shouldProcessProviderEventAsync !== "function") {
       return res.status(503).json({ error: "speko_webhook_dedupe_unavailable" });
     }
@@ -3063,7 +3105,25 @@ function createSpekoWebhookHandler(ctx = {}) {
             : {};
       const callId = String(metadata.voicednut_call_id || "").trim();
       if (!callId || !sessionId) {
+        await Promise.resolve(
+          ctx.recordSpekoWebhookFailure?.(eventType, "speko_webhook_correlation_missing"),
+        ).catch(() => {});
         return res.status(200).json({ status: "ok", ignored: true });
+      }
+
+      const lifecycleEvent = eventType === "call.status" || [
+        "call.report",
+        "call.analysis",
+        "call.recording",
+      ].includes(eventType) || eventType.startsWith("call.transfer.");
+      const db = getDb(ctx);
+      if (lifecycleEvent && typeof db?.getCall === "function") {
+        const callRecord = await db.getCall(callId);
+        if (!callRecord) {
+          const notReady = new Error("Speko call record is not ready for webhook processing");
+          notReady.code = "speko_call_record_not_ready";
+          throw notReady;
+        }
       }
 
       const sequence = Number(data.sequence);
@@ -3158,6 +3218,10 @@ function createSpekoWebhookHandler(ctx = {}) {
         await ctx.advanceSpekoCallSequence({ call_sid: sessionId, sequence_number: sequence });
       }
 
+      if (typeof ctx.recordSpekoWebhookMetric === "function") {
+        await ctx.recordSpekoWebhookMetric(callId, sessionId, eventType, data);
+      }
+
       return res.status(200).json({ status: "ok" });
     } catch (error) {
       if (sequenceClaim && typeof ctx.releaseSpekoCallSequenceClaim === "function") {
@@ -3169,6 +3233,12 @@ function createSpekoWebhookHandler(ctx = {}) {
       console.error("Speko webhook processing failed:", {
         code: error?.code || "speko_webhook_processing_failed",
       });
+      await Promise.resolve(
+        ctx.recordSpekoWebhookFailure?.(
+          eventType,
+          error?.code || "speko_webhook_processing_failed",
+        ),
+      ).catch(() => {});
       return res.status(503).json({ error: "speko_webhook_processing_failed" });
     }
   };

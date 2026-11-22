@@ -1443,6 +1443,27 @@ async function runProviderPreflight(options = {}) {
             suggestedFix: "Set SPEKO_ENABLED=true after configuring Speko.",
           };
         }
+        if (spekoConfig.budgetConfigValid === false) {
+          return {
+            status: CHECK_STATUS.FAIL,
+            reason: "Speko spend or balance threshold is not a valid non-negative number",
+            suggestedFix: "Set SPEKO_MONTHLY_SPEND_LIMIT_USD and SPEKO_LOW_BALANCE_ALERT_USD to valid non-negative USD amounts, or set them to 0 to disable.",
+          };
+        }
+        if (spekoConfig.exclusiveModeValid === false) {
+          return {
+            status: CHECK_STATUS.FAIL,
+            reason: "SPEKO_EXCLUSIVE_MODE must be a boolean value",
+            suggestedFix: "Set SPEKO_EXCLUSIVE_MODE to true or false.",
+          };
+        }
+        if (spekoConfig.agentReleaseGateValid === false) {
+          return {
+            status: CHECK_STATUS.FAIL,
+            reason: "SPEKO_AGENT_RELEASE_GATE_REQUIRED must be a boolean value",
+            suggestedFix: "Set SPEKO_AGENT_RELEASE_GATE_REQUIRED to true or false.",
+          };
+        }
         try {
           const adapter = new SpekoVoiceAdapter({ config: spekoConfig });
           adapter.validateConfig();

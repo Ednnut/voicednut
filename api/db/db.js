@@ -1,4 +1,5 @@
 const sqlite3 = require('sqlite3').verbose();
+const { randomUUID } = require('crypto');
 const path = require('path');
 const {
     buildObjectiveTagsForFlow,
@@ -188,6 +189,8 @@ class EnhancedDatabase {
                 console.log('Connected to enhanced SQLite database');
                 this.applyConnectionPragmas()
                     .then(() => this.createEnhancedTables())
+                    .then(() => this.ensureCallJobDlqResolvedStatus())
+                    .then(() => this.ensureSpekoAuditColumns())
                     .then(() => this.initializeSMSTables())
                     .then(() => this.initializeEmailTables())
                     .then(() => this.initializePostCallAutomationTables())
@@ -450,12 +453,13 @@ class EnhancedDatabase {
                 attempts INTEGER DEFAULT 0,
                 last_error TEXT,
                 dead_letter_reason TEXT,
-                status TEXT DEFAULT 'open' CHECK(status IN ('open', 'replayed')),
+                status TEXT DEFAULT 'open' CHECK(status IN ('open', 'replayed', 'resolved')),
                 replay_count INTEGER DEFAULT 0,
                 last_replay_job_id INTEGER,
                 replayed_at DATETIME,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                resolved_at DATETIME
             )`,
 
             // Operational review cases for non-transfer escalations
@@ -671,6 +675,79 @@ class EnhancedDatabase {
                 lease_until DATETIME NOT NULL,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )`,
+
+            `CREATE TABLE IF NOT EXISTS speko_human_calls (
+                call_id TEXT PRIMARY KEY,
+                direction TEXT,
+                status TEXT,
+                broker_id TEXT,
+                answered_at TEXT,
+                ended_at TEXT,
+                end_reason TEXT,
+                latest_event_at TEXT,
+                latest_event_id TEXT,
+                created_at TEXT,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )`,
+
+            `CREATE TABLE IF NOT EXISTS speko_human_call_legs (
+                control_id TEXT PRIMARY KEY,
+                call_id TEXT NOT NULL,
+                kind TEXT,
+                direction TEXT,
+                status TEXT,
+                broker_id TEXT,
+                muted INTEGER,
+                on_hold INTEGER,
+                answered_at TEXT,
+                ended_at TEXT,
+                end_reason TEXT,
+                latest_event_at TEXT,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )`,
+
+            `CREATE INDEX IF NOT EXISTS idx_speko_human_legs_call_id
+                ON speko_human_call_legs(call_id)`,
+
+            `CREATE TABLE IF NOT EXISTS speko_human_broker_owners (
+                broker_id TEXT PRIMARY KEY,
+                telegram_user_id TEXT NOT NULL UNIQUE,
+                assigned_by TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )`,
+
+            `CREATE TABLE IF NOT EXISTS speko_human_call_events (
+                event_id TEXT PRIMARY KEY,
+                call_id TEXT NOT NULL,
+                control_id TEXT,
+                event_type TEXT NOT NULL,
+                occurred_at TEXT,
+                source TEXT NOT NULL,
+                safe_details TEXT,
+                received_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )`,
+
+            `CREATE INDEX IF NOT EXISTS idx_speko_human_events_call_id
+                ON speko_human_call_events(call_id, occurred_at)`,
+
+            `CREATE TABLE IF NOT EXISTS speko_human_call_control_audit (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                operation TEXT NOT NULL,
+                call_id TEXT,
+                control_id TEXT,
+                scope_id TEXT,
+                status TEXT NOT NULL CHECK(status IN ('started','succeeded','failed')),
+                error_code TEXT,
+                actor_hint TEXT,
+                actor_source TEXT NOT NULL DEFAULT 'shared_admin_token',
+                request_id TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                completed_at DATETIME
+            )`,
+
+            `CREATE INDEX IF NOT EXISTS idx_speko_human_control_audit_created
+                ON speko_human_call_control_audit(created_at)`,
 
             // Outbound call idempotency guard (provider-agnostic)
             `CREATE TABLE IF NOT EXISTS outbound_call_idempotency (
@@ -912,6 +989,63 @@ class EnhancedDatabase {
         }
 
         console.log('✅ Enhanced database tables and indexes created successfully');
+    }
+
+    async ensureSpekoAuditColumns() {
+        const columns = await new Promise((resolve, reject) => this.db.all(
+            'PRAGMA table_info(speko_human_call_control_audit)',
+            (err, rows) => err ? reject(err) : resolve(rows || []),
+        ));
+        if (columns.some((row) => row.name === 'scope_id')) return;
+        await new Promise((resolve, reject) => this.db.run(
+            'ALTER TABLE speko_human_call_control_audit ADD COLUMN scope_id TEXT',
+            (err) => err ? reject(err) : resolve(),
+        ));
+    }
+
+    async ensureCallJobDlqResolvedStatus() {
+        const row = await new Promise((resolve, reject) => this.db.get(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'call_job_dlq'",
+            (err, result) => err ? reject(err) : resolve(result || null),
+        ));
+        if (!row?.sql || /'resolved'/.test(row.sql)) return;
+        const run = (sql) => new Promise((resolve, reject) => this.db.run(sql, (err) => err ? reject(err) : resolve()));
+        let started = false;
+        try {
+            await run('BEGIN IMMEDIATE');
+            started = true;
+            await run('ALTER TABLE call_job_dlq RENAME TO call_job_dlq_legacy');
+            await run(`CREATE TABLE call_job_dlq (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id INTEGER NOT NULL UNIQUE,
+                job_type TEXT NOT NULL,
+                payload TEXT,
+                attempts INTEGER DEFAULT 0,
+                last_error TEXT,
+                dead_letter_reason TEXT,
+                status TEXT DEFAULT 'open' CHECK(status IN ('open', 'replayed', 'resolved')),
+                replay_count INTEGER DEFAULT 0,
+                last_replay_job_id INTEGER,
+                replayed_at DATETIME,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                resolved_at DATETIME
+            )`);
+            await run(`INSERT INTO call_job_dlq (
+                id, job_id, job_type, payload, attempts, last_error, dead_letter_reason,
+                status, replay_count, last_replay_job_id, replayed_at, created_at, updated_at
+            ) SELECT id, job_id, job_type, payload, attempts, last_error, dead_letter_reason,
+                     status, replay_count, last_replay_job_id, replayed_at, created_at, updated_at
+              FROM call_job_dlq_legacy`);
+            await run('DROP TABLE call_job_dlq_legacy');
+            await run('CREATE INDEX IF NOT EXISTS idx_call_job_dlq_status ON call_job_dlq(status)');
+            await run('CREATE INDEX IF NOT EXISTS idx_call_job_dlq_created_at ON call_job_dlq(created_at)');
+            await run('COMMIT');
+            started = false;
+        } catch (error) {
+            if (started) await run('ROLLBACK').catch(() => {});
+            throw error;
+        }
     }
 
     async ensureCallColumns(columns = []) {
@@ -3385,6 +3519,195 @@ class EnhancedDatabase {
         });
     }
 
+    async setSpekoHumanBrokerOwner(payload = {}) {
+        const brokerId = String(payload.broker_id || '').trim();
+        const telegramUserId = String(payload.telegram_user_id || '').trim();
+        if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(brokerId) || !/^\d{1,24}$/.test(telegramUserId)) {
+            throw new Error('speko_broker_owner_invalid');
+        }
+        return new Promise((resolve, reject) => this.db.run(
+            `INSERT INTO speko_human_broker_owners(broker_id,telegram_user_id,assigned_by)
+             VALUES(?,?,?) ON CONFLICT(broker_id) DO UPDATE SET telegram_user_id=excluded.telegram_user_id,
+             assigned_by=excluded.assigned_by,updated_at=CURRENT_TIMESTAMP`,
+            [brokerId, telegramUserId, String(payload.assigned_by || '').slice(0, 80) || null],
+            function(err) {
+                if (err) reject(err);
+                else resolve({ broker_id: brokerId, telegram_user_id: telegramUserId });
+            },
+        ));
+    }
+
+    async getSpekoHumanBrokerOwner(payload = {}) {
+        const telegramUserId = String(payload.telegram_user_id || '').trim();
+        const brokerId = String(payload.broker_id || '').trim();
+        if (!telegramUserId && !brokerId) return null;
+        const column = telegramUserId ? 'telegram_user_id' : 'broker_id';
+        const value = telegramUserId || brokerId;
+        return new Promise((resolve, reject) => this.db.get(
+            `SELECT broker_id,telegram_user_id,assigned_by,created_at,updated_at FROM speko_human_broker_owners WHERE ${column}=?`,
+            [value], (err, row) => err ? reject(err) : resolve(row || null),
+        ));
+    }
+
+    async deleteSpekoHumanBrokerOwner(payload = {}) {
+        const brokerId = String(payload.broker_id || '').trim();
+        if (!brokerId) return 0;
+        return new Promise((resolve, reject) => this.db.run(
+            'DELETE FROM speko_human_broker_owners WHERE broker_id=?', [brokerId],
+            function(err) { if (err) reject(err); else resolve(this.changes || 0); },
+        ));
+    }
+
+    async isSpekoHumanCallOwnedByBroker(payload = {}) {
+        const callId = String(payload.call_id || '').trim();
+        const brokerId = String(payload.broker_id || '').trim();
+        if (!callId || !brokerId) return false;
+        return new Promise((resolve, reject) => this.db.get(
+            'SELECT 1 AS owned FROM speko_human_call_legs WHERE call_id=? AND broker_id=? LIMIT 1',
+            [callId, brokerId], (err, row) => err ? reject(err) : resolve(Boolean(row)),
+        ));
+    }
+
+    async startSpekoHumanCallControlAudit(payload = {}) {
+        const operation = String(payload.operation || '').trim().slice(0, 80);
+        if (!operation) throw new Error('speko_audit_operation_required');
+        const clean = (value, max) => String(value || '').replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, max) || null;
+        const actorSource = ['named_admin_token', 'miniapp_session'].includes(payload.actor_source)
+            ? payload.actor_source : 'shared_admin_token';
+        return new Promise((resolve, reject) => this.db.run(
+            `INSERT INTO speko_human_call_control_audit(operation,call_id,control_id,scope_id,status,actor_hint,actor_source,request_id)
+             VALUES(?,?,?,?, 'started',?,?,?)`,
+            [operation, clean(payload.call_id, 180), clean(payload.control_id, 512), clean(payload.scope_id, 180), clean(payload.actor_hint, 120), actorSource, clean(payload.request_id, 180)],
+            function(err) { if (err) reject(err); else resolve(this.lastID); },
+        ));
+    }
+
+    async finishSpekoHumanCallControlAudit(payload = {}) {
+        const id = Number(payload.id);
+        if (!Number.isSafeInteger(id) || id < 1) return 0;
+        const status = payload.status === 'succeeded' ? 'succeeded' : 'failed';
+        const errorCode = status === 'failed'
+            ? String(payload.error_code || 'speko_call_control_failed').replace(/[^A-Za-z0-9_.-]/g, '').slice(0, 100)
+            : null;
+        return new Promise((resolve, reject) => this.db.run(
+            `UPDATE speko_human_call_control_audit SET status=?,error_code=?,call_id=COALESCE(?,call_id),completed_at=CURRENT_TIMESTAMP WHERE id=? AND status='started'`,
+            [status, errorCode, payload.call_id ? String(payload.call_id).slice(0, 180) : null, id],
+            function(err) { if (err) reject(err); else resolve(this.changes || 0); },
+        ));
+    }
+
+    async listSpekoHumanCallControlAudit(payload = {}) {
+        const limit = Math.max(1, Math.min(200, Number(payload.limit) || 50));
+        const callId = String(payload.call_id || '').trim();
+        return new Promise((resolve, reject) => this.db.all(
+            `SELECT id,operation,call_id,control_id,scope_id,status,error_code,actor_hint,actor_source,request_id,created_at,completed_at
+             FROM speko_human_call_control_audit ${callId ? 'WHERE call_id=?' : ''}
+             ORDER BY id DESC LIMIT ?`,
+            callId ? [callId, limit] : [limit],
+            (err, rows) => err ? reject(err) : resolve(rows || []),
+        ));
+    }
+
+    async saveSpekoHumanCall(payload = {}) {
+        const call = payload.call && typeof payload.call === 'object' ? payload.call : payload;
+        const callId = String(call.id || call.callId || payload.call_id || '').trim();
+        if (!callId) throw new Error('speko_human_call_id_required');
+        const legs = Array.isArray(call.legs) ? call.legs : [];
+        const iso = (value) => value ? String(value).slice(0, 64) : null;
+        await new Promise((resolve, reject) => this.db.run(
+            `INSERT INTO speko_human_calls (call_id,direction,status,answered_at,ended_at,end_reason,created_at,updated_at)
+             VALUES (?,?,?,?,?,?,COALESCE(?,CURRENT_TIMESTAMP),CURRENT_TIMESTAMP)
+             ON CONFLICT(call_id) DO UPDATE SET direction=excluded.direction,status=excluded.status,
+             answered_at=COALESCE(excluded.answered_at,speko_human_calls.answered_at),
+             ended_at=COALESCE(excluded.ended_at,speko_human_calls.ended_at),
+             end_reason=COALESCE(excluded.end_reason,speko_human_calls.end_reason),updated_at=CURRENT_TIMESTAMP`,
+            [callId, call.direction || null, call.status || null, iso(call.answeredAt), iso(call.endedAt),
+             call.endReason ? String(call.endReason).slice(0, 120) : null, iso(call.createdAt)],
+            (err) => err ? reject(err) : resolve(),
+        ));
+        for (const leg of legs) {
+            const controlId = String(leg.controlId || '').trim();
+            if (!controlId) continue;
+            await new Promise((resolve, reject) => this.db.run(
+                `INSERT INTO speko_human_call_legs (control_id,call_id,kind,direction,status,broker_id,muted,on_hold,answered_at,ended_at,end_reason)
+                 VALUES (?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(control_id) DO UPDATE SET call_id=excluded.call_id,
+                 kind=excluded.kind,direction=excluded.direction,status=excluded.status,broker_id=excluded.broker_id,
+                 muted=excluded.muted,on_hold=excluded.on_hold,answered_at=COALESCE(excluded.answered_at,speko_human_call_legs.answered_at),
+                 ended_at=COALESCE(excluded.ended_at,speko_human_call_legs.ended_at),end_reason=COALESCE(excluded.end_reason,speko_human_call_legs.end_reason),updated_at=CURRENT_TIMESTAMP`,
+                [controlId, callId, leg.kind || null, leg.direction || null, leg.status || null,
+                 leg.brokerId || null, leg.muted ? 1 : 0, leg.onHold ? 1 : 0, iso(leg.answeredAt), iso(leg.endedAt),
+                 leg.endReason ? String(leg.endReason).slice(0, 120) : null],
+                (err) => err ? reject(err) : resolve(),
+            ));
+        }
+        return this.getSpekoHumanCall({ call_id: callId });
+    }
+
+    async getSpekoHumanCall(payload = {}) {
+        const callId = String(payload.call_id || payload.callId || '').trim();
+        if (!callId) return null;
+        const call = await new Promise((resolve, reject) => this.db.get(
+            'SELECT * FROM speko_human_calls WHERE call_id=?', [callId], (err, row) => err ? reject(err) : resolve(row || null),
+        ));
+        if (!call) return null;
+        call.legs = await new Promise((resolve, reject) => this.db.all(
+            'SELECT * FROM speko_human_call_legs WHERE call_id=? ORDER BY control_id', [callId], (err, rows) => err ? reject(err) : resolve(rows || []),
+        ));
+        return call;
+    }
+
+    async getSpekoHumanCallLeg(payload = {}) {
+        const controlId = String(payload.control_id || payload.controlId || '').trim();
+        if (!controlId) return null;
+        return new Promise((resolve, reject) => this.db.get(
+            'SELECT * FROM speko_human_call_legs WHERE control_id=?', [controlId], (err, row) => err ? reject(err) : resolve(row || null),
+        ));
+    }
+
+    async recordSpekoHumanCallEvent(payload = {}) {
+        const eventId = String(payload.event_id || payload.eventId || '').trim();
+        const callId = String(payload.call_id || payload.callId || '').trim();
+        const eventType = String(payload.event_type || payload.eventType || '').trim().slice(0, 100);
+        if (!eventId || !callId || !eventType) throw new Error('speko_human_event_identifiers_required');
+        const safe = {};
+        for (const key of ['status', 'mode', 'transfer_id', 'failure_cause', 'reason']) {
+            const value = payload.details?.[key];
+            if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') safe[key] = String(value).slice(0, 120);
+        }
+        const inserted = await new Promise((resolve, reject) => this.db.run(
+            `INSERT OR IGNORE INTO speko_human_call_events(event_id,call_id,control_id,event_type,occurred_at,source,safe_details)
+             VALUES(?,?,?,?,?,?,?)`,
+            [eventId, callId, payload.control_id || payload.controlId || null, eventType,
+             payload.occurred_at || payload.occurredAt || null, payload.source || 'webhook', JSON.stringify(safe)],
+            function(err) { if (err) reject(err); else resolve((this.changes || 0) > 0); },
+        ));
+        if (inserted) {
+            const occurredAt = payload.occurred_at || payload.occurredAt || null;
+            const statusByType = {
+                'call.initiated': 'initiating', 'call.ringing': 'ringing', 'call.answered': 'active',
+                'call.bridged': 'active', 'call.hold': 'held', 'call.unhold': 'active',
+                'call.hangup': 'ended', 'call.leg.hangup': 'ended', 'call.transfer.failed': 'active',
+            };
+            const status = statusByType[eventType];
+            if (status) {
+                await new Promise((resolve, reject) => this.db.run(
+                    `UPDATE speko_human_calls SET status=?,latest_event_at=?,latest_event_id=?,updated_at=CURRENT_TIMESTAMP
+                     WHERE call_id=? AND (latest_event_at IS NULL OR (? IS NOT NULL AND latest_event_at<=?))`,
+                    [status, occurredAt, eventId, callId, occurredAt, occurredAt], (err) => err ? reject(err) : resolve(),
+                ));
+                if (payload.control_id || payload.controlId) {
+                    await new Promise((resolve, reject) => this.db.run(
+                        `UPDATE speko_human_call_legs SET status=?,latest_event_at=?,updated_at=CURRENT_TIMESTAMP
+                         WHERE control_id=? AND (latest_event_at IS NULL OR (? IS NOT NULL AND latest_event_at<=?))`,
+                        [status, occurredAt, payload.control_id || payload.controlId, occurredAt, occurredAt],
+                        (err) => err ? reject(err) : resolve(),
+                    ));
+                }
+            }
+        }
+        return { inserted };
+    }
+
     async advanceSpekoCallSequence(payload = {}) {
         const callSid = String(payload.call_sid || '').trim();
         const sequence = Number(payload.sequence_number);
@@ -4545,6 +4868,79 @@ class EnhancedDatabase {
         });
     }
 
+    async addCallMetricOnce(call_sid, metric_type, metric_value, metric_data = null) {
+        return new Promise((resolve, reject) => {
+            const stmt = this.db.prepare(`
+                INSERT INTO call_metrics (call_sid, metric_type, metric_value, metric_data)
+                SELECT ?, ?, ?, ?
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM call_metrics WHERE call_sid = ? AND metric_type = ?
+                )
+            `);
+            stmt.run(
+                [
+                    call_sid,
+                    metric_type,
+                    metric_value,
+                    JSON.stringify(metric_data),
+                    call_sid,
+                    metric_type,
+                ],
+                function (err) {
+                    if (err) reject(err);
+                    else resolve({ inserted: this.changes > 0, id: this.lastID || null });
+                },
+            );
+            stmt.finalize();
+        });
+    }
+
+    async getSpekoOperationalMetrics(hours = 24) {
+        const periodHours = Number.isFinite(Number(hours))
+            ? Math.min(720, Math.max(1, Math.floor(Number(hours))))
+            : 24;
+        return new Promise((resolve, reject) => {
+            const sql = `
+                SELECT
+                    CASE
+                        WHEN metric_type = 'speko_webhook_event'
+                        THEN COALESCE(json_extract(metric_data, '$.event_type'), 'unknown') ||
+                             CASE
+                                 WHEN json_extract(metric_data, '$.status') IS NOT NULL
+                                 THEN ':' || json_extract(metric_data, '$.status')
+                                 ELSE ''
+                             END
+                        WHEN metric_type = 'speko_call_created'
+                             AND json_extract(metric_data, '$.event_type') IS NOT NULL
+                        THEN json_extract(metric_data, '$.event_type')
+                        ELSE metric_type
+                    END AS event,
+                    COUNT(*) AS count,
+                    SUM(metric_value) AS total,
+                    AVG(metric_value) AS average,
+                    MAX(timestamp) AS last_occurrence
+                FROM call_metrics
+                WHERE metric_type GLOB 'speko_*'
+                  AND timestamp >= datetime('now', ?)
+                GROUP BY event
+                ORDER BY event
+            `;
+            this.db.all(sql, [`-${periodHours} hours`], (err, rows) => {
+                if (err) return reject(err);
+                resolve({
+                    period_hours: periodHours,
+                    events: rows.map((row) => ({
+                        event: row.event,
+                        count: Number(row.count) || 0,
+                        total: Number(row.total) || 0,
+                        average: Number(row.average) || 0,
+                        last_occurrence: row.last_occurrence || null,
+                    })),
+                });
+            });
+        });
+    }
+
     async createCallJob(job_type, payload = {}, run_at = null) {
         const scheduled = run_at || new Date().toISOString();
         return new Promise((resolve, reject) => {
@@ -4573,6 +4969,18 @@ class EnhancedDatabase {
                     resolve(row || null);
                 }
             });
+        });
+    }
+
+    async getCallJobDlqEntryByJobId(job_id) {
+        const id = Number(job_id);
+        if (!Number.isInteger(id) || id < 1) return null;
+        return new Promise((resolve, reject) => {
+            this.db.get(
+                'SELECT * FROM call_job_dlq WHERE job_id = ? LIMIT 1',
+                [id],
+                (err, row) => err ? reject(err) : resolve(row || null),
+            );
         });
     }
 
@@ -4606,6 +5014,31 @@ class EnhancedDatabase {
         });
     }
 
+    async getCallJobStatusSummary() {
+        const [statusRows, deadLetterCount] = await Promise.all([
+            new Promise((resolve, reject) => {
+                this.db.all(
+                    'SELECT status, COUNT(*) AS count FROM call_jobs GROUP BY status',
+                    (err, rows) => err ? reject(err) : resolve(rows || []),
+                );
+            }),
+            this.countOpenCallJobDlq(),
+        ]);
+        const summary = {
+            pending: 0,
+            running: 0,
+            completed: 0,
+            failed: 0,
+            open_dead_letters: Number(deadLetterCount) || 0,
+        };
+        for (const row of statusRows) {
+            if (Object.prototype.hasOwnProperty.call(summary, row.status)) {
+                summary[row.status] = Number(row.count) || 0;
+            }
+        }
+        return summary;
+    }
+
     async claimDueCallJobs(limit = 10) {
         const now = new Date().toISOString();
         const rows = await new Promise((resolve, reject) => {
@@ -4623,25 +5056,127 @@ class EnhancedDatabase {
 
         const claimed = [];
         for (const row of rows) {
+            const lockToken = `${now}#${randomUUID()}`;
             const updated = await new Promise((resolve, reject) => {
                 const sql = `
                     UPDATE call_jobs
                     SET status = 'running', attempts = attempts + 1, locked_at = ?, updated_at = ?
                     WHERE id = ? AND status = 'pending'
                 `;
-                this.db.run(sql, [now, now, row.id], function(err) {
+                this.db.run(sql, [lockToken, now, row.id], function(err) {
                     if (err) reject(err);
                     else resolve(this.changes);
                 });
             });
             if (updated) {
-                claimed.push({ ...row, attempts: (row.attempts || 0) + 1 });
+                claimed.push({
+                    ...row,
+                    attempts: (row.attempts || 0) + 1,
+                    locked_at: lockToken,
+                });
             }
         }
         return claimed;
     }
 
-    async rescheduleCallJob(job_id, run_at, error = null) {
+    async quarantineStaleRunningCallJobs(staleBefore) {
+        const cutoff = String(staleBefore || '').trim();
+        if (!cutoff || Number.isNaN(Date.parse(cutoff))) {
+            throw new Error('A valid stale call-job cutoff is required');
+        }
+        const marker = 'worker_interrupted_requires_review';
+        const reviewMessage = 'Worker stopped before recording the operation outcome; inspect before taking further action.';
+        const usesDedicatedConnection = this.dbPath !== ':memory:';
+        const connection = usesDedicatedConnection
+            ? await new Promise((resolve, reject) => {
+                const handle = new sqlite3.Database(this.dbPath, (err) => {
+                    if (err) reject(err);
+                    else resolve(handle);
+                });
+            })
+            : this.db;
+        const run = (sql, params = []) => new Promise((resolve, reject) => {
+            connection.run(sql, params, function(err) {
+                if (err) reject(err);
+                else resolve(this.changes || 0);
+            });
+        });
+        const all = (sql, params = []) => new Promise((resolve, reject) => {
+            connection.all(sql, params, (err, rows) => err ? reject(err) : resolve(rows || []));
+        });
+        let transactionStarted = false;
+        try {
+            await run('PRAGMA busy_timeout = 5000');
+            await run('BEGIN IMMEDIATE');
+            transactionStarted = true;
+            const staleJobs = await all(
+                `SELECT * FROM call_jobs
+                 WHERE status = 'running'
+                   AND locked_at IS NOT NULL
+                   AND locked_at <= ?
+                 ORDER BY locked_at ASC LIMIT 100`,
+                [cutoff],
+            );
+            let quarantined = 0;
+            for (const job of staleJobs) {
+                const updatedAt = new Date().toISOString();
+                const updated = await run(
+                    `UPDATE call_jobs
+                     SET status = 'failed', last_error = ?, updated_at = ?,
+                         completed_at = COALESCE(completed_at, ?), locked_at = NULL
+                     WHERE id = ? AND status = 'running' AND locked_at = ? AND locked_at <= ?`,
+                    [marker, updatedAt, updatedAt, job.id, job.locked_at, cutoff],
+                );
+                if (!updated) continue;
+                await run(
+                    `INSERT INTO call_job_dlq (
+                        job_id, job_type, payload, attempts, last_error,
+                        dead_letter_reason, status, updated_at
+                     ) VALUES (?, ?, ?, ?, ?, ?, 'open', ?)
+                     ON CONFLICT(job_id) DO UPDATE SET
+                        job_type = excluded.job_type,
+                        payload = excluded.payload,
+                        attempts = excluded.attempts,
+                        last_error = CASE
+                            WHEN call_job_dlq.dead_letter_reason IN (
+                                'ambiguous_outbound_outcome', 'worker_interrupted_requires_review'
+                            ) THEN call_job_dlq.last_error
+                            ELSE excluded.last_error
+                        END,
+                        dead_letter_reason = CASE
+                            WHEN call_job_dlq.dead_letter_reason IN (
+                                'ambiguous_outbound_outcome', 'worker_interrupted_requires_review'
+                            ) THEN call_job_dlq.dead_letter_reason
+                            ELSE excluded.dead_letter_reason
+                        END,
+                        status = 'open', updated_at = excluded.updated_at`,
+                    [
+                        job.id,
+                        String(job.job_type || 'unknown'),
+                        typeof job.payload === 'string' ? job.payload : JSON.stringify(job.payload || {}),
+                        Math.max(0, Number(job.attempts) || 0),
+                        reviewMessage,
+                        marker,
+                        updatedAt,
+                    ],
+                );
+                quarantined += 1;
+            }
+            await run('COMMIT');
+            transactionStarted = false;
+            return quarantined;
+        } catch (error) {
+            if (transactionStarted) await run('ROLLBACK').catch(() => {});
+            throw error;
+        } finally {
+            if (usesDedicatedConnection) {
+                await new Promise((resolve) => connection.close(() => resolve()));
+            }
+        }
+    }
+
+    async rescheduleCallJob(job_id, run_at, error = null, expectedLockAt = null) {
+        if (!expectedLockAt) return 0;
         const updatedAt = new Date().toISOString();
         return new Promise((resolve, reject) => {
             const sql = `
@@ -4651,9 +5186,9 @@ class EnhancedDatabase {
                     last_error = ?,
                     updated_at = ?,
                     locked_at = NULL
-                WHERE id = ?
+                WHERE id = ? AND status = 'running' AND locked_at = ?
             `;
-            this.db.run(sql, [run_at, error, updatedAt, job_id], function(err) {
+            this.db.run(sql, [run_at, error, updatedAt, job_id, expectedLockAt], function(err) {
                 if (err) {
                     reject(err);
                 } else {
@@ -4663,7 +5198,8 @@ class EnhancedDatabase {
         });
     }
 
-    async completeCallJob(job_id, status = 'completed', error = null) {
+    async completeCallJob(job_id, status = 'completed', error = null, expectedLockAt = null) {
+        if (!expectedLockAt) return 0;
         const updatedAt = new Date().toISOString();
         const completedAt = (status === 'completed' || status === 'failed') ? updatedAt : null;
         return new Promise((resolve, reject) => {
@@ -4674,15 +5210,127 @@ class EnhancedDatabase {
                     updated_at = ?,
                     completed_at = COALESCE(?, completed_at),
                     locked_at = NULL
-                WHERE id = ?
+                WHERE id = ? AND status = 'running' AND locked_at = ?
             `;
-            this.db.run(sql, [status, error, updatedAt, completedAt, job_id], function(err) {
+            this.db.run(sql, [status, error, updatedAt, completedAt, job_id, expectedLockAt], function(err) {
                 if (err) {
                     reject(err);
                 } else {
                     resolve(this.changes);
                 }
             });
+        });
+    }
+
+    async failCallJobToDlq(job = {}, reason = 'non_retryable_error', error = null, expectedLockAt = null) {
+        const jobId = Number(job?.id);
+        if (!Number.isInteger(jobId) || jobId < 1 || !expectedLockAt) return false;
+        const now = new Date().toISOString();
+        const payload = typeof job?.payload === 'string'
+            ? job.payload
+            : JSON.stringify(job?.payload || {});
+        const attempts = Math.max(0, Number(job?.attempts) || 0);
+        const usesDedicatedConnection = this.dbPath !== ':memory:';
+        const connection = usesDedicatedConnection
+            ? await new Promise((resolve, reject) => {
+                const handle = new sqlite3.Database(this.dbPath, (err) => {
+                    if (err) reject(err);
+                    else resolve(handle);
+                });
+            })
+            : this.db;
+        const run = (sql, params = []) => new Promise((resolve, reject) => {
+            connection.run(sql, params, function(err) {
+                if (err) reject(err);
+                else resolve(this.changes || 0);
+            });
+        });
+        let transactionStarted = false;
+        try {
+            await run('PRAGMA busy_timeout = 5000');
+            await run('BEGIN IMMEDIATE');
+            transactionStarted = true;
+            const updated = await run(
+                `UPDATE call_jobs
+                 SET status = 'failed', last_error = ?, updated_at = ?,
+                     completed_at = ?, locked_at = NULL
+                 WHERE id = ? AND status = 'running' AND locked_at = ?`,
+                [error || job?.last_error || null, now, now, jobId, expectedLockAt],
+            );
+            if (!updated) {
+                await run('ROLLBACK');
+                transactionStarted = false;
+                return false;
+            }
+            await run(
+                `INSERT INTO call_job_dlq (
+                    job_id, job_type, payload, attempts, last_error,
+                    dead_letter_reason, status, updated_at
+                 ) VALUES (?, ?, ?, ?, ?, ?, 'open', ?)
+                 ON CONFLICT(job_id) DO UPDATE SET
+                    job_type = excluded.job_type,
+                    payload = excluded.payload,
+                    attempts = excluded.attempts,
+                    last_error = CASE
+                        WHEN call_job_dlq.dead_letter_reason IN (
+                            'ambiguous_outbound_outcome', 'worker_interrupted_requires_review'
+                        ) THEN call_job_dlq.last_error
+                        ELSE excluded.last_error
+                    END,
+                    dead_letter_reason = CASE
+                        WHEN call_job_dlq.dead_letter_reason IN (
+                            'ambiguous_outbound_outcome', 'worker_interrupted_requires_review'
+                        ) THEN call_job_dlq.dead_letter_reason
+                        ELSE excluded.dead_letter_reason
+                    END,
+                    status = 'open', updated_at = excluded.updated_at`,
+                [
+                    jobId,
+                    String(job?.job_type || 'unknown'),
+                    payload,
+                    attempts,
+                    error || job?.last_error || null,
+                    reason || null,
+                    now,
+                ],
+            );
+            await run('COMMIT');
+            transactionStarted = false;
+            return true;
+        } catch (failure) {
+            if (transactionStarted) await run('ROLLBACK').catch(() => {});
+            throw failure;
+        } finally {
+            if (usesDedicatedConnection) {
+                await new Promise((resolve) => connection.close(() => resolve()));
+            }
+        }
+    }
+
+    async updatePendingCallbackJob(job_id, status, run_at = null, error = null) {
+        const id = Number(job_id);
+        const normalizedStatus = String(status || '').trim().toLowerCase();
+        if (!Number.isInteger(id) || id < 1 || !['pending', 'completed', 'failed'].includes(normalizedStatus)) {
+            return 0;
+        }
+        if (normalizedStatus === 'pending' && !run_at) return 0;
+        const updatedAt = new Date().toISOString();
+        const completedAt = normalizedStatus === 'pending' ? null : updatedAt;
+        return new Promise((resolve, reject) => {
+            this.db.run(
+                `UPDATE call_jobs
+                 SET status = ?, run_at = COALESCE(?, run_at), last_error = ?,
+                     updated_at = ?, completed_at = ?, locked_at = NULL
+                 WHERE id = ? AND job_type = 'callback_call' AND status = 'pending'
+                   AND NOT EXISTS (
+                     SELECT 1 FROM call_job_dlq WHERE call_job_dlq.job_id = call_jobs.id
+                   )`,
+                [normalizedStatus, run_at, error, updatedAt, completedAt, id],
+                function(err) {
+                    if (err) reject(err);
+                    else resolve(this.changes || 0);
+                },
+            );
         });
     }
 
@@ -4845,8 +5493,18 @@ class EnhancedDatabase {
                 job_type = excluded.job_type,
                 payload = excluded.payload,
                 attempts = excluded.attempts,
-                last_error = excluded.last_error,
-                dead_letter_reason = excluded.dead_letter_reason,
+                last_error = CASE
+                    WHEN call_job_dlq.dead_letter_reason IN (
+                        'ambiguous_outbound_outcome', 'worker_interrupted_requires_review'
+                    ) THEN call_job_dlq.last_error
+                    ELSE excluded.last_error
+                END,
+                dead_letter_reason = CASE
+                    WHEN call_job_dlq.dead_letter_reason IN (
+                        'ambiguous_outbound_outcome', 'worker_interrupted_requires_review'
+                    ) THEN call_job_dlq.dead_letter_reason
+                    ELSE excluded.dead_letter_reason
+                END,
                 status = 'open',
                 updated_at = excluded.updated_at
         `;
@@ -4897,6 +5555,32 @@ class EnhancedDatabase {
         });
     }
 
+    async listCallJobDlqSummaries({ status = null, limit = 20, offset = 0 } = {}) {
+        const params = [];
+        const clauses = [];
+        if (status && String(status).toLowerCase() !== 'all') {
+            clauses.push('status = ?');
+            params.push(String(status).toLowerCase());
+        }
+        const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+        const sql = `
+            SELECT id, job_id, job_type, attempts, dead_letter_reason, status,
+                   created_at, updated_at
+            FROM call_job_dlq
+            ${where}
+            ORDER BY created_at DESC
+            LIMIT ? OFFSET ?
+        `;
+        params.push(Math.min(100, Math.max(1, Number(limit) || 20)));
+        params.push(Math.max(0, Number(offset) || 0));
+        return new Promise((resolve, reject) => {
+            this.db.all(sql, params, (err, rows) => {
+                if (err) reject(err);
+                else resolve(rows || []);
+            });
+        });
+    }
+
     async getCallJobDlqEntry(dlqId) {
         return new Promise((resolve, reject) => {
             const sql = 'SELECT * FROM call_job_dlq WHERE id = ?';
@@ -4908,6 +5592,66 @@ class EnhancedDatabase {
                 }
             });
         });
+    }
+
+    async resolveSpekoCallDlqEntry(dlqId, resolution = {}) {
+        const id = Number(dlqId);
+        const sessionId = String(resolution.sessionId || '').trim().slice(0, 128);
+        const reason = String(resolution.reason || '').trim().slice(0, 500);
+        const actor = resolution.actor == null ? null : String(resolution.actor).slice(0, 128);
+        if (!Number.isInteger(id) || id < 1 || !sessionId || reason.length < 10) {
+            throw new Error('A DLQ id, provider session id, and resolution reason are required');
+        }
+        const run = (sql, params = []) => new Promise((resolve, reject) => this.db.run(sql, params, function(err) {
+            if (err) reject(err);
+            else resolve({ changes: this.changes || 0 });
+        }));
+        const get = (sql, params = []) => new Promise((resolve, reject) => this.db.get(sql, params, (err, row) => err ? reject(err) : resolve(row || null)));
+        let started = false;
+        try {
+            await run('BEGIN IMMEDIATE');
+            started = true;
+            const entry = await get('SELECT id, job_id, job_type, status FROM call_job_dlq WHERE id = ?', [id]);
+            if (!entry) {
+                await run('ROLLBACK');
+                started = false;
+                return { status: 'not_found' };
+            }
+            if (entry.status !== 'open') {
+                await run('ROLLBACK');
+                started = false;
+                return { status: 'not_open' };
+            }
+            if (!['outbound_call', 'callback_call'].includes(String(entry.job_type || ''))) {
+                await run('ROLLBACK');
+                started = false;
+                return { status: 'unsupported_job' };
+            }
+            const now = new Date().toISOString();
+            const updated = await run(
+                `UPDATE call_job_dlq SET status = 'resolved', resolved_at = ?, updated_at = ?
+                 WHERE id = ? AND status = 'open'`,
+                [now, now, id],
+            );
+            if (!updated.changes) throw new Error('DLQ entry changed during resolution');
+            await run(
+                `INSERT INTO service_health_logs (service_name, status, details) VALUES (?, ?, ?)`,
+                ['call_jobs', 'dlq_speko_resolved', JSON.stringify({
+                    dlq_id: id,
+                    job_id: Number(entry.job_id) || null,
+                    session_id: sessionId,
+                    reason,
+                    actor,
+                    at: now,
+                })],
+            );
+            await run('COMMIT');
+            started = false;
+            return { status: 'resolved', dlqId: id, sessionId };
+        } catch (error) {
+            if (started) await run('ROLLBACK').catch(() => {});
+            throw error;
+        }
     }
 
     async countOpenCallJobDlq() {
@@ -4943,6 +5687,103 @@ class EnhancedDatabase {
                 }
             });
         });
+    }
+
+    async replayCallJobDlqEntry(dlqId, { runAt, maxReplays = 2 } = {}) {
+        const id = Number(dlqId);
+        const limit = Math.max(1, Number(maxReplays) || 2);
+        const replayAt = runAt || new Date().toISOString();
+        const run = (sql, params = []) => new Promise((resolve, reject) => {
+            this.db.run(sql, params, function(err) {
+                if (err) reject(err);
+                else resolve({ changes: this.changes || 0, lastID: this.lastID || 0 });
+            });
+        });
+        const get = (sql, params = []) => new Promise((resolve, reject) => {
+            this.db.get(sql, params, (err, row) => err ? reject(err) : resolve(row || null));
+        });
+
+        let transactionStarted = false;
+        try {
+            await run('BEGIN IMMEDIATE');
+            transactionStarted = true;
+            const entry = await get('SELECT * FROM call_job_dlq WHERE id = ?', [id]);
+            if (!entry) {
+                await run('ROLLBACK');
+                transactionStarted = false;
+                return { status: 'not_found' };
+            }
+            if (entry.status !== 'open') {
+                await run('ROLLBACK');
+                transactionStarted = false;
+                return { status: 'already_replayed' };
+            }
+            const reviewOnlyReason = [
+                'ambiguous_outbound_outcome',
+                'worker_interrupted_requires_review',
+            ].includes(entry.dead_letter_reason);
+            const sideEffectingCallJob = ['outbound_call', 'callback_call'].includes(
+                String(entry.job_type || '').toLowerCase(),
+            );
+            if (reviewOnlyReason || sideEffectingCallJob) {
+                await run('ROLLBACK');
+                transactionStarted = false;
+                return {
+                    status: 'requires_review',
+                    deadLetterReason: reviewOnlyReason
+                        ? entry.dead_letter_reason
+                        : 'side_effecting_call_requires_review',
+                };
+            }
+            if (Number(entry.replay_count) >= limit) {
+                await run('ROLLBACK');
+                transactionStarted = false;
+                return {
+                    status: 'replay_limit_reached',
+                    replayCount: Number(entry.replay_count) || 0,
+                };
+            }
+
+            let payload;
+            try {
+                payload = entry.payload ? JSON.parse(entry.payload) : {};
+            } catch {
+                await run('ROLLBACK');
+                transactionStarted = false;
+                return { status: 'invalid_payload' };
+            }
+            const created = await run(
+                `INSERT INTO call_jobs (job_type, payload, status, run_at, attempts, created_at, updated_at)
+                 VALUES (?, ?, 'pending', ?, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+                [String(entry.job_type || 'unknown'), JSON.stringify(payload), replayAt],
+            );
+            const replayJobId = created.lastID;
+            const updated = await run(
+                `UPDATE call_job_dlq
+                 SET replay_count = replay_count + 1,
+                     status = 'replayed',
+                     last_replay_job_id = ?,
+                     replayed_at = ?,
+                     updated_at = ?
+                 WHERE id = ? AND status = 'open' AND replay_count < ?`,
+                [replayJobId, replayAt, replayAt, id, limit],
+            );
+            if (!updated.changes) {
+                throw new Error('DLQ entry changed during replay transaction');
+            }
+            await run('COMMIT');
+            transactionStarted = false;
+            return {
+                status: 'replayed',
+                dlqId: id,
+                originalJobId: entry.job_id,
+                replayJobId,
+                replayCount: (Number(entry.replay_count) || 0) + 1,
+            };
+        } catch (error) {
+            if (transactionStarted) await run('ROLLBACK').catch(() => {});
+            throw error;
+        }
     }
 
     // FIXED: User session tracking - Using INSERT OR REPLACE instead of ON CONFLICT

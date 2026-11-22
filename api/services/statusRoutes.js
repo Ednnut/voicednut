@@ -229,6 +229,9 @@ function createHealthHandler(ctx = {}) {
   return async function handleHealth(req, res) {
     const timestamp = new Date().toISOString();
     const isReadinessProbe = req.path === "/ready";
+    if (isReadinessProbe) {
+      res.set("Cache-Control", "no-store");
+    }
     try {
       const db =
         typeof ctx.getDb === "function"
@@ -296,6 +299,10 @@ function createHealthHandler(ctx = {}) {
       }
 
       const calls = await db.getCallsWithTranscripts(1);
+      const callJobSummary =
+        typeof db.getCallJobStatusSummary === "function"
+          ? await db.getCallJobStatusSummary().catch(() => null)
+          : null;
       const webhookHealth = await webhookService.healthCheck();
       const callStats = webhookService.getCallStatusStats();
       const notificationMetrics = await db.getNotificationAnalytics(1);
@@ -359,6 +366,7 @@ function createHealthHandler(ctx = {}) {
           },
           webhook_service: webhookHealth,
           call_tracking: callStats,
+          call_jobs: callJobSummary,
           notification_system: {
             total_today: notificationMetrics.total_notifications,
             success_rate: notificationMetrics.overall_success_rate + "%",

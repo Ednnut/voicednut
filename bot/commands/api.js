@@ -2,6 +2,9 @@ const config = require('../config');
 const httpClient = require('../utils/httpClient');
 const { escapeMarkdown, buildLine, sendEphemeral, buildMainMenuReplyMarkup } = require('../utils/ui');
 const { getAccessProfile, getDeniedAuditSummary } = require('../utils/capabilities');
+const { getDeadLetterStatusFields } = require('../utils/deadLetterStatus');
+const { getProviderStatusFields } = require('../utils/providerStatus');
+const { buildCallbackData } = require('../utils/actions');
 
 async function replyApiError(ctx, error, fallback, options = {}) {
     const message = httpClient.getUserMessage(error, fallback);
@@ -43,6 +46,11 @@ function formatCallbackTaskLine(task) {
     const runAt = escapeMarkdown(formatTimestamp(task?.run_at));
     const phone = escapeMarkdown(formatPhoneSuffix(task?.phone_number));
     return `• #${id} ${status} at ${runAt} for xxxx${phone}`;
+}
+
+function formatDeadLetterLine(entry) {
+    const { id, jobType, reason } = getDeadLetterStatusFields(entry);
+    return `• #${escapeMarkdown(id)} ${escapeMarkdown(jobType)} — ${escapeMarkdown(reason)}`;
 }
 
 function formatReviewCaseLine(reviewCase) {
@@ -90,7 +98,7 @@ async function handleStatusCommand(ctx) {
         if (config.admin?.apiToken) {
             healthHeaders['x-admin-token'] = config.admin.apiToken;
         }
-        const response = await httpClient.get(null, `${config.apiUrl}/health`, {
+        const response = await httpClient.get(null, `${config.apiUrl}/ready`, {
             timeout: 15000,
             headers: healthHeaders
         });
@@ -100,6 +108,8 @@ async function handleStatusCommand(ctx) {
 
         const apiHealthStatus = health.status || 'healthy';
         let message = `🔍 *System Status Report*\n\n`;
+        let spekoDlqEntries = [];
+        let spekoUsageAvailable = false;
         message += `🤖 Bot: ✅ Online & Responsive\n`;
         message += `🌐 API: ${health.status === 'healthy' ? '✅' : '❌'} ${escapeMarkdown(apiHealthStatus)}\n`;
         message += `${buildLine('⚡', 'API Response Time', `${responseTime}ms`)}\n\n`;
@@ -124,6 +134,59 @@ async function handleStatusCommand(ctx) {
             const notifications = health.services.notification_system;
             if (notifications) {
                 message += `${buildLine('🔔', 'Notifications', `${escapeMarkdown(String(notifications.success_rate || 'N/A'))} success rate`)}\n`;
+            }
+
+            const providers = getProviderStatusFields(health.services.provider_failover);
+            if (providers.length) {
+                spekoUsageAvailable = providers.some((provider) =>
+                    provider.name === 'speko' && provider.configured
+                );
+                message += `\n*📞 Call Provider Configuration*\n`;
+                for (const provider of providers) {
+                    const state = !provider.configured
+                        ? '⚪ Not configured'
+                        : provider.degraded
+                            ? '⚠️ Degraded'
+                            : provider.circuitState === 'half_open'
+                                ? '🟡 Recovering'
+                                : '✅ Configured';
+                    const evidence = provider.healthScore === null
+                        ? ''
+                        : `; observed score ${provider.healthScore}/100`;
+                    message += `${buildLine('•', provider.name, `${state}${evidence}`)}\n`;
+                }
+                message += `_Configuration and circuit state only; this view does not probe live provider connectivity._\n`;
+            }
+
+            const callJobs = health.services.call_jobs;
+            if (callJobs) {
+                const dlqCount = Number(callJobs.open_dead_letters) || 0;
+                message += `${buildLine('🧰', 'Call jobs', `${Number(callJobs.pending) || 0} pending, ${Number(callJobs.running) || 0} running`)}\n`;
+                message += `${buildLine(dlqCount > 0 ? '⚠️' : '✅', 'Open dead letters', dlqCount)}\n`;
+                if (dlqCount > 0) {
+                    try {
+                        const dlqResponse = await httpClient.get(
+                            null,
+                            `${config.apiUrl}/admin/call-jobs/dlq/summary?status=open&limit=3&provider_details=true`,
+                            { timeout: 8000, headers: healthHeaders },
+                        );
+                        const entries = getArrayPayload(dlqResponse, 'rows');
+                        spekoDlqEntries = entries.filter((entry) =>
+                            ['outbound_call', 'callback_call'].includes(String(entry?.job_type || '')) &&
+                            String(entry?.provider || '').toLowerCase() === 'speko'
+                        );
+                        if (entries.length) {
+                            message += `\n*⚠️ Recent jobs requiring review:*\n`;
+                            message += entries.map(formatDeadLetterLine).join('\n');
+                            if (dlqCount > entries.length) {
+                                message += `\n• ${dlqCount - entries.length} more open item(s)`;
+                            }
+                            message += '\n';
+                        }
+                    } catch (_) {
+                        message += '\nReview item details are temporarily unavailable.\n';
+                    }
+                }
             }
 
             message += `\n`;
@@ -185,9 +248,33 @@ async function handleStatusCommand(ctx) {
         message += `\n${buildLine('⏰','Last Updated', escapeMarkdown(new Date(health.timestamp).toLocaleString()))}`;
         message += `\n${buildLine('📡','API Endpoint', escapeMarkdown(config.apiUrl))}`;
 
+        const replyMarkup = buildMainMenuReplyMarkup(ctx);
+        if (spekoUsageAvailable) {
+            replyMarkup.inline_keyboard.unshift([
+                {
+                    text: '📊 Speko usage & budget',
+                    callback_data: buildCallbackData(ctx, 'SPEKO_USAGE'),
+                },
+                {
+                    text: '📈 Speko activity',
+                    callback_data: buildCallbackData(ctx, 'SPEKO_METRICS'),
+                },
+            ]);
+        }
+        const reconcileButtons = spekoDlqEntries.slice(0, 3).map((entry) => {
+            const id = Number(entry?.id);
+            if (!Number.isInteger(id) || id < 1) return null;
+            return [{
+                text: `🔎 Reconcile call DLQ #${id}`,
+                callback_data: buildCallbackData(ctx, `DLQ_RECONCILE:${id}`),
+            }];
+        }).filter(Boolean);
+        if (reconcileButtons.length) {
+            replyMarkup.inline_keyboard = [...reconcileButtons, ...(replyMarkup.inline_keyboard || [])];
+        }
         await ctx.reply(message, {
             parse_mode: 'Markdown',
-            reply_markup: buildMainMenuReplyMarkup(ctx)
+            reply_markup: replyMarkup
         });
     } catch (error) {
         console.error('Status command error:', error);
@@ -376,5 +463,6 @@ module.exports = {
     handleHealthCommand,
     handleCallbackTasksCommand,
     handleReviewCasesCommand,
-    handleDomainStatsCommand
+    handleDomainStatsCommand,
+    formatDeadLetterLine
 };
