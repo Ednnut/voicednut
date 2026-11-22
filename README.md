@@ -208,7 +208,7 @@ SERVER=your-domain.com
 
 # OpenRouter AI Configuration
 OPENROUTER_API_KEY=sk-or-v1-xxx
-OPENROUTER_MODEL=meta-llama/llama-3.1-8b-instruct:free
+OPENROUTER_MODEL=openai/gpt-4o-mini
 YOUR_SITE_URL=http://localhost:3000
 YOUR_SITE_NAME=Voice Call Bot
 
@@ -417,7 +417,7 @@ CMD ["npm", "start"]
 
 Available free models through OpenRouter:
 
-- `meta-llama/llama-3.1-8b-instruct:free` (default)
+- `openai/gpt-4o-mini` (default)
 - `microsoft/wizardlm-2-8x22b`
 - `google/gemma-2-9b-it:free`
 - `qwen/qwen-2-7b-instruct:free`

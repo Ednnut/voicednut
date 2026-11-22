@@ -466,6 +466,15 @@ const spekoEnabled =
   String(readEnv("SPEKO_ENABLED") || "false").toLowerCase() === "true";
 const spekoInboundEnabled =
   String(readEnv("SPEKO_INBOUND_ENABLED") || "false").toLowerCase() === "true";
+const spekoCallControlEnabled =
+  String(readEnv("SPEKO_CALL_CONTROL_ENABLED") || "false").toLowerCase() === "true";
+const spekoRunMode =
+  String(readEnv("SPEKO_RUN_MODE") || "s2s").trim().toLowerCase() === "cascade"
+    ? "cascade"
+    : "s2s";
+const spekoS2sModel =
+  String(readEnv("SPEKO_S2S_MODEL") || "openai:gpt-live-1.1").trim() ||
+  "openai:gpt-live-1.1";
 const spekoMaxDurationSeconds = Number(
   readEnv("SPEKO_MAX_DURATION_SECONDS") || "300",
 );
@@ -477,6 +486,21 @@ const spekoRequestTimeoutMs = Number(
 );
 const apiSecret = readEnv("API_SECRET");
 const adminApiToken = apiSecret || readEnv("ADMIN_API_TOKEN");
+function parseAdminUserTokens(rawValue) {
+  if (!rawValue) return {};
+  try {
+    const parsed = JSON.parse(rawValue);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+    return Object.fromEntries(Object.entries(parsed).filter(([actor, token]) =>
+      /^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/.test(actor) &&
+      typeof token === "string" && token.length >= 32,
+    ));
+  } catch (_) {
+    console.warn('ADMIN_API_USER_TOKENS must be a JSON object of actor IDs to tokens');
+    return {};
+  }
+}
+const adminUserTokens = parseAdminUserTokens(readEnv("ADMIN_API_USER_TOKENS"));
 const complianceModeRaw = (
   readEnv("CONFIG_COMPLIANCE_MODE") || "safe"
 ).toLowerCase();
@@ -1121,6 +1145,9 @@ module.exports = {
   speko: {
     enabled: spekoEnabled,
     inboundEnabled: spekoInboundEnabled,
+    callControlEnabled: spekoCallControlEnabled,
+    runMode: spekoRunMode,
+    s2sModel: spekoS2sModel,
     agentToolsEnabled:
       String(readEnv("SPEKO_AGENT_TOOLS_ENABLED") || "false").toLowerCase() === "true",
     apiKey: readEnv("SPEKO_API_KEY"),
@@ -1353,7 +1380,7 @@ module.exports = {
   },
   openRouter: {
     apiKey: ensure("OPENROUTER_API_KEY"),
-    model: ensure("OPENROUTER_MODEL", "meta-llama/llama-3.1-8b-instruct:free"),
+    model: ensure("OPENROUTER_MODEL", "openai/gpt-4o-mini"),
     backupModel: readEnv("OPENROUTER_BACKUP_MODEL"),
     siteUrl: ensure("YOUR_SITE_URL", "http://localhost:3000"),
     siteName: ensure("YOUR_SITE_NAME", "Voice Call Bot"),
@@ -1464,6 +1491,7 @@ module.exports = {
   },
   admin: {
     apiToken: adminApiToken,
+    userTokens: adminUserTokens,
   },
   compliance: {
     mode: complianceMode,

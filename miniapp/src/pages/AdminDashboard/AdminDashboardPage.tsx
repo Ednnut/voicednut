@@ -1097,7 +1097,7 @@ export function AdminDashboardPage() {
 
   const handleOverflowCloseMiniApp = useCallback((): void => {
     setOverflowMenuOpen(false);
-    handleCloseMiniApp();
+    void handleCloseMiniApp();
   }, [handleCloseMiniApp]);
 
   const handlePullReadyStateChange = useCallback((ready: boolean): void => {
@@ -1671,7 +1671,7 @@ export function AdminDashboardPage() {
         onClose={closeOverflowMenu}
         onOpenSettings={handleOverflowSettings}
         onRefreshDashboard={handleOverflowRefresh}
-        onShareMiniApp={handleShareMiniApp}
+        onShareMiniApp={() => { void handleShareMiniApp(); }}
         onCloseMiniApp={miniApp.close.isAvailable() ? handleOverflowCloseMiniApp : undefined}
       />
       <DashboardActionDialog

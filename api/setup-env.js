@@ -70,7 +70,7 @@ const SECTIONS = [
     comments: ['# OpenRouter AI configuration'],
     fields: [
       { key: 'OPENROUTER_API_KEY', prompt: 'OpenRouter API Key' },
-      { key: 'OPENROUTER_MODEL', prompt: 'Default OpenRouter Model', defaultValue: 'meta-llama/llama-3.1-8b-instruct:free' },
+      { key: 'OPENROUTER_MODEL', prompt: 'Default OpenRouter Model', defaultValue: 'openai/gpt-4o-mini' },
       { key: 'YOUR_SITE_URL', prompt: 'Your site URL', defaultValue: 'http://localhost:3000' },
       { key: 'YOUR_SITE_NAME', prompt: 'Your site name', defaultValue: 'Voice Call Bot' },
     ],

@@ -496,7 +496,7 @@ class EnhancedSmsService extends EventEmitter {
                 "X-Title": config.openRouter.siteName || "SMS AI Assistant",
             }
         });
-        this.model = config.openRouter.model || "meta-llama/llama-3.1-8b-instruct:free";
+        this.model = config.openRouter.model || "openai/gpt-4o-mini";
 
         // SMS conversation tracking
         this.activeConversations = new Map();

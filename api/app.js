@@ -114,6 +114,7 @@ const {
   VonageVoiceAdapter,
 } = require("./adapters");
 const { SpekoVoiceAdapter, isE164 } = require("./adapters/spekoVoiceAdapter");
+const { SpekoCallControlService } = require("./adapters/spekoCallControlService");
 const {
   isSpekoWebhookSecret,
   verifySpekoWebhook,
@@ -12423,6 +12424,7 @@ const vonageCallMap = new Map();
 let plivoVoiceAdapter = null;
 let vonageVoiceAdapter = null;
 let spekoVoiceAdapter = null;
+let spekoCallControlService = null;
 let vonageMappingReconcileTimer = null;
 
 function getSpekoVoiceAdapter() {
@@ -12432,8 +12434,24 @@ function getSpekoVoiceAdapter() {
   return spekoVoiceAdapter;
 }
 
+function getSpekoCallControlService() {
+  if (!spekoCallControlService) {
+    spekoCallControlService = new SpekoCallControlService({
+      config: config.speko,
+      voiceAdapter: getSpekoVoiceAdapter(),
+      store: db,
+    });
+  }
+  return spekoCallControlService;
+}
+
 function setSpekoVoiceAdapterForTests(adapter) {
   spekoVoiceAdapter = adapter || null;
+  spekoCallControlService = null;
+}
+
+function setSpekoCallControlServiceForTests(service) {
+  spekoCallControlService = service || null;
 }
 
 function rememberPlivoCallMapping(callSid, plivoUuid, source = "unknown") {
@@ -12871,19 +12889,42 @@ const builtinPersonas = [
 ];
 
 function requireAdminToken(req, res, next) {
+  const provided = req.headers[ADMIN_HEADER_NAME];
   const token = config.admin?.apiToken;
+  // A credential shared with every administrator must never acquire a named
+  // identity merely because it was also entered in the per-user map.
+  if (token && safeCompareSecret(provided, token)) {
+    req.adminIdentity = { actorId: null, source: "shared_admin_token" };
+    return next();
+  }
+  let actorId = null;
+  const namedTokens = config.admin?.userTokens && typeof config.admin.userTokens === "object"
+    ? Object.entries(config.admin.userTokens) : [];
+  for (const [actor, token] of namedTokens) {
+    if (safeCompareSecret(provided, token)) {
+      actorId = actor;
+      break;
+    }
+  }
+  if (actorId) {
+    req.adminIdentity = { actorId, source: "named_admin_token" };
+    return next();
+  }
   if (!token) {
     return res
       .status(500)
       .json({ success: false, error: "Admin token not configured" });
   }
-  const provided = req.headers[ADMIN_HEADER_NAME];
-  if (!safeCompareSecret(provided, token)) {
-    return res
-      .status(403)
-      .json({ success: false, error: "Admin token required" });
-  }
-  return next();
+  return res.status(403).json({ success: false, error: "Admin token required" });
+}
+
+function requireNamedAdminToken(req, res, next) {
+  return requireAdminToken(req, res, () => {
+    if (req.adminIdentity?.source !== "named_admin_token") {
+      return res.status(403).json({ success: false, error: "named_admin_token_required" });
+    }
+    return next();
+  });
 }
 
 function hasAdminToken(req) {
@@ -21434,6 +21475,180 @@ app.get("/miniapp/bootstrap", requireMiniAppSession, async (req, res) => {
   }
 });
 
+async function resolveMiniAppSpekoBroker(req, res) {
+  if (!requireMiniAppCapability(req, res, "provider_manage")) return null;
+  const telegramUserId = String(req.miniAppSession?.telegram_id || "").trim();
+  const owner = await db.getSpekoHumanBrokerOwner({ telegram_user_id: telegramUserId });
+  if (!owner || owner.broker_id !== String(config.speko?.brokerId || "")) {
+    res.status(403).json({ success: false, error: "speko_broker_not_assigned" });
+    return null;
+  }
+  return owner;
+}
+
+function miniAppSpekoAuditContext(req) {
+  return {
+    actorId: String(req.miniAppSession?.telegram_id || "").trim(),
+    actorSource: "miniapp_session",
+    requestId: req.requestId,
+  };
+}
+
+async function miniAppOwnsSpekoCall(owner, callId) {
+  return db.isSpekoHumanCallOwnedByBroker({ call_id: callId, broker_id: owner.broker_id });
+}
+
+app.get("/miniapp/speko/call-control/calls", requireMiniAppSession, async (req, res) => {
+  try {
+    const owner = await resolveMiniAppSpekoBroker(req, res);
+    if (!owner) return;
+    const result = await getSpekoCallControlService().listCalls({
+      brokerId: owner.broker_id, limit: req.query?.limit,
+    });
+    const calls = (result?.calls || []).filter((call) =>
+      (call.legs || []).some((leg) => leg.brokerId === owner.broker_id),
+    );
+    res.set("Cache-Control", "no-store");
+    return res.json({ success: true, calls });
+  } catch (error) {
+    return res.status(error?.status || 502).json({ success: false, error: error?.code || "speko_calls_failed" });
+  }
+});
+
+app.get("/miniapp/speko/call-control/calls/:callId", requireMiniAppSession, async (req, res) => {
+  try {
+    const owner = await resolveMiniAppSpekoBroker(req, res);
+    if (!owner) return;
+    if (!await miniAppOwnsSpekoCall(owner, req.params.callId)) {
+      return res.status(404).json({ success: false, error: "speko_call_not_found" });
+    }
+    const call = await getSpekoCallControlService().getCall(req.params.callId);
+    if (!(call?.legs || []).some((leg) => leg.brokerId === owner.broker_id)) {
+      return res.status(404).json({ success: false, error: "speko_call_not_found" });
+    }
+    res.set("Cache-Control", "no-store");
+    return res.json({ success: true, call });
+  } catch (error) {
+    return res.status(error?.status || 502).json({ success: false, error: error?.code || "speko_call_read_failed" });
+  }
+});
+
+app.get("/miniapp/speko/call-control/calls/:callId/events", requireMiniAppSession, async (req, res) => {
+  try {
+    const owner = await resolveMiniAppSpekoBroker(req, res);
+    if (!owner) return;
+    if (!await miniAppOwnsSpekoCall(owner, req.params.callId)) {
+      return res.status(404).json({ success: false, error: "speko_call_not_found" });
+    }
+    const result = await getSpekoCallControlService().getCallEvents(req.params.callId);
+    res.set("Cache-Control", "no-store");
+    return res.json({ success: true, events: result?.events || [] });
+  } catch (error) {
+    return res.status(error?.status || 502).json({ success: false, error: error?.code || "speko_call_events_failed" });
+  }
+});
+
+app.post("/miniapp/speko/call-control/legs/:controlId/join", requireMiniAppSession, async (req, res) => {
+  try {
+    const owner = await resolveMiniAppSpekoBroker(req, res);
+    if (!owner) return;
+    let leg = await db.getSpekoHumanCallLeg({ control_id: req.params.controlId });
+    if (!leg) {
+      // Ring offers can arrive before any list/read populated local mappings.
+      // Refresh a bounded broker-scoped window, then re-check ownership locally.
+      await getSpekoCallControlService().refreshCallsForBroker(owner.broker_id, 100);
+      leg = await db.getSpekoHumanCallLeg({ control_id: req.params.controlId });
+    }
+    if (!leg || !await miniAppOwnsSpekoCall(owner, leg.call_id)) {
+      return res.status(404).json({ success: false, error: "speko_call_leg_not_found" });
+    }
+    const credentials = await getSpekoCallControlService().join(req.params.controlId);
+    res.set("Cache-Control", "no-store");
+    return res.json({ success: true, ...credentials });
+  } catch (error) {
+    return res.status(error?.status || 502).json({ success: false, error: error?.code || "speko_call_join_failed" });
+  }
+});
+
+app.post("/miniapp/speko/call-control/controls/:controlId/:command", requireMiniAppSession, async (req, res) => {
+  try {
+    const owner = await resolveMiniAppSpekoBroker(req, res);
+    if (!owner) return;
+    const leg = await db.getSpekoHumanCallLeg({ control_id: req.params.controlId });
+    if (!leg || !await miniAppOwnsSpekoCall(owner, leg.call_id)) {
+      return res.status(404).json({ success: false, error: "speko_call_leg_not_found" });
+    }
+    const result = await getSpekoCallControlService().command(
+      String(req.params.command || "").toLowerCase(), req.params.controlId, req.body || {},
+      miniAppSpekoAuditContext(req),
+    );
+    res.set("Cache-Control", "no-store");
+    return res.json({ success: true, result });
+  } catch (error) {
+    return res.status(error?.status || 502).json({ success: false, error: error?.code || "speko_call_command_failed" });
+  }
+});
+
+app.post("/miniapp/speko/call-control/dial", requireMiniAppSession, async (req, res) => {
+  try {
+    const owner = await resolveMiniAppSpekoBroker(req, res);
+    if (!owner) return;
+    const call = await getSpekoCallControlService().dial({ to: req.body?.to, from: req.body?.from }, miniAppSpekoAuditContext(req));
+    res.set("Cache-Control", "no-store");
+    return res.json({ success: true, ...call });
+  } catch (error) {
+    return res.status(error?.status || 502).json({ success: false, error: error?.code || "speko_call_dial_failed", uncertain: error?.uncertain === true });
+  }
+});
+
+app.post("/miniapp/speko/call-control/presence/token", requireMiniAppSession, async (req, res) => {
+  try {
+    const owner = await resolveMiniAppSpekoBroker(req, res);
+    if (!owner) return;
+    const credentials = await getSpekoCallControlService().getPresenceToken();
+    res.set("Cache-Control", "no-store");
+    return res.json({ success: true, ...credentials });
+  } catch (error) {
+    return res.status(error?.status || 502).json({ success: false, error: error?.code || "speko_presence_token_failed" });
+  }
+});
+
+app.post("/miniapp/speko/call-control/presence/status", requireMiniAppSession, async (req, res) => {
+  try {
+    const owner = await resolveMiniAppSpekoBroker(req, res);
+    if (!owner) return;
+    const presence = await getSpekoCallControlService().setStatus(req.body?.status, miniAppSpekoAuditContext(req));
+    res.set("Cache-Control", "no-store");
+    return res.json({ success: true, presence });
+  } catch (error) {
+    return res.status(error?.status || 502).json({ success: false, error: error?.code || "speko_presence_status_failed" });
+  }
+});
+
+app.post("/miniapp/speko/call-control/presence/register", requireMiniAppSession, async (req, res) => {
+  try {
+    const owner = await resolveMiniAppSpekoBroker(req, res);
+    if (!owner) return;
+    const presence = await getSpekoCallControlService().register(miniAppSpekoAuditContext(req));
+    res.set("Cache-Control", "no-store");
+    return res.json({ success: true, presence });
+  } catch (error) {
+    return res.status(error?.status || 502).json({ success: false, error: error?.code || "speko_presence_register_failed" });
+  }
+});
+
+app.post("/miniapp/speko/call-control/presence/heartbeat", requireMiniAppSession, async (req, res) => {
+  try {
+    const owner = await resolveMiniAppSpekoBroker(req, res);
+    if (!owner) return;
+    const presence = await getSpekoCallControlService().heartbeat();
+    res.set("Cache-Control", "no-store");
+    return res.json({ success: true, presence });
+  } catch (error) {
+    return res.status(error?.status || 502).json({ success: false, error: error?.code || "speko_presence_heartbeat_failed" });
+  }
+});
+
 app.get("/miniapp/calls/active", requireMiniAppSession, async (req, res) => {
   res.locals.miniAppRoute = "call_active";
   if (await enforceMiniAppRateLimit(req, res, "poll")) {
@@ -21932,6 +22147,385 @@ app.get("/admin/speko/usage", requireAdminToken, async (req, res) => {
     return res.status(error?.status || 502).json({
       success: false,
       error: error?.code || "speko_usage_failed",
+    });
+  }
+});
+
+app.get("/admin/speko/metrics", requireAdminToken, async (req, res) => {
+  const requestedHours = Number(req.query?.hours ?? 24);
+  const hours = Number.isFinite(requestedHours)
+    ? Math.min(720, Math.max(1, Math.floor(requestedHours)))
+    : 24;
+  if (!db?.getSpekoOperationalMetrics || !db?.getServiceHealthSummary) {
+    return res.status(503).json({ success: false, error: "speko_metrics_unavailable" });
+  }
+  try {
+    const [calls, health] = await Promise.all([
+      db.getSpekoOperationalMetrics(hours),
+      db.getServiceHealthSummary(hours),
+    ]);
+    return res.json({
+      success: true,
+      period_hours: hours,
+      calls,
+      health: health?.services?.speko || {},
+    });
+  } catch (error) {
+    console.error("Failed to load Speko metrics:", {
+      code: error?.code || "speko_metrics_failed",
+    });
+    return res.status(502).json({ success: false, error: "speko_metrics_failed" });
+  }
+});
+
+async function resolveSpekoSessionId(callSid) {
+  if (!db?.getCall) return null;
+  const call = await db.getCall(callSid);
+  const providerMetadata =
+    call?.provider_metadata && typeof call.provider_metadata === "object"
+      ? call.provider_metadata
+      : {};
+  if (String(call?.provider || "").toLowerCase() !== "speko") return null;
+  return String(
+    providerMetadata.speko_session_id ||
+      call.speko_session_id ||
+      "",
+  ).trim() || null;
+}
+
+app.post(
+  "/admin/speko/calls/:callSid/transfers/blind",
+  requireAdminToken,
+  async (req, res) => {
+    try {
+      const sessionId = await resolveSpekoSessionId(req.params.callSid);
+      if (!sessionId) {
+        return res.status(404).json({
+          success: false,
+          error: "speko_call_not_found",
+        });
+      }
+      const result = await getSpekoVoiceAdapter().blindTransfer(sessionId, {
+        to: req.body?.to,
+        participantIdentity: req.body?.participantIdentity,
+        playDialtone: req.body?.playDialtone,
+        ringingTimeout: req.body?.ringingTimeout,
+        headers: req.body?.headers,
+      });
+      return res.json({ success: true, transfer: result });
+    } catch (error) {
+      return res.status(error?.status || 502).json({
+        success: false,
+        error: error?.code || "speko_blind_transfer_failed",
+        uncertain: error?.uncertain === true,
+      });
+    }
+  },
+);
+
+app.post(
+  "/admin/speko/calls/:callSid/transfers/warm",
+  requireAdminToken,
+  async (req, res) => {
+    try {
+      const sessionId = await resolveSpekoSessionId(req.params.callSid);
+      if (!sessionId) {
+        return res.status(404).json({
+          success: false,
+          error: "speko_call_not_found",
+        });
+      }
+      const result = await getSpekoVoiceAdapter().warmTransfer(sessionId, req.body || {});
+      return res.json({ success: true, transfer: result });
+    } catch (error) {
+      return res.status(error?.status || 502).json({
+        success: false,
+        error: error?.code || "speko_warm_transfer_failed",
+        uncertain: error?.uncertain === true,
+      });
+    }
+  },
+);
+
+app.post(
+  "/admin/speko/calls/:callSid/transfers/:transferId/complete",
+  requireAdminToken,
+  async (req, res) => {
+    try {
+      const sessionId = await resolveSpekoSessionId(req.params.callSid);
+      if (!sessionId) {
+        return res.status(404).json({
+          success: false,
+          error: "speko_call_not_found",
+        });
+      }
+      const result = await getSpekoVoiceAdapter().completeWarmTransfer(
+        sessionId,
+        req.params.transferId,
+        req.body || {},
+      );
+      return res.json({ success: true, transfer: result });
+    } catch (error) {
+      return res.status(error?.status || 502).json({
+        success: false,
+        error: error?.code || "speko_warm_transfer_complete_failed",
+        uncertain: error?.uncertain === true,
+      });
+    }
+  },
+);
+
+app.post(
+  "/admin/speko/calls/:callSid/transfers/:transferId/cancel",
+  requireAdminToken,
+  async (req, res) => {
+    try {
+      const sessionId = await resolveSpekoSessionId(req.params.callSid);
+      if (!sessionId) {
+        return res.status(404).json({
+          success: false,
+          error: "speko_call_not_found",
+        });
+      }
+      const result = await getSpekoVoiceAdapter().cancelWarmTransfer(
+        sessionId,
+        req.params.transferId,
+        req.body || {},
+      );
+      return res.json({ success: true, transfer: result });
+    } catch (error) {
+      return res.status(error?.status || 502).json({
+        success: false,
+        error: error?.code || "speko_warm_transfer_cancel_failed",
+        uncertain: error?.uncertain === true,
+      });
+    }
+  },
+);
+
+app.post("/admin/speko/call-control/dial", requireAdminToken, async (req, res) => {
+  try {
+    const result = await getSpekoCallControlService().dial(req.body || {}, {
+      actorId: req.adminIdentity?.actorId, actorSource: req.adminIdentity?.source, requestId: req.requestId,
+    });
+    return res.json({ success: true, call: result });
+  } catch (error) {
+    return res.status(error?.status || 502).json({
+      success: false,
+      error: error?.code || "speko_human_call_failed",
+      uncertain: error?.uncertain === true,
+    });
+  }
+});
+
+app.get("/admin/speko/call-control/calls", requireAdminToken, async (req, res) => {
+  try {
+    const calls = await getSpekoCallControlService().listCalls({
+      status: req.query?.status,
+      direction: req.query?.direction,
+      brokerId: req.query?.brokerId,
+      limit: req.query?.limit,
+    });
+    return res.json({ success: true, ...calls });
+  } catch (error) {
+    return res.status(error?.status || 502).json({
+      success: false,
+      error: error?.code || "speko_human_calls_failed",
+    });
+  }
+});
+
+app.post(
+  "/admin/speko/call-control/presence/token",
+  requireAdminToken,
+  async (_req, res) => {
+    try {
+      const credentials = await getSpekoCallControlService().getPresenceToken();
+      res.set("Cache-Control", "no-store");
+      return res.json({ success: true, ...credentials });
+    } catch (error) {
+      return res.status(error?.status || 502).json({
+        success: false,
+        error: error?.code || "speko_human_presence_token_failed",
+      });
+    }
+  },
+);
+
+app.post(
+  "/admin/speko/call-control/legs/:controlId/join",
+  requireAdminToken,
+  async (req, res) => {
+    try {
+      const credentials = await getSpekoCallControlService().join(req.params.controlId);
+      res.set("Cache-Control", "no-store");
+      return res.json({ success: true, ...credentials });
+    } catch (error) {
+      return res.status(error?.status || 502).json({
+        success: false,
+        error: error?.code || "speko_human_call_join_failed",
+      });
+    }
+  },
+);
+
+app.get("/admin/speko/call-control/calls/:callId", requireAdminToken, async (req, res) => {
+  try {
+    const result = await getSpekoCallControlService().getCall(req.params.callId);
+    return res.json({ success: true, call: result });
+  } catch (error) {
+    return res.status(error?.status || 502).json({
+      success: false,
+      error: error?.code || "speko_human_call_read_failed",
+    });
+  }
+});
+
+app.get("/admin/speko/call-control/calls/:callId/events", requireAdminToken, async (req, res) => {
+  try {
+    const result = await getSpekoCallControlService().getCallEvents(req.params.callId);
+    return res.json({ success: true, events: result });
+  } catch (error) {
+    return res.status(error?.status || 502).json({
+      success: false,
+      error: error?.code || "speko_human_call_events_failed",
+    });
+  }
+});
+
+app.post("/admin/speko/call-control/calls/:callId/reconcile", requireAdminToken, async (req, res) => {
+  try {
+    const result = await getSpekoCallControlService().reconcileCallEvents(req.params.callId);
+    return res.json({ success: true, call: result.call, events: result.events });
+  } catch (error) {
+    return res.status(error?.status || 502).json({
+      success: false,
+      error: error?.code || "speko_human_call_reconcile_failed",
+    });
+  }
+});
+
+app.get("/admin/speko/call-control/audit", requireAdminToken, async (req, res) => {
+  try {
+    const audit = await db.listSpekoHumanCallControlAudit({
+      call_id: req.query?.callId, limit: req.query?.limit,
+    });
+    return res.json({ success: true, audit });
+  } catch (error) {
+    return res.status(503).json({ success: false, error: "speko_call_control_audit_unavailable" });
+  }
+});
+
+app.put("/admin/speko/call-control/brokers/:brokerId/owner", requireNamedAdminToken, async (req, res) => {
+  const brokerId = String(req.params.brokerId || "").trim();
+  const telegramUserId = String(req.body?.telegramUserId || "").trim();
+  if (!config.speko?.callControlEnabled || brokerId !== String(config.speko?.brokerId || "") ||
+      !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(brokerId)) {
+    return res.status(400).json({ success: false, error: "speko_broker_owner_invalid" });
+  }
+  const role = resolveMiniAppUserRole(telegramUserId);
+  if (!role || role === "viewer") {
+    return res.status(400).json({ success: false, error: "speko_broker_owner_user_not_authorized" });
+  }
+  let auditId;
+  try {
+    auditId = await db.startSpekoHumanCallControlAudit({
+      scope_id: brokerId,
+      operation: "broker_owner_assign", actor_hint: req.adminIdentity.actorId,
+      actor_source: "named_admin_token", request_id: req.requestId,
+    });
+    const owner = await db.setSpekoHumanBrokerOwner({
+      broker_id: brokerId, telegram_user_id: telegramUserId,
+      assigned_by: req.adminIdentity.actorId,
+    });
+    await db.finishSpekoHumanCallControlAudit({ id: auditId, status: "succeeded" });
+    return res.json({ success: true, owner });
+  } catch (error) {
+    if (auditId) await db.finishSpekoHumanCallControlAudit({ id: auditId, status: "failed", error_code: "speko_broker_owner_write_failed" }).catch(() => {});
+    return res.status(error?.message === "speko_broker_owner_invalid" ? 400 : 409)
+      .json({ success: false, error: "speko_broker_owner_write_failed" });
+  }
+});
+
+app.delete("/admin/speko/call-control/brokers/:brokerId/owner", requireNamedAdminToken, async (req, res) => {
+  const brokerId = String(req.params.brokerId || "").trim();
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(brokerId)) {
+    return res.status(400).json({ success: false, error: "speko_broker_owner_invalid" });
+  }
+  let auditId;
+  try {
+    auditId = await db.startSpekoHumanCallControlAudit({
+      scope_id: brokerId,
+      operation: "broker_owner_remove", actor_hint: req.adminIdentity.actorId,
+      actor_source: "named_admin_token", request_id: req.requestId,
+    });
+    const removed = await db.deleteSpekoHumanBrokerOwner({ broker_id: brokerId });
+    await db.finishSpekoHumanCallControlAudit({ id: auditId, status: "succeeded" });
+    return res.json({ success: true, removed: removed > 0 });
+  } catch (_) {
+    if (auditId) await db.finishSpekoHumanCallControlAudit({ id: auditId, status: "failed", error_code: "speko_broker_owner_remove_failed" }).catch(() => {});
+    return res.status(503).json({ success: false, error: "speko_broker_owner_remove_failed" });
+  }
+});
+
+app.post(
+  "/admin/speko/call-control/controls/:controlId/:command",
+  requireAdminToken,
+  async (req, res) => {
+    try {
+      const result = await getSpekoCallControlService().command(
+        String(req.params.command || "").toLowerCase(),
+        req.params.controlId,
+        req.body || {},
+        { actorId: req.adminIdentity?.actorId, actorSource: req.adminIdentity?.source, requestId: req.requestId },
+      );
+      return res.json({ success: true, result });
+    } catch (error) {
+      return res.status(error?.status || 502).json({
+        success: false,
+        error: error?.code || "speko_human_call_command_failed",
+        uncertain: error?.uncertain === true,
+      });
+    }
+  },
+);
+
+app.post("/admin/speko/call-control/presence/register", requireAdminToken, async (_req, res) => {
+  try {
+    const result = await getSpekoCallControlService().register({
+      actorId: req.adminIdentity?.actorId, actorSource: req.adminIdentity?.source, requestId: req.requestId,
+    });
+    return res.json({ success: true, presence: result });
+  } catch (error) {
+    return res.status(error?.status || 502).json({
+      success: false,
+      error: error?.code || "speko_human_presence_register_failed",
+    });
+  }
+});
+
+app.post("/admin/speko/call-control/presence/heartbeat", requireAdminToken, async (_req, res) => {
+  try {
+    const result = await getSpekoCallControlService().heartbeat();
+    return res.json({ success: true, presence: result });
+  } catch (error) {
+    return res.status(error?.status || 502).json({
+      success: false,
+      error: error?.code || "speko_human_presence_heartbeat_failed",
+    });
+  }
+});
+
+app.post("/admin/speko/call-control/presence/status", requireAdminToken, async (req, res) => {
+  try {
+    const result = await getSpekoCallControlService().setStatus(req.body?.status, {
+      actorId: req.adminIdentity?.actorId, actorSource: req.adminIdentity?.source, requestId: req.requestId,
+    });
+    return res.json({ success: true, presence: result });
+  } catch (error) {
+    return res.status(error?.status || 502).json({
+      success: false,
+      error: error?.code || "speko_human_presence_status_failed",
     });
   }
 });
@@ -25402,6 +25996,12 @@ async function placeOutboundCall(payload, hostOverride = null) {
       }
       lastError = error;
       recordProviderError(provider, error);
+      if (provider === "speko") {
+        await recordSpekoHealth("outbound_call_error", {
+          event_type: "outbound",
+          code: error?.code || "speko_call_failed",
+        });
+      }
       recordProviderFlowMetric("outbound_call_error", {
         channel: "call",
         flow: keypadRequired ? "digit_capture" : "outbound_voice",
@@ -25754,6 +26354,16 @@ async function placeOutboundCall(payload, hostOverride = null) {
     });
     await db.updateCallState(callId, "call_created", callCreatedState);
     await db.recordCallOutcomeFromCallCreated(callId, callCreatedState);
+    if (selectedProvider === "speko") {
+      await recordSpekoCallMetric(callId, "speko_call_created", 1, {
+        session_id: providerMetadata?.speko_session_id,
+        event_type: "outbound",
+        status: callStatus,
+      });
+      await recordSpekoHealth("outbound_call_created", {
+        event_type: "outbound",
+      });
+    }
     setCallPhase(callId, "dialing", {
       source: "placeOutboundCall",
       reason: "outbound_created",
@@ -30347,6 +30957,12 @@ async function handleSpekoCallReport(
     recording_url_expires_at: report?.recording_url_expires_at || null,
     received_at: new Date().toISOString(),
   });
+  if (duration && duration > 0) {
+    await recordSpekoCallMetric(callSid, "speko_call_duration_seconds", duration, {
+      session_id: sessionId,
+      event_type: "call.report",
+    });
+  }
 
   const call = (await dbInstance.getCall(callSid).catch(() => null)) || {};
   const transcripts = await dbInstance.getCallTranscripts(callSid).catch(() => []);
@@ -30381,6 +30997,60 @@ async function handleSpekoCallReport(
         notificationType: notificationTypeForCallStatus(finalStatus),
         duration,
       }),
+    });
+  }
+}
+
+async function recordSpekoCallMetric(callSid, metricType, metricValue, details = {}) {
+  if (
+    (!db?.addCallMetric && !db?.addCallMetricOnce) ||
+    !String(callSid || "").trim()
+  ) return;
+  const safeDetails = {
+    provider: "speko",
+    ...(details.event_type
+      ? { event_type: String(details.event_type).slice(0, 64) }
+      : {}),
+    ...(details.status ? { status: String(details.status).slice(0, 40) } : {}),
+    ...(details.session_id
+      ? { session_id: String(details.session_id).slice(0, 256) }
+      : {}),
+    ...(Number.isSafeInteger(Number(details.sequence))
+      ? { sequence: Number(details.sequence) }
+      : {}),
+  };
+  try {
+    const once = metricType === "speko_call_created" && db.addCallMetricOnce;
+    const addMetric = once ? db.addCallMetricOnce.bind(db) : db.addCallMetric?.bind(db);
+    if (!addMetric) return;
+    await addMetric(
+      String(callSid),
+      String(metricType).slice(0, 80),
+      Number.isFinite(Number(metricValue)) ? Number(metricValue) : 1,
+      safeDetails,
+    );
+  } catch (error) {
+    console.warn("speko_call_metric_write_failed", {
+      metric_type: String(metricType).slice(0, 80),
+      code: error?.code || "call_metric_write_failed",
+    });
+  }
+}
+
+async function recordSpekoHealth(status, details = {}) {
+  if (!db?.logServiceHealth) return;
+  const safeDetails = {
+    provider: "speko",
+    ...(details.event_type
+      ? { event_type: String(details.event_type).slice(0, 64) }
+      : {}),
+    ...(details.code ? { code: String(details.code).slice(0, 80) } : {}),
+  };
+  try {
+    await db.logServiceHealth("speko", String(status).slice(0, 80), safeDetails);
+  } catch (error) {
+    console.warn("speko_health_log_write_failed", {
+      code: error?.code || "service_health_write_failed",
     });
   }
 }
@@ -30703,6 +31373,14 @@ async function handleSpekoPreCall(event = {}) {
     throw error;
   }
   callDirections.set(callSid, "inbound");
+  await recordSpekoCallMetric(callSid, "speko_call_created", 1, {
+    session_id: sessionId,
+    event_type: "call.pre_call",
+    status: "initiated",
+  });
+  await recordSpekoHealth("inbound_call_created", {
+    event_type: "call.pre_call",
+  });
   return { metadata: { voicednut_call_id: callSid } };
 }
 
@@ -30800,6 +31478,16 @@ registerWebhookRoutes(app, {
   handleSpekoCallAnalysis,
   handleSpekoCallRecording,
   handleSpekoCallTransfer,
+  recordSpekoWebhookMetric: (callSid, sessionId, eventType, eventData = {}) =>
+    recordSpekoCallMetric(callSid, "speko_webhook_event", 1, {
+      session_id: sessionId,
+      event_type: eventType,
+      status: eventData.status,
+      sequence: eventData.sequence,
+    }),
+  recordSpekoWebhookFailure: (eventType, code) =>
+    recordSpekoHealth("webhook_processing_error", { event_type: eventType, code }),
+  recordSpekoHumanCallControlEvent: (payload) => db.recordSpekoHumanCallEvent(payload),
   resolveSessionCall: (sessionId) => db.getSpekoCallBySessionId(sessionId),
   shouldProcessToolCall: async (idempotencyKey) => {
     if (!db?.reserveProviderEventIdempotency) {
@@ -31208,6 +31896,7 @@ module.exports = {
   __testables: {
     setDbForTests,
     setSpekoVoiceAdapterForTests,
+    setSpekoCallControlServiceForTests,
     syncRuntimeProviderMirrors,
     placeOutboundCall,
     handleSpekoPreCall,

@@ -188,6 +188,7 @@ class EnhancedDatabase {
                 console.log('Connected to enhanced SQLite database');
                 this.applyConnectionPragmas()
                     .then(() => this.createEnhancedTables())
+                    .then(() => this.ensureSpekoAuditColumns())
                     .then(() => this.initializeSMSTables())
                     .then(() => this.initializeEmailTables())
                     .then(() => this.initializePostCallAutomationTables())
@@ -672,6 +673,79 @@ class EnhancedDatabase {
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )`,
 
+            `CREATE TABLE IF NOT EXISTS speko_human_calls (
+                call_id TEXT PRIMARY KEY,
+                direction TEXT,
+                status TEXT,
+                broker_id TEXT,
+                answered_at TEXT,
+                ended_at TEXT,
+                end_reason TEXT,
+                latest_event_at TEXT,
+                latest_event_id TEXT,
+                created_at TEXT,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )`,
+
+            `CREATE TABLE IF NOT EXISTS speko_human_call_legs (
+                control_id TEXT PRIMARY KEY,
+                call_id TEXT NOT NULL,
+                kind TEXT,
+                direction TEXT,
+                status TEXT,
+                broker_id TEXT,
+                muted INTEGER,
+                on_hold INTEGER,
+                answered_at TEXT,
+                ended_at TEXT,
+                end_reason TEXT,
+                latest_event_at TEXT,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )`,
+
+            `CREATE INDEX IF NOT EXISTS idx_speko_human_legs_call_id
+                ON speko_human_call_legs(call_id)`,
+
+            `CREATE TABLE IF NOT EXISTS speko_human_broker_owners (
+                broker_id TEXT PRIMARY KEY,
+                telegram_user_id TEXT NOT NULL UNIQUE,
+                assigned_by TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )`,
+
+            `CREATE TABLE IF NOT EXISTS speko_human_call_events (
+                event_id TEXT PRIMARY KEY,
+                call_id TEXT NOT NULL,
+                control_id TEXT,
+                event_type TEXT NOT NULL,
+                occurred_at TEXT,
+                source TEXT NOT NULL,
+                safe_details TEXT,
+                received_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )`,
+
+            `CREATE INDEX IF NOT EXISTS idx_speko_human_events_call_id
+                ON speko_human_call_events(call_id, occurred_at)`,
+
+            `CREATE TABLE IF NOT EXISTS speko_human_call_control_audit (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                operation TEXT NOT NULL,
+                call_id TEXT,
+                control_id TEXT,
+                scope_id TEXT,
+                status TEXT NOT NULL CHECK(status IN ('started','succeeded','failed')),
+                error_code TEXT,
+                actor_hint TEXT,
+                actor_source TEXT NOT NULL DEFAULT 'shared_admin_token',
+                request_id TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                completed_at DATETIME
+            )`,
+
+            `CREATE INDEX IF NOT EXISTS idx_speko_human_control_audit_created
+                ON speko_human_call_control_audit(created_at)`,
+
             // Outbound call idempotency guard (provider-agnostic)
             `CREATE TABLE IF NOT EXISTS outbound_call_idempotency (
                 idempotency_key TEXT PRIMARY KEY,
@@ -912,6 +986,18 @@ class EnhancedDatabase {
         }
 
         console.log('✅ Enhanced database tables and indexes created successfully');
+    }
+
+    async ensureSpekoAuditColumns() {
+        const columns = await new Promise((resolve, reject) => this.db.all(
+            'PRAGMA table_info(speko_human_call_control_audit)',
+            (err, rows) => err ? reject(err) : resolve(rows || []),
+        ));
+        if (columns.some((row) => row.name === 'scope_id')) return;
+        await new Promise((resolve, reject) => this.db.run(
+            'ALTER TABLE speko_human_call_control_audit ADD COLUMN scope_id TEXT',
+            (err) => err ? reject(err) : resolve(),
+        ));
     }
 
     async ensureCallColumns(columns = []) {
@@ -3385,6 +3471,195 @@ class EnhancedDatabase {
         });
     }
 
+    async setSpekoHumanBrokerOwner(payload = {}) {
+        const brokerId = String(payload.broker_id || '').trim();
+        const telegramUserId = String(payload.telegram_user_id || '').trim();
+        if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(brokerId) || !/^\d{1,24}$/.test(telegramUserId)) {
+            throw new Error('speko_broker_owner_invalid');
+        }
+        return new Promise((resolve, reject) => this.db.run(
+            `INSERT INTO speko_human_broker_owners(broker_id,telegram_user_id,assigned_by)
+             VALUES(?,?,?) ON CONFLICT(broker_id) DO UPDATE SET telegram_user_id=excluded.telegram_user_id,
+             assigned_by=excluded.assigned_by,updated_at=CURRENT_TIMESTAMP`,
+            [brokerId, telegramUserId, String(payload.assigned_by || '').slice(0, 80) || null],
+            function(err) {
+                if (err) reject(err);
+                else resolve({ broker_id: brokerId, telegram_user_id: telegramUserId });
+            },
+        ));
+    }
+
+    async getSpekoHumanBrokerOwner(payload = {}) {
+        const telegramUserId = String(payload.telegram_user_id || '').trim();
+        const brokerId = String(payload.broker_id || '').trim();
+        if (!telegramUserId && !brokerId) return null;
+        const column = telegramUserId ? 'telegram_user_id' : 'broker_id';
+        const value = telegramUserId || brokerId;
+        return new Promise((resolve, reject) => this.db.get(
+            `SELECT broker_id,telegram_user_id,assigned_by,created_at,updated_at FROM speko_human_broker_owners WHERE ${column}=?`,
+            [value], (err, row) => err ? reject(err) : resolve(row || null),
+        ));
+    }
+
+    async deleteSpekoHumanBrokerOwner(payload = {}) {
+        const brokerId = String(payload.broker_id || '').trim();
+        if (!brokerId) return 0;
+        return new Promise((resolve, reject) => this.db.run(
+            'DELETE FROM speko_human_broker_owners WHERE broker_id=?', [brokerId],
+            function(err) { if (err) reject(err); else resolve(this.changes || 0); },
+        ));
+    }
+
+    async isSpekoHumanCallOwnedByBroker(payload = {}) {
+        const callId = String(payload.call_id || '').trim();
+        const brokerId = String(payload.broker_id || '').trim();
+        if (!callId || !brokerId) return false;
+        return new Promise((resolve, reject) => this.db.get(
+            'SELECT 1 AS owned FROM speko_human_call_legs WHERE call_id=? AND broker_id=? LIMIT 1',
+            [callId, brokerId], (err, row) => err ? reject(err) : resolve(Boolean(row)),
+        ));
+    }
+
+    async startSpekoHumanCallControlAudit(payload = {}) {
+        const operation = String(payload.operation || '').trim().slice(0, 80);
+        if (!operation) throw new Error('speko_audit_operation_required');
+        const clean = (value, max) => String(value || '').replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, max) || null;
+        const actorSource = ['named_admin_token', 'miniapp_session'].includes(payload.actor_source)
+            ? payload.actor_source : 'shared_admin_token';
+        return new Promise((resolve, reject) => this.db.run(
+            `INSERT INTO speko_human_call_control_audit(operation,call_id,control_id,scope_id,status,actor_hint,actor_source,request_id)
+             VALUES(?,?,?,?, 'started',?,?,?)`,
+            [operation, clean(payload.call_id, 180), clean(payload.control_id, 512), clean(payload.scope_id, 180), clean(payload.actor_hint, 120), actorSource, clean(payload.request_id, 180)],
+            function(err) { if (err) reject(err); else resolve(this.lastID); },
+        ));
+    }
+
+    async finishSpekoHumanCallControlAudit(payload = {}) {
+        const id = Number(payload.id);
+        if (!Number.isSafeInteger(id) || id < 1) return 0;
+        const status = payload.status === 'succeeded' ? 'succeeded' : 'failed';
+        const errorCode = status === 'failed'
+            ? String(payload.error_code || 'speko_call_control_failed').replace(/[^A-Za-z0-9_.-]/g, '').slice(0, 100)
+            : null;
+        return new Promise((resolve, reject) => this.db.run(
+            `UPDATE speko_human_call_control_audit SET status=?,error_code=?,call_id=COALESCE(?,call_id),completed_at=CURRENT_TIMESTAMP WHERE id=? AND status='started'`,
+            [status, errorCode, payload.call_id ? String(payload.call_id).slice(0, 180) : null, id],
+            function(err) { if (err) reject(err); else resolve(this.changes || 0); },
+        ));
+    }
+
+    async listSpekoHumanCallControlAudit(payload = {}) {
+        const limit = Math.max(1, Math.min(200, Number(payload.limit) || 50));
+        const callId = String(payload.call_id || '').trim();
+        return new Promise((resolve, reject) => this.db.all(
+            `SELECT id,operation,call_id,control_id,scope_id,status,error_code,actor_hint,actor_source,request_id,created_at,completed_at
+             FROM speko_human_call_control_audit ${callId ? 'WHERE call_id=?' : ''}
+             ORDER BY id DESC LIMIT ?`,
+            callId ? [callId, limit] : [limit],
+            (err, rows) => err ? reject(err) : resolve(rows || []),
+        ));
+    }
+
+    async saveSpekoHumanCall(payload = {}) {
+        const call = payload.call && typeof payload.call === 'object' ? payload.call : payload;
+        const callId = String(call.id || call.callId || payload.call_id || '').trim();
+        if (!callId) throw new Error('speko_human_call_id_required');
+        const legs = Array.isArray(call.legs) ? call.legs : [];
+        const iso = (value) => value ? String(value).slice(0, 64) : null;
+        await new Promise((resolve, reject) => this.db.run(
+            `INSERT INTO speko_human_calls (call_id,direction,status,answered_at,ended_at,end_reason,created_at,updated_at)
+             VALUES (?,?,?,?,?,?,COALESCE(?,CURRENT_TIMESTAMP),CURRENT_TIMESTAMP)
+             ON CONFLICT(call_id) DO UPDATE SET direction=excluded.direction,status=excluded.status,
+             answered_at=COALESCE(excluded.answered_at,speko_human_calls.answered_at),
+             ended_at=COALESCE(excluded.ended_at,speko_human_calls.ended_at),
+             end_reason=COALESCE(excluded.end_reason,speko_human_calls.end_reason),updated_at=CURRENT_TIMESTAMP`,
+            [callId, call.direction || null, call.status || null, iso(call.answeredAt), iso(call.endedAt),
+             call.endReason ? String(call.endReason).slice(0, 120) : null, iso(call.createdAt)],
+            (err) => err ? reject(err) : resolve(),
+        ));
+        for (const leg of legs) {
+            const controlId = String(leg.controlId || '').trim();
+            if (!controlId) continue;
+            await new Promise((resolve, reject) => this.db.run(
+                `INSERT INTO speko_human_call_legs (control_id,call_id,kind,direction,status,broker_id,muted,on_hold,answered_at,ended_at,end_reason)
+                 VALUES (?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(control_id) DO UPDATE SET call_id=excluded.call_id,
+                 kind=excluded.kind,direction=excluded.direction,status=excluded.status,broker_id=excluded.broker_id,
+                 muted=excluded.muted,on_hold=excluded.on_hold,answered_at=COALESCE(excluded.answered_at,speko_human_call_legs.answered_at),
+                 ended_at=COALESCE(excluded.ended_at,speko_human_call_legs.ended_at),end_reason=COALESCE(excluded.end_reason,speko_human_call_legs.end_reason),updated_at=CURRENT_TIMESTAMP`,
+                [controlId, callId, leg.kind || null, leg.direction || null, leg.status || null,
+                 leg.brokerId || null, leg.muted ? 1 : 0, leg.onHold ? 1 : 0, iso(leg.answeredAt), iso(leg.endedAt),
+                 leg.endReason ? String(leg.endReason).slice(0, 120) : null],
+                (err) => err ? reject(err) : resolve(),
+            ));
+        }
+        return this.getSpekoHumanCall({ call_id: callId });
+    }
+
+    async getSpekoHumanCall(payload = {}) {
+        const callId = String(payload.call_id || payload.callId || '').trim();
+        if (!callId) return null;
+        const call = await new Promise((resolve, reject) => this.db.get(
+            'SELECT * FROM speko_human_calls WHERE call_id=?', [callId], (err, row) => err ? reject(err) : resolve(row || null),
+        ));
+        if (!call) return null;
+        call.legs = await new Promise((resolve, reject) => this.db.all(
+            'SELECT * FROM speko_human_call_legs WHERE call_id=? ORDER BY control_id', [callId], (err, rows) => err ? reject(err) : resolve(rows || []),
+        ));
+        return call;
+    }
+
+    async getSpekoHumanCallLeg(payload = {}) {
+        const controlId = String(payload.control_id || payload.controlId || '').trim();
+        if (!controlId) return null;
+        return new Promise((resolve, reject) => this.db.get(
+            'SELECT * FROM speko_human_call_legs WHERE control_id=?', [controlId], (err, row) => err ? reject(err) : resolve(row || null),
+        ));
+    }
+
+    async recordSpekoHumanCallEvent(payload = {}) {
+        const eventId = String(payload.event_id || payload.eventId || '').trim();
+        const callId = String(payload.call_id || payload.callId || '').trim();
+        const eventType = String(payload.event_type || payload.eventType || '').trim().slice(0, 100);
+        if (!eventId || !callId || !eventType) throw new Error('speko_human_event_identifiers_required');
+        const safe = {};
+        for (const key of ['status', 'mode', 'transfer_id', 'failure_cause', 'reason']) {
+            const value = payload.details?.[key];
+            if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') safe[key] = String(value).slice(0, 120);
+        }
+        const inserted = await new Promise((resolve, reject) => this.db.run(
+            `INSERT OR IGNORE INTO speko_human_call_events(event_id,call_id,control_id,event_type,occurred_at,source,safe_details)
+             VALUES(?,?,?,?,?,?,?)`,
+            [eventId, callId, payload.control_id || payload.controlId || null, eventType,
+             payload.occurred_at || payload.occurredAt || null, payload.source || 'webhook', JSON.stringify(safe)],
+            function(err) { if (err) reject(err); else resolve((this.changes || 0) > 0); },
+        ));
+        if (inserted) {
+            const occurredAt = payload.occurred_at || payload.occurredAt || null;
+            const statusByType = {
+                'call.initiated': 'initiating', 'call.ringing': 'ringing', 'call.answered': 'active',
+                'call.bridged': 'active', 'call.hold': 'held', 'call.unhold': 'active',
+                'call.hangup': 'ended', 'call.leg.hangup': 'ended', 'call.transfer.failed': 'active',
+            };
+            const status = statusByType[eventType];
+            if (status) {
+                await new Promise((resolve, reject) => this.db.run(
+                    `UPDATE speko_human_calls SET status=?,latest_event_at=?,latest_event_id=?,updated_at=CURRENT_TIMESTAMP
+                     WHERE call_id=? AND (latest_event_at IS NULL OR ? IS NULL OR latest_event_at<=?)`,
+                    [status, occurredAt, eventId, callId, occurredAt, occurredAt], (err) => err ? reject(err) : resolve(),
+                ));
+                if (payload.control_id || payload.controlId) {
+                    await new Promise((resolve, reject) => this.db.run(
+                        `UPDATE speko_human_call_legs SET status=?,latest_event_at=?,updated_at=CURRENT_TIMESTAMP
+                         WHERE control_id=? AND (latest_event_at IS NULL OR ? IS NULL OR latest_event_at<=?)`,
+                        [status, occurredAt, payload.control_id || payload.controlId, occurredAt, occurredAt],
+                        (err) => err ? reject(err) : resolve(),
+                    ));
+                }
+            }
+        }
+        return { inserted };
+    }
+
     async advanceSpekoCallSequence(payload = {}) {
         const callSid = String(payload.call_sid || '').trim();
         const sequence = Number(payload.sequence_number);
@@ -4542,6 +4817,79 @@ class EnhancedDatabase {
                 }
             });
             stmt.finalize();
+        });
+    }
+
+    async addCallMetricOnce(call_sid, metric_type, metric_value, metric_data = null) {
+        return new Promise((resolve, reject) => {
+            const stmt = this.db.prepare(`
+                INSERT INTO call_metrics (call_sid, metric_type, metric_value, metric_data)
+                SELECT ?, ?, ?, ?
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM call_metrics WHERE call_sid = ? AND metric_type = ?
+                )
+            `);
+            stmt.run(
+                [
+                    call_sid,
+                    metric_type,
+                    metric_value,
+                    JSON.stringify(metric_data),
+                    call_sid,
+                    metric_type,
+                ],
+                function (err) {
+                    if (err) reject(err);
+                    else resolve({ inserted: this.changes > 0, id: this.lastID || null });
+                },
+            );
+            stmt.finalize();
+        });
+    }
+
+    async getSpekoOperationalMetrics(hours = 24) {
+        const periodHours = Number.isFinite(Number(hours))
+            ? Math.min(720, Math.max(1, Math.floor(Number(hours))))
+            : 24;
+        return new Promise((resolve, reject) => {
+            const sql = `
+                SELECT
+                    CASE
+                        WHEN metric_type = 'speko_webhook_event'
+                        THEN COALESCE(json_extract(metric_data, '$.event_type'), 'unknown') ||
+                             CASE
+                                 WHEN json_extract(metric_data, '$.status') IS NOT NULL
+                                 THEN ':' || json_extract(metric_data, '$.status')
+                                 ELSE ''
+                             END
+                        WHEN metric_type = 'speko_call_created'
+                             AND json_extract(metric_data, '$.event_type') IS NOT NULL
+                        THEN json_extract(metric_data, '$.event_type')
+                        ELSE metric_type
+                    END AS event,
+                    COUNT(*) AS count,
+                    SUM(metric_value) AS total,
+                    AVG(metric_value) AS average,
+                    MAX(timestamp) AS last_occurrence
+                FROM call_metrics
+                WHERE metric_type GLOB 'speko_*'
+                  AND timestamp >= datetime('now', ?)
+                GROUP BY event
+                ORDER BY event
+            `;
+            this.db.all(sql, [`-${periodHours} hours`], (err, rows) => {
+                if (err) return reject(err);
+                resolve({
+                    period_hours: periodHours,
+                    events: rows.map((row) => ({
+                        event: row.event,
+                        count: Number(row.count) || 0,
+                        total: Number(row.total) || 0,
+                        average: Number(row.average) || 0,
+                        last_occurrence: row.last_occurrence || null,
+                    })),
+                });
+            });
         });
     }
 

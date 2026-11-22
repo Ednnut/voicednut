@@ -4,20 +4,49 @@ const E164_PATTERN = /^\+[1-9]\d{1,14}$/;
 const DEFAULT_BASE_URL = "https://api.speko.dev";
 const DEFAULT_TIMEOUT_MS = 30000;
 const PHONE_SESSION_OPTION_KEYS = new Set([
+  "constraints",
   "voice",
   "llm",
   "ttsOptions",
   "sttOptions",
+  "turnHandling",
   "telephony",
   "timezone",
   "variables",
+  "toolSecrets",
+  "metadata",
   "webhookTags",
 ]);
 const NESTED_PHONE_SESSION_OPTION_KEYS = Object.freeze({
-  llm: new Set(["temperature", "maxTokens"]),
+  llm: new Set(["temperature", "maxTokens", "reasoningEffort"]),
   ttsOptions: new Set(["sampleRate", "speed"]),
   sttOptions: new Set(["keywords", "prompt", "language"]),
-  telephony: new Set(["region", "amd"]),
+  turnHandling: new Set([
+    "vad",
+    "noiseCancellation",
+    "profile",
+    "endpointing",
+    "interruption",
+    "turnDetection",
+    "contextThreshold",
+    "heardBy",
+    "keypad",
+    "keypadAllowedKeys",
+    "recordCallerKeypad",
+    "greetFirst",
+    "amdPrompt",
+    "onMachine",
+    "onHuman",
+    "voicemailMessage",
+    "voicemailSoundId",
+    "holdTimeoutSeconds",
+    "machineBudgetSeconds",
+  ]),
+  vad: new Set(["provider"]),
+  noiseCancellation: new Set(["enabled", "model"]),
+  endpointing: new Set(["minDelay", "maxDelay"]),
+  interruption: new Set(["mode", "minDuration", "minWords"]),
+  telephony: new Set(["region", "amd", "dtmf"]),
   amd: new Set(["mode", "timeoutSeconds"]),
 });
 const AGENT_DRAFT_FIELDS = new Set([
@@ -65,6 +94,13 @@ function validateNestedPhoneSessionOptions(options = {}) {
     if (key === "telephony" && value.amd !== undefined) {
       validateNestedPhoneSessionOptions({ amd: value.amd });
     }
+    if (key === "turnHandling") {
+      for (const nestedKey of ["endpointing", "interruption", "vad", "noiseCancellation"]) {
+        if (value[nestedKey] !== undefined) {
+          validateNestedPhoneSessionOptions({ [nestedKey]: value[nestedKey] });
+        }
+      }
+    }
   }
 }
 
@@ -109,7 +145,7 @@ class SpekoVoiceAdapter {
     return this.config.enabled === true;
   }
 
-  validateConfig(options = {}) {
+  validateApiConfig() {
     normalizeBaseUrl(this.config.baseUrl);
     if (!this.isEnabled()) {
       throw new SpekoAdapterError("Speko is disabled", {
@@ -121,6 +157,11 @@ class SpekoVoiceAdapter {
         code: "speko_missing_api_key",
       });
     }
+    return true;
+  }
+
+  validateConfig(options = {}) {
+    this.validateApiConfig();
     if (
       options.requireAgent !== false &&
       !String(this.config.agentId || "").trim()
@@ -224,22 +265,34 @@ class SpekoVoiceAdapter {
           status: 400,
         });
       }
-      if (value !== undefined && value !== null) body[key] = value;
+      if (value !== undefined && value !== null) {
+        if (key === "metadata") {
+          if (!value || typeof value !== "object" || Array.isArray(value)) {
+            throw new SpekoAdapterError("Speko metadata option must be an object", {
+              code: "speko_invalid_options",
+              status: 400,
+            });
+          }
+          body.metadata = { ...(body.metadata || {}), ...value };
+        } else {
+          body[key] = value;
+        }
+      }
     }
     validateNestedPhoneSessionOptions(body);
-    body.metadata.voicednut_call_id = String(options.callId || "");
+    body.metadata = {
+      ...(body.metadata && typeof body.metadata === "object" && !Array.isArray(body.metadata)
+        ? body.metadata
+        : {}),
+      voicednut_call_id: String(options.callId || ""),
+    };
     if (this.config.phoneNumber) body.from = this.config.phoneNumber;
     if (Number.isFinite(Number(this.config.maxDurationSeconds))) {
-      body.maxDurationSeconds = Math.floor(
-        Number(this.config.maxDurationSeconds),
-      );
+      body.maxDurationSeconds = Math.floor(Number(this.config.maxDurationSeconds));
     }
     if (Number.isFinite(Number(this.config.ringTimeoutSeconds))) {
-      body.ringTimeoutSeconds = Math.floor(
-        Number(this.config.ringTimeoutSeconds),
-      );
+      body.ringTimeoutSeconds = Math.floor(Number(this.config.ringTimeoutSeconds));
     }
-
     const timeoutMs = Math.max(
       1000,
       Number(this.config.requestTimeoutMs) || DEFAULT_TIMEOUT_MS,
@@ -737,154 +790,102 @@ class SpekoVoiceAdapter {
     return client.agents.tools.delete(normalizedAgentId, normalizedToolId);
   }
 
-  validateCallControlConfig() {
-    this.validateConfig({ requireWebhook: false, requireAgent: false });
-    if (!String(this.config.brokerId || "").trim()) {
-      throw new SpekoAdapterError(
-        "Speko broker ID is not configured",
-        { code: "speko_missing_broker_id", status: 400 },
-      );
-    }
-  }
-
-  async dialHumanCall(params = {}) {
-    this.validateCallControlConfig();
-    if (!isE164(params.to)) {
-      throw new SpekoAdapterError(
-        "Destination must be a valid E.164 number",
-        { code: "speko_invalid_destination", status: 400 },
-      );
-    }
-    if (params.from !== undefined && !isE164(params.from)) {
-      throw new SpekoAdapterError(
-        "Caller ID must be a valid E.164 number",
-        { code: "speko_invalid_phone_number", status: 400 },
-      );
-    }
-    const client = await this.getClient();
-    return client.callControl.dial({
-      to: String(params.to).trim(),
-      ...(params.from ? { from: String(params.from).trim() } : {}),
-      ...(params.metadata && typeof params.metadata === "object"
-        ? { metadata: params.metadata }
-        : {}),
-    });
-  }
-
-  async getHumanCall(callId) {
-    this.validateCallControlConfig();
-    const client = await this.getClient();
-    return client.callControl.get(String(callId || "").trim());
-  }
-
-  async listHumanCalls(params = {}) {
-    this.validateCallControlConfig();
-    const client = await this.getClient();
-    return client.callControl.list(params);
-  }
-
-  async getHumanCallEvents(callId) {
-    this.validateCallControlConfig();
-    const client = await this.getClient();
-    return client.callControl.events(String(callId || "").trim());
-  }
-
-  async humanCallCommand(command, controlId, params = {}) {
-    this.validateCallControlConfig();
-    const normalizedControlId = String(controlId || "").trim();
-    if (!normalizedControlId) {
-      throw new SpekoAdapterError("Speko control ID is required", {
-        code: "speko_missing_control_id",
-        status: 400,
-      });
-    }
-    const client = await this.getClient();
-    const supported = new Set([
-      "answer",
-      "hangup",
-      "bridge",
-      "hold",
-      "unhold",
-      "mute",
-      "unmute",
-      "dtmf",
-      "transfer",
-    ]);
-    if (!supported.has(command)) {
-      throw new SpekoAdapterError("Unsupported Speko call-control command", {
-        code: "speko_call_control_unsupported",
-        status: 400,
-      });
-    }
-    if (command === "dtmf") {
-      if (!/^[0-9*#,w]{1,64}$/.test(String(params.digits || ""))) {
-        throw new SpekoAdapterError("Invalid Speko DTMF digits", {
-          code: "speko_invalid_dtmf",
-          status: 400,
-        });
-      }
-      return client.callControl.dtmf(normalizedControlId, {
-        digits: String(params.digits),
-      });
-    }
-    if (command === "transfer") {
-      if (!params.to || !params.mode) {
-        throw new SpekoAdapterError("Speko transfer requires to and mode", {
-          code: "speko_invalid_transfer",
-          status: 400,
-        });
-      }
-      if (!["blind", "warm"].includes(params.mode)) {
-        throw new SpekoAdapterError("Unsupported Speko transfer mode", {
-          code: "speko_invalid_transfer_mode",
-          status: 400,
-        });
-      }
-      return client.callControl.transfer(normalizedControlId, {
-        to: String(params.to).trim(),
-        mode: params.mode,
-      });
-    }
-    if (command === "bridge") {
-      return client.callControl.bridge(normalizedControlId, {
-        bridgeTo: String(params.bridgeTo || "").trim(),
-      });
-    }
-    if (command === "hangup") {
-      return client.callControl.hangup(normalizedControlId, params.reason
-        ? { reason: String(params.reason) }
-        : {});
-    }
-    return client.callControl[command](normalizedControlId);
-  }
-
-  async registerHumanPresence() {
-    this.validateCallControlConfig();
-    const client = await this.getClient();
-    return client.callControl.register();
-  }
-
-  async heartbeatHumanPresence() {
-    this.validateCallControlConfig();
-    const client = await this.getClient();
-    return client.callControl.heartbeat();
-  }
-
-  async setHumanPresenceStatus(status) {
-    this.validateCallControlConfig();
-    if (!["available", "busy", "away", "offline"].includes(status)) {
-      throw new SpekoAdapterError("Invalid Speko presence status", {
-        code: "speko_invalid_presence_status",
-        status: 400,
-      });
-    }
-    const client = await this.getClient();
-    return client.callControl.setStatus(status);
-  }
-
   async endCall(sessionId) {
     const client = await this.getClient();
     return client.calls.end(String(sessionId));
+  }
+
+  async blindTransfer(sessionId, params = {}) {
+    const normalizedSessionId = String(sessionId || "").trim();
+    if (!normalizedSessionId) {
+      throw new SpekoAdapterError("A Speko session ID is required", {
+        code: "speko_missing_session_id",
+        status: 400,
+      });
+    }
+    if (!isE164(params.to)) {
+      throw new SpekoAdapterError("Speko transfer destination must be E.164", {
+        code: "speko_invalid_transfer_destination",
+        status: 400,
+      });
+    }
+    const client = await this.getClient();
+    return client.calls.blindTransfer(normalizedSessionId, {
+      to: String(params.to).trim(),
+      ...(params.participantIdentity ? { participantIdentity: String(params.participantIdentity) } : {}),
+      ...(typeof params.playDialtone === "boolean" ? { playDialtone: params.playDialtone } : {}),
+      ...(Number.isInteger(params.ringingTimeout) ? { ringingTimeout: params.ringingTimeout } : {}),
+      ...(params.headers && typeof params.headers === "object" ? { headers: params.headers } : {}),
+    });
+  }
+
+  async warmTransfer(sessionId, params = {}) {
+    const normalizedSessionId = String(sessionId || "").trim();
+    if (!normalizedSessionId) {
+      throw new SpekoAdapterError("A Speko session ID is required", {
+        code: "speko_missing_session_id",
+        status: 400,
+      });
+    }
+    if (!params.to && !Array.isArray(params.destinations)) {
+      throw new SpekoAdapterError("Speko warm transfer requires a destination", {
+        code: "speko_invalid_transfer_destination",
+        status: 400,
+      });
+    }
+    if (params.to && !isE164(params.to)) {
+      throw new SpekoAdapterError("Speko transfer destination must be E.164", {
+        code: "speko_invalid_transfer_destination",
+        status: 400,
+      });
+    }
+    if (Array.isArray(params.destinations)) {
+      if (
+        !params.destinations.length ||
+        params.destinations.some((item) => !isE164(item?.to))
+      ) {
+        throw new SpekoAdapterError("Every Speko warm transfer destination must be E.164", {
+          code: "speko_invalid_transfer_destination",
+          status: 400,
+        });
+      }
+    }
+    const client = await this.getClient();
+    return client.calls.warmTransfer(normalizedSessionId, params);
+  }
+
+  async completeWarmTransfer(sessionId, transferId, params = {}) {
+    const normalizedSessionId = String(sessionId || "").trim();
+    const normalizedTransferId = String(transferId || "").trim();
+    if (!normalizedSessionId || !normalizedTransferId) {
+      throw new SpekoAdapterError("Speko session and transfer IDs are required", {
+        code: "speko_missing_transfer_id",
+        status: 400,
+      });
+    }
+    const client = await this.getClient();
+    return client.calls.completeWarmTransfer(
+      normalizedSessionId,
+      normalizedTransferId,
+      params,
+    );
+  }
+
+  async cancelWarmTransfer(sessionId, transferId, params = {}) {
+    const normalizedSessionId = String(sessionId || "").trim();
+    const normalizedTransferId = String(transferId || "").trim();
+    if (!normalizedSessionId || !normalizedTransferId) {
+      throw new SpekoAdapterError("Speko session and transfer IDs are required", {
+        code: "speko_missing_transfer_id",
+        status: 400,
+      });
+    }
+    const client = await this.getClient();
+    return client.calls.cancelWarmTransfer(
+      normalizedSessionId,
+      normalizedTransferId,
+      params,
+    );
   }
 
   async getTranscript(sessionId) {

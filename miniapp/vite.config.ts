@@ -32,6 +32,9 @@ export default defineConfig({
       output: {
         manualChunks(id) {
           if (id.includes('node_modules')) {
+            if (id.includes('/node_modules/livekit-client/') || id.includes('/node_modules/@livekit/')) {
+              return 'vendor-livekit';
+            }
             if (/node_modules\/(react|react-dom|scheduler)\//.test(id)) {
               return 'vendor-react';
             }

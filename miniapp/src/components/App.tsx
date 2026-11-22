@@ -49,6 +49,10 @@ const StatusCommandPage = lazy(async () => {
   const module = await import('@/pages/CommandPages/StatusCommandPage.tsx');
   return { default: module.default };
 });
+const SpekoSoftphonePage = lazy(async () => {
+  const module = await import('@/pages/SpekoSoftphonePage.tsx');
+  return { default: module.SpekoSoftphonePage };
+});
 
 const adminWorkspaceRoutes = [...DASHBOARD_WORKSPACE_ROUTE_PATHS];
 
@@ -102,6 +106,7 @@ export function App() {
             <Route path={MINIAPP_COMMAND_ROUTE_CONTRACTS.GUIDE} element={<GuideCommandPage />} />
             <Route path={MINIAPP_COMMAND_ROUTE_CONTRACTS.HEALTH} element={<HealthCommandPage />} />
             <Route path={MINIAPP_COMMAND_ROUTE_CONTRACTS.STATUS} element={<StatusCommandPage />} />
+            <Route path="/speko-softphone" element={<SpekoSoftphonePage />} />
             {adminWorkspaceRoutes.map((path) => (
               <Route key={`workspace-${path}`} path={path} element={<AdminDashboardPage />} />
             ))}

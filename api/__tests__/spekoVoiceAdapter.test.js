@@ -3,8 +3,9 @@ const { SpekoVoiceAdapter } = require("../adapters/spekoVoiceAdapter");
 const { verifySpekoWebhook } = require("../adapters/spekoWebhookSecurity");
 const {
   createSpekoWebhookHandler,
-  __testables: { normalizeSpekoCallStatus },
+  __testables: webhookRouteTestables,
 } = require("../services/webhookRoutes");
+const { normalizeSpekoCallStatus } = webhookRouteTestables;
 
 const validConfig = {
   enabled: true,
@@ -12,6 +13,9 @@ const validConfig = {
   baseUrl: "https://api.speko.dev",
   agentId: "agent_test",
   brokerId: "broker_test",
+  callControlEnabled: true,
+  runMode: "s2s",
+  s2sModel: "openai:gpt-live-1.1",
   phoneNumber: "+12015550199",
   webhookSecret: `whsec_${Buffer.from("test-secret").toString("base64")}`,
   requestTimeoutMs: 30000,
@@ -162,17 +166,28 @@ describe("Speko voice adapter", () => {
       systemPrompt: " ",
       firstMessage: "",
       idempotencyKey: "operation-456",
+      metadata: { campaign: "spring" },
       spekoOptions: {
         voice: "voice_123",
         llm: { temperature: 0.2, maxTokens: 128 },
-        telephony: { amd: { mode: "agent", timeoutSeconds: 8 } },
+        telephony: { amd: { mode: "agent", timeoutSeconds: 8 }, dtmf: "ww1w8" },
+        turnHandling: { onMachine: "leave_message", voicemailMessage: "Please call us back." },
         variables: { customer_name: "Sam" },
+        toolSecrets: { access_token: "not-logged-or-prompted" },
+        metadata: { campaign: "spring" },
       },
     });
     assert.equal("systemPrompt" in requestBody, false);
     assert.equal("firstMessage" in requestBody, false);
     assert.equal(requestBody.voice, "voice_123");
     assert.equal(requestBody.telephony.amd.mode, "agent");
+    assert.equal(requestBody.telephony.dtmf, "ww1w8");
+    assert.equal(requestBody.turnHandling.onMachine, "leave_message");
+    assert.equal(requestBody.toolSecrets.access_token, "not-logged-or-prompted");
+    assert.deepEqual(requestBody.metadata, {
+      campaign: "spring",
+      voicednut_call_id: "voicednut_456",
+    });
     assert.equal(requestBody.metadata.voicednut_call_id, "voicednut_456");
 
     await assert.rejects(
@@ -443,32 +458,6 @@ describe("Speko voice adapter", () => {
             },
           },
         },
-        callControl: {
-          dial: async (params) => {
-            calls.push(["callControl.dial", params]);
-            return { call: { id: "call_1" }, join: { token: "token" } };
-          },
-          get: async (callId) => {
-            calls.push(["callControl.get", callId]);
-            return { id: callId };
-          },
-          events: async (callId) => {
-            calls.push(["callControl.events", callId]);
-            return { events: [] };
-          },
-          dtmf: async (controlId, params) => {
-            calls.push(["callControl.dtmf", controlId, params]);
-            return { status: "active" };
-          },
-          transfer: async (controlId, params) => {
-            calls.push(["callControl.transfer", controlId, params]);
-            return { status: "initiated" };
-          },
-          hangup: async (controlId, params) => {
-            calls.push(["callControl.hangup", controlId, params]);
-            return { status: "ended" };
-          },
-        },
       }),
     });
 
@@ -490,34 +479,89 @@ describe("Speko voice adapter", () => {
     assert.equal((await adapter.updateAgentTool("agent_test", "tool_1", { description: "Updated" })).id, "tool_1");
     assert.equal((await adapter.deleteAgentTool("agent_test", "tool_1")).deleted, true);
 
-    assert.equal((await adapter.dialHumanCall({
-      to: "+12015550123",
-      from: "+12015550199",
-      metadata: { case_id: "case_1" },
-    })).call.id, "call_1");
-    assert.equal((await adapter.getHumanCall("call_1")).id, "call_1");
-    assert.equal((await adapter.getHumanCallEvents("call_1")).events.length, 0);
-    await adapter.humanCallCommand("dtmf", "control_pstn", { digits: "1w2" });
-    await adapter.humanCallCommand("transfer", "control_browser", {
-      to: "+12015550124",
-      mode: "blind",
-    });
-    await adapter.humanCallCommand("hangup", "control_browser", {
-      reason: "resolved",
+  });
+
+  it("supports blind and warm AI-call transfers and rejects disabled call control", async () => {
+    const calls = [];
+    const adapter = new SpekoVoiceAdapter({
+      config: validConfig,
+      clientFactory: async () => ({
+        calls: {
+          blindTransfer: async (sessionId, params) => {
+            calls.push(["blind", sessionId, params]);
+            return { transferId: "transfer_blind" };
+          },
+          warmTransfer: async (sessionId, params) => {
+            calls.push(["warm", sessionId, params]);
+            return { transferId: "transfer_warm" };
+          },
+          completeWarmTransfer: async (sessionId, transferId, params) => {
+            calls.push(["complete", sessionId, transferId, params]);
+            return { transferId };
+          },
+          cancelWarmTransfer: async (sessionId, transferId, params) => {
+            calls.push(["cancel", sessionId, transferId, params]);
+            return { transferId };
+          },
+        },
+      }),
     });
 
-    assert.deepEqual(calls.slice(-3), [
-      ["callControl.dtmf", "control_pstn", { digits: "1w2" }],
-      ["callControl.transfer", "control_browser", {
+    await adapter.blindTransfer("session_1", {
+      to: "+12015550123",
+      ringingTimeout: 25,
+    });
+    await adapter.warmTransfer("session_1", {
+      to: "+12015550124",
+      screeningPrompt: "A caller needs assistance.",
+      ringingTimeout: 25,
+    });
+    await adapter.completeWarmTransfer("session_1", "transfer_warm", {
+      summary: "Caller verified.",
+    });
+    await adapter.cancelWarmTransfer("session_1", "transfer_warm", {
+      reason: "recipient unavailable",
+      tryNext: false,
+    });
+
+    assert.deepEqual(calls, [
+      ["blind", "session_1", { to: "+12015550123", ringingTimeout: 25 }],
+      ["warm", "session_1", {
         to: "+12015550124",
-        mode: "blind",
+        screeningPrompt: "A caller needs assistance.",
+        ringingTimeout: 25,
       }],
-      ["callControl.hangup", "control_browser", { reason: "resolved" }],
+      ["complete", "session_1", "transfer_warm", { summary: "Caller verified." }],
+      ["cancel", "session_1", "transfer_warm", {
+        reason: "recipient unavailable",
+        tryNext: false,
+      }],
     ]);
+
   });
 });
 
 describe("Speko webhook verification and lifecycle mapping", () => {
+  it("routes human call-control events through separate durable idempotency", async () => {
+    const reservations = [];
+    const recorded = [];
+    const handler = createSpekoWebhookHandler({
+      config: { speko: { webhookSecret: validConfig.webhookSecret } },
+      shouldProcessProviderEventAsync: async (source, event) => (reservations.push([source, event]), true),
+      recordSpekoHumanCallControlEvent: async (event) => recorded.push(event),
+    });
+    const body = JSON.stringify({ type: "call.answered", event_id: "human-event-1", data: {
+      call_id: "human-call-1", control_id: "opaque-leg", occurred_at: "2026-01-01T00:00:00Z",
+      payload: { status: "active", digits: "1234", phone_number: "+15551234567" },
+    } });
+    const response = makeResponse();
+    await handler(makeRequest(validConfig.webhookSecret, body, { webhookId: "webhook-delivery-1" }), response);
+    assert.equal(response.statusCode, 200);
+    assert.deepEqual(reservations, [["speko_human_call_control", { webhook_id: "webhook-delivery-1" }]]);
+    assert.equal(recorded[0].event_id, "human-event-1");
+    assert.deepEqual(recorded[0].details, { status: "active" });
+  });
+
   it("authenticates Standard Webhooks signatures and rejects stale timestamps", () => {
     const req = makeRequest(validConfig.webhookSecret, '{"type":"call.status"}');
     assert.equal(
@@ -550,11 +594,74 @@ describe("Speko webhook verification and lifecycle mapping", () => {
     );
   });
 
+  it("rejects a missing raw request body instead of signing a re-serialized body", async () => {
+    let processed = false;
+    const handler = createSpekoWebhookHandler({
+      config: { speko: { webhookSecret: validConfig.webhookSecret } },
+      handleSpekoPreCall: async () => {
+        processed = true;
+        return {};
+      },
+    });
+    const request = makeRequest(validConfig.webhookSecret, JSON.stringify({
+      type: "call.pre_call",
+      direction: "inbound",
+      to: validConfig.phoneNumber,
+    }));
+    delete request.rawBody;
+    const response = makeResponse();
+    await handler(request, response);
+    assert.equal(response.statusCode, 401);
+    assert.equal(processed, false);
+  });
+
+  it("fails closed when a shared webhook guard has no verifier", () => {
+    const guard = webhookRouteTestables.createWebhookAuthGuard({});
+    let processed = false;
+    const wrapped = guard("twilio_call_status", (_req, res) => {
+      processed = true;
+      res.status(200).send("OK");
+    });
+    const response = {
+      statusCode: 200,
+      status(code) {
+        this.statusCode = code;
+        return this;
+      },
+      json(body) {
+        this.body = body;
+        return this;
+      },
+    };
+    wrapped({ headers: {}, requestId: "guard-test" }, response);
+    assert.equal(response.statusCode, 503);
+    assert.deepEqual(response.body, { error: "webhook_verifier_unavailable" });
+    assert.equal(processed, false);
+  });
+
+  it("keeps shared webhook guards on the existing provider verification path", () => {
+    let verified = 0;
+    let processed = 0;
+    const guard = webhookRouteTestables.createWebhookAuthGuard({
+      requireValidTwilioSignature: () => {
+        verified += 1;
+        return true;
+      },
+    });
+    const wrapped = guard("twilio_call_status", () => {
+      processed += 1;
+    });
+    wrapped({ headers: {}, requestId: "twilio-regression" }, {});
+    assert.equal(verified, 1);
+    assert.equal(processed, 1);
+  });
+
   it("deduplicates verified events and releases reservations when processing fails", async () => {
     let processed = 0;
     let released = 0;
     let sequence = 0;
     let duplicate = false;
+    let recordedMetrics = 0;
     const handler = createSpekoWebhookHandler({
       config: { speko: { webhookSecret: validConfig.webhookSecret } },
       shouldProcessProviderEventAsync: async () => !duplicate,
@@ -570,6 +677,9 @@ describe("Speko webhook verification and lifecycle mapping", () => {
         return { advanced: true };
       },
       releaseSpekoCallSequenceClaim: async () => 1,
+      recordSpekoWebhookMetric: async () => {
+        recordedMetrics += 1;
+      },
       recordCallStatus: async () => {
         processed += 1;
         if (processed === 1) throw new Error("temporary DB failure");
@@ -597,12 +707,14 @@ describe("Speko webhook verification and lifecycle mapping", () => {
     assert.equal(second.statusCode, 200);
     assert.equal(sequence, 7);
     assert.equal(processed, 2);
+    assert.equal(recordedMetrics, 1);
 
     duplicate = true;
     const third = makeResponse();
     await handler(request, third);
     assert.equal(third.body.duplicate, true);
     assert.equal(processed, 2);
+    assert.equal(recordedMetrics, 1);
 
     const invalid = makeResponse();
     await handler(
