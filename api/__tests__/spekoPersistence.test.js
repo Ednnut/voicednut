@@ -149,4 +149,38 @@ describe("Speko persistent lifecycle ordering", () => {
       { claimed: true },
     );
   });
+
+  it("allows only one concurrent Speko call reconciliation per call", async () => {
+    const claims = await Promise.all([
+      db.claimSpekoReconciliation({ call_sid: "speko_reconcile_1" }),
+      db.claimSpekoReconciliation({ call_sid: "speko_reconcile_1" }),
+    ]);
+    assert.equal(claims.filter((claim) => claim.claimed).length, 1);
+    assert.equal(claims.filter((claim) => !claim.claimed).length, 1);
+    await db.releaseSpekoReconciliation({ call_sid: "speko_reconcile_1" });
+    assert.deepEqual(
+      await db.claimSpekoReconciliation({ call_sid: "speko_reconcile_1" }),
+      { claimed: true },
+    );
+  });
+
+  it("resolves a persisted Speko session to its Voicednut call record", async () => {
+    await db.createCall({
+      call_sid: "speko_tool_lookup_test",
+      phone_number: "+12015550100",
+      prompt: "Support",
+      first_message: "Hello",
+      user_chat_id: null,
+      direction: "outbound",
+    });
+    await db.updateCallState("speko_tool_lookup_test", "call_created", {
+      provider: "speko",
+      provider_metadata: { speko_session_id: "speko_session_tool_test" },
+    });
+
+    const call = await db.getSpekoCallBySessionId("speko_session_tool_test");
+    assert.equal(call.call_sid, "speko_tool_lookup_test");
+    assert.equal(call.provider, "speko");
+    assert.equal(await db.getSpekoCallBySessionId("unknown_session"), null);
+  });
 });

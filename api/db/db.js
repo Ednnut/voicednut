@@ -666,6 +666,12 @@ class EnhancedDatabase {
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )`,
 
+            `CREATE TABLE IF NOT EXISTS speko_reconciliation_leases (
+                call_sid TEXT PRIMARY KEY,
+                lease_until DATETIME NOT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )`,
+
             // Outbound call idempotency guard (provider-agnostic)
             `CREATE TABLE IF NOT EXISTS outbound_call_idempotency (
                 idempotency_key TEXT PRIMARY KEY,
@@ -3419,6 +3425,44 @@ class EnhancedDatabase {
         });
     }
 
+    async claimSpekoReconciliation(payload = {}) {
+        const callSid = String(payload.call_sid || '').trim();
+        const leaseSeconds = Math.max(30, Math.min(300, Number(payload.lease_seconds) || 90));
+        if (!callSid) return { claimed: false, invalid: true };
+        await new Promise((resolve, reject) => {
+            this.db.run(
+                "DELETE FROM speko_reconciliation_leases WHERE lease_until <= CURRENT_TIMESTAMP",
+                (err) => err ? reject(err) : resolve(),
+            );
+        });
+        return new Promise((resolve, reject) => {
+            this.db.run(
+                `INSERT OR IGNORE INTO speko_reconciliation_leases (call_sid, lease_until)
+                 VALUES (?, datetime('now', ?))`,
+                [callSid, `+${leaseSeconds} seconds`],
+                function(err) {
+                    if (err) reject(err);
+                    else resolve({ claimed: (this.changes || 0) > 0 });
+                },
+            );
+        });
+    }
+
+    async releaseSpekoReconciliation(payload = {}) {
+        const callSid = String(payload.call_sid || '').trim();
+        if (!callSid) return 0;
+        return new Promise((resolve, reject) => {
+            this.db.run(
+                'DELETE FROM speko_reconciliation_leases WHERE call_sid = ?',
+                [callSid],
+                function(err) {
+                    if (err) reject(err);
+                    else resolve(this.changes || 0);
+                },
+            );
+        });
+    }
+
     async claimSpekoCallSequence(payload = {}) {
         const callSid = String(payload.call_sid || '').trim();
         const sequence = Number(payload.sequence_number);
@@ -4973,6 +5017,29 @@ class EnhancedDatabase {
                 }
             });
         });
+    }
+
+    async getSpekoCallBySessionId(session_id) {
+        const normalizedSessionId = String(session_id || '').trim();
+        if (!normalizedSessionId || normalizedSessionId.length > 256) return null;
+        const callSid = await new Promise((resolve, reject) => {
+            const sql = `
+                SELECT call_sid
+                FROM call_states
+                WHERE state = 'call_created'
+                  AND json_extract(data, '$.provider') = 'speko'
+                  AND json_extract(data, '$.provider_metadata.speko_session_id') = ?
+                ORDER BY timestamp DESC, sequence_number DESC
+                LIMIT 1
+            `;
+            this.db.get(sql, [normalizedSessionId], (err, row) => {
+                if (err) reject(err);
+                else resolve(row?.call_sid || null);
+            });
+        });
+        if (!callSid) return null;
+        const call = await this.getCall(callSid);
+        return call ? { ...call, provider: 'speko' } : null;
     }
 
     async upsertCallOutcome(outcome = {}) {

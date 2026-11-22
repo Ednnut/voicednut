@@ -86,3 +86,48 @@ describe("Speko recording authorization", () => {
     assert.equal(fixture.recordingRequests, 1);
   });
 });
+
+describe("Speko call reconciliation authorization", () => {
+  function createReconcileFixture() {
+    let reconcileCalls = 0;
+    const handler = __testables.createReconcileSpekoCallHandler({
+      isSafeId: (value) => /^[a-z0-9_-]{1,128}$/i.test(value),
+      db: {
+        getCall: async () => ({ call_sid: "call_123", user_chat_id: "owner-1" }),
+      },
+      reconcileSpekoCall: async (callSid) => {
+        reconcileCalls += 1;
+        return { call_sid: callSid, status: "completed" };
+      },
+    });
+    return { handler, get reconcileCalls() { return reconcileCalls; } };
+  }
+
+  it("requires the call owner before invoking Speko reconciliation", async () => {
+    const fixture = createReconcileFixture();
+    const res = response();
+    await fixture.handler({
+      params: { callSid: "call_123" },
+      headers: { "x-telegram-chat-id": "owner-2" },
+    }, res);
+    assert.equal(res.statusCode, 403);
+    assert.deepEqual(res.body, { error: "call_owner_mismatch" });
+    assert.equal(fixture.reconcileCalls, 0);
+  });
+
+  it("runs the bounded reconciliation only for an authorized owner", async () => {
+    const fixture = createReconcileFixture();
+    const res = response();
+    await fixture.handler({
+      params: { callSid: "call_123" },
+      headers: { "x-telegram-chat-id": "owner-1" },
+    }, res);
+    assert.equal(res.statusCode, 200);
+    assert.deepEqual(res.body, {
+      success: true,
+      call_sid: "call_123",
+      status: "completed",
+    });
+    assert.equal(fixture.reconcileCalls, 1);
+  });
+});

@@ -20,6 +20,30 @@ const NESTED_PHONE_SESSION_OPTION_KEYS = Object.freeze({
   telephony: new Set(["region", "amd"]),
   amd: new Set(["mode", "timeoutSeconds"]),
 });
+const AGENT_DRAFT_FIELDS = new Set([
+  "name",
+  "systemPrompt",
+  "voice",
+  "voiceInstructions",
+  "firstMessage",
+  "inboundFirstMessage",
+  "outboundFirstMessage",
+  "timezone",
+  "intent",
+  "llmOptions",
+  "stackPreferences",
+  "sttOptions",
+  "ttsOptions",
+  "runMode",
+  "runtime",
+  "backgroundAudio",
+  "audioOutput",
+  "speechNormalization",
+  "idleRePrompts",
+  "sttMissRecovery",
+  "turnHandling",
+  "languageRouting",
+]);
 
 function validateNestedPhoneSessionOptions(options = {}) {
   for (const [key, value] of Object.entries(options)) {
@@ -97,7 +121,10 @@ class SpekoVoiceAdapter {
         code: "speko_missing_api_key",
       });
     }
-    if (!String(this.config.agentId || "").trim()) {
+    if (
+      options.requireAgent !== false &&
+      !String(this.config.agentId || "").trim()
+    ) {
       throw new SpekoAdapterError("Speko agent ID is not configured", {
         code: "speko_missing_agent_id",
       });
@@ -146,6 +173,7 @@ class SpekoVoiceAdapter {
           apiKey: this.config.apiKey,
           baseUrl: normalizeBaseUrl(this.config.baseUrl),
           timeout: this.config.requestTimeoutMs || DEFAULT_TIMEOUT_MS,
+          brokerId: this.config.brokerId || undefined,
         });
       });
     }
@@ -414,6 +442,444 @@ class SpekoVoiceAdapter {
   async getCall(sessionId) {
     const client = await this.getClient();
     return client.calls.get(String(sessionId));
+  }
+
+  async getCallEvents(sessionId) {
+    const client = await this.getClient();
+    const response = await client.calls.events(String(sessionId));
+    if (!Array.isArray(response?.events)) {
+      throw new SpekoAdapterError(
+        "Speko returned an invalid call event history",
+        { code: "speko_call_events_invalid_response", uncertain: true },
+      );
+    }
+    return response.events;
+  }
+
+  async getUsage(options = {}) {
+    this.validateConfig({ requireWebhook: false, requireAgent: false });
+    const params = {};
+    if (options.from !== undefined) params.from = String(options.from).trim();
+    if (options.to !== undefined) params.to = String(options.to).trim();
+    const client = await this.getClient();
+    return client.usage.get(Object.keys(params).length ? params : undefined);
+  }
+
+  async listAgents() {
+    this.validateConfig({ requireWebhook: false, requireAgent: false });
+    const client = await this.getClient();
+    return client.agents.list();
+  }
+
+  async getAgent(agentId) {
+    this.validateConfig({ requireWebhook: false, requireAgent: false });
+    const normalizedAgentId = String(agentId || "").trim();
+    if (!normalizedAgentId) {
+      throw new SpekoAdapterError("Speko agent ID is required", {
+        code: "speko_missing_agent_id",
+        status: 400,
+      });
+    }
+    const client = await this.getClient();
+    return client.agents.get(normalizedAgentId);
+  }
+
+  async listAgentTools(agentId, options = {}) {
+    this.validateConfig({ requireWebhook: false, requireAgent: false });
+    const normalizedAgentId = String(agentId || "").trim();
+    if (!normalizedAgentId) {
+      throw new SpekoAdapterError("Speko agent ID is required", {
+        code: "speko_missing_agent_id",
+        status: 400,
+      });
+    }
+    const client = await this.getClient();
+    return client.agents.tools.list(
+      normalizedAgentId,
+      options.signal,
+      { available: options.available === true },
+    );
+  }
+
+  async createAgent(params) {
+    this.validateConfig({ requireWebhook: false, requireAgent: false });
+    if (!params || typeof params !== "object" || Array.isArray(params)) {
+      throw new SpekoAdapterError("Speko agent parameters are required", {
+        code: "speko_invalid_agent_params",
+        status: 400,
+      });
+    }
+    const client = await this.getClient();
+    return client.agents.create(params);
+  }
+
+  async updateAgent(agentId, params) {
+    this.validateConfig({ requireWebhook: false, requireAgent: false });
+    const normalizedAgentId = String(agentId || "").trim();
+    if (!normalizedAgentId) {
+      throw new SpekoAdapterError("Speko agent ID is required", {
+        code: "speko_missing_agent_id",
+        status: 400,
+      });
+    }
+    if (!params || typeof params !== "object" || Array.isArray(params)) {
+      throw new SpekoAdapterError("Speko agent parameters are required", {
+        code: "speko_invalid_agent_params",
+        status: 400,
+      });
+    }
+    const client = await this.getClient();
+    return client.agents.update(normalizedAgentId, params);
+  }
+
+  async deleteAgent(agentId) {
+    this.validateConfig({ requireWebhook: false, requireAgent: false });
+    const normalizedAgentId = String(agentId || "").trim();
+    if (!normalizedAgentId) {
+      throw new SpekoAdapterError("Speko agent ID is required", {
+        code: "speko_missing_agent_id",
+        status: 400,
+      });
+    }
+    const client = await this.getClient();
+    return client.agents.delete(normalizedAgentId);
+  }
+
+  async requestAgentLifecycle(agentId, suffix, options = {}) {
+    this.validateConfig({ requireWebhook: false, requireAgent: false });
+    const normalizedAgentId = String(agentId || "").trim();
+    if (!normalizedAgentId) {
+      throw new SpekoAdapterError("Speko agent ID is required", {
+        code: "speko_missing_agent_id",
+        status: 400,
+      });
+    }
+    const method = String(options.method || "GET").toUpperCase();
+    const timeoutMs = Math.min(
+      Math.max(Number(this.config.requestTimeoutMs) || DEFAULT_TIMEOUT_MS, 1000),
+      120000,
+    );
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const response = await this.fetch(
+        `${normalizeBaseUrl(this.config.baseUrl)}/v1/agents/${encodeURIComponent(normalizedAgentId)}/${suffix}`,
+        {
+          method,
+          headers: {
+            authorization: `Bearer ${this.config.apiKey}`,
+            ...(options.body !== undefined ? { "content-type": "application/json" } : {}),
+          },
+          ...(options.body !== undefined ? { body: JSON.stringify(options.body) } : {}),
+          signal: controller.signal,
+        },
+      );
+      let payload = null;
+      try {
+        payload = await response.json();
+      } catch (_error) {
+        payload = null;
+      }
+      if (!response.ok) {
+        throw new SpekoAdapterError(
+          payload?.error || `Speko agent ${suffix} request failed`,
+          {
+            code: String(payload?.code || `speko_agent_${suffix}_failed`).toLowerCase(),
+            status: response.status,
+          },
+        );
+      }
+      return payload;
+    } catch (error) {
+      if (error instanceof SpekoAdapterError) throw error;
+      throw new SpekoAdapterError(`Speko agent ${suffix} request failed`, {
+        code: error?.name === "AbortError"
+          ? "speko_agent_request_timeout"
+          : "speko_agent_request_failed",
+        uncertain: method !== "GET" && method !== "DELETE",
+      });
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  async getAgentDraft(agentId) {
+    return this.requestAgentLifecycle(agentId, "draft");
+  }
+
+  async updateAgentDraft(agentId, params) {
+    if (!params || typeof params !== "object" || Array.isArray(params)) {
+      throw new SpekoAdapterError("Speko agent draft must be an object", {
+        code: "speko_invalid_agent_draft",
+        status: 400,
+      });
+    }
+    const keys = Object.keys(params);
+    if (!keys.length || keys.some((key) => !AGENT_DRAFT_FIELDS.has(key))) {
+      throw new SpekoAdapterError("Speko agent draft contains unsupported fields", {
+        code: "speko_unsupported_agent_draft_field",
+        status: 400,
+      });
+    }
+    return this.requestAgentLifecycle(agentId, "draft", {
+      method: "PUT",
+      body: params,
+    });
+  }
+
+  async discardAgentDraft(agentId) {
+    return this.requestAgentLifecycle(agentId, "draft", { method: "DELETE" });
+  }
+
+  async listAgentVersions(agentId) {
+    return this.requestAgentLifecycle(agentId, "versions");
+  }
+
+  async deployAgentDraft(agentId) {
+    return this.requestAgentLifecycle(agentId, "deploy", { method: "POST", body: {} });
+  }
+
+  async rollbackAgent(agentId, targetVersionNumber) {
+    const version = Number(targetVersionNumber);
+    if (!Number.isInteger(version) || version < 1) {
+      throw new SpekoAdapterError("A valid Speko target version is required", {
+        code: "speko_invalid_agent_version",
+        status: 400,
+      });
+    }
+    return this.requestAgentLifecycle(agentId, "rollback", {
+      method: "POST",
+      body: { target_version_number: version },
+    });
+  }
+
+  async listAgentCalls(agentId, params = {}) {
+    this.validateConfig({ requireWebhook: false, requireAgent: false });
+    const normalizedAgentId = String(agentId || "").trim();
+    if (!normalizedAgentId) {
+      throw new SpekoAdapterError("Speko agent ID is required", {
+        code: "speko_missing_agent_id",
+        status: 400,
+      });
+    }
+    const client = await this.getClient();
+    return client.agents.listCalls(normalizedAgentId, params);
+  }
+
+  async createAgentTool(agentId, params) {
+    this.validateConfig({ requireWebhook: false, requireAgent: false });
+    const normalizedAgentId = String(agentId || "").trim();
+    if (!normalizedAgentId) {
+      throw new SpekoAdapterError("Speko agent ID is required", {
+        code: "speko_missing_agent_id",
+        status: 400,
+      });
+    }
+    if (!params || typeof params !== "object" || Array.isArray(params)) {
+      throw new SpekoAdapterError("Speko tool parameters are required", {
+        code: "speko_invalid_tool_params",
+        status: 400,
+      });
+    }
+    const client = await this.getClient();
+    return client.agents.tools.create(normalizedAgentId, params);
+  }
+
+  async getAgentTool(agentId, toolId) {
+    this.validateConfig({ requireWebhook: false, requireAgent: false });
+    const normalizedAgentId = String(agentId || "").trim();
+    const normalizedToolId = String(toolId || "").trim();
+    if (!normalizedAgentId || !normalizedToolId) {
+      throw new SpekoAdapterError("Speko agent and tool IDs are required", {
+        code: "speko_missing_tool_id",
+        status: 400,
+      });
+    }
+    const client = await this.getClient();
+    return client.agents.tools.get(normalizedAgentId, normalizedToolId);
+  }
+
+  async updateAgentTool(agentId, toolId, params) {
+    this.validateConfig({ requireWebhook: false, requireAgent: false });
+    const normalizedAgentId = String(agentId || "").trim();
+    const normalizedToolId = String(toolId || "").trim();
+    if (!normalizedAgentId || !normalizedToolId) {
+      throw new SpekoAdapterError("Speko agent and tool IDs are required", {
+        code: "speko_missing_tool_id",
+        status: 400,
+      });
+    }
+    if (!params || typeof params !== "object" || Array.isArray(params)) {
+      throw new SpekoAdapterError("Speko tool parameters are required", {
+        code: "speko_invalid_tool_params",
+        status: 400,
+      });
+    }
+    const client = await this.getClient();
+    return client.agents.tools.update(
+      normalizedAgentId,
+      normalizedToolId,
+      params,
+    );
+  }
+
+  async deleteAgentTool(agentId, toolId) {
+    this.validateConfig({ requireWebhook: false, requireAgent: false });
+    const normalizedAgentId = String(agentId || "").trim();
+    const normalizedToolId = String(toolId || "").trim();
+    if (!normalizedAgentId || !normalizedToolId) {
+      throw new SpekoAdapterError("Speko agent and tool IDs are required", {
+        code: "speko_missing_tool_id",
+        status: 400,
+      });
+    }
+    const client = await this.getClient();
+    return client.agents.tools.delete(normalizedAgentId, normalizedToolId);
+  }
+
+  validateCallControlConfig() {
+    this.validateConfig({ requireWebhook: false, requireAgent: false });
+    if (!String(this.config.brokerId || "").trim()) {
+      throw new SpekoAdapterError(
+        "Speko broker ID is not configured",
+        { code: "speko_missing_broker_id", status: 400 },
+      );
+    }
+  }
+
+  async dialHumanCall(params = {}) {
+    this.validateCallControlConfig();
+    if (!isE164(params.to)) {
+      throw new SpekoAdapterError(
+        "Destination must be a valid E.164 number",
+        { code: "speko_invalid_destination", status: 400 },
+      );
+    }
+    if (params.from !== undefined && !isE164(params.from)) {
+      throw new SpekoAdapterError(
+        "Caller ID must be a valid E.164 number",
+        { code: "speko_invalid_phone_number", status: 400 },
+      );
+    }
+    const client = await this.getClient();
+    return client.callControl.dial({
+      to: String(params.to).trim(),
+      ...(params.from ? { from: String(params.from).trim() } : {}),
+      ...(params.metadata && typeof params.metadata === "object"
+        ? { metadata: params.metadata }
+        : {}),
+    });
+  }
+
+  async getHumanCall(callId) {
+    this.validateCallControlConfig();
+    const client = await this.getClient();
+    return client.callControl.get(String(callId || "").trim());
+  }
+
+  async listHumanCalls(params = {}) {
+    this.validateCallControlConfig();
+    const client = await this.getClient();
+    return client.callControl.list(params);
+  }
+
+  async getHumanCallEvents(callId) {
+    this.validateCallControlConfig();
+    const client = await this.getClient();
+    return client.callControl.events(String(callId || "").trim());
+  }
+
+  async humanCallCommand(command, controlId, params = {}) {
+    this.validateCallControlConfig();
+    const normalizedControlId = String(controlId || "").trim();
+    if (!normalizedControlId) {
+      throw new SpekoAdapterError("Speko control ID is required", {
+        code: "speko_missing_control_id",
+        status: 400,
+      });
+    }
+    const client = await this.getClient();
+    const supported = new Set([
+      "answer",
+      "hangup",
+      "bridge",
+      "hold",
+      "unhold",
+      "mute",
+      "unmute",
+      "dtmf",
+      "transfer",
+    ]);
+    if (!supported.has(command)) {
+      throw new SpekoAdapterError("Unsupported Speko call-control command", {
+        code: "speko_call_control_unsupported",
+        status: 400,
+      });
+    }
+    if (command === "dtmf") {
+      if (!/^[0-9*#,w]{1,64}$/.test(String(params.digits || ""))) {
+        throw new SpekoAdapterError("Invalid Speko DTMF digits", {
+          code: "speko_invalid_dtmf",
+          status: 400,
+        });
+      }
+      return client.callControl.dtmf(normalizedControlId, {
+        digits: String(params.digits),
+      });
+    }
+    if (command === "transfer") {
+      if (!params.to || !params.mode) {
+        throw new SpekoAdapterError("Speko transfer requires to and mode", {
+          code: "speko_invalid_transfer",
+          status: 400,
+        });
+      }
+      if (!["blind", "warm"].includes(params.mode)) {
+        throw new SpekoAdapterError("Unsupported Speko transfer mode", {
+          code: "speko_invalid_transfer_mode",
+          status: 400,
+        });
+      }
+      return client.callControl.transfer(normalizedControlId, {
+        to: String(params.to).trim(),
+        mode: params.mode,
+      });
+    }
+    if (command === "bridge") {
+      return client.callControl.bridge(normalizedControlId, {
+        bridgeTo: String(params.bridgeTo || "").trim(),
+      });
+    }
+    if (command === "hangup") {
+      return client.callControl.hangup(normalizedControlId, params.reason
+        ? { reason: String(params.reason) }
+        : {});
+    }
+    return client.callControl[command](normalizedControlId);
+  }
+
+  async registerHumanPresence() {
+    this.validateCallControlConfig();
+    const client = await this.getClient();
+    return client.callControl.register();
+  }
+
+  async heartbeatHumanPresence() {
+    this.validateCallControlConfig();
+    const client = await this.getClient();
+    return client.callControl.heartbeat();
+  }
+
+  async setHumanPresenceStatus(status) {
+    this.validateCallControlConfig();
+    if (!["available", "busy", "away", "offline"].includes(status)) {
+      throw new SpekoAdapterError("Invalid Speko presence status", {
+        code: "speko_invalid_presence_status",
+        status: 400,
+      });
+    }
+    const client = await this.getClient();
+    return client.callControl.setStatus(status);
   }
 
   async endCall(sessionId) {

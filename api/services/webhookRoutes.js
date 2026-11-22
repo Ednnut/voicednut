@@ -4,6 +4,7 @@ const {
   buildCanonicalSmsDeliveryEvent,
 } = require("../adapters/providerFlowPolicy");
 const { verifySpekoWebhook } = require("../adapters/spekoWebhookSecurity");
+const { createSpekoAgentToolHandler } = require("./spekoAgentToolService");
 const { createPaypalPaymentService } = require("./paypalPaymentService");
 const { createSquarePaymentService } = require("./squarePaymentService");
 const { createStripePaymentService } = require("./stripePaymentService");
@@ -2871,11 +2872,14 @@ function registerWebhookRoutes(app, ctx = {}) {
     ctx.handleSquareWebhook || createSquareWebhookHandler(ctx);
   const handleSpekoWebhook =
     ctx.handleSpekoWebhook || createSpekoWebhookHandler(ctx);
+  const handleSpekoAgentTool =
+    ctx.handleSpekoAgentTool || createSpekoAgentToolHandler(ctx);
 
   app.get("/capture/secure", handleSecureCaptureView);
   app.post("/capture/secure", handleSecureCaptureSubmit);
   app.post("/webhook/telegram", withWebhookAuth("telegram", handleTelegramWebhook));
   app.post("/webhook/speko", handleSpekoWebhook);
+  app.post("/webhook/speko/tools", handleSpekoAgentTool);
   app.get("/plivo/answer", withWebhookAuth("plivo_answer", handlePlivoAnswer));
   app.post("/plivo/answer", withWebhookAuth("plivo_answer", handlePlivoAnswer));
   app.post("/plivo/events", withWebhookAuth("plivo_event", handlePlivoEvent));
@@ -3173,6 +3177,7 @@ function createSpekoWebhookHandler(ctx = {}) {
 module.exports = {
   registerWebhookRoutes,
   createSpekoWebhookHandler,
+  createSpekoAgentToolHandler,
   createVonageEventWebhookHandler,
   createPlivoEventWebhookHandler,
   createPlivoAnswerWebhookHandler,

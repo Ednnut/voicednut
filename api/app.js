@@ -3573,6 +3573,7 @@ function scheduleCallLifecycleCleanup(callSid, delayMs = 10 * 60 * 1000) {
       source: "call_lifecycle_cleanup",
     });
   }, delayMs);
+  if (typeof timer.unref === "function") timer.unref();
   callLifecycleCleanupTimers.set(callSid, timer);
 }
 
@@ -4072,8 +4073,16 @@ async function ensureCallRecord(
     await db.recordCallOutcomeFromCallCreated(callSid, callCreatedState);
     return await db.getCall(callSid);
   } catch (error) {
-    const racedCall = await db.getCall(callSid).catch(() => null);
-    if (racedCall) return racedCall;
+    if (String(error?.message || "").includes("UNIQUE constraint failed: calls.call_sid")) {
+      for (let attempt = 0; attempt < 8; attempt += 1) {
+        const racedCall = await db.getCall(callSid).catch(() => null);
+        const createdState = racedCall
+          ? await db.getLatestCallState(callSid, "call_created").catch(() => null)
+          : null;
+        if (racedCall && createdState) return racedCall;
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+    }
     console.error("Failed to create inbound call record:", error);
     return null;
   }
@@ -14466,6 +14475,7 @@ async function startServer(options = {}) {
         "provider_event_idempotency",
         "speko_call_sequences",
         "speko_call_sequence_claims",
+        "speko_reconciliation_leases",
         "outbound_call_attempt_leases",
         "call_runtime_state",
       ],
@@ -21906,6 +21916,208 @@ app.get("/admin/provider", requireAdminToken, async (req, res) => {
     },
     compatibility: getProviderCompatibilityReport(),
   });
+});
+
+app.get("/admin/speko/usage", requireAdminToken, async (req, res) => {
+  try {
+    const usage = await getSpekoVoiceAdapter().getUsage({
+      from: req.query?.from,
+      to: req.query?.to,
+    });
+    return res.json({ success: true, usage });
+  } catch (error) {
+    console.error("Failed to load Speko usage:", {
+      code: error?.code || "speko_usage_failed",
+    });
+    return res.status(error?.status || 502).json({
+      success: false,
+      error: error?.code || "speko_usage_failed",
+    });
+  }
+});
+
+app.get("/admin/speko/agents", requireAdminToken, async (_req, res) => {
+  try {
+    const agents = await getSpekoVoiceAdapter().listAgents();
+    return res.json({ success: true, agents });
+  } catch (error) {
+    console.error("Failed to list Speko agents:", {
+      code: error?.code || "speko_agents_failed",
+    });
+    return res.status(error?.status || 502).json({
+      success: false,
+      error: error?.code || "speko_agents_failed",
+    });
+  }
+});
+
+app.get("/admin/speko/agents/:agentId", requireAdminToken, async (req, res) => {
+  try {
+    const agent = await getSpekoVoiceAdapter().getAgent(req.params.agentId);
+    return res.json({ success: true, agent });
+  } catch (error) {
+    console.error("Failed to read Speko agent:", {
+      code: error?.code || "speko_agent_failed",
+    });
+    return res.status(error?.status || 502).json({
+      success: false,
+      error: error?.code || "speko_agent_failed",
+    });
+  }
+});
+
+app.get(
+  "/admin/speko/agents/:agentId/tools",
+  requireAdminToken,
+  async (req, res) => {
+    try {
+      const tools = await getSpekoVoiceAdapter().listAgentTools(
+        req.params.agentId,
+        { available: req.query?.available === "1" },
+      );
+      return res.json({ success: true, tools });
+    } catch (error) {
+      console.error("Failed to list Speko agent tools:", {
+        code: error?.code || "speko_agent_tools_failed",
+      });
+      return res.status(error?.status || 502).json({
+        success: false,
+        error: error?.code || "speko_agent_tools_failed",
+      });
+    }
+  },
+);
+
+app.get("/admin/speko/agents/:agentId/draft", requireAdminToken, async (req, res) => {
+  try {
+    const draft = await getSpekoVoiceAdapter().getAgentDraft(req.params.agentId);
+    return res.json({ success: true, draft });
+  } catch (error) {
+    console.error("Failed to read Speko agent draft:", {
+      code: error?.code || "speko_agent_draft_failed",
+    });
+    return res.status(error?.status || 502).json({
+      success: false,
+      error: error?.code || "speko_agent_draft_failed",
+    });
+  }
+});
+
+app.put("/admin/speko/agents/:agentId/draft", requireAdminToken, async (req, res) => {
+  try {
+    const draft = await getSpekoVoiceAdapter().updateAgentDraft(
+      req.params.agentId,
+      req.body,
+    );
+    return res.json({ success: true, draft });
+  } catch (error) {
+    console.error("Failed to update Speko agent draft:", {
+      code: error?.code || "speko_agent_draft_failed",
+    });
+    return res.status(error?.status || 502).json({
+      success: false,
+      error: error?.code || "speko_agent_draft_failed",
+    });
+  }
+});
+
+app.delete("/admin/speko/agents/:agentId/draft", requireAdminToken, async (req, res) => {
+  try {
+    const draft = await getSpekoVoiceAdapter().discardAgentDraft(req.params.agentId);
+    return res.json({ success: true, draft });
+  } catch (error) {
+    console.error("Failed to discard Speko agent draft:", {
+      code: error?.code || "speko_agent_draft_failed",
+    });
+    return res.status(error?.status || 502).json({
+      success: false,
+      error: error?.code || "speko_agent_draft_failed",
+    });
+  }
+});
+
+app.get("/admin/speko/agents/:agentId/versions", requireAdminToken, async (req, res) => {
+  try {
+    const versions = await getSpekoVoiceAdapter().listAgentVersions(req.params.agentId);
+    return res.json({ success: true, versions });
+  } catch (error) {
+    console.error("Failed to list Speko agent versions:", {
+      code: error?.code || "speko_agent_versions_failed",
+    });
+    return res.status(error?.status || 502).json({
+      success: false,
+      error: error?.code || "speko_agent_versions_failed",
+    });
+  }
+});
+
+app.post("/admin/speko/agents/:agentId/deploy", requireAdminToken, async (req, res) => {
+  const agentId = String(req.params.agentId || "").trim();
+  const confirmedVersion = Number(req.body?.confirmed_draft_version_number);
+  if (req.body?.confirm_live_deploy !== agentId || !Number.isInteger(confirmedVersion) || confirmedVersion < 1) {
+    return res.status(400).json({
+      success: false,
+      error: "explicit_live_deploy_confirmation_required",
+    });
+  }
+  try {
+    const adapter = getSpekoVoiceAdapter();
+    const draft = await adapter.getAgentDraft(agentId);
+    if (!draft?.has_draft || draft.stale === true || Number(draft.draft_version_number) !== confirmedVersion) {
+      return res.status(409).json({
+        success: false,
+        error: "speko_agent_draft_changed_review_again",
+      });
+    }
+    const result = await adapter.deployAgentDraft(agentId);
+    console.info("Speko agent draft deployed:", {
+      agentId,
+      versionNumber: Number(result?.version_number) || null,
+    });
+    return res.json({ success: true, deployment: result });
+  } catch (error) {
+    console.error("Failed to deploy Speko agent draft:", {
+      code: error?.code || "speko_agent_deploy_failed",
+    });
+    return res.status(error?.status || 502).json({
+      success: false,
+      error: error?.code || "speko_agent_deploy_failed",
+      uncertain: error?.uncertain === true,
+    });
+  }
+});
+
+app.post("/admin/speko/agents/:agentId/rollback", requireAdminToken, async (req, res) => {
+  const agentId = String(req.params.agentId || "").trim();
+  const targetVersion = Number(req.body?.target_version_number);
+  if (
+    req.body?.confirm_live_rollback !== `${agentId}:${targetVersion}` ||
+    !Number.isInteger(targetVersion) ||
+    targetVersion < 1
+  ) {
+    return res.status(400).json({
+      success: false,
+      error: "explicit_live_rollback_confirmation_required",
+    });
+  }
+  try {
+    const rollback = await getSpekoVoiceAdapter().rollbackAgent(agentId, targetVersion);
+    console.info("Speko agent version rolled back:", {
+      agentId,
+      targetVersionNumber: targetVersion,
+      resultingVersionNumber: Number(rollback?.version_number) || null,
+    });
+    return res.json({ success: true, rollback });
+  } catch (error) {
+    console.error("Failed to roll back Speko agent:", {
+      code: error?.code || "speko_agent_rollback_failed",
+    });
+    return res.status(error?.status || 502).json({
+      success: false,
+      error: error?.code || "speko_agent_rollback_failed",
+      uncertain: error?.uncertain === true,
+    });
+  }
 });
 
 app.get("/admin/voice-models", requireAdminToken, async (req, res) => {
@@ -30011,6 +30223,7 @@ registerCallRoutes(app, {
   getDb: () => db,
   getSpekoRecording: (sessionId) =>
     getSpekoVoiceAdapter().getRecording(sessionId),
+  reconcileSpekoCall,
   isSafeId,
   normalizeCallRecordForApi,
   buildCallbackPayload,
@@ -30065,7 +30278,12 @@ registerStatusRoutes(app, {
   callFunctionSystems,
 });
 
-async function handleSpekoCallReport(callSid, sessionId, report = {}) {
+async function handleSpekoCallReport(
+  callSid,
+  sessionId,
+  report = {},
+  options = {},
+) {
   const dbInstance = db;
   const entries = Array.isArray(report?.transcript?.entries)
     ? report.transcript.entries
@@ -30133,36 +30351,286 @@ async function handleSpekoCallReport(callSid, sessionId, report = {}) {
   const call = (await dbInstance.getCall(callSid).catch(() => null)) || {};
   const transcripts = await dbInstance.getCallTranscripts(callSid).catch(() => []);
   const duration = Number(report?.duration_seconds) || null;
-  void runPostCallQaEvaluation({
-    callSid,
-    call,
-    transcripts,
-    durationSeconds: duration,
-    config,
-    db: dbInstance,
-    logger: console,
-  }).catch((error) => {
-    console.error("speko_post_call_qa_failed", {
-      call_sid: callSid,
-      error: error?.code || "post_call_qa_failed",
-    });
-  });
-  void runPostCallAutomationTrigger({
-    service: postCallAutomationService,
-    webhookService,
-    db: dbInstance,
-    logger: console,
-    callSid,
-    payload: buildCallCompletionAutomationPayload({
+  if (options.runPostCallSideEffects !== false) {
+    void runPostCallQaEvaluation({
       callSid,
       call,
       transcripts,
-      summary: { summary: report?.summary || "" },
-      finalStatus,
-      notificationType: notificationTypeForCallStatus(finalStatus),
-      duration,
-    }),
+      durationSeconds: duration,
+      config,
+      db: dbInstance,
+      logger: console,
+    }).catch((error) => {
+      console.error("speko_post_call_qa_failed", {
+        call_sid: callSid,
+        error: error?.code || "post_call_qa_failed",
+      });
+    });
+    void runPostCallAutomationTrigger({
+      service: postCallAutomationService,
+      webhookService,
+      db: dbInstance,
+      logger: console,
+      callSid,
+      payload: buildCallCompletionAutomationPayload({
+        callSid,
+        call,
+        transcripts,
+        summary: { summary: report?.summary || "" },
+        finalStatus,
+        notificationType: notificationTypeForCallStatus(finalStatus),
+        duration,
+      }),
+    });
+  }
+}
+
+function normalizeSpekoReconciliationStatus(event = {}) {
+  const eventType = String(event.event_type || "").trim().toLowerCase();
+  const status = String(event.status || "").trim().toLowerCase();
+  const endReason = String(event.end_reason || event.failure_cause || "")
+    .trim()
+    .toLowerCase();
+  if (["sip_busy", "busy", "line_busy"].includes(endReason)) return "busy";
+  if (["sip_no_answer", "no_answer", "no-answer", "timeout"].includes(endReason)) {
+    return "no-answer";
+  }
+  if (["sip_declined", "caller_abandoned"].includes(endReason)) return "canceled";
+  if (eventType === "call.initiated") return "initiated";
+  if (eventType === "call.ringing") return "ringing";
+  if (["call.answered", "call.bridged"].includes(eventType)) return "in-progress";
+  if (["call.hangup", "session.ended", "room_finished"].includes(eventType)) {
+    return status === "failed" ? "failed" : "completed";
+  }
+  if (status === "active" || status === "answered") return "in-progress";
+  if (status === "ringing") return "ringing";
+  if (status === "failed" || status === "failure") return "failed";
+  if (status === "ended" || status === "completed") return "completed";
+  return null;
+}
+
+async function reconcileSpekoCall(callSid) {
+  const call = await db.getCall(callSid).catch(() => null);
+  if (!call) {
+    const error = new Error("Call not found");
+    error.code = "call_not_found";
+    error.status = 404;
+    throw error;
+  }
+  const created = await db.getLatestCallState(callSid, "call_created");
+  const sessionId = String(
+    created?.provider_metadata?.speko_session_id || "",
+  ).trim();
+  if (created?.provider !== "speko" || !sessionId) {
+    const error = new Error("Call is not linked to a Speko session");
+    error.code = "speko_session_not_linked";
+    error.status = 409;
+    throw error;
+  }
+
+  const previous = await db.getLatestCallState(callSid, "speko_reconciliation");
+  const previousAttemptAt = Date.parse(previous?.attempted_at || "");
+  if (Number.isFinite(previousAttemptAt) && Date.now() - previousAttemptAt < 30000) {
+    const error = new Error("Speko call was reconciled recently");
+    error.code = "speko_reconciliation_rate_limited";
+    error.status = 429;
+    throw error;
+  }
+  const lease = await db.claimSpekoReconciliation({
+    call_sid: callSid,
+    lease_seconds: 90,
   });
+  if (!lease?.claimed) {
+    const error = new Error("Speko call reconciliation is already running");
+    error.code = "speko_reconciliation_in_progress";
+    error.status = 429;
+    throw error;
+  }
+  const attemptedAt = new Date().toISOString();
+  try {
+    await db.updateCallState(callSid, "speko_reconciliation", {
+      provider: "speko",
+      speko_session_id: sessionId,
+      attempted_at: attemptedAt,
+      outcome: "started",
+    });
+    const adapter = getSpekoVoiceAdapter();
+    const [detail, events] = await Promise.all([
+      adapter.getCall(sessionId),
+      adapter.getCallEvents(sessionId),
+    ]);
+    if (!detail || typeof detail !== "object" || !Array.isArray(events)) {
+      const error = new Error("Speko returned invalid call reconciliation data");
+      error.code = "speko_reconciliation_invalid_response";
+      error.status = 502;
+      throw error;
+    }
+    const remoteSessionId = String(
+      detail.id || detail.call_id || detail.session_id || "",
+    ).trim();
+    if (remoteSessionId && remoteSessionId !== sessionId) {
+      const error = new Error("Speko call identity did not match the stored session");
+      error.code = "speko_reconciliation_session_mismatch";
+      error.status = 409;
+      throw error;
+    }
+    const remoteInternalId = String(
+      detail.metadata?.voicednut_call_id || "",
+    ).trim();
+    if (remoteInternalId && remoteInternalId !== callSid) {
+      const error = new Error("Speko metadata did not match the Voicednut call");
+      error.code = "speko_reconciliation_metadata_mismatch";
+      error.status = 409;
+      throw error;
+    }
+
+    const safeEvents = events.slice(-250);
+    for (const event of safeEvents) {
+      const eventPayload =
+        event?.payload && typeof event.payload === "object" && !Array.isArray(event.payload)
+          ? event.payload
+          : {};
+      const sequence = Number(event?.sequence ?? eventPayload.sequence);
+      const eventType = String(event?.event_type || eventPayload.event_type || "")
+        .trim()
+        .toLowerCase();
+      const eventId = String(event?.id || eventPayload.event_id || "").trim();
+      if (!eventType) continue;
+      const hasSequence = Number.isSafeInteger(sequence) && sequence > 0;
+      let claim = null;
+      if (hasSequence) {
+        claim = {
+          call_sid: sessionId,
+          sequence_number: sequence,
+          event_key: `reconcile:${eventId || `${eventType}:${sequence}`}`,
+        };
+        const claimResult = await db.claimSpekoCallSequence(claim);
+        if (claimResult?.stale) continue;
+        if (!claimResult?.claimed) {
+          const error = new Error("Speko event sequence is being processed");
+          error.code = "speko_reconciliation_sequence_busy";
+          error.status = 409;
+          throw error;
+        }
+      }
+      try {
+        const eventData = {
+          ...eventPayload,
+          event_type: eventType,
+          status: event?.status ?? eventPayload.status,
+          end_reason: eventPayload.end_reason || event?.failure_cause || null,
+          failure_cause: event?.failure_cause || eventPayload.failure_cause || null,
+          sequence: hasSequence ? sequence : null,
+        };
+        const status = normalizeSpekoReconciliationStatus(eventData);
+        if (status) {
+          await recordCallStatus(
+            callSid,
+            status,
+            notificationTypeForCallStatus(status),
+            {
+              provider: "speko",
+              provider_status: eventData.status || null,
+              speko_session_id: sessionId,
+              speko_event_type: eventType,
+              speko_sequence: hasSequence ? sequence : null,
+              end_reason: eventData.end_reason,
+              failure_cause: eventData.failure_cause,
+            },
+          );
+        }
+        if (eventType.startsWith("call.transfer.")) {
+          await handleSpekoCallTransfer(callSid, sessionId, eventType, eventData);
+        }
+        await db.updateCallState(callSid, "speko_reconciled_event", {
+          provider: "speko",
+          speko_session_id: sessionId,
+          event_id: eventId || null,
+          event_type: eventType,
+          status: eventData.status || null,
+          sequence: hasSequence ? sequence : null,
+          occurred_at: event?.occurred_at || eventPayload.occurred_at || null,
+          reconciled_at: new Date().toISOString(),
+        });
+        if (claim) {
+          const finish = await db.finishSpekoCallSequence(claim);
+          if (finish?.advanced === false) {
+            const error = new Error("Speko event sequence claim was lost");
+            error.code = "speko_reconciliation_claim_lost";
+            error.status = 409;
+            throw error;
+          }
+        }
+      } catch (error) {
+        if (claim) await db.releaseSpekoCallSequenceClaim(claim).catch(() => {});
+        throw error;
+      }
+    }
+
+    const report = detail.report && typeof detail.report === "object"
+      ? detail.report
+      : null;
+    if (report) {
+      await handleSpekoCallReport(callSid, sessionId, report, {
+        runPostCallSideEffects: false,
+      });
+    } else {
+      const detailStatus = normalizeSpekoReconciliationStatus({
+        status: detail.status,
+        event_type: detail.status === "ended" ? "session.ended" : "",
+        end_reason: detail.end_reason,
+      });
+      if (detailStatus) {
+        await recordCallStatus(
+          callSid,
+          detailStatus,
+          notificationTypeForCallStatus(detailStatus),
+          {
+            provider: "speko",
+            provider_status: detail.status || null,
+            speko_session_id: sessionId,
+            speko_reconciled: true,
+          },
+        );
+      }
+    }
+    if (detail.recording_status) {
+      await handleSpekoCallRecording(callSid, sessionId, {
+        recording: {
+          status: detail.recording_status,
+          duration_ms: detail.recording_duration_ms,
+        },
+      });
+    }
+    const finalCall = await db.getCall(callSid);
+    const result = {
+      call_sid: callSid,
+      speko_session_id: sessionId,
+      status: finalCall?.status || null,
+      events_examined: safeEvents.length,
+      latest_sequence: await db.getSpekoCallSequence({ call_sid: sessionId }),
+      reconciled_at: new Date().toISOString(),
+    };
+    await db.updateCallState(callSid, "speko_reconciliation", {
+      provider: "speko",
+      speko_session_id: sessionId,
+      attempted_at: attemptedAt,
+      outcome: "complete",
+      ...result,
+    });
+    return result;
+  } catch (error) {
+    await db.updateCallState(callSid, "speko_reconciliation", {
+      provider: "speko",
+      speko_session_id: sessionId,
+      attempted_at: attemptedAt,
+      outcome: "failed",
+      error_code: error?.code || "speko_reconciliation_failed",
+    }).catch(() => {});
+    throw error;
+  } finally {
+    await db.releaseSpekoReconciliation({ call_sid: callSid }).catch(() => {});
+  }
 }
 
 async function handleSpekoPreCall(event = {}) {
@@ -30234,7 +30702,7 @@ async function handleSpekoPreCall(event = {}) {
     error.status = 503;
     throw error;
   }
-  callDirections.set(sessionId, "inbound");
+  callDirections.set(callSid, "inbound");
   return { metadata: { voicednut_call_id: callSid } };
 }
 
@@ -30332,6 +30800,39 @@ registerWebhookRoutes(app, {
   handleSpekoCallAnalysis,
   handleSpekoCallRecording,
   handleSpekoCallTransfer,
+  resolveSessionCall: (sessionId) => db.getSpekoCallBySessionId(sessionId),
+  shouldProcessToolCall: async (idempotencyKey) => {
+    if (!db?.reserveProviderEventIdempotency) {
+      throw new Error("speko_tool_idempotency_unavailable");
+    }
+    return shouldProcessProviderEventAsync(
+      "speko_agent_tool",
+      { idempotency_key: idempotencyKey },
+      { ttlMs: 24 * 60 * 60 * 1000 },
+    );
+  },
+  releaseToolCall: (idempotencyKey) =>
+    releaseProviderEventAsync("speko_agent_tool", {
+      idempotency_key: idempotencyKey,
+    }),
+  executeTool: async ({ callSid, tool, args }) => {
+    const implementations = buildConnectorPackImplementations({
+      callSid,
+      getCallConfig: () => callConfigurations.get(callSid) || {},
+      db,
+      webhookService,
+      fetchFn: fetch,
+      getCurrentProvider: () => "speko",
+    });
+    const implementation = implementations[tool];
+    if (typeof implementation !== "function") {
+      const error = new Error("speko_tool_not_allowed");
+      error.code = "speko_tool_not_allowed";
+      error.status = 403;
+      throw error;
+    }
+    return implementation(args);
+  },
   getPlivoCallUuid,
   resolvePlivoCallSid,
   rememberPlivoCallMapping,
@@ -30710,6 +31211,7 @@ module.exports = {
     syncRuntimeProviderMirrors,
     placeOutboundCall,
     handleSpekoPreCall,
+    reconcileSpekoCall,
     verifyHmacSignature,
     resolveApiHmacReplayValidationMode,
     resetHmacReplayCacheForTests,

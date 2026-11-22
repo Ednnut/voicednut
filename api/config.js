@@ -1121,12 +1121,16 @@ module.exports = {
   speko: {
     enabled: spekoEnabled,
     inboundEnabled: spekoInboundEnabled,
+    agentToolsEnabled:
+      String(readEnv("SPEKO_AGENT_TOOLS_ENABLED") || "false").toLowerCase() === "true",
     apiKey: readEnv("SPEKO_API_KEY"),
     baseUrl: readEnv("SPEKO_BASE_URL") || "https://api.speko.dev",
     agentId: readEnv("SPEKO_AGENT_ID"),
+    brokerId: readEnv("SPEKO_BROKER_ID"),
     phoneNumber: readEnv("SPEKO_PHONE_NUMBER"),
     inboundPhoneNumber: readEnv("SPEKO_INBOUND_PHONE_NUMBER"),
     webhookSecret: readEnv("SPEKO_WEBHOOK_SECRET"),
+    agentToolWebhookSecret: readEnv("SPEKO_AGENT_TOOL_WEBHOOK_SECRET"),
     requestTimeoutMs:
       Number.isFinite(spekoRequestTimeoutMs) && spekoRequestTimeoutMs > 0
         ? Math.floor(spekoRequestTimeoutMs)

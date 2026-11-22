@@ -526,6 +526,43 @@ function createGetSpekoRecordingHandler(ctx = {}) {
   };
 }
 
+function createReconcileSpekoCallHandler(ctx = {}) {
+  return async function handleReconcileSpekoCall(req, res) {
+    const db = typeof ctx.getDb === "function" ? ctx.getDb() : ctx.db;
+    const callSid = String(req.params?.callSid || "").trim();
+    if (!ctx.isSafeId?.(callSid, { max: 128 })) {
+      return res.status(400).json({ error: "invalid_call_id" });
+    }
+    if (!db || typeof ctx.reconcileSpekoCall !== "function") {
+      return res.status(503).json({ error: "speko_reconciliation_unavailable" });
+    }
+    try {
+      const call = await db.getCall(callSid);
+      if (!call) return res.status(404).json({ error: "call_not_found" });
+      const requesterChatId = getRequesterChatId(req);
+      if (call.user_chat_id && !requesterChatId) {
+        return res.status(403).json({ error: "call_owner_required" });
+      }
+      if (isOwnedByDifferentChat(call, requesterChatId)) {
+        return res.status(403).json({ error: "call_owner_mismatch" });
+      }
+      const result = await ctx.reconcileSpekoCall(callSid);
+      return res.json({ success: true, ...result });
+    } catch (error) {
+      const status = [400, 404, 409, 429, 503].includes(Number(error?.status))
+        ? Number(error.status)
+        : 502;
+      console.error("Speko call reconciliation failed:", {
+        call_sid: callSid,
+        code: error?.code || "speko_reconciliation_failed",
+      });
+      return res.status(status).json({
+        error: error?.code || "speko_reconciliation_failed",
+      });
+    }
+  };
+}
+
 function createGetTranscriptAudioHandler(ctx = {}) {
   const { isSafeId } = ctx;
 
@@ -1844,6 +1881,7 @@ function registerCallRoutes(app, ctx = {}) {
   const handleOutboundCall = createOutboundCallHandler(ctx);
   const handleGetCallDetails = createGetCallDetailsHandler(ctx);
   const handleGetSpekoRecording = createGetSpekoRecordingHandler(ctx);
+  const handleReconcileSpekoCall = createReconcileSpekoCallHandler(ctx);
   const handleGetTranscriptAudio = createGetTranscriptAudioHandler(ctx);
   const handleListCalls = createListCallsHandler(ctx);
   const handleListCallsFiltered = createListCallsFilteredHandler(ctx);
@@ -1870,6 +1908,11 @@ function registerCallRoutes(app, ctx = {}) {
     "/api/calls/:callSid/recording",
     requireOutboundAuthorization,
     handleGetSpekoRecording,
+  );
+  app.post(
+    "/api/calls/:callSid/reconcile",
+    requireOutboundAuthorization,
+    handleReconcileSpekoCall,
   );
   app.get(
     "/api/calls/:callSid/transcript/audio",
@@ -1923,5 +1966,6 @@ module.exports = {
   __testables: {
     createOutboundCallHandler,
     createGetSpekoRecordingHandler,
+    createReconcileSpekoCallHandler,
   },
 };

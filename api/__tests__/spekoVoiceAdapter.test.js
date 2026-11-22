@@ -11,6 +11,7 @@ const validConfig = {
   apiKey: "test-key",
   baseUrl: "https://api.speko.dev",
   agentId: "agent_test",
+  brokerId: "broker_test",
   phoneNumber: "+12015550199",
   webhookSecret: `whsec_${Buffer.from("test-secret").toString("base64")}`,
   requestTimeoutMs: 30000,
@@ -321,6 +322,199 @@ describe("Speko voice adapter", () => {
       phoneNumberConfigured: true,
     });
   });
+
+  it("reads call detail and durable event history through the SDK", async () => {
+    const requested = [];
+    const adapter = new SpekoVoiceAdapter({
+      config: validConfig,
+      clientFactory: async () => ({
+        calls: {
+          get: async (sessionId) => {
+            requested.push(["get", sessionId]);
+            return { id: sessionId, status: "ended" };
+          },
+          events: async (sessionId) => {
+            requested.push(["events", sessionId]);
+            return { events: [{ id: "evt_1", event_type: "call.hangup" }] };
+          },
+        },
+      }),
+    });
+    const detail = await adapter.getCall("session_789");
+    const events = await adapter.getCallEvents("session_789");
+    assert.equal(detail.status, "ended");
+    assert.equal(events.length, 1);
+    assert.deepEqual(requested, [
+      ["get", "session_789"],
+      ["events", "session_789"],
+    ]);
+  });
+
+  it("provides read-only usage and agent visibility through the SDK", async () => {
+    const calls = [];
+    const adapter = new SpekoVoiceAdapter({
+      config: validConfig,
+      clientFactory: async () => ({
+        usage: {
+          get: async (params) => {
+            calls.push(["usage", params]);
+            return { totalSessions: 3, totalMinutes: 12.5, totalCost: 4.25 };
+          },
+        },
+        agents: {
+          list: async () => {
+            calls.push(["agents.list"]);
+            return [{ id: "agent_test", name: "Support" }];
+          },
+          get: async (agentId) => {
+            calls.push(["agents.get", agentId]);
+            return { id: agentId, name: "Support" };
+          },
+          tools: {
+            list: async (agentId, signal, options) => {
+              calls.push(["agents.tools.list", agentId, signal, options]);
+              return [{ id: "tool_1", name: "lookup_customer" }];
+            },
+          },
+        },
+      }),
+    });
+
+    const usage = await adapter.getUsage({
+      from: "2026-11-01",
+      to: "2026-11-22",
+    });
+    assert.equal(usage.totalCost, 4.25);
+    assert.deepEqual((await adapter.listAgents())[0], {
+      id: "agent_test",
+      name: "Support",
+    });
+    assert.equal((await adapter.getAgent("agent_test")).name, "Support");
+    assert.equal(
+      (await adapter.listAgentTools("agent_test", { available: true })).length,
+      1,
+    );
+    assert.deepEqual(calls, [
+      ["usage", { from: "2026-11-01", to: "2026-11-22" }],
+      ["agents.list"],
+      ["agents.get", "agent_test"],
+      ["agents.tools.list", "agent_test", undefined, { available: true }],
+    ]);
+  });
+
+  it("supports explicit agent, tool, and human call-control SDK operations", async () => {
+    const calls = [];
+    const adapter = new SpekoVoiceAdapter({
+      config: validConfig,
+      clientFactory: async () => ({
+        agents: {
+          create: async (params) => {
+            calls.push(["agents.create", params]);
+            return { id: "agent_created" };
+          },
+          update: async (agentId, params) => {
+            calls.push(["agents.update", agentId, params]);
+            return { id: agentId, name: "Updated" };
+          },
+          delete: async (agentId) => {
+            calls.push(["agents.delete", agentId]);
+            return { deleted: true };
+          },
+          listCalls: async (agentId, params) => {
+            calls.push(["agents.listCalls", agentId, params]);
+            return { calls: [], entries: [] };
+          },
+          tools: {
+            create: async (agentId, params) => {
+              calls.push(["agents.tools.create", agentId, params]);
+              return { id: "tool_created" };
+            },
+            get: async (agentId, toolId) => {
+              calls.push(["agents.tools.get", agentId, toolId]);
+              return { id: toolId };
+            },
+            update: async (agentId, toolId, params) => {
+              calls.push(["agents.tools.update", agentId, toolId, params]);
+              return { id: toolId };
+            },
+            delete: async (agentId, toolId) => {
+              calls.push(["agents.tools.delete", agentId, toolId]);
+              return { deleted: true };
+            },
+          },
+        },
+        callControl: {
+          dial: async (params) => {
+            calls.push(["callControl.dial", params]);
+            return { call: { id: "call_1" }, join: { token: "token" } };
+          },
+          get: async (callId) => {
+            calls.push(["callControl.get", callId]);
+            return { id: callId };
+          },
+          events: async (callId) => {
+            calls.push(["callControl.events", callId]);
+            return { events: [] };
+          },
+          dtmf: async (controlId, params) => {
+            calls.push(["callControl.dtmf", controlId, params]);
+            return { status: "active" };
+          },
+          transfer: async (controlId, params) => {
+            calls.push(["callControl.transfer", controlId, params]);
+            return { status: "initiated" };
+          },
+          hangup: async (controlId, params) => {
+            calls.push(["callControl.hangup", controlId, params]);
+            return { status: "ended" };
+          },
+        },
+      }),
+    });
+
+    assert.equal((await adapter.createAgent({
+      name: "Support",
+      systemPrompt: "Help callers",
+      intent: { language: "en" },
+    })).id, "agent_created");
+    assert.equal((await adapter.updateAgent("agent_test", { name: "Updated" })).name, "Updated");
+    assert.equal((await adapter.deleteAgent("agent_test")).deleted, true);
+    assert.equal((await adapter.listAgentCalls("agent_test", { limit: 10 })).calls.length, 0);
+    assert.equal((await adapter.createAgentTool("agent_test", {
+      name: "lookup",
+      description: "Look up a customer",
+      parameters: { type: "object", properties: {} },
+      source: { type: "webhook", url: "https://example.com/tool" },
+    })).id, "tool_created");
+    assert.equal((await adapter.getAgentTool("agent_test", "tool_1")).id, "tool_1");
+    assert.equal((await adapter.updateAgentTool("agent_test", "tool_1", { description: "Updated" })).id, "tool_1");
+    assert.equal((await adapter.deleteAgentTool("agent_test", "tool_1")).deleted, true);
+
+    assert.equal((await adapter.dialHumanCall({
+      to: "+12015550123",
+      from: "+12015550199",
+      metadata: { case_id: "case_1" },
+    })).call.id, "call_1");
+    assert.equal((await adapter.getHumanCall("call_1")).id, "call_1");
+    assert.equal((await adapter.getHumanCallEvents("call_1")).events.length, 0);
+    await adapter.humanCallCommand("dtmf", "control_pstn", { digits: "1w2" });
+    await adapter.humanCallCommand("transfer", "control_browser", {
+      to: "+12015550124",
+      mode: "blind",
+    });
+    await adapter.humanCallCommand("hangup", "control_browser", {
+      reason: "resolved",
+    });
+
+    assert.deepEqual(calls.slice(-3), [
+      ["callControl.dtmf", "control_pstn", { digits: "1w2" }],
+      ["callControl.transfer", "control_browser", {
+        to: "+12015550124",
+        mode: "blind",
+      }],
+      ["callControl.hangup", "control_browser", { reason: "resolved" }],
+    ]);
+  });
 });
 
 describe("Speko webhook verification and lifecycle mapping", () => {
@@ -442,6 +636,48 @@ describe("Speko webhook verification and lifecycle mapping", () => {
     assert.equal(dedupeCalls, 0);
   });
 
+  it("passes authenticated pre-call payloads to the inbound route and fails closed", async () => {
+    let acceptedEvent = null;
+    const acceptedHandler = createSpekoWebhookHandler({
+      config: { speko: { webhookSecret: validConfig.webhookSecret } },
+      handleSpekoPreCall: async (event) => {
+        acceptedEvent = event;
+        return { metadata: { voicednut_call_id: "speko_in_test" } };
+      },
+    });
+    const body = JSON.stringify({
+      type: "call.pre_call",
+      session_id: "session_inbound",
+      direction: "inbound",
+      to: "+12015550199",
+    });
+    const accepted = makeResponse();
+    await acceptedHandler(
+      makeRequest(validConfig.webhookSecret, body),
+      accepted,
+    );
+    assert.equal(accepted.statusCode, 200);
+    assert.equal(acceptedEvent.session_id, "session_inbound");
+    assert.equal(accepted.body.metadata.voicednut_call_id, "speko_in_test");
+
+    const deniedHandler = createSpekoWebhookHandler({
+      config: { speko: { webhookSecret: validConfig.webhookSecret } },
+      handleSpekoPreCall: async () => {
+        const error = new Error("unassigned");
+        error.code = "speko_inbound_number_unassigned";
+        error.status = 403;
+        throw error;
+      },
+    });
+    const denied = makeResponse();
+    await deniedHandler(
+      makeRequest(validConfig.webhookSecret, body, { webhookId: "evt_denied" }),
+      denied,
+    );
+    assert.equal(denied.statusCode, 403);
+    assert.equal(denied.body.error, "speko_inbound_number_unassigned");
+  });
+
   it("persists sequenced report, analysis, recording, and transfer events by session", async () => {
     const sequences = [];
     const events = [];
@@ -499,5 +735,65 @@ describe("Speko webhook verification and lifecycle mapping", () => {
     assert.deepEqual(events[0], ["report", "session_123", null]);
     assert.deepEqual(events[2], ["recording", "session_123", "ready"]);
     assert.deepEqual(events[4], ["report", "session_123", "https://signed.example/audio"]);
+  });
+
+  it("uses Speko's draft and version endpoints without updating live agents", async () => {
+    const requests = [];
+    const responses = [
+      { has_draft: false, agent_id: "agent_1" },
+      { has_draft: true, changed_fields: ["systemPrompt"], draft_version_number: 2 },
+      [{ version_number: 1, status: "live" }],
+      { published_draft: true, version_number: 2 },
+      { version_number: 3, status: "live" },
+    ];
+    const adapter = new SpekoVoiceAdapter({
+      config: validConfig,
+      fetch: async (url, options) => {
+        requests.push({ url, options });
+        return createResponse(200, responses.shift());
+      },
+    });
+
+    await adapter.getAgentDraft("agent/1");
+    await adapter.updateAgentDraft("agent/1", { systemPrompt: "Updated prompt" });
+    await adapter.listAgentVersions("agent/1");
+    await adapter.deployAgentDraft("agent/1");
+    await adapter.rollbackAgent("agent/1", 1);
+
+    assert.deepEqual(requests.map(({ url, options }) => [
+      url.replace("https://api.speko.dev", ""),
+      options.method || "GET",
+    ]), [
+      ["/v1/agents/agent%2F1/draft", "GET"],
+      ["/v1/agents/agent%2F1/draft", "PUT"],
+      ["/v1/agents/agent%2F1/versions", "GET"],
+      ["/v1/agents/agent%2F1/deploy", "POST"],
+      ["/v1/agents/agent%2F1/rollback", "POST"],
+    ]);
+    assert.deepEqual(JSON.parse(requests[1].options.body), { systemPrompt: "Updated prompt" });
+    assert.deepEqual(JSON.parse(requests[3].options.body), {});
+    assert.deepEqual(JSON.parse(requests[4].options.body), { target_version_number: 1 });
+    assert.equal(requests.some(({ url }) => /\/v1\/agents\/agent%2F1$/.test(url)), false);
+  });
+
+  it("rejects unsupported agent draft fields and invalid rollback versions locally", async () => {
+    const adapter = new SpekoVoiceAdapter({
+      config: validConfig,
+      fetch: async () => {
+        throw new Error("Draft validation should not make a request");
+      },
+    });
+    await assert.rejects(
+      adapter.updateAgentDraft("agent_test", { outboundDtmf: true }),
+      { code: "speko_unsupported_agent_draft_field", status: 400 },
+    );
+    await assert.rejects(
+      adapter.updateAgentDraft("agent_test", {}),
+      { code: "speko_unsupported_agent_draft_field", status: 400 },
+    );
+    await assert.rejects(
+      adapter.rollbackAgent("agent_test", 0),
+      { code: "speko_invalid_agent_version", status: 400 },
+    );
   });
 });
