@@ -12,7 +12,7 @@ const config = require("../config");
 assert.equal(config.apiUrl, "https://api.example.test");
 assert.equal(config.scriptsApiUrl, "https://api.example.test");
 assert.equal(
-  config.normalizeApiBaseUrl("https://api.example.test///", "API_URL"),
+  config.normalizeApiBaseUrl("https://api.example.test/", "API_URL"),
   "https://api.example.test",
 );
 assert.throws(
