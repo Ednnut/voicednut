@@ -23,12 +23,40 @@ if (!adminApiToken || !apiHmacSecret) {
   process.exit(1);
 }
 
-const scriptsApiUrl = process.env.SCRIPTS_API_URL || process.env.TEMPLATES_API_URL || process.env.API_URL;
+function normalizeApiBaseUrl(value, label) {
+  const raw = String(value || '').trim();
+  let parsed;
+  try {
+    parsed = new URL(raw);
+  } catch (error) {
+    throw new Error('Invalid ' + label + ': ' + (raw || 'undefined') + ' (' + error.message + ')');
+  }
+  if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password || parsed.search || parsed.hash) {
+    throw new Error(label + ' must be an HTTP(S) API origin without credentials, query, or fragment.');
+  }
+  if (parsed.pathname !== '/' && parsed.pathname !== '') {
+    throw new Error(label + ' must be the API origin only; do not include a path such as /api.');
+  }
+  return parsed.origin;
+}
+
+let apiUrl;
+let scriptsApiUrl;
+try {
+  apiUrl = normalizeApiBaseUrl(process.env.API_URL, 'API_URL');
+  scriptsApiUrl = normalizeApiBaseUrl(
+    process.env.SCRIPTS_API_URL || process.env.TEMPLATES_API_URL || apiUrl,
+    'SCRIPTS_API_URL',
+  );
+} catch (error) {
+  console.error('❌ ' + error.message);
+  process.exit(1);
+}
 function resolveMiniAppUrl() {
   const explicit = String(process.env.MINI_APP_URL || '').trim();
   if (explicit) return explicit;
   try {
-    return new URL('/miniapp', process.env.API_URL).toString();
+    return new URL('/miniapp', apiUrl).toString();
   } catch {
     return '';
   }
@@ -40,15 +68,7 @@ function parsePositiveInt(value, fallback) {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
-try {
-  // eslint-disable-next-line no-new
-  new URL(scriptsApiUrl);
-} catch (error) {
-  console.error(`❌ Invalid SCRIPTS_API_URL: ${scriptsApiUrl || 'undefined'} (${error.message})`);
-  process.exit(1);
-}
-
-// Check for required environment variables
+// API URLs are normalized once so all bot routes use a consistent origin.
 
 module.exports = {
   admin: {
@@ -56,7 +76,7 @@ module.exports = {
     username: process.env.ADMIN_TELEGRAM_USERNAME,
     apiToken: adminApiToken
   },
-  apiUrl: process.env.API_URL,
+  apiUrl,
   botToken: process.env.BOT_TOKEN,
   scriptsApiUrl,
   miniApp: {
@@ -71,4 +91,5 @@ module.exports = {
   apiAuth: {
     hmacSecret: apiHmacSecret,
   },
+  normalizeApiBaseUrl,
 };
